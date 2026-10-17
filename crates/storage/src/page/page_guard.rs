@@ -7,7 +7,9 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::{
     buffer::{
         arc_replacer::ArcReplacer,
-        buffer_pool_manager::{FrameHeader, FrameReadLatch, FrameWriteLatch},
+        buffer_pool_manager::{
+            BpmLatch, BufferPoolManagerState, FrameHeader, FrameReadLatch, FrameWriteLatch,
+        },
     },
     disk::disk_scheduler::DiskScheduler,
     page::{PAGE_SIZE, PageBuf, PageId},
@@ -26,7 +28,7 @@ pub struct ReadPageGuard {
     page_id: PageId,
     frame: Arc<FrameHeader>,
     replacer: Arc<ArcReplacer>,
-    bpm_latch: Arc<Mutex<()>>,
+    bpm_latch: BpmLatch,
     disk_scheduler: Arc<DiskScheduler>,
     /// `Some` until `drop`, which releases it before unpinning.
     latch: Option<FrameReadLatch>,
@@ -38,7 +40,7 @@ impl ReadPageGuard {
         page_id: PageId,
         frame: Arc<FrameHeader>,
         replacer: Arc<ArcReplacer>,
-        bpm_latch: Arc<Mutex<()>>,
+        bpm_latch: BpmLatch,
         disk_scheduler: Arc<DiskScheduler>,
     ) -> Self {
         debug_assert!(
@@ -101,7 +103,7 @@ pub struct WritePageGuard {
     page_id: PageId,
     frame: Arc<FrameHeader>,
     replacer: Arc<ArcReplacer>,
-    bpm_latch: Arc<Mutex<()>>,
+    bpm_latch: BpmLatch,
     disk_scheduler: Arc<DiskScheduler>,
     /// `Some` until `drop`, which releases it before unpinning.
     latch: Option<FrameWriteLatch>,
@@ -113,7 +115,7 @@ impl WritePageGuard {
         page_id: PageId,
         frame: Arc<FrameHeader>,
         replacer: Arc<ArcReplacer>,
-        bpm_latch: Arc<Mutex<()>>,
+        bpm_latch: BpmLatch,
         disk_scheduler: Arc<DiskScheduler>,
     ) -> Self {
         debug_assert!(
@@ -214,7 +216,11 @@ fn cast_error<T>() -> String {
 ///
 /// Called after the frame latch is released, so this never holds the frame
 /// latch while waiting for the buffer pool latch.
-fn unpin_frame(frame: &FrameHeader, replacer: &ArcReplacer, bpm_latch: &Mutex<()>) {
+fn unpin_frame(
+    frame: &FrameHeader,
+    replacer: &ArcReplacer,
+    bpm_latch: &Mutex<BufferPoolManagerState>,
+) {
     let _bpm = bpm_latch.lock();
     if frame.unpin() == Some(0) {
         replacer.set_evictable(frame.frame_id(), true);
@@ -261,7 +267,7 @@ mod tests {
         _dir: TempDir,
         frame: Arc<FrameHeader>,
         replacer: Arc<ArcReplacer>,
-        bpm_latch: Arc<Mutex<()>>,
+        bpm_latch: BpmLatch,
         disk_scheduler: Arc<DiskScheduler>,
     }
 
@@ -279,7 +285,7 @@ mod tests {
                 _dir: dir,
                 frame,
                 replacer,
-                bpm_latch: Arc::new(Mutex::new(())),
+                bpm_latch: Arc::new(Mutex::new(BufferPoolManagerState::default())),
                 disk_scheduler: Arc::new(DiskScheduler::new(dm)),
             }
         }
