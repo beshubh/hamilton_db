@@ -1,4 +1,5 @@
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub mod page_guard;
@@ -10,6 +11,38 @@ pub const INVALID_PAGE_ID: PageId = -1;
 pub type PageData = Box<[u8; PAGE_SIZE]>;
 pub type PageReadGuard<'a> = RwLockReadGuard<'a, PageData>;
 pub type PageWriteGuard<'a> = RwLockWriteGuard<'a, PageData>;
+
+/// A page-sized buffer aligned to 8 bytes, so its bytes can be viewed as any
+/// on-disk struct with alignment up to 8 (see `ReadPageGuard::as_ref`).
+#[derive(Clone)]
+#[repr(C, align(8))]
+pub struct PageBuf(pub [u8; PAGE_SIZE]);
+
+impl PageBuf {
+    pub fn zeroed() -> Self {
+        Self([0u8; PAGE_SIZE])
+    }
+}
+
+impl Default for PageBuf {
+    fn default() -> Self {
+        Self::zeroed()
+    }
+}
+
+impl Deref for PageBuf {
+    type Target = [u8; PAGE_SIZE];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for PageBuf {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 /// An in-memory frame in the buffer pool holding one on-disk page.
 ///
