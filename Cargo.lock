@@ -27,6 +27,11 @@ name = "catalog"
 version = "0.1.0"
 dependencies = [
  "common",
+ "parking_lot",
+ "storage",
+ "tempfile",
+ "thiserror",
+ "zerocopy",
 ]
 
 [[package]]
