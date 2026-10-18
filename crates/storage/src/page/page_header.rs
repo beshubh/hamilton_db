@@ -16,6 +16,8 @@ pub enum PageType {
     BTreeInternal = 2,
     BTreeLeaf = 3,
     Directory = 4,
+    /// Page 0, which locates the system catalog.
+    CatalogHeader = 5,
 }
 
 impl TryFrom<u32> for PageType {
@@ -28,6 +30,7 @@ impl TryFrom<u32> for PageType {
             2 => Self::BTreeInternal,
             3 => Self::BTreeLeaf,
             4 => Self::Directory,
+            5 => Self::CatalogHeader,
             other => return Err(other),
         })
     }

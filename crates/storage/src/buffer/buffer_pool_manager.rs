@@ -146,6 +146,8 @@ pub struct BufferPoolManager {
 }
 
 impl BufferPoolManager {
+    /// Page ids continue after the highest page already in `disk_manager`'s
+    /// db file, so reopening a database never hands out a page id in use.
     pub fn new(num_frames: usize, disk_manager: Arc<DiskManager>) -> Self {
         let frames = (0..num_frames)
             .map(|i| Arc::new(FrameHeader::new(i as FrameId)))
@@ -154,9 +156,10 @@ impl BufferPoolManager {
             page_table: HashMap::new(),
             free_frames: (0..num_frames as FrameId).collect(),
         };
+        let next_page_id = disk_manager.next_page_id();
         Self {
             num_frames,
-            next_page_id: AtomicI32::new(0),
+            next_page_id: AtomicI32::new(next_page_id),
             frames,
             latch: Arc::new(Mutex::new(state)),
             replacer: Arc::new(ArcReplacer::new(num_frames)),
@@ -427,6 +430,23 @@ mod tests {
         assert_eq!(bpm.new_page(), 0);
         assert_eq!(bpm.new_page(), 1);
         assert_eq!(bpm.new_page(), 2);
+    }
+
+    #[test]
+    fn new_page_ids_continue_after_reopen() {
+        let (dir, dm, bpm) = setup(2);
+        for _ in 0..3 {
+            let pid = bpm.new_page();
+            write_bytes(&bpm, pid, b"x");
+        }
+        bpm.flush_all_pages().unwrap();
+        dm.shut_down().unwrap();
+        drop((bpm, dm));
+
+        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
+        let bpm = BufferPoolManager::new(2, dm);
+        assert_eq!(bpm.new_page(), 3);
+        assert_eq!(read_bytes(&bpm, 2, 1), b"x");
     }
 
     #[test]
