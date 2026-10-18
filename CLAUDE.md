@@ -23,4 +23,5 @@ cargo fmt --all
 - The page directory and page metadata (page_id → offset, free space per page, free and allocated slots) live in a separate `<db>.meta` file, not inside the db file. The db file holds only page data.
 - Don't run `cargo fmt --all`: it reformats unrelated files. Format only the files you changed (`rustfmt --edition 2024 <file>`).
   - `rustfmt` follows `mod` declarations, so formatting `lib.rs` (or any file declaring modules) also rewrites those submodules. Check `git diff --stat` afterwards and revert files you didn't mean to touch.
+- Commits and PRs carry no Claude attribution: no `Co-Authored-By` trailer, no "Generated with Claude Code" line.
 - Library crates return typed `thiserror` errors (`storage::StorageError`, `execution::ExecutionError`, …), each with a crate-level `Result<T>` alias. Higher crates wrap lower ones with `#[from]`. Only binaries (`bench`, future CLI/server) use `anyhow`. Tests match on variants (`matches!(err, StorageError::NoFreeFrame)`), not `io::ErrorKind`.
