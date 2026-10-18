@@ -1,3 +1,4 @@
+use crate::tuple;
 use crate::value::DataType;
 
 /// A named, typed column of a table or of a query's output.
@@ -22,14 +23,41 @@ impl Column {
 ///
 /// Names need not be unique: a query's output can repeat a column
 /// (`SELECT a, a`). Table schemas are kept unique by the catalog.
+///
+/// The schema also holds where each column's fixed-width slot sits in an
+/// encoded tuple (see [`crate::tuple`]), so one column can be read without
+/// walking the ones before it.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Schema {
     columns: Vec<Column>,
+    fixed_offsets: Vec<usize>,
+    /// Length of the null bitmap and fixed-width slots together; the
+    /// variable-length data of a tuple starts here.
+    fixed_len: usize,
 }
 
 impl Schema {
     pub fn new(columns: Vec<Column>) -> Self {
-        Self { columns }
+        let mut fixed_offsets = Vec::with_capacity(columns.len());
+        let mut fixed_len = tuple::bitmap_len(columns.len());
+        for column in &columns {
+            fixed_offsets.push(fixed_len);
+            fixed_len += tuple::fixed_width(column.data_type);
+        }
+        Self {
+            columns,
+            fixed_offsets,
+            fixed_len,
+        }
+    }
+
+    /// Offset of column `idx`'s fixed-width slot in an encoded tuple.
+    pub(crate) fn fixed_offset(&self, idx: usize) -> usize {
+        self.fixed_offsets[idx]
+    }
+
+    pub(crate) fn fixed_len(&self) -> usize {
+        self.fixed_len
     }
 
     pub fn columns(&self) -> &[Column] {
