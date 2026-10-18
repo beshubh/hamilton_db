@@ -1,9 +1,9 @@
-use std::io;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use crate::disk::disk_manager::DiskManager;
+use crate::error::{Result, StorageError};
 use crate::page::{PAGE_SIZE, PageData, PageId};
 
 /// A unit of work for the background worker. Each request carries the sending
@@ -11,31 +11,31 @@ use crate::page::{PAGE_SIZE, PageData, PageId};
 enum DiskRequest {
     Read {
         page_id: PageId,
-        done: Sender<io::Result<PageData>>,
+        done: Sender<Result<PageData>>,
     },
     Write {
         page_id: PageId,
         data: PageData,
-        done: Sender<io::Result<()>>,
+        done: Sender<Result<()>>,
     },
     Delete {
         page_id: PageId,
-        done: Sender<io::Result<()>>,
+        done: Sender<Result<()>>,
     },
 }
 
 /// Handle to the result of a scheduled request.
 #[must_use = "a DiskFuture does nothing unless you `wait` on it"]
 pub struct DiskFuture<T> {
-    rx: Receiver<io::Result<T>>,
+    rx: Receiver<Result<T>>,
 }
 
 impl<T> DiskFuture<T> {
     /// Blocks until the worker has finished the request.
-    pub fn wait(self) -> io::Result<T> {
+    pub fn wait(self) -> Result<T> {
         self.rx
             .recv()
-            .unwrap_or_else(|_| Err(io::Error::other("disk scheduler worker exited")))
+            .unwrap_or(Err(StorageError::DiskSchedulerShutDown))
     }
 }
 
@@ -83,10 +83,7 @@ impl DiskScheduler {
         self.schedule(|done| DiskRequest::Delete { page_id, done })
     }
 
-    fn schedule<T>(
-        &self,
-        make: impl FnOnce(Sender<io::Result<T>>) -> DiskRequest,
-    ) -> DiskFuture<T> {
+    fn schedule<T>(&self, make: impl FnOnce(Sender<Result<T>>) -> DiskRequest) -> DiskFuture<T> {
         let (done, rx) = mpsc::channel();
         let sender = self.sender.as_ref().expect("disk scheduler is shut down");
         // If the worker has died, `done` is dropped with the request and
@@ -187,7 +184,7 @@ mod tests {
     fn errors_are_reported() {
         let (_dir, _dm, scheduler) = setup();
         let err = scheduler.read_page(INVALID_PAGE_ID).wait().unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(err, StorageError::InvalidPageId(INVALID_PAGE_ID)));
     }
 
     #[test]

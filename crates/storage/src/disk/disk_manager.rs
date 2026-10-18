@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
+use crate::error::{Result, StorageError};
 use crate::page::{PAGE_SIZE, PageId};
 
 /// Number of pages the db file has room for when first created.
@@ -65,7 +66,7 @@ impl DiskManager {
     /// Opens (or creates) `db_file` with matching `.log` and `.meta` files
     /// next to it. The page directory of an existing database is loaded from
     /// its `.meta` file.
-    pub fn new(db_file: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn new(db_file: impl AsRef<Path>) -> Result<Self> {
         let db_file_name = db_file.as_ref().to_path_buf();
         let log_file_name = db_file_name.with_extension("log");
         let meta_file_name = db_file_name.with_extension("meta");
@@ -90,15 +91,12 @@ impl DiskManager {
                 // The meta file is saved before the db file is grown, so a
                 // db file with data but no meta file was not made by us.
                 if db_len != 0 {
-                    return Err(invalid_data(format!(
-                        "{} is missing",
-                        meta_file_name.display()
-                    )));
+                    return Err(StorageError::MissingMetadata(meta_file_name));
                 }
                 state.meta_dirty = true;
                 state.save_meta(&meta_file_name)?;
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
         let file_len = file_len_for(state.page_capacity);
         if (db_len as u64) < file_len {
@@ -120,13 +118,14 @@ impl DiskManager {
 
     /// Saves the metadata and flushes all files to stable storage. The files
     /// are closed when the `DiskManager` is dropped.
-    pub fn shut_down(&self) -> io::Result<()> {
+    pub fn shut_down(&self) -> Result<()> {
         self.checkpoint()?;
-        self.log.lock().log_io.sync_all()
+        self.log.lock().log_io.sync_all()?;
+        Ok(())
     }
 
     /// Flushes the db file and saves the metadata file if it changed.
-    pub fn checkpoint(&self) -> io::Result<()> {
+    pub fn checkpoint(&self) -> Result<()> {
         let mut state = self.state.lock();
         state.db_io.sync_all()?;
         state.save_meta(&self.meta_file_name)
@@ -140,20 +139,15 @@ impl DiskManager {
     }
 
     /// Records how many bytes are free in the page.
-    pub fn set_free_space(&self, page_id: PageId, free_space: usize) -> io::Result<()> {
+    pub fn set_free_space(&self, page_id: PageId, free_space: usize) -> Result<()> {
         if free_space > PAGE_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("free space {free_space} is larger than a page"),
-            ));
+            return Err(StorageError::InvalidFreeSpace(free_space));
         }
         let mut state = self.state.lock();
-        let entry = state.pages.get_mut(&page_id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("page {page_id} is not allocated"),
-            )
-        })?;
+        let entry = state
+            .pages
+            .get_mut(&page_id)
+            .ok_or(StorageError::PageNotAllocated(page_id))?;
         if entry.free_space != free_space as u32 {
             entry.free_space = free_space as u32;
             state.meta_dirty = true;
@@ -163,7 +157,7 @@ impl DiskManager {
 
     /// Writes `page_data` to the page's slot in the db file, giving the page
     /// a slot first if it does not have one yet.
-    pub fn write_page(&self, page_id: PageId, page_data: &[u8; PAGE_SIZE]) -> io::Result<()> {
+    pub fn write_page(&self, page_id: PageId, page_data: &[u8; PAGE_SIZE]) -> Result<()> {
         check_page_id(page_id)?;
         let mut state = self.state.lock();
         let offset = state.offset_or_allocate(page_id)?;
@@ -177,7 +171,7 @@ impl DiskManager {
 
     /// Reads the page into `page_data`. A page that has never been written
     /// reads as all zeroes.
-    pub fn read_page(&self, page_id: PageId, page_data: &mut [u8; PAGE_SIZE]) -> io::Result<()> {
+    pub fn read_page(&self, page_id: PageId, page_data: &mut [u8; PAGE_SIZE]) -> Result<()> {
         check_page_id(page_id)?;
         let mut state = self.state.lock();
         let offset = state.offset_or_allocate(page_id)?;
@@ -200,7 +194,7 @@ impl DiskManager {
     }
 
     /// Appends `log_data` to the log file and flushes it.
-    pub fn write_log(&self, log_data: &[u8]) -> io::Result<()> {
+    pub fn write_log(&self, log_data: &[u8]) -> Result<()> {
         if log_data.is_empty() {
             return Ok(());
         }
@@ -213,13 +207,13 @@ impl DiskManager {
             .and_then(|_| log.log_io.flush());
         log.num_flushes += 1;
         self.flush_log.store(false, Ordering::Release);
-        result
+        Ok(result?)
     }
 
     /// Reads `log_data.len()` bytes from the log file starting at `offset`.
     /// Returns `false` if `offset` is past the end of the log; a short read
     /// leaves the rest of the buffer zeroed.
-    pub fn read_log(&self, log_data: &mut [u8], offset: u64) -> io::Result<bool> {
+    pub fn read_log(&self, log_data: &mut [u8], offset: u64) -> Result<bool> {
         let mut log = self.log.lock();
         if offset >= log.log_io.metadata()?.len() {
             return Ok(false);
@@ -260,13 +254,13 @@ impl DiskManager {
     }
 
     /// Size of the db file on disk, in bytes.
-    pub fn db_file_size(&self) -> io::Result<u64> {
+    pub fn db_file_size(&self) -> Result<u64> {
         Ok(self.state.lock().db_io.metadata()?.len())
     }
 }
 
 impl DiskState {
-    fn offset_or_allocate(&mut self, page_id: PageId) -> io::Result<u64> {
+    fn offset_or_allocate(&mut self, page_id: PageId) -> Result<u64> {
         if let Some(entry) = self.pages.get(&page_id) {
             return Ok(entry.offset);
         }
@@ -278,7 +272,7 @@ impl DiskState {
     }
 
     /// Returns a free offset, doubling the db file when it is full.
-    fn allocate_page(&mut self) -> io::Result<u64> {
+    fn allocate_page(&mut self) -> Result<u64> {
         if let Some(offset) = self.free_slots.pop() {
             return Ok(offset);
         }
@@ -294,7 +288,7 @@ impl DiskState {
     ///
     /// It is written to a temporary file that is then renamed over `path`,
     /// so a crash leaves either the old or the new metadata in place.
-    fn save_meta(&mut self, path: &Path) -> io::Result<()> {
+    fn save_meta(&mut self, path: &Path) -> Result<()> {
         if !self.meta_dirty {
             return Ok(());
         }
@@ -334,28 +328,26 @@ impl DiskState {
 
     /// Loads the metadata, checking that every offset is a whole slot within
     /// `page_capacity`.
-    fn load_meta(&mut self, bytes: &[u8]) -> io::Result<()> {
+    fn load_meta(&mut self, bytes: &[u8]) -> Result<()> {
         let (body, checksum) = bytes
             .split_last_chunk::<8>()
-            .ok_or_else(|| invalid_data("metadata file is truncated"))?;
+            .ok_or_else(|| corrupt_meta("file is truncated"))?;
         if fnv1a(body) != u64::from_le_bytes(*checksum) {
-            return Err(invalid_data("metadata file checksum mismatch"));
+            return Err(corrupt_meta("checksum mismatch"));
         }
         let mut r = Reader(body);
         if r.u64()? != META_MAGIC {
-            return Err(invalid_data("not a hamilton_db metadata file"));
+            return Err(corrupt_meta("not a hamilton_db metadata file"));
         }
         let version = r.u32()?;
         if version != META_VERSION {
-            return Err(invalid_data(format!(
-                "unsupported metadata version {version}"
-            )));
+            return Err(StorageError::UnsupportedMetadataVersion(version));
         }
         r.u32()?;
         let slot_end = file_len_for(self.page_capacity);
         let check_offset = |offset: u64| {
             if !offset.is_multiple_of(PAGE_SIZE as u64) || offset >= slot_end {
-                return Err(invalid_data(format!("bad page offset {offset}")));
+                return Err(corrupt_meta(format!("bad page offset {offset}")));
             }
             Ok(offset)
         };
@@ -370,7 +362,7 @@ impl DiskState {
                 || free_space as usize > PAGE_SIZE
                 || pages.insert(page_id, entry).is_some()
             {
-                return Err(invalid_data(format!("bad entry for page {page_id}")));
+                return Err(corrupt_meta(format!("bad entry for page {page_id}")));
             }
         }
         let mut free_slots = Vec::new();
@@ -378,7 +370,7 @@ impl DiskState {
             free_slots.push(check_offset(r.u64()?)?);
         }
         if !r.0.is_empty() {
-            return Err(invalid_data("trailing bytes in metadata file"));
+            return Err(corrupt_meta("trailing bytes"));
         }
 
         self.pages = pages;
@@ -392,20 +384,20 @@ impl DiskState {
 struct Reader<'a>(&'a [u8]);
 
 impl Reader<'_> {
-    fn take<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+    fn take<const N: usize>(&mut self) -> Result<[u8; N]> {
         let (head, rest) = self
             .0
             .split_first_chunk::<N>()
-            .ok_or_else(|| invalid_data("metadata file is truncated"))?;
+            .ok_or_else(|| corrupt_meta("file is truncated"))?;
         self.0 = rest;
         Ok(*head)
     }
 
-    fn u32(&mut self) -> io::Result<u32> {
+    fn u32(&mut self) -> Result<u32> {
         self.take().map(u32::from_le_bytes)
     }
 
-    fn u64(&mut self) -> io::Result<u64> {
+    fn u64(&mut self) -> Result<u64> {
         self.take().map(u64::from_le_bytes)
     }
 }
@@ -430,8 +422,8 @@ fn sync_parent_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn invalid_data(msg: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg.into())
+fn corrupt_meta(msg: impl Into<String>) -> StorageError {
+    StorageError::CorruptMetadata(msg.into())
 }
 
 fn open_rw(path: &Path) -> io::Result<File> {
@@ -447,12 +439,9 @@ fn file_len_for(page_capacity: usize) -> u64 {
     (page_capacity * PAGE_SIZE) as u64
 }
 
-fn check_page_id(page_id: PageId) -> io::Result<()> {
+fn check_page_id(page_id: PageId) -> Result<()> {
     if page_id < 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid page id {page_id}"),
-        ));
+        return Err(StorageError::InvalidPageId(page_id));
     }
     Ok(())
 }
@@ -589,7 +578,7 @@ mod tests {
     fn rejects_invalid_page_id() {
         let (_dir, dm) = setup();
         let err = dm.write_page(INVALID_PAGE_ID, &page_filled(0)).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(err, StorageError::InvalidPageId(INVALID_PAGE_ID)));
     }
 
     #[test]
@@ -655,14 +644,14 @@ mod tests {
         dm.write_page(1, &page_filled(0)).unwrap();
         assert_eq!(dm.free_space(0), Some(PAGE_SIZE));
         dm.set_free_space(0, 100).unwrap();
-        assert_eq!(
-            dm.set_free_space(0, PAGE_SIZE + 1).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert_eq!(
-            dm.set_free_space(9, 0).unwrap_err().kind(),
-            io::ErrorKind::NotFound
-        );
+        assert!(matches!(
+            dm.set_free_space(0, PAGE_SIZE + 1),
+            Err(StorageError::InvalidFreeSpace(_))
+        ));
+        assert!(matches!(
+            dm.set_free_space(9, 0),
+            Err(StorageError::PageNotAllocated(9))
+        ));
         let dm = reopen(&dir, dm);
 
         assert_eq!(dm.free_space(0), Some(100));
@@ -694,7 +683,7 @@ mod tests {
         bytes[20] ^= 1;
         fs::write(&meta, bytes).unwrap();
         let err = DiskManager::new(dir.path().join("test.db")).err().unwrap();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(err, StorageError::CorruptMetadata(_)));
     }
 
     #[test]
@@ -705,7 +694,7 @@ mod tests {
 
         fs::remove_file(dir.path().join("test.meta")).unwrap();
         let err = DiskManager::new(dir.path().join("test.db")).err().unwrap();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(err, StorageError::MissingMetadata(_)));
     }
 
     #[test]

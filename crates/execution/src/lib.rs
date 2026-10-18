@@ -2,6 +2,10 @@ pub fn add(left: u64, right: u64) -> u64 {
     left + right
 }
 
+pub mod error;
+
+pub use error::{ExecutionError, Result};
+
 #[cfg(test)]
 mod tests {
     use super::*;
