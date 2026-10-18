@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use common::{INVALID_PAGE_ID, PageId, Rid, SlotId};
+use common::{INVALID_PAGE_ID, PageId, Rid, SlotId, Tuple};
 use parking_lot::Mutex;
 
 use crate::buffer::arc_replacer::AccessType;
@@ -60,13 +60,13 @@ impl TableHeap {
 
     /// Appends a tuple to the last page, starting a new page when that one is
     /// full, and returns where it went.
-    pub fn insert(&self, meta: &TupleMeta, payload: &[u8]) -> Result<Rid> {
+    pub fn insert(&self, meta: &TupleMeta, tuple: &Tuple) -> Result<Rid> {
         let mut last_page_id = self.last_page_id.lock();
         let mut guard = self
             .bpm
             .checked_write_page(*last_page_id, AccessType::Unknown)?;
         let mut page = TablePage::new(guard.get_data_mut())?;
-        match page.insert(meta, payload) {
+        match page.insert(meta, tuple.data()) {
             Ok(slot) => return Ok(Rid::new(*last_page_id, slot)),
             Err(StorageError::PageFull) => {}
             Err(e) => return Err(e),
@@ -79,21 +79,21 @@ impl TableHeap {
             .bpm
             .checked_write_page(new_page_id, AccessType::Unknown)?;
         let mut new_page = TablePage::init(new_guard.get_data_mut());
-        let slot = new_page.insert(meta, payload)?;
+        let slot = new_page.insert(meta, tuple.data())?;
         page.set_next_page_id(new_page_id);
         *last_page_id = new_page_id;
         Ok(Rid::new(new_page_id, slot))
     }
 
-    /// The tuple at `rid`, copied out of the page. Deleted tuples are still
-    /// returned; their meta says so.
-    pub fn get(&self, rid: Rid) -> Result<(TupleMeta, Vec<u8>)> {
+    /// The tuple at `rid`, copied out of the page and carrying `rid`. Deleted
+    /// tuples are still returned; their meta says so.
+    pub fn get(&self, rid: Rid) -> Result<(TupleMeta, Tuple)> {
         let guard = self
             .bpm
             .checked_read_page(rid.page_id, AccessType::Lookup)?;
         let page = TablePage::new(guard.get_data())?;
         let (meta, payload) = page.get(rid.slot)?;
-        Ok((meta, payload.to_vec()))
+        Ok((meta, Tuple::from_bytes(payload.to_vec()).with_rid(rid)))
     }
 
     /// Replaces the meta of the tuple at `rid`, such as stamping the commit
@@ -122,9 +122,9 @@ impl TableHeap {
     /// Replaces the tuple at `rid`, keeping its `Rid`. Fails with `PageFull`
     /// if the new version does not fit on the tuple's page; the caller then
     /// deletes it and inserts the new version elsewhere.
-    pub fn update_in_place(&self, rid: Rid, meta: &TupleMeta, payload: &[u8]) -> Result<()> {
+    pub fn update_in_place(&self, rid: Rid, meta: &TupleMeta, tuple: &Tuple) -> Result<()> {
         let mut guard = self.write_page(rid)?;
-        TablePage::new(guard.get_data_mut())?.update(rid.slot, meta, payload)
+        TablePage::new(guard.get_data_mut())?.update(rid.slot, meta, tuple.data())
     }
 
     /// Iterates over the live rows of the table. See `TableIterator`.
@@ -169,16 +169,27 @@ mod tests {
         (dir, Arc::new(BufferPoolManager::new(num_frames, dm)))
     }
 
+    fn tuple(bytes: impl AsRef<[u8]>) -> Tuple {
+        Tuple::from_bytes(bytes.as_ref().to_vec())
+    }
+
+    /// The meta and bytes at `rid`, checking the tuple says where it is.
+    fn get(heap: &TableHeap, rid: Rid) -> (TupleMeta, Vec<u8>) {
+        let (meta, tuple) = heap.get(rid).unwrap();
+        assert_eq!(tuple.rid(), Some(rid));
+        (meta, tuple.into_data())
+    }
+
     #[test]
     fn insert_and_get() {
         let (_dir, bpm) = setup(4);
         let heap = TableHeap::create(bpm).unwrap();
-        let a = heap.insert(&TupleMeta::new(1), b"alpha").unwrap();
-        let b = heap.insert(&TupleMeta::new(2), b"beta").unwrap();
+        let a = heap.insert(&TupleMeta::new(1), &tuple(b"alpha")).unwrap();
+        let b = heap.insert(&TupleMeta::new(2), &tuple(b"beta")).unwrap();
         assert_eq!(a, Rid::new(heap.first_page_id(), 0));
         assert_eq!(b, Rid::new(heap.first_page_id(), 1));
-        assert_eq!(heap.get(a).unwrap(), (TupleMeta::new(1), b"alpha".to_vec()));
-        assert_eq!(heap.get(b).unwrap(), (TupleMeta::new(2), b"beta".to_vec()));
+        assert_eq!(get(&heap, a), (TupleMeta::new(1), b"alpha".to_vec()));
+        assert_eq!(get(&heap, b), (TupleMeta::new(2), b"beta".to_vec()));
     }
 
     #[test]
@@ -187,7 +198,7 @@ mod tests {
         let heap = TableHeap::create(Arc::clone(&bpm)).unwrap();
         let rids: Vec<Rid> = (0..200u32)
             .map(|i| {
-                heap.insert(&TupleMeta::new(i as u64), &[i as u8; 100])
+                heap.insert(&TupleMeta::new(i as u64), &tuple([i as u8; 100]))
                     .unwrap()
             })
             .collect();
@@ -199,7 +210,7 @@ mod tests {
         );
         for (i, &rid) in rids.iter().enumerate() {
             assert_eq!(
-                heap.get(rid).unwrap(),
+                get(&heap, rid),
                 (TupleMeta::new(i as u64), vec![i as u8; 100])
             );
         }
@@ -207,7 +218,9 @@ mod tests {
         // Reopening walks the chain to the same last page.
         let reopened = TableHeap::open(bpm, heap.first_page_id()).unwrap();
         assert_eq!(*reopened.last_page_id.lock(), *heap.last_page_id.lock());
-        let next = reopened.insert(&TupleMeta::new(0), b"tail").unwrap();
+        let next = reopened
+            .insert(&TupleMeta::new(0), &tuple(b"tail"))
+            .unwrap();
         assert_eq!(next.page_id, rids.last().unwrap().page_id);
     }
 
@@ -217,7 +230,7 @@ mod tests {
         let heap = TableHeap::create(bpm).unwrap();
         let first = heap.first_page_id();
         assert!(matches!(
-            heap.insert(&TupleMeta::new(1), &vec![0u8; MAX_PAYLOAD_SIZE + 1]),
+            heap.insert(&TupleMeta::new(1), &tuple(vec![0u8; MAX_PAYLOAD_SIZE + 1])),
             Err(StorageError::TupleTooLarge { .. })
         ));
         assert_eq!(*heap.last_page_id.lock(), first);
@@ -231,7 +244,7 @@ mod tests {
             has_nulls: true,
             ..TupleMeta::new(1)
         };
-        let rid = heap.insert(&meta, b"row").unwrap();
+        let rid = heap.insert(&meta, &tuple(b"row")).unwrap();
         heap.mark_delete(rid, 7, 42).unwrap();
 
         let expected = TupleMeta {
@@ -240,27 +253,29 @@ mod tests {
             is_deleted: true,
             has_nulls: true,
         };
-        assert_eq!(heap.get(rid).unwrap(), (expected, b"row".to_vec()));
+        assert_eq!(get(&heap, rid), (expected, b"row".to_vec()));
     }
 
     #[test]
     fn update_meta() {
         let (_dir, bpm) = setup(4);
         let heap = TableHeap::create(bpm).unwrap();
-        let rid = heap.insert(&TupleMeta::new(1 << 63 | 5), b"row").unwrap();
+        let rid = heap
+            .insert(&TupleMeta::new(1 << 63 | 5), &tuple(b"row"))
+            .unwrap();
         heap.update_meta(rid, &TupleMeta::new(10)).unwrap();
-        assert_eq!(heap.get(rid).unwrap().0, TupleMeta::new(10));
+        assert_eq!(get(&heap, rid).0, TupleMeta::new(10));
     }
 
     #[test]
     fn update_in_place() {
         let (_dir, bpm) = setup(4);
         let heap = TableHeap::create(bpm).unwrap();
-        let rid = heap.insert(&TupleMeta::new(1), b"short").unwrap();
-        heap.update_in_place(rid, &TupleMeta::new(2), b"a much longer row")
+        let rid = heap.insert(&TupleMeta::new(1), &tuple(b"short")).unwrap();
+        heap.update_in_place(rid, &TupleMeta::new(2), &tuple(b"a much longer row"))
             .unwrap();
         assert_eq!(
-            heap.get(rid).unwrap(),
+            get(&heap, rid),
             (TupleMeta::new(2), b"a much longer row".to_vec())
         );
     }
@@ -269,13 +284,16 @@ mod tests {
     fn update_in_place_on_full_page() {
         let (_dir, bpm) = setup(4);
         let heap = TableHeap::create(bpm).unwrap();
-        let rid = heap.insert(&TupleMeta::new(1), &[1u8; 1500]).unwrap();
-        heap.insert(&TupleMeta::new(1), &[2u8; 1500]).unwrap();
+        let rid = heap
+            .insert(&TupleMeta::new(1), &tuple([1u8; 1500]))
+            .unwrap();
+        heap.insert(&TupleMeta::new(1), &tuple([2u8; 1500]))
+            .unwrap();
         assert!(matches!(
-            heap.update_in_place(rid, &TupleMeta::new(2), &[3u8; 3000]),
+            heap.update_in_place(rid, &TupleMeta::new(2), &tuple([3u8; 3000])),
             Err(StorageError::PageFull)
         ));
-        assert_eq!(heap.get(rid).unwrap().1, vec![1u8; 1500]);
+        assert_eq!(get(&heap, rid).1, vec![1u8; 1500]);
     }
 
     #[test]
@@ -301,7 +319,8 @@ mod tests {
                     (0..100u8)
                         .map(|i| {
                             (
-                                heap.insert(&TupleMeta::new(t as u64), &[t, i]).unwrap(),
+                                heap.insert(&TupleMeta::new(t as u64), &tuple([t, i]))
+                                    .unwrap(),
                                 t,
                                 i,
                             )
@@ -318,10 +337,7 @@ mod tests {
         let rids: HashSet<Rid> = inserted.iter().map(|&(rid, _, _)| rid).collect();
         assert_eq!(rids.len(), 400);
         for (rid, t, i) in inserted {
-            assert_eq!(
-                heap.get(rid).unwrap(),
-                (TupleMeta::new(t as u64), vec![t, i])
-            );
+            assert_eq!(get(&heap, rid), (TupleMeta::new(t as u64), vec![t, i]));
         }
     }
 }

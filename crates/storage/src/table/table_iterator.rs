@@ -1,14 +1,14 @@
 use std::collections::VecDeque;
 
-use common::{INVALID_PAGE_ID, PageId, Rid, SlotId};
+use common::{INVALID_PAGE_ID, PageId, Rid, SlotId, Tuple};
 
 use crate::buffer::arc_replacer::AccessType;
 use crate::error::Result;
 use crate::table::table_heap::TableHeap;
 use crate::table::table_page::{TablePage, TupleMeta};
 
-/// A row copied out of a table page.
-pub type TableRow = (Rid, TupleMeta, Vec<u8>);
+/// A row copied out of a table page. The tuple carries its `Rid`.
+pub type TableRow = (TupleMeta, Tuple);
 
 /// Iterates over the live rows of a table heap, page by page. Deleted rows
 /// are skipped.
@@ -62,7 +62,10 @@ impl<'a> TableIterator<'a> {
                 .iter()
                 .take_while(|&(slot, _, _)| slot < end)
                 .filter(|(_, meta, _)| !meta.is_deleted)
-                .map(|(slot, meta, payload)| (Rid::new(page_id, slot), meta, payload.to_vec()))
+                .map(|(slot, meta, payload)| {
+                    let tuple = Tuple::from_bytes(payload.to_vec());
+                    (meta, tuple.with_rid(Rid::new(page_id, slot)))
+                })
                 .collect();
             self.next_page_id = if is_last {
                 INVALID_PAGE_ID
@@ -111,8 +114,15 @@ mod tests {
         (dir, Arc::new(BufferPoolManager::new(num_frames, dm)))
     }
 
+    fn tuple(bytes: impl AsRef<[u8]>) -> Tuple {
+        Tuple::from_bytes(bytes.as_ref().to_vec())
+    }
+
     fn payloads(heap: &TableHeap) -> Vec<Vec<u8>> {
-        heap.iter().unwrap().map(|row| row.unwrap().2).collect()
+        heap.iter()
+            .unwrap()
+            .map(|row| row.unwrap().1.into_data())
+            .collect()
     }
 
     #[test]
@@ -129,17 +139,17 @@ mod tests {
         let heap = TableHeap::create(bpm).unwrap();
         let rids: Vec<Rid> = (0..200u32)
             .map(|i| {
-                heap.insert(&TupleMeta::new(i as u64), &[i as u8; 100])
+                heap.insert(&TupleMeta::new(i as u64), &tuple([i as u8; 100]))
                     .unwrap()
             })
             .collect();
 
         let rows: Vec<TableRow> = heap.iter().unwrap().map(Result::unwrap).collect();
         assert_eq!(rows.len(), 200);
-        for (i, (rid, meta, payload)) in rows.into_iter().enumerate() {
-            assert_eq!(rid, rids[i]);
+        for (i, (meta, tuple)) in rows.into_iter().enumerate() {
+            assert_eq!(tuple.rid(), Some(rids[i]));
             assert_eq!(meta, TupleMeta::new(i as u64));
-            assert_eq!(payload, vec![i as u8; 100]);
+            assert_eq!(tuple.into_data(), vec![i as u8; 100]);
         }
     }
 
@@ -148,13 +158,17 @@ mod tests {
         let (_dir, bpm) = setup(3);
         let heap = TableHeap::create(bpm).unwrap();
         for i in 0..100u8 {
-            heap.insert(&TupleMeta::new(1), &[i; 100]).unwrap();
+            heap.insert(&TupleMeta::new(1), &tuple([i; 100])).unwrap();
         }
         let mut iter = heap.iter().unwrap();
         let mut total = 0;
         while let Some(batch) = iter.next_batch().unwrap() {
-            let page_id = batch[0].0.page_id;
-            assert!(batch.iter().all(|(rid, _, _)| rid.page_id == page_id));
+            let page_id = batch[0].1.rid().unwrap().page_id;
+            assert!(
+                batch
+                    .iter()
+                    .all(|(_, tuple)| tuple.rid().unwrap().page_id == page_id)
+            );
             total += batch.len();
         }
         assert_eq!(total, 100);
@@ -165,7 +179,7 @@ mod tests {
         let (_dir, bpm) = setup(4);
         let heap = TableHeap::create(bpm).unwrap();
         let rids: Vec<Rid> = (0..90u8)
-            .map(|i| heap.insert(&TupleMeta::new(1), &[i; 100]).unwrap())
+            .map(|i| heap.insert(&TupleMeta::new(1), &tuple([i; 100])).unwrap())
             .collect();
         // Delete every row on the first page, and every other row after.
         let first = heap.first_page_id();
@@ -189,14 +203,14 @@ mod tests {
         let (_dir, bpm) = setup(4);
         let heap = TableHeap::create(bpm).unwrap();
         for i in 0..40u8 {
-            heap.insert(&TupleMeta::new(1), &[i; 100]).unwrap();
+            heap.insert(&TupleMeta::new(1), &tuple([i; 100])).unwrap();
         }
         let mut seen = 0;
         // Insert a copy of every row while scanning, as `INSERT INTO t SELECT
         // * FROM t` would. Spills onto new pages and fills the old last page.
         for row in heap.iter().unwrap() {
-            let (_, meta, payload) = row.unwrap();
-            heap.insert(&meta, &payload).unwrap();
+            let (meta, tuple) = row.unwrap();
+            heap.insert(&meta, &tuple).unwrap();
             seen += 1;
         }
         assert_eq!(seen, 40);
