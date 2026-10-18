@@ -199,6 +199,15 @@ impl<B: Deref<Target = [u8; PAGE_SIZE]>> TablePage<B> {
         Ok((TupleMeta::from(header), payload))
     }
 
+    /// Every tuple in slot order, deleted ones included. Free slots are
+    /// skipped.
+    pub fn iter(&self) -> impl Iterator<Item = (SlotId, TupleMeta, &[u8])> {
+        (0..self.slot_count()).filter_map(|slot| {
+            let (meta, payload) = self.get(slot).ok()?;
+            Some((slot, meta, payload))
+        })
+    }
+
     fn header(&self) -> &TableHeader {
         TableHeader::ref_from_bytes(&self.data[TABLE_HEADER_OFFSET..SLOTS_OFFSET]).unwrap()
     }
