@@ -3,6 +3,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub mod page_guard;
+pub mod page_header;
 pub type PageId = i32;
 
 pub const PAGE_SIZE: usize = 4096;
