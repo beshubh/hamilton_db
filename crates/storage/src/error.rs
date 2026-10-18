@@ -1,8 +1,10 @@
 use std::io;
 use std::path::PathBuf;
 
-use common::PageId;
+use common::{PageId, SlotId};
 use thiserror::Error;
+
+use crate::page::page_header::PageType;
 
 pub type Result<T, E = StorageError> = std::result::Result<T, E>;
 
@@ -49,6 +51,22 @@ pub enum StorageError {
 
     #[error("unsupported metadata version {0}")]
     UnsupportedMetadataVersion(u32),
+
+    /// The page's header names a different page type than the caller expects.
+    #[error("expected a {expected:?} page, found page type {found}")]
+    UnexpectedPageType { expected: PageType, found: u32 },
+
+    /// The page does not have room for the tuple right now.
+    #[error("page is full")]
+    PageFull,
+
+    /// The tuple is too large to fit on any page.
+    #[error("tuple of {size} bytes is larger than the maximum of {max}")]
+    TupleTooLarge { size: usize, max: usize },
+
+    /// The slot is past the end of the slot array, or holds no tuple.
+    #[error("invalid slot {0}")]
+    InvalidSlot(SlotId),
 
     /// The disk scheduler's worker thread exited before finishing a request.
     #[error("disk scheduler worker exited")]
