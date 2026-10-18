@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 
+use common::{FrameId, PageId};
 use hashlink::LinkedHashSet;
 use parking_lot::Mutex;
-
-use crate::{buffer::replacer::FrameId, page::PageId};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AccessType {

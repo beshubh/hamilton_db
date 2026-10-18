@@ -1,6 +1,6 @@
-use std::io;
 use std::sync::Arc;
 
+use common::PageId;
 use parking_lot::Mutex;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -12,7 +12,8 @@ use crate::{
         },
     },
     disk::disk_scheduler::DiskScheduler,
-    page::{PAGE_SIZE, PageBuf, PageId},
+    error::Result,
+    page::{PAGE_SIZE, PageBuf, page_header::stamp_checksum},
 };
 
 /// Shared, latched access to a page in the buffer pool.
@@ -79,7 +80,7 @@ impl ReadPageGuard {
     }
 
     /// Writes the page to disk if it is dirty, then marks it clean.
-    pub fn flush(&self) -> io::Result<()> {
+    pub fn flush(&self) -> Result<()> {
         flush_page(self.page_id, &self.frame, self.buf(), &self.disk_scheduler)
     }
 
@@ -171,7 +172,7 @@ impl WritePageGuard {
     }
 
     /// Writes the page to disk if it is dirty, then marks it clean.
-    pub fn flush(&self) -> io::Result<()> {
+    pub fn flush(&self) -> Result<()> {
         flush_page(self.page_id, &self.frame, self.buf(), &self.disk_scheduler)
     }
 
@@ -232,13 +233,13 @@ fn flush_page(
     frame: &FrameHeader,
     data: &PageBuf,
     disk_scheduler: &DiskScheduler,
-) -> io::Result<()> {
+) -> Result<()> {
     if !frame.is_dirty() {
         return Ok(());
     }
-    disk_scheduler
-        .write_page(page_id, Box::new(data.0))
-        .wait()?;
+    let mut data = Box::new(data.0);
+    stamp_checksum(page_id, &mut data);
+    disk_scheduler.write_page(page_id, data).wait()?;
     frame.set_dirty(false);
     Ok(())
 }

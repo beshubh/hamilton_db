@@ -1,12 +1,12 @@
+use common::{INVALID_PAGE_ID, PageId};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub mod page_guard;
-pub type PageId = i32;
+pub mod page_header;
 
 pub const PAGE_SIZE: usize = 4096;
-pub const INVALID_PAGE_ID: PageId = -1;
 
 pub type PageData = Box<[u8; PAGE_SIZE]>;
 pub type PageReadGuard<'a> = RwLockReadGuard<'a, PageData>;

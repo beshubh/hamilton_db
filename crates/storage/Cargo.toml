@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+common = { path = "../common" }
 parking_lot = { version = "0.12.5", features = ["arc_lock", "send_guard"] }
 hashlink = "0.10"
-anyhow = "1.0.104"
+thiserror.workspace = true
 zerocopy = { version = "0.8.63", features = ["derive"] }
+crc32c = "0.6.8"
 
 [dev-dependencies]
 tempfile = "3.27.0"
