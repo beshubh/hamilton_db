@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use common::{INVALID_PAGE_ID, PageId, Rid};
+use common::{INVALID_PAGE_ID, PageId, Rid, SlotId};
 use parking_lot::Mutex;
 
 use crate::buffer::arc_replacer::AccessType;
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::error::{Result, StorageError};
-use crate::page::page_guard::WritePageGuard;
+use crate::page::page_guard::{ReadPageGuard, WritePageGuard};
+use crate::table::table_iterator::TableIterator;
 use crate::table::table_page::{TablePage, TupleMeta};
 
 /// A table stored as a linked list of table pages, reached through the
@@ -124,6 +125,28 @@ impl TableHeap {
     pub fn update_in_place(&self, rid: Rid, meta: &TupleMeta, payload: &[u8]) -> Result<()> {
         let mut guard = self.write_page(rid)?;
         TablePage::new(guard.get_data_mut())?.update(rid.slot, meta, payload)
+    }
+
+    /// Iterates over the live rows of the table. See `TableIterator`.
+    pub fn iter(&self) -> Result<TableIterator<'_>> {
+        TableIterator::new(self)
+    }
+
+    /// The last page and its slot count, read together so no insert can
+    /// land between the two.
+    pub(crate) fn end(&self) -> Result<(PageId, SlotId)> {
+        let last_page_id = self.last_page_id.lock();
+        let guard = self.read_page(*last_page_id, AccessType::Scan)?;
+        let slot_count = TablePage::new(guard.get_data())?.slot_count();
+        Ok((*last_page_id, slot_count))
+    }
+
+    pub(crate) fn read_page(
+        &self,
+        page_id: PageId,
+        access_type: AccessType,
+    ) -> Result<ReadPageGuard> {
+        self.bpm.checked_read_page(page_id, access_type)
     }
 
     fn write_page(&self, rid: Rid) -> Result<WritePageGuard> {
