@@ -1,4 +1,4 @@
-pub type FrameId = i32;
+use common::FrameId;
 
 /// Replacer is a trait that tracks the page usage
 pub trait Replacer {

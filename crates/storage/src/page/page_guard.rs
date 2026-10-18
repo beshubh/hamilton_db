@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use common::PageId;
 use parking_lot::Mutex;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -12,7 +13,7 @@ use crate::{
     },
     disk::disk_scheduler::DiskScheduler,
     error::Result,
-    page::{PAGE_SIZE, PageBuf, PageId, page_header::stamp_checksum},
+    page::{PAGE_SIZE, PageBuf, page_header::stamp_checksum},
 };
 
 /// Shared, latched access to a page in the buffer pool.

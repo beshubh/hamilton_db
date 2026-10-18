@@ -1,14 +1,10 @@
 use std::mem::offset_of;
 
+use common::{INVALID_LSN, Lsn, PageId};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::error::{Result, StorageError};
-use crate::page::{PAGE_SIZE, PageId};
-
-/// Log sequence number of the last change applied to a page.
-pub type Lsn = u64;
-
-pub const INVALID_LSN: Lsn = 0;
+use crate::page::PAGE_SIZE;
 
 /// What a page holds. Stored in the header as a `u32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
