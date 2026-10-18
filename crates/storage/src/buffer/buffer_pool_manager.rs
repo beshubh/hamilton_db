@@ -1,16 +1,14 @@
 use crate::{
-    buffer::{
-        arc_replacer::{AccessType, ArcReplacer},
-        replacer::FrameId,
-    },
+    buffer::arc_replacer::{AccessType, ArcReplacer},
     disk::{disk_manager::DiskManager, disk_scheduler::DiskScheduler},
     error::{Result, StorageError},
     page::{
-        INVALID_PAGE_ID, PageBuf, PageId,
+        PageBuf,
         page_guard::{ReadPageGuard, WritePageGuard},
         page_header::{stamp_checksum, verify_checksum},
     },
 };
+use common::{FrameId, INVALID_PAGE_ID, PageId};
 use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, Mutex, RawRwLock, RwLock};
 use std::{
     collections::{HashMap, VecDeque},

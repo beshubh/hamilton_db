@@ -1,9 +1,8 @@
 use std::io;
 use std::path::PathBuf;
 
+use common::PageId;
 use thiserror::Error;
-
-use crate::page::PageId;
 
 pub type Result<T, E = StorageError> = std::result::Result<T, E>;
 

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+common = { path = "../common" }
 parking_lot = { version = "0.12.5", features = ["arc_lock", "send_guard"] }
 hashlink = "0.10"
 thiserror.workspace = true

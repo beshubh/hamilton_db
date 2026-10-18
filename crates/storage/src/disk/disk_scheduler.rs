@@ -2,9 +2,11 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
+use common::PageId;
+
 use crate::disk::disk_manager::DiskManager;
 use crate::error::{Result, StorageError};
-use crate::page::{PAGE_SIZE, PageData, PageId};
+use crate::page::{PAGE_SIZE, PageData};
 
 /// A unit of work for the background worker. Each request carries the sending
 /// half of a one-shot channel that the worker uses to report the result.
@@ -131,7 +133,7 @@ fn run_worker(disk_manager: &DiskManager, receiver: Receiver<DiskRequest>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::page::INVALID_PAGE_ID;
+    use common::INVALID_PAGE_ID;
     use tempfile::TempDir;
 
     fn setup() -> (TempDir, Arc<DiskManager>, DiskScheduler) {

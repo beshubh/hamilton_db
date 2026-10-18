@@ -4,10 +4,11 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use common::PageId;
 use parking_lot::Mutex;
 
 use crate::error::{Result, StorageError};
-use crate::page::{PAGE_SIZE, PageId};
+use crate::page::PAGE_SIZE;
 
 /// Number of pages the db file has room for when first created.
 pub const DEFAULT_DB_IO_SIZE: usize = 16;
@@ -463,7 +464,7 @@ fn read_full(file: &mut File, buf: &mut [u8]) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::page::INVALID_PAGE_ID;
+    use common::INVALID_PAGE_ID;
     use std::sync::Arc;
     use std::thread;
     use tempfile::TempDir;
