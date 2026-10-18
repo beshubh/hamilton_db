@@ -5,3 +5,10 @@ edition = "2024"
 
 [dependencies]
 common = { path = "../common" }
+storage = { path = "../storage" }
+parking_lot = "0.12.5"
+thiserror.workspace = true
+zerocopy = { version = "0.8.63", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

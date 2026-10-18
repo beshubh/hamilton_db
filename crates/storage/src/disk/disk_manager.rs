@@ -139,6 +139,13 @@ impl DiskManager {
         state.pages.get(&page_id).map(|e| e.free_space as usize)
     }
 
+    /// One past the highest page id that has a slot in the db file, or 0 for
+    /// an empty database. Ids handed out but never written are not counted.
+    pub fn next_page_id(&self) -> PageId {
+        let state = self.state.lock();
+        state.pages.keys().max().map_or(0, |&max| max + 1)
+    }
+
     /// Records how many bytes are free in the page.
     pub fn set_free_space(&self, page_id: PageId, free_space: usize) -> Result<()> {
         if free_space > PAGE_SIZE {
