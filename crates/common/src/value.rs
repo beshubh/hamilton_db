@@ -29,6 +29,20 @@ pub enum DataType {
     Array,
 }
 
+impl DataType {
+    /// The SQL name of the type without its parameters, for error messages;
+    /// matches [`Value::type_name`].
+    pub fn type_name(self) -> &'static str {
+        match self {
+            DataType::Int => "INT",
+            DataType::BigInt => "BIGINT",
+            DataType::Bool => "BOOL",
+            DataType::Varchar(_) => "VARCHAR",
+            DataType::Array => "ARRAY",
+        }
+    }
+}
+
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

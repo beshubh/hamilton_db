@@ -1,14 +1,17 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Turns parsed statements into plans.
+//!
+//! The [`Binder`] resolves a [`parser::Statement`] against the catalog into
+//! a [`BoundStatement`]: names become table oids and column positions, and
+//! every expression is type-checked. Planning works only on bound
+//! statements.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod binder;
+pub mod bound;
+pub mod error;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use binder::Binder;
+pub use bound::{
+    BoundCreateTable, BoundDelete, BoundExpr, BoundExprKind, BoundFrom, BoundInsert, BoundOrderBy,
+    BoundSelect, BoundSelectItem, BoundStatement, BoundTable, BoundUpdate, Function,
+};
+pub use error::{PlannerError, Result};
