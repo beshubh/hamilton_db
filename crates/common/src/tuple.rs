@@ -39,6 +39,8 @@ pub(crate) fn fixed_width(data_type: DataType) -> usize {
         DataType::BigInt => 8,
         DataType::Bool => 1,
         DataType::Varchar(_) => 4,
+        // Never holds a value: encoding a non-NULL ARRAY fails.
+        DataType::Array => 0,
     }
 }
 
@@ -174,6 +176,12 @@ fn encode(schema: &Schema, values: &[Value]) -> Result<Vec<u8>> {
                 buf[at..at + 2].copy_from_slice(&(offset as u16).to_le_bytes());
                 buf[at + 2..at + 4].copy_from_slice(&(s.len() as u16).to_le_bytes());
             }
+            (DataType::Array, _) => {
+                return Err(ValueError::NotStorable {
+                    column: column.name.clone(),
+                    data_type: column.data_type,
+                });
+            }
             _ => {
                 return Err(ValueError::TypeMismatch {
                     column: column.name.clone(),
@@ -215,6 +223,7 @@ fn decode_column(schema: &Schema, bytes: &[u8], idx: usize) -> Result<Value> {
                 .map_err(|_| ValueError::CorruptTuple("VARCHAR is not UTF-8"))?;
             Value::Varchar(s.to_owned())
         }
+        DataType::Array => return Err(ValueError::CorruptTuple("ARRAY is not NULL")),
     })
 }
 
@@ -468,5 +477,16 @@ mod tests {
         let mut bad_offset = bytes.clone();
         bad_offset[name..name + 2].copy_from_slice(&0u16.to_le_bytes());
         assert!(corrupt(&bad_offset, 1));
+    }
+
+    #[test]
+    fn arrays_are_not_storable() {
+        let schema = Schema::new(vec![Column::new("xs", DataType::Array, true)]);
+        assert!(matches!(
+            Tuple::encode(&schema, &[Value::Array(vec![Value::Int(1)])]),
+            Err(ValueError::NotStorable { column, data_type: DataType::Array }) if column == "xs"
+        ));
+        let null = Tuple::encode(&schema, &[Value::Null]).unwrap();
+        assert_eq!(null.value(&schema, 0).unwrap(), Value::Null);
     }
 }
