@@ -246,7 +246,12 @@ dependencies = [
 name = "planner"
 version = "0.1.0"
 dependencies = [
+ "catalog",
  "common",
+ "parser",
+ "storage",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
