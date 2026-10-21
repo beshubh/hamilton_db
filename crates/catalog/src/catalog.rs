@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use common::{Column, PageId, Schema};
+use common::{Column, DataType, PageId, Schema, ValueError};
 use parking_lot::RwLock;
 use storage::StorageError;
 use storage::buffer::arc_replacer::AccessType;
@@ -224,6 +224,13 @@ impl Catalog {
             if !seen.insert(column.name.as_str()) {
                 return Err(CatalogError::DuplicateColumn(column.name.clone()));
             }
+            if column.data_type == DataType::Array {
+                return Err(ValueError::NotStorable {
+                    column: column.name.clone(),
+                    data_type: column.data_type,
+                }
+                .into());
+            }
         }
 
         let mut state = self.state.write();
@@ -406,7 +413,7 @@ fn corrupt(err: CatalogError) -> CatalogError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::{DataType, Tuple, Value};
+    use common::{Tuple, Value};
     use storage::disk::disk_manager::DiskManager;
     use storage::page::page_header::PageType;
     use storage::table::table_page::{TablePage, TupleMeta};
@@ -527,6 +534,11 @@ mod tests {
         assert!(matches!(
             db.catalog.create_table("t", long_column),
             Err(CatalogError::InvalidName(_))
+        ));
+        let array = Schema::new(vec![Column::new("xs", DataType::Array, false)]);
+        assert!(matches!(
+            db.catalog.create_table("t", array),
+            Err(CatalogError::Value(ValueError::NotStorable { .. }))
         ));
         assert!(db.catalog.get_table("t").is_none());
     }

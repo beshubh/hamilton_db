@@ -4,4 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+catalog = { path = "../catalog" }
 common = { path = "../common" }
+parser = { path = "../parser" }
+thiserror.workspace = true
+
+[dev-dependencies]
+storage = { path = "../storage" }
+tempfile = "3.27.0"
