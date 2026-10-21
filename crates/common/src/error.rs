@@ -60,6 +60,10 @@ pub enum ValueError {
         max: u32,
     },
 
+    /// The column's type exists only in expressions, never in a tuple.
+    #[error("column {column} is {data_type}, which cannot be stored")]
+    NotStorable { column: String, data_type: DataType },
+
     #[error("encoded tuple is larger than {} bytes", MAX_TUPLE_SIZE)]
     TupleTooLarge,
 

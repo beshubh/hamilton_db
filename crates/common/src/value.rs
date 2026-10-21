@@ -24,6 +24,9 @@ pub enum DataType {
     Bool,
     /// UTF-8 string of at most this many bytes.
     Varchar(u32),
+    /// A list of values, built by expressions. It has no element type and
+    /// cannot be stored in a tuple.
+    Array,
 }
 
 impl fmt::Display for DataType {
@@ -33,6 +36,7 @@ impl fmt::Display for DataType {
             DataType::BigInt => f.write_str("BIGINT"),
             DataType::Bool => f.write_str("BOOL"),
             DataType::Varchar(max_len) => write!(f, "VARCHAR({max_len})"),
+            DataType::Array => f.write_str("ARRAY"),
         }
     }
 }
@@ -45,6 +49,7 @@ pub enum Value {
     BigInt(i64),
     Bool(bool),
     Varchar(String),
+    Array(Vec<Value>),
 }
 
 #[derive(Clone, Copy)]
@@ -94,6 +99,7 @@ impl Value {
             Value::BigInt(_) => "BIGINT",
             Value::Bool(_) => "BOOL",
             Value::Varchar(_) => "VARCHAR",
+            Value::Array(_) => "ARRAY",
         }
     }
 
@@ -281,6 +287,16 @@ impl fmt::Display for Value {
             Value::BigInt(v) => write!(f, "{v}"),
             Value::Bool(v) => write!(f, "{v}"),
             Value::Varchar(v) => f.write_str(v),
+            Value::Array(values) => {
+                f.write_str("{")?;
+                for (i, v) in values.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(",")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                f.write_str("}")
+            }
         }
     }
 }
@@ -474,5 +490,10 @@ mod tests {
         assert_eq!(v(true).to_string(), "true");
         assert_eq!(v("hi").to_string(), "hi");
         assert_eq!(DataType::Varchar(32).to_string(), "VARCHAR(32)");
+        assert_eq!(
+            Value::Array(vec![v(1), NULL, v(3)]).to_string(),
+            "{1,NULL,3}"
+        );
+        assert_eq!(Value::Array(vec![]).to_string(), "{}");
     }
 }
