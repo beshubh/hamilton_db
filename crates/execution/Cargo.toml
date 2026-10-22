@@ -7,4 +7,5 @@ edition = "2024"
 common = { path = "../common" }
 enum_dispatch = "0.3.13"
 storage = { path = "../storage" }
+catalog = { path = "../catalog" }
 thiserror.workspace = true

@@ -7,6 +7,7 @@ edition = "2024"
 catalog = { path = "../catalog" }
 common = { path = "../common" }
 parser = { path = "../parser" }
+execution = { path = "../execution"}
 thiserror.workspace = true
 
 [dev-dependencies]

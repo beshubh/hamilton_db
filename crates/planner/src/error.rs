@@ -60,4 +60,9 @@ pub enum PlannerError {
     /// `ORDER BY n` where the select list has no n-th item.
     #[error("ORDER BY position {position} is not in the select list")]
     OrderByPositionOutOfRange { position: i64 },
+
+    /// A statement that runs without a plan, such as CREATE TABLE, which
+    /// goes to the catalog directly.
+    #[error("{0} has no query plan")]
+    NoPlan(&'static str),
 }
