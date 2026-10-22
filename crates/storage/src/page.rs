@@ -3,10 +3,11 @@ use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-pub mod page_guard;
-pub mod page_header;
+pub mod btree_header_page;
 pub mod btree_internal_page;
 pub mod btree_leaf_page;
+pub mod page_guard;
+pub mod page_header;
 
 pub const PAGE_SIZE: usize = 4096;
 

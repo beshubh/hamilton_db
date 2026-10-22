@@ -13,8 +13,9 @@
 //! +----------------------------------------------------------------+
 //! ```
 //!
-//! Keys are stored in increasing order, `RID(i)` being the record of
-//! `KEY(i)`. `next_page_id` links the leaves left to right for range scans.
+//! Keys are stored in increasing order, as the tree's `KeyComparator` orders
+//! them, `RID(i)` being the record of `KEY(i)`. `next_page_id` links the
+//! leaves left to right for range scans.
 //!
 //! Deleting a key does not remove it right away: its slot index is appended
 //! to the tombstone buffer, which holds up to `NUM_TOMBS` indexes, oldest
@@ -36,7 +37,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::error::{Result, StorageError};
 use crate::page::PAGE_SIZE;
-use crate::page::btree_internal_page::BtreeKey;
+use crate::page::btree_internal_page::{BtreeKey, KeyComparator};
 use crate::page::page_header::{PageHeader, PageType};
 
 const _: () = assert!(PAGE_SIZE <= u16::MAX as usize);
@@ -181,25 +182,31 @@ impl<BufT: Deref<Target = [u8; PAGE_SIZE]>, KeyT: BtreeKey, const NUM_TOMBS: usi
     }
 
     /// The record id of `key`, unless it is missing or tombstoned.
-    pub fn lookup(&self, key: &KeyT) -> Option<Rid> {
-        let index = self.key_index(key);
-        (index < self.size() && self.read_key(index) == *key && !self.is_tombstone(index))
+    pub fn lookup(&self, key: &KeyT, cmp: &impl KeyComparator<KeyT>) -> Option<Rid> {
+        let index = self.key_index(key, cmp);
+        (self.holds_at(index, key, cmp) && !self.is_tombstone(index))
             .then(|| self.read_value(index))
     }
 
     /// Index of the first key `>= key`, tombstoned or not, or `size` if there
     /// is none. A range scan starts here.
-    pub fn key_index(&self, key: &KeyT) -> usize {
+    pub fn key_index(&self, key: &KeyT, cmp: &impl KeyComparator<KeyT>) -> usize {
         let (mut lo, mut hi) = (0, self.size());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.read_key(mid) < *key {
+            if cmp.compare(&self.read_key(mid), key).is_lt() {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
         lo
+    }
+
+    /// Whether slot `index`, as found by `key_index`, holds `key`, tombstoned
+    /// or not.
+    fn holds_at(&self, index: usize, key: &KeyT, cmp: &impl KeyComparator<KeyT>) -> bool {
+        index < self.size() && cmp.compare(&self.read_key(index), key).is_eq()
     }
 
     /// Position in the tombstone buffer of the tombstone for slot `index`.
@@ -284,9 +291,9 @@ impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>, KeyT: BtreeKey, const NUM_TOMBS: 
     /// Fails with `DuplicateKey` if `key` is already live, and with
     /// `PageFull` if the page already holds `max_size` keys; the caller
     /// splits it first, or makes room with `purge_tombstones`.
-    pub fn insert(&mut self, key: KeyT, rid: Rid) -> Result<usize> {
-        let index = self.key_index(&key);
-        if index < self.size() && self.read_key(index) == key {
+    pub fn insert(&mut self, key: KeyT, rid: Rid, cmp: &impl KeyComparator<KeyT>) -> Result<usize> {
+        let index = self.key_index(&key, cmp);
+        if self.holds_at(index, &key, cmp) {
             let Some(pos) = self.tomb_position(index) else {
                 return Err(StorageError::DuplicateKey);
             };
@@ -306,9 +313,9 @@ impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>, KeyT: BtreeKey, const NUM_TOMBS: 
     /// Deletes `key` by tombstoning it, and returns its record id, or `None`
     /// if it is missing or already tombstoned. If the tombstone buffer is
     /// full, the oldest tombstoned key is removed for good first.
-    pub fn remove(&mut self, key: &KeyT) -> Option<Rid> {
-        let mut index = self.key_index(key);
-        if index >= self.size() || self.read_key(index) != *key || self.is_tombstone(index) {
+    pub fn remove(&mut self, key: &KeyT, cmp: &impl KeyComparator<KeyT>) -> Option<Rid> {
+        let mut index = self.key_index(key, cmp);
+        if !self.holds_at(index, key, cmp) || self.is_tombstone(index) {
             return None;
         }
         let rid = self.read_value(index);

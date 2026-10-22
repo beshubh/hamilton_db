@@ -401,6 +401,7 @@ version = "0.1.0"
 dependencies = [
  "common",
  "crc32c",
+ "enum_dispatch",
  "hashlink",
  "parking_lot",
  "tempfile",

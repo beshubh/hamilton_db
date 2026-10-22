@@ -20,7 +20,12 @@
 //! which depends on the key size. Keys are any fixed-size type that can be
 //! copied to and from bytes (`BtreeKey`); page ids are little-endian. Nothing
 //! is aligned, so a page can be viewed from any byte buffer.
+//!
+//! The page does not know how its keys are ordered: every call that searches
+//! takes the tree's `KeyComparator`, so the order can depend on runtime state
+//! such as an index's key schema.
 
+use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut, Range};
 
@@ -38,11 +43,31 @@ const INTERNAL_HEADER_OFFSET: usize = PageHeader::SIZE;
 const KEYS_OFFSET: usize = INTERNAL_HEADER_OFFSET + size_of::<InternalHeader>();
 const PAGE_ID_SIZE: usize = size_of::<I32>();
 
-/// A key stored in a B+tree page: fixed-size, copied in and out as raw bytes,
-/// and ordered by `Ord`.
-pub trait BtreeKey: FromBytes + IntoBytes + Immutable + Copy + Ord {}
+/// A key stored in a B+tree page: fixed-size and copied in and out as raw
+/// bytes. A `KeyComparator` orders it.
+pub trait BtreeKey: FromBytes + IntoBytes + Immutable + Copy {}
 
-impl<T: FromBytes + IntoBytes + Immutable + Copy + Ord> BtreeKey for T {}
+impl<T: FromBytes + IntoBytes + Immutable + Copy> BtreeKey for T {}
+
+/// Orders the keys of a B+tree.
+///
+/// It must be a total order, and a tree must always be used with the same
+/// one: its pages are sorted by it. Keys that compare equal are the same key,
+/// even if their bytes differ.
+pub trait KeyComparator<KeyT> {
+    fn compare(&self, a: &KeyT, b: &KeyT) -> Ordering;
+}
+
+/// Orders keys by their `Ord` impl, such as big-endian byte arrays, whose
+/// byte order is their numeric order.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OrdComparator;
+
+impl<KeyT: Ord> KeyComparator<KeyT> for OrdComparator {
+    fn compare(&self, a: &KeyT, b: &KeyT) -> Ordering {
+        a.cmp(b)
+    }
+}
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
@@ -141,17 +166,17 @@ impl<BufT: Deref<Target = [u8; PAGE_SIZE]>, KeyT: BtreeKey> BtreeInternalPage<Bu
     ///
     /// # Panics
     /// If the page has no children.
-    pub fn lookup(&self, key: &KeyT) -> PageId {
+    pub fn lookup(&self, key: &KeyT, cmp: &impl KeyComparator<KeyT>) -> PageId {
         assert!(self.size() > 0, "lookup in an empty internal page");
-        self.read_value(self.upper_bound(key) - 1)
+        self.read_value(self.upper_bound(key, cmp) - 1)
     }
 
     /// Index of the first key `> key` in `1..size`, or `size` if there is none.
-    fn upper_bound(&self, key: &KeyT) -> usize {
+    fn upper_bound(&self, key: &KeyT, cmp: &impl KeyComparator<KeyT>) -> usize {
         let (mut lo, mut hi) = (1, self.size().max(1));
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.read_key(mid) <= *key {
+            if cmp.compare(&self.read_key(mid), key).is_le() {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -277,12 +302,17 @@ impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>, KeyT: BtreeKey> BtreeInternalPage
     /// # Panics
     /// If the page has no children: the leftmost child has no key, so it has
     /// to be set with `populate_new_root` or `push_front`.
-    pub fn insert(&mut self, key: KeyT, child: PageId) -> Result<usize> {
+    pub fn insert(
+        &mut self,
+        key: KeyT,
+        child: PageId,
+        cmp: &impl KeyComparator<KeyT>,
+    ) -> Result<usize> {
         assert!(self.size() > 0, "insert into an empty internal page");
         if self.is_full() {
             return Err(StorageError::PageFull);
         }
-        let index = self.upper_bound(&key);
+        let index = self.upper_bound(&key, cmp);
         self.shift_right(index);
         self.write_key(index, key);
         self.write_value(index, child);

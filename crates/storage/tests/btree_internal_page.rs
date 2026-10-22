@@ -1,6 +1,6 @@
 use common::PageId;
 use storage::StorageError;
-use storage::page::btree_internal_page::BtreeInternalPage;
+use storage::page::btree_internal_page::{BtreeInternalPage, OrdComparator};
 use storage::page::page_header::{PageHeader, PageType};
 use storage::page::{PAGE_SIZE, PageBuf};
 
@@ -27,7 +27,7 @@ fn page_with(buf: &mut PageBuf, max_size: usize, children: usize) -> Page<'_> {
     let mut page = Page::init(&mut *buf, max_size);
     page.populate_new_root(100, key(10), 110);
     for i in 2..children {
-        page.insert(key(10 * i as u64), 100 + 10 * i as PageId)
+        page.insert(key(10 * i as u64), 100 + 10 * i as PageId, &OrdComparator)
             .unwrap();
     }
     page
@@ -73,13 +73,13 @@ fn lookup_ignores_first_key() {
     assert_eq!(keys(&page), [10, 20, 30]);
     assert_eq!(values(&page), [100, 110, 120, 130]);
 
-    assert_eq!(page.lookup(&key(0)), 100);
-    assert_eq!(page.lookup(&key(9)), 100);
-    assert_eq!(page.lookup(&key(10)), 110);
-    assert_eq!(page.lookup(&key(19)), 110);
-    assert_eq!(page.lookup(&key(20)), 120);
-    assert_eq!(page.lookup(&key(30)), 130);
-    assert_eq!(page.lookup(&key(u64::MAX)), 130);
+    assert_eq!(page.lookup(&key(0), &OrdComparator), 100);
+    assert_eq!(page.lookup(&key(9), &OrdComparator), 100);
+    assert_eq!(page.lookup(&key(10), &OrdComparator), 110);
+    assert_eq!(page.lookup(&key(19), &OrdComparator), 110);
+    assert_eq!(page.lookup(&key(20), &OrdComparator), 120);
+    assert_eq!(page.lookup(&key(30), &OrdComparator), 130);
+    assert_eq!(page.lookup(&key(u64::MAX), &OrdComparator), 130);
 }
 
 #[test]
@@ -88,8 +88,8 @@ fn lookup_with_one_child() {
     let mut page = Page::init(&mut *buf, 4);
     page.push_front(key(99), 7).unwrap();
     assert_eq!(page.size(), 1);
-    assert_eq!(page.lookup(&key(0)), 7);
-    assert_eq!(page.lookup(&key(u64::MAX)), 7);
+    assert_eq!(page.lookup(&key(0), &OrdComparator), 7);
+    assert_eq!(page.lookup(&key(u64::MAX), &OrdComparator), 7);
 }
 
 #[test]
@@ -97,21 +97,21 @@ fn insert_keeps_keys_sorted() {
     let mut buf = PageBuf::zeroed();
     let mut page = Page::init(&mut *buf, 8);
     page.populate_new_root(1, key(40), 2);
-    assert_eq!(page.insert(key(20), 3).unwrap(), 1);
-    assert_eq!(page.insert(key(60), 4).unwrap(), 3);
-    assert_eq!(page.insert(key(30), 5).unwrap(), 2);
-    assert_eq!(page.insert(key(10), 6).unwrap(), 1);
+    assert_eq!(page.insert(key(20), 3, &OrdComparator).unwrap(), 1);
+    assert_eq!(page.insert(key(60), 4, &OrdComparator).unwrap(), 3);
+    assert_eq!(page.insert(key(30), 5, &OrdComparator).unwrap(), 2);
+    assert_eq!(page.insert(key(10), 6, &OrdComparator).unwrap(), 1);
 
     assert_eq!(keys(&page), [10, 20, 30, 40, 60]);
     assert_eq!(values(&page), [1, 6, 3, 5, 2, 4]);
-    assert_eq!(page.lookup(&key(35)), 5);
+    assert_eq!(page.lookup(&key(35), &OrdComparator), 5);
 }
 
 #[test]
 fn insert_equal_key_goes_after() {
     let mut buf = PageBuf::zeroed();
     let mut page = page_with(&mut buf, 8, 3);
-    assert_eq!(page.insert(key(10), 999).unwrap(), 2);
+    assert_eq!(page.insert(key(10), 999, &OrdComparator).unwrap(), 2);
     assert_eq!(keys(&page), [10, 10, 20]);
     assert_eq!(values(&page), [100, 110, 999, 120]);
 }
@@ -121,7 +121,7 @@ fn insert_into_full_page_fails() {
     let mut buf = PageBuf::zeroed();
     let mut page = page_with(&mut buf, 3, 3);
     assert!(page.is_full());
-    let err = page.insert(key(5), 1).unwrap_err();
+    let err = page.insert(key(5), 1, &OrdComparator).unwrap_err();
     assert!(matches!(err, StorageError::PageFull));
     assert!(matches!(
         page.push_front(key(5), 1).unwrap_err(),
@@ -140,16 +140,17 @@ fn fill_to_slot_cnt() {
     let mut page = Page::init(&mut *buf, slot_cnt);
     page.populate_new_root(0, key(slot_cnt as u64 - 1), slot_cnt as PageId - 1);
     for i in (1..slot_cnt - 1).rev() {
-        page.insert(key(i as u64), i as PageId).unwrap();
+        page.insert(key(i as u64), i as PageId, &OrdComparator)
+            .unwrap();
     }
     assert_eq!(page.size(), slot_cnt);
     assert!(matches!(
-        page.insert(key(0), 0).unwrap_err(),
+        page.insert(key(0), 0, &OrdComparator).unwrap_err(),
         StorageError::PageFull
     ));
     for i in 0..slot_cnt {
         assert_eq!(page.value_at(i), i as PageId);
-        assert_eq!(page.lookup(&key(i as u64)), i as PageId);
+        assert_eq!(page.lookup(&key(i as u64), &OrdComparator), i as PageId);
     }
     assert_eq!(keys(&page), (1..slot_cnt as u64).collect::<Vec<_>>());
 }
@@ -171,7 +172,7 @@ fn remove_at() {
     page.remove_at(0);
     assert_eq!(keys(&page), [30]);
     assert_eq!(values(&page), [110, 130]);
-    assert_eq!(page.lookup(&key(0)), 110);
+    assert_eq!(page.lookup(&key(0), &OrdComparator), 110);
 }
 
 #[test]
@@ -190,8 +191,8 @@ fn push_front_adds_leftmost_child() {
     page.push_front(key(5), 90).unwrap();
     assert_eq!(keys(&page), [5, 10, 20]);
     assert_eq!(values(&page), [90, 100, 110, 120]);
-    assert_eq!(page.lookup(&key(4)), 90);
-    assert_eq!(page.lookup(&key(5)), 100);
+    assert_eq!(page.lookup(&key(4), &OrdComparator), 90);
+    assert_eq!(page.lookup(&key(5), &OrdComparator), 100);
 }
 
 #[test]
