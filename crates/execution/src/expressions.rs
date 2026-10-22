@@ -7,19 +7,27 @@
 
 mod arithmetic;
 mod array;
+mod cast;
 mod column_value;
+mod comparison;
 mod constant;
+mod is_null;
 mod logic;
 mod string;
 #[cfg(test)]
 mod test_util;
+mod unary;
 
 pub use arithmetic::{ArithmeticExpr, ArithmeticOp};
 pub use array::ArrayExpr;
+pub use cast::CastExpr;
 pub use column_value::ColumnValueExpr;
+pub use comparison::{ComparisonExpr, ComparisonOp};
 pub use constant::ConstantExpr;
+pub use is_null::IsNullExpr;
 pub use logic::{LogicExpr, LogicOp};
 pub use string::{StringExpr, StringOp};
+pub use unary::{UnaryExpr, UnaryOp};
 
 use common::{Column, DataType, Schema, Tuple, Value};
 use enum_dispatch::enum_dispatch;
@@ -58,9 +66,13 @@ pub enum AbstractExpr {
     ColumnValueExpr,
     ConstantExpr,
     ArithmeticExpr,
+    ComparisonExpr,
     LogicExpr,
+    UnaryExpr,
+    IsNullExpr,
     StringExpr,
     ArrayExpr,
+    CastExpr,
 }
 
 /// The SQL name of a type, for error messages; matches [`Value::type_name`].
