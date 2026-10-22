@@ -8,8 +8,10 @@
 pub mod binder;
 pub mod bound;
 pub mod error;
+pub mod planner;
 
 pub use binder::Binder;
+pub use planner::Planner;
 pub use bound::{
     BoundCreateTable, BoundDelete, BoundExpr, BoundExprKind, BoundFrom, BoundInsert, BoundOrderBy,
     BoundSelect, BoundSelectItem, BoundStatement, BoundTable, BoundUpdate, Function,
