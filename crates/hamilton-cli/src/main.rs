@@ -1,9 +1,23 @@
+mod database;
+mod output;
+
 use std::io::{self, BufRead, Write};
+
+use database::Database;
 
 const PROMPT: &str = "hamilton> ";
 const CONTINUATION_PROMPT: &str = "       -> ";
 
+/// The database file used when none is given.
+const DEFAULT_DB_FILE: &str = "hamilton.db";
+
 fn main() -> anyhow::Result<()> {
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_DB_FILE.to_owned());
+    let db = Database::open(&path)?;
+    println!("hamilton_db: {path} (\\q to quit)");
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut buffer = StatementBuffer::default();
@@ -29,27 +43,26 @@ fn main() -> anyhow::Result<()> {
         }
 
         for statement in buffer.push_line(&line) {
-            execute(&statement, &mut stdout)?;
+            execute(&db, &statement, &mut stdout)?;
         }
     }
 
-    Ok(())
+    db.close()
 }
 
 fn is_quit_command(line: &str) -> bool {
     matches!(line, "\\q" | "exit" | "quit")
 }
 
-/// Parses the statement and prints what was understood. Execution comes
-/// once the binder and planner exist.
-fn execute(statement: &str, out: &mut impl Write) -> io::Result<()> {
-    match parser::parse(statement) {
-        Ok(parsed) => {
-            for stmt in parsed {
-                writeln!(out, "{stmt:?}")?;
+/// Runs the statement and prints its result, or the error that stopped it.
+fn execute(db: &Database, statement: &str, out: &mut impl Write) -> io::Result<()> {
+    match db.execute(statement) {
+        Ok(outputs) => {
+            for output in outputs {
+                writeln!(out, "{output}\n")?;
             }
         }
-        Err(err) => writeln!(out, "error: {err}")?,
+        Err(err) => writeln!(out, "error: {err:#}\n")?,
     }
     Ok(())
 }

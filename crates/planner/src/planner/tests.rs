@@ -72,6 +72,7 @@ impl Db {
 /// The plan tree as `Name(child, ...)`.
 fn shape(plan: &AbstractPlanNode) -> String {
     let name = match plan {
+        AbstractPlanNode::CreateTablePlan(_) => "CreateTable",
         AbstractPlanNode::SeqScanPlan(scan) => return format!("SeqScan {}", scan.table_name()),
         AbstractPlanNode::IndexScanPlan(_) => "IndexScan",
         AbstractPlanNode::ValuesPlan(_) => "Values",
@@ -264,10 +265,15 @@ fn expressions_keep_the_bound_types() {
 }
 
 #[test]
-fn create_table_has_no_plan() {
+fn create_table() {
     let db = Db::new();
-    let err = db.try_plan("CREATE TABLE t (a INT)").unwrap_err();
-    assert_eq!(err, PlannerError::NoPlan("CREATE TABLE"));
+    let plan = db.plan("CREATE TABLE t (a INT NOT NULL, b VARCHAR(8))");
+    let AbstractPlanNode::CreateTablePlan(create) = &*plan else {
+        panic!("{plan:?}");
+    };
+    assert_eq!(create.table_name(), "t");
+    assert_eq!(names(create.table_schema()), ["a", "b"]);
+    assert!(create.get_output_schema().is_empty());
 }
 
 #[test]

@@ -1,12 +1,21 @@
-use catalog::Catalog;
-use storage::buffer::buffer_pool_manager::BufferPoolManager;
+use std::sync::Arc;
 
+use catalog::Catalog;
+
+/// What the executors of one statement share.
 pub struct ExecutionContext {
-    cataglog: Catalog,
-    bpm: BufferPoolManager,
-    is_delete: bool,
+    catalog: Arc<Catalog>,
     // TBD
     // txn manager
     // lock manager maybe
-    // nlj check executors associated with this execution ctx
+}
+
+impl ExecutionContext {
+    pub fn new(catalog: Arc<Catalog>) -> Self {
+        Self { catalog }
+    }
+
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
 }

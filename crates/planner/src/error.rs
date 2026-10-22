@@ -97,9 +97,4 @@ pub enum PlannerError {
     /// handle yet, such as a correlated subquery.
     #[error("{0} is not supported")]
     Unsupported(String),
-
-    /// A statement that runs without a plan, such as CREATE TABLE, which
-    /// goes to the catalog directly.
-    #[error("{0} has no query plan")]
-    NoPlan(&'static str),
 }

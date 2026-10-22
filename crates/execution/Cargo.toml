@@ -9,3 +9,6 @@ enum_dispatch = "0.3.13"
 storage = { path = "../storage" }
 catalog = { path = "../catalog" }
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

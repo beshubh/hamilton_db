@@ -1,8 +1,11 @@
 use std::collections::VecDeque;
 
+use std::sync::Arc;
+
 use common::{INVALID_PAGE_ID, PageId, Rid, SlotId, Tuple};
 
 use crate::buffer::arc_replacer::AccessType;
+use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::error::Result;
 use crate::table::table_heap::TableHeap;
 use crate::table::table_page::{TablePage, TupleMeta};
@@ -22,8 +25,11 @@ pub type TableRow = (TupleMeta, Tuple);
 /// Rows inserted later are not seen, so a statement that inserts into the
 /// table it is scanning cannot keep feeding itself. Rows changed on a page
 /// the scan has not reached yet are seen as they are when it gets there.
-pub struct TableIterator<'a> {
-    heap: &'a TableHeap,
+///
+/// The iterator holds the buffer pool rather than borrowing the heap, so it
+/// can be kept next to the `Arc` that owns the heap, as a scan executor does.
+pub struct TableIterator {
+    bpm: Arc<BufferPoolManager>,
     /// The next page to read, or `INVALID_PAGE_ID` once the scan is done.
     next_page_id: PageId,
     last_page_id: PageId,
@@ -33,11 +39,11 @@ pub struct TableIterator<'a> {
     rows: VecDeque<TableRow>,
 }
 
-impl<'a> TableIterator<'a> {
-    pub(crate) fn new(heap: &'a TableHeap) -> Result<Self> {
+impl TableIterator {
+    pub(crate) fn new(heap: &TableHeap) -> Result<Self> {
         let (last_page_id, last_slot_count) = heap.end()?;
         Ok(Self {
-            heap,
+            bpm: Arc::clone(heap.bpm()),
             next_page_id: heap.first_page_id(),
             last_page_id,
             last_slot_count,
@@ -50,7 +56,7 @@ impl<'a> TableIterator<'a> {
     pub fn next_batch(&mut self) -> Result<Option<Vec<TableRow>>> {
         while self.next_page_id != INVALID_PAGE_ID {
             let page_id = self.next_page_id;
-            let guard = self.heap.read_page(page_id, AccessType::Scan)?;
+            let guard = self.bpm.checked_read_page(page_id, AccessType::Scan)?;
             let page = TablePage::new(guard.get_data())?;
             let is_last = page_id == self.last_page_id;
             let end = if is_last {
@@ -82,7 +88,7 @@ impl<'a> TableIterator<'a> {
     }
 }
 
-impl Iterator for TableIterator<'_> {
+impl Iterator for TableIterator {
     type Item = Result<TableRow>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -103,9 +109,7 @@ impl Iterator for TableIterator<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::buffer_pool_manager::BufferPoolManager;
     use crate::disk::disk_manager::DiskManager;
-    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn setup(num_frames: usize) -> (TempDir, Arc<BufferPoolManager>) {

@@ -11,6 +11,7 @@
 //! with one child, and `tuple_idx` 0 (left) or 1 (right) for a join.
 
 mod aggregation;
+mod create_table;
 mod delete;
 mod filter;
 mod hash_join;
@@ -29,6 +30,7 @@ mod values;
 mod window;
 
 pub use aggregation::{Aggregate, AggregationPlan};
+pub use create_table::CreateTablePlan;
 pub use delete::DeletePlan;
 pub use filter::FilterPlan;
 pub use hash_join::HashJoinPlan;
@@ -70,6 +72,7 @@ pub trait PlanNode {
 #[enum_dispatch(PlanNode)]
 #[derive(Clone, Debug)]
 pub enum AbstractPlanNode {
+    CreateTablePlan,
     SeqScanPlan,
     IndexScanPlan,
     ValuesPlan,

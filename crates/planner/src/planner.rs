@@ -18,9 +18,10 @@ use catalog::Catalog;
 use common::Schema;
 use execution::expressions::{AbstractExpr, ColumnValueExpr};
 use execution::plans::{
-    AbstractPlanNode, Aggregate, AggregationPlan, DeletePlan, FilterPlan, InsertPlan, JoinType,
-    LimitPlan, NestedLoopJoinPlan, OrderBy, PlanNode, ProjectionPlan, SeqScanPlan, SortPlan,
-    UpdatePlan, ValuesPlan, WindowColumn, WindowFunction, WindowFunctionKind, WindowPlan,
+    AbstractPlanNode, Aggregate, AggregationPlan, CreateTablePlan, DeletePlan, FilterPlan,
+    InsertPlan, JoinType, LimitPlan, NestedLoopJoinPlan, OrderBy, PlanNode, ProjectionPlan,
+    SeqScanPlan, SortPlan, UpdatePlan, ValuesPlan, WindowColumn, WindowFunction,
+    WindowFunctionKind, WindowPlan,
 };
 use parser::JoinKind;
 
@@ -30,7 +31,7 @@ use crate::bound::{
     BoundOrderBy, BoundSelect, BoundStatement, BoundTable, BoundUpdate, BoundWindow,
     BoundWindowFunction,
 };
-use crate::error::{PlannerError, Result};
+use crate::error::Result;
 
 pub struct Planner<'a> {
     // For choosing index scans, once storage has indexes to scan.
@@ -43,11 +44,12 @@ impl<'a> Planner<'a> {
         Self { catalog }
     }
 
-    /// The root of the plan for `stmt`. CREATE TABLE has none: it goes to
-    /// the catalog directly.
+    /// The root of the plan for `stmt`.
     pub fn plan(&self, stmt: &BoundStatement) -> Result<Arc<AbstractPlanNode>> {
         let plan = match stmt {
-            BoundStatement::CreateTable(_) => return Err(PlannerError::NoPlan("CREATE TABLE")),
+            BoundStatement::CreateTable(create) => {
+                CreateTablePlan::new(&create.name, create.schema.clone()).into()
+            }
             BoundStatement::Insert(insert) => self.plan_insert(insert)?,
             BoundStatement::Select(select) => self.plan_select(select)?,
             BoundStatement::Update(update) => self.plan_update(update)?,

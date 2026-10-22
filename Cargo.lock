@@ -105,6 +105,7 @@ dependencies = [
  "common",
  "enum_dispatch",
  "storage",
+ "tempfile",
  "thiserror",
 ]
 
@@ -142,7 +143,13 @@ name = "hamilton-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "catalog",
+ "common",
+ "execution",
  "parser",
+ "planner",
+ "storage",
+ "tempfile",
 ]
 
 [[package]]

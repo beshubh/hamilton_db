@@ -1,3 +1,4 @@
+use catalog::{CatalogError, TableOid};
 use common::ValueError;
 use storage::StorageError;
 use thiserror::Error;
@@ -19,4 +20,15 @@ pub enum ExecutionError {
     /// such as the right side of a join outside a join. A planner bug.
     #[error("column reads input {tuple_idx}, but only {inputs} input(s) were given")]
     TupleIndexOutOfRange { tuple_idx: usize, inputs: usize },
+
+    #[error(transparent)]
+    Catalog(#[from] CatalogError),
+
+    /// A plan names a table the catalog does not have.
+    #[error("table with oid {0} does not exist")]
+    TableNotFound(TableOid),
+
+    /// A plan whose executor has not been written yet.
+    #[error("{0} plans cannot be executed yet")]
+    NoExecutor(&'static str),
 }
