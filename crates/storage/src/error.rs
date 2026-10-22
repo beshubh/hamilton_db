@@ -60,6 +60,10 @@ pub enum StorageError {
     #[error("page is full")]
     PageFull,
 
+    /// The index already holds the key.
+    #[error("duplicate key")]
+    DuplicateKey,
+
     /// The tuple is too large to fit on any page.
     #[error("tuple of {size} bytes is larger than the maximum of {max}")]
     TupleTooLarge { size: usize, max: usize },

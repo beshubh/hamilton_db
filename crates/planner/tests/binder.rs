@@ -7,9 +7,9 @@ use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::disk::disk_manager::DiskManager;
 use tempfile::TempDir;
 
-use super::Binder;
-use crate::bound::*;
-use crate::error::{PlannerError, Result};
+use planner::Binder;
+use planner::bound::*;
+use planner::error::{PlannerError, Result};
 
 /// A catalog with two tables:
 ///

@@ -15,6 +15,7 @@ mod is_null;
 mod logic;
 mod string;
 #[cfg(test)]
+#[path = "../tests/util/expressions.rs"]
 mod test_util;
 mod unary;
 

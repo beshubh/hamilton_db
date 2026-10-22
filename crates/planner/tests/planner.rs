@@ -10,10 +10,9 @@ use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::disk::disk_manager::DiskManager;
 use tempfile::TempDir;
 
-use super::Planner;
-use crate::Binder;
-use crate::bound::BoundStatement;
-use crate::error::{PlannerError, Result};
+use planner::bound::BoundStatement;
+use planner::error::{PlannerError, Result};
+use planner::{Binder, Planner};
 
 /// The tables of the binder tests:
 ///

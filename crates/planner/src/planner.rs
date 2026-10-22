@@ -9,8 +9,6 @@
 //! expressions are bound but not planned yet.
 
 mod expr;
-#[cfg(test)]
-mod tests;
 
 use std::sync::Arc;
 

@@ -22,6 +22,7 @@ mod insert;
 mod projection;
 mod seq_scan;
 #[cfg(test)]
+#[path = "../tests/util/executors.rs"]
 mod test_util;
 mod values;
 

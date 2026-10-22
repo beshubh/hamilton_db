@@ -8,8 +8,6 @@
 mod aggregate;
 mod expr;
 mod scope;
-#[cfg(test)]
-mod tests;
 
 use std::collections::HashSet;
 
