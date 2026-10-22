@@ -6,10 +6,19 @@
 //!
 //! - WHERE, the select list and ORDER BY of a SELECT see the whole FROM row:
 //!   the columns of every table in FROM, left to right ([`BoundFrom::schema`]).
+//!   So do GROUP BY and the arguments of aggregate calls.
+//! - In an aggregating SELECT (one with GROUP BY, HAVING or an aggregate
+//!   call), HAVING, the select list, ORDER BY and the parts of window calls
+//!   see the aggregation row instead: the GROUP BY keys, then the results of
+//!   [`BoundSelect::aggregates`].
+//! - With window calls, the select list and ORDER BY see that row (FROM or
+//!   aggregation) followed by the results of [`BoundSelect::windows`].
 //! - A join's ON sees only that join's row: its left side's columns, then its
 //!   right side's.
 //! - UPDATE and DELETE see their one table's row.
 //! - INSERT values see no row at all.
+//! - A subquery sees only its own FROM row; correlated subqueries are not
+//!   supported.
 
 use catalog::TableOid;
 use common::{Column, Schema, Value};
@@ -54,6 +63,16 @@ pub struct BoundSelect {
     pub from: Option<BoundFrom>,
     /// A BOOL condition on the FROM row.
     pub selection: Option<BoundExpr>,
+    /// Grouping keys on the FROM row.
+    pub group_by: Vec<BoundExpr>,
+    /// The distinct aggregate calls of HAVING, the select list and ORDER BY,
+    /// whose results follow the GROUP BY keys in the aggregation row.
+    pub aggregates: Vec<BoundAggregate>,
+    /// A BOOL condition on the aggregation row.
+    pub having: Option<BoundExpr>,
+    /// The distinct window calls of the select list and ORDER BY, whose
+    /// results follow the FROM or aggregation row.
+    pub windows: Vec<BoundWindow>,
     /// The output columns, with `*` expanded.
     pub projection: Vec<BoundSelectItem>,
     /// Sort keys on the FROM row, so they can use columns the select list
@@ -64,6 +83,12 @@ pub struct BoundSelect {
 }
 
 impl BoundSelect {
+    /// Whether the rows are grouped: with GROUP BY, HAVING or an aggregate
+    /// call. Without GROUP BY, all rows form one group.
+    pub fn is_aggregate(&self) -> bool {
+        !self.group_by.is_empty() || !self.aggregates.is_empty() || self.having.is_some()
+    }
+
     pub fn output_schema(&self) -> Schema {
         Schema::new(
             self.projection
@@ -109,6 +134,11 @@ pub struct BoundDelete {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundFrom {
     Table(BoundTable),
+    /// `(SELECT ...) alias`: the subquery's output columns, named `alias`.
+    Subquery {
+        select: Box<BoundSelect>,
+        alias: String,
+    },
     Join {
         kind: JoinKind,
         left: Box<BoundFrom>,
@@ -135,6 +165,13 @@ impl BoundFrom {
                 column.nullable |= null_padded;
                 column
             })),
+            BoundFrom::Subquery { select, .. } => {
+                out.extend(select.output_schema().columns().iter().map(|column| {
+                    let mut column = column.clone();
+                    column.nullable |= null_padded;
+                    column
+                }))
+            }
             BoundFrom::Join {
                 kind, left, right, ..
             } => {
@@ -157,7 +194,8 @@ pub struct BoundExpr {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundExprKind {
     /// Column `idx` of the row the expression is evaluated on (see the
-    /// module docs). `table` is the alias it was resolved through.
+    /// module docs). `table` is the alias it was resolved through, or empty
+    /// for a column of an aggregation or window row.
     Column {
         table: String,
         idx: usize,
@@ -188,6 +226,160 @@ pub enum BoundExprKind {
     /// `return_type`; narrowing fails at run time if the value does not
     /// fit. Inserted only where a value is stored into a column.
     Cast(Box<BoundExpr>),
+    /// An aggregate call, with its argument on the FROM row. Exists only
+    /// while a SELECT is being bound: it is replaced by a column of the
+    /// aggregation row.
+    Aggregate(Box<BoundAggregate>),
+    /// A window call. Exists only while a SELECT is being bound: it is
+    /// replaced by a column of the window row.
+    Window(Box<BoundWindow>),
+    /// `(SELECT ...)` with one output column: its value in the first row, or
+    /// NULL if there are none. More than one row is a run-time error.
+    Subquery(Box<BoundSelect>),
+    /// `[NOT] EXISTS (SELECT ...)`. Never NULL.
+    Exists {
+        subquery: Box<BoundSelect>,
+        negated: bool,
+    },
+    /// `expr [NOT] IN (SELECT ...)` with one output column, which `expr`
+    /// is comparable with. NULL if `expr` is, or if there is no match and the
+    /// subquery produces a NULL, as with `=` on each row.
+    InSubquery {
+        expr: Box<BoundExpr>,
+        subquery: Box<BoundSelect>,
+        negated: bool,
+    },
+}
+
+impl BoundExpr {
+    /// The expressions directly inside this one that are evaluated on the
+    /// same row, so not those inside a subquery.
+    pub fn children(&self) -> Vec<&BoundExpr> {
+        match &self.kind {
+            BoundExprKind::Column { .. }
+            | BoundExprKind::Constant(_)
+            | BoundExprKind::Subquery(_)
+            | BoundExprKind::Exists { .. } => vec![],
+            BoundExprKind::Binary { left, right, .. } => vec![left, right],
+            BoundExprKind::Unary { expr, .. }
+            | BoundExprKind::IsNull { expr, .. }
+            | BoundExprKind::Cast(expr)
+            | BoundExprKind::InSubquery { expr, .. } => vec![expr],
+            BoundExprKind::Function { args, .. } => args.iter().collect(),
+            BoundExprKind::Array(elements) => elements.iter().collect(),
+            BoundExprKind::Aggregate(aggregate) => aggregate.arg.iter().collect(),
+            BoundExprKind::Window(window) => window.children(),
+        }
+    }
+
+    /// Whether this expression or one inside it (outside subqueries)
+    /// satisfies `pred`.
+    pub fn contains(&self, pred: &impl Fn(&BoundExprKind) -> bool) -> bool {
+        pred(&self.kind)
+            || self
+                .children()
+                .into_iter()
+                .any(|child| child.contains(pred))
+    }
+}
+
+/// An aggregate call such as `sum(x)` or `count(*)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundAggregate {
+    pub function: AggregateFunction,
+    /// `None` exactly for `count(*)`.
+    pub arg: Option<BoundExpr>,
+    /// `count` is BIGINT and never NULL; `sum` is BIGINT; `min` and `max`
+    /// have the argument's type. All but `count` are NULL over no values.
+    pub return_type: Column,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggregateFunction {
+    /// `count(*)` counts rows; `count(x)` counts non-NULL values.
+    Count,
+    /// Of integers.
+    Sum,
+    /// Of integers, BOOLs or VARCHARs.
+    Min,
+    Max,
+}
+
+impl AggregateFunction {
+    pub fn lookup(name: &str) -> Option<Self> {
+        match name {
+            "count" => Some(AggregateFunction::Count),
+            "sum" => Some(AggregateFunction::Sum),
+            "min" => Some(AggregateFunction::Min),
+            "max" => Some(AggregateFunction::Max),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            AggregateFunction::Count => "count",
+            AggregateFunction::Sum => "sum",
+            AggregateFunction::Min => "min",
+            AggregateFunction::Max => "max",
+        }
+    }
+}
+
+/// `function OVER (PARTITION BY partition_by ORDER BY order_by)`. The
+/// argument, partition and sort keys are on the row before the windows: the
+/// FROM row, or the aggregation row in an aggregating SELECT.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundWindow {
+    pub function: BoundWindowFunction,
+    pub partition_by: Vec<BoundExpr>,
+    pub order_by: Vec<BoundOrderBy>,
+    pub return_type: Column,
+}
+
+impl BoundWindow {
+    /// The argument, partition and sort keys.
+    pub fn children(&self) -> Vec<&BoundExpr> {
+        let arg = match &self.function {
+            BoundWindowFunction::Aggregate(aggregate) => aggregate.arg.as_ref(),
+            BoundWindowFunction::Rank | BoundWindowFunction::RowNumber => None,
+        };
+        arg.into_iter()
+            .chain(&self.partition_by)
+            .chain(self.order_by.iter().map(|item| &item.expr))
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundWindowFunction {
+    /// An aggregate over the partition, or with ORDER BY over the rows up to
+    /// the current one and its peers.
+    Aggregate(BoundAggregate),
+    /// `rank()`: BIGINT; rows tied on the sort keys share a rank.
+    Rank,
+    /// `row_number()`: BIGINT, the row's position in its partition from 1.
+    RowNumber,
+}
+
+impl BoundWindowFunction {
+    /// The window-only functions; aggregates are looked up with
+    /// [`AggregateFunction::lookup`].
+    pub fn lookup(name: &str) -> Option<Self> {
+        match name {
+            "rank" => Some(BoundWindowFunction::Rank),
+            "row_number" => Some(BoundWindowFunction::RowNumber),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            BoundWindowFunction::Aggregate(aggregate) => aggregate.function.name(),
+            BoundWindowFunction::Rank => "rank",
+            BoundWindowFunction::RowNumber => "row_number",
+        }
+    }
 }
 
 /// The functions the binder knows.

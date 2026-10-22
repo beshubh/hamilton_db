@@ -11,7 +11,7 @@ use common::{Column, Value};
 pub enum Statement {
     CreateTable(CreateTable),
     Insert(Insert),
-    Select(Select),
+    Select(Box<Select>),
     Update(Update),
     Delete(Delete),
 }
@@ -34,13 +34,16 @@ pub struct Insert {
     pub rows: Vec<Vec<Expr>>,
 }
 
-/// `SELECT items [FROM from] [WHERE selection] [ORDER BY ...] [LIMIT n]`
+/// `SELECT items [FROM from] [WHERE selection] [GROUP BY ...] [HAVING having]
+/// [ORDER BY ...] [LIMIT n]`
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Select {
     pub projection: Vec<SelectItem>,
     /// `None` for a SELECT without FROM, such as `SELECT 1`.
     pub from: Option<FromItem>,
     pub selection: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
 }
@@ -83,6 +86,11 @@ pub struct TableRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FromItem {
     Table(TableRef),
+    /// `(SELECT ...) [AS] alias`. The alias is required.
+    Subquery {
+        query: Box<Select>,
+        alias: String,
+    },
     Join {
         kind: JoinKind,
         left: Box<FromItem>,
@@ -132,13 +140,38 @@ pub enum Expr {
         expr: Box<Expr>,
         negated: bool,
     },
-    /// `name(args)`. Which functions exist is up to the binder.
+    /// `name(args) [OVER (...)]`. Which functions exist is up to the binder.
     Function {
         name: String,
         args: Vec<Expr>,
+        /// `name(*)`, as in `count(*)`; `args` is then empty.
+        star: bool,
+        /// The window of a window function call.
+        over: Option<WindowSpec>,
     },
     /// `ARRAY[elements]`
     Array(Vec<Expr>),
+    /// `(SELECT ...)`, a subquery producing one value.
+    Subquery(Box<Select>),
+    /// `[NOT] EXISTS (SELECT ...)`
+    Exists {
+        subquery: Box<Select>,
+        negated: bool,
+    },
+    /// `expr [NOT] IN (SELECT ...)`
+    InSubquery {
+        expr: Box<Expr>,
+        subquery: Box<Select>,
+        negated: bool,
+    },
+}
+
+/// `OVER ([PARTITION BY ...] [ORDER BY ...])`. Window frames and named
+/// windows are not supported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowSpec {
+    pub partition_by: Vec<Expr>,
+    pub order_by: Vec<OrderByItem>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

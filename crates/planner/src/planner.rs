@@ -1,9 +1,12 @@
 //! Turns bound statements into plan trees for the execution engine.
 //!
 //! The planner builds the plain plan for each statement: scans, nested loop
-//! joins, a filter for WHERE, then sort, limit and projection. Choosing
-//! better operators (hash joins, index scans, top-N) is left to rewrites of
-//! that tree.
+//! joins, a filter for WHERE, aggregation, a filter for HAVING, windows,
+//! then sort, limit and projection. Choosing better operators (hash joins,
+//! index scans, top-N) is left to rewrites of that tree.
+//!
+//! Subqueries in FROM are planned as part of the tree. Subqueries in
+//! expressions are bound but not planned yet.
 
 mod expr;
 #[cfg(test)]
@@ -15,15 +18,17 @@ use catalog::Catalog;
 use common::Schema;
 use execution::expressions::{AbstractExpr, ColumnValueExpr};
 use execution::plans::{
-    AbstractPlanNode, DeletePlan, FilterPlan, InsertPlan, JoinType, LimitPlan, NestedLoopJoinPlan,
-    OrderBy, PlanNode, ProjectionPlan, SeqScanPlan, SortPlan, UpdatePlan, ValuesPlan,
+    AbstractPlanNode, Aggregate, AggregationPlan, DeletePlan, FilterPlan, InsertPlan, JoinType,
+    LimitPlan, NestedLoopJoinPlan, OrderBy, PlanNode, ProjectionPlan, SeqScanPlan, SortPlan,
+    UpdatePlan, ValuesPlan, WindowColumn, WindowFunction, WindowFunctionKind, WindowPlan,
 };
 use parser::JoinKind;
 
 use self::expr::{Inputs, plan_expr};
 use crate::bound::{
-    BoundDelete, BoundExpr, BoundFrom, BoundInsert, BoundSelect, BoundStatement, BoundTable,
-    BoundUpdate,
+    AggregateFunction, BoundAggregate, BoundDelete, BoundExpr, BoundFrom, BoundInsert,
+    BoundOrderBy, BoundSelect, BoundStatement, BoundTable, BoundUpdate, BoundWindow,
+    BoundWindowFunction,
 };
 use crate::error::{PlannerError, Result};
 
@@ -51,10 +56,11 @@ impl<'a> Planner<'a> {
         Ok(Arc::new(plan))
     }
 
-    /// `Projection(Limit(Sort(Filter(from))))`, leaving out what the query
-    /// doesn't have. Sorting comes before the projection because ORDER BY
-    /// can use columns the select list leaves out; limiting does too, so the
-    /// select list is computed only for the rows returned.
+    /// `Projection(Limit(Sort(Window(Filter(Aggregation(Filter(from)))))))`,
+    /// leaving out what the query doesn't have: the first filter is WHERE
+    /// and the second HAVING. Sorting comes before the projection because
+    /// ORDER BY can use columns the select list leaves out; limiting does
+    /// too, so the select list is computed only for the rows returned.
     fn plan_select(&self, select: &BoundSelect) -> Result<AbstractPlanNode> {
         let mut plan = match &select.from {
             Some(from) => self.plan_from(from)?,
@@ -64,17 +70,23 @@ impl<'a> Planner<'a> {
         if let Some(selection) = &select.selection {
             plan = filter(plan, selection)?;
         }
-        if !select.order_by.is_empty() {
-            let order_bys = select
-                .order_by
+        if select.is_aggregate() {
+            let group_bys = plan_exprs(&select.group_by)?;
+            let aggregates = select
+                .aggregates
                 .iter()
-                .map(|item| {
-                    Ok(OrderBy {
-                        expr: plan_expr(&item.expr, Inputs::One)?,
-                        desc: item.desc,
-                    })
-                })
+                .map(plan_aggregate)
                 .collect::<Result<_>>()?;
+            plan = Arc::new(AggregationPlan::new(group_bys, aggregates, plan).into());
+        }
+        if let Some(having) = &select.having {
+            plan = filter(plan, having)?;
+        }
+        if !select.windows.is_empty() {
+            plan = window(plan, &select.windows)?;
+        }
+        if !select.order_by.is_empty() {
+            let order_bys = plan_order_bys(&select.order_by)?;
             plan = Arc::new(SortPlan::new(order_bys, plan).into());
         }
         if let Some(limit) = select.limit {
@@ -88,11 +100,13 @@ impl<'a> Planner<'a> {
         Ok(ProjectionPlan::new(select.output_schema(), exprs, plan).into())
     }
 
-    /// Scans for tables and nested loop joins for joins; their output is the
-    /// FROM row of [`BoundFrom::schema`].
+    /// Scans for tables, the subquery's plan for a subquery, and nested loop
+    /// joins for joins; their output is the FROM row of
+    /// [`BoundFrom::schema`].
     fn plan_from(&self, from: &BoundFrom) -> Result<Arc<AbstractPlanNode>> {
         let plan = match from {
             BoundFrom::Table(table) => return Ok(scan(table)),
+            BoundFrom::Subquery { select, .. } => return Ok(Arc::new(self.plan_select(select)?)),
             BoundFrom::Join {
                 kind,
                 left,
@@ -174,4 +188,74 @@ fn filtered_scan(
 fn filter(child: Arc<AbstractPlanNode>, predicate: &BoundExpr) -> Result<Arc<AbstractPlanNode>> {
     let predicate = plan_expr(predicate, Inputs::One)?;
     Ok(Arc::new(FilterPlan::new(predicate, child).into()))
+}
+
+/// The child's columns followed by one per window, the row the binder put
+/// window results on.
+fn window(child: Arc<AbstractPlanNode>, windows: &[BoundWindow]) -> Result<Arc<AbstractPlanNode>> {
+    let input = child.get_output_schema().columns().to_vec();
+    let mut columns: Vec<WindowColumn> = input
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            WindowColumn::Expr(ColumnValueExpr::new(0, idx, column.clone()).into())
+        })
+        .collect();
+    let mut schema = input;
+    for window in windows {
+        let function = match &window.function {
+            BoundWindowFunction::Aggregate(aggregate) => {
+                WindowFunctionKind::Aggregate(plan_aggregate(aggregate)?)
+            }
+            BoundWindowFunction::Rank => WindowFunctionKind::Rank,
+            BoundWindowFunction::RowNumber => WindowFunctionKind::RowNumber,
+        };
+        columns.push(WindowColumn::Window(WindowFunction {
+            function,
+            partition_by: plan_exprs(&window.partition_by)?,
+            order_by: plan_order_bys(&window.order_by)?,
+        }));
+        let mut column = window.return_type.clone();
+        column.name = window.function.name().to_owned();
+        schema.push(column);
+    }
+    Ok(Arc::new(
+        WindowPlan::new(Schema::new(schema), columns, child).into(),
+    ))
+}
+
+fn plan_aggregate(aggregate: &BoundAggregate) -> Result<Aggregate> {
+    let arg = aggregate
+        .arg
+        .as_ref()
+        .map(|arg| plan_expr(arg, Inputs::One))
+        .transpose()?;
+    Ok(match (aggregate.function, arg) {
+        (AggregateFunction::Count, None) => Aggregate::CountStar,
+        (AggregateFunction::Count, Some(arg)) => Aggregate::Count(arg),
+        (AggregateFunction::Sum, Some(arg)) => Aggregate::Sum(arg),
+        (AggregateFunction::Min, Some(arg)) => Aggregate::Min(arg),
+        (AggregateFunction::Max, Some(arg)) => Aggregate::Max(arg),
+        (function, None) => unreachable!("the binder allows * only for count, not {function:?}"),
+    })
+}
+
+/// Expressions on the row of a single-input plan.
+fn plan_exprs(exprs: &[BoundExpr]) -> Result<Vec<AbstractExpr>> {
+    exprs
+        .iter()
+        .map(|expr| plan_expr(expr, Inputs::One))
+        .collect()
+}
+
+fn plan_order_bys(order_by: &[BoundOrderBy]) -> Result<Vec<OrderBy>> {
+    order_by
+        .iter()
+        .map(|item| {
+            Ok(OrderBy {
+                expr: plan_expr(&item.expr, Inputs::One)?,
+                desc: item.desc,
+            })
+        })
+        .collect()
 }

@@ -683,3 +683,409 @@ fn every_statement_kind_binds() {
         assert!(same_kind, "{stmt:?} bound to {bound:?}");
     }
 }
+
+#[test]
+fn grouped_select_reads_the_aggregation_row() {
+    let db = Db::new();
+    let select =
+        db.select("SELECT user_id, count(*), sum(total) AS s FROM orders GROUP BY user_id");
+    assert!(select.is_aggregate());
+    assert_eq!(column_ref(&select.group_by[0]), ("orders", 1));
+
+    let functions: Vec<_> = select.aggregates.iter().map(|a| a.function).collect();
+    assert_eq!(
+        functions,
+        [AggregateFunction::Count, AggregateFunction::Sum]
+    );
+    assert_eq!(select.aggregates[0].arg, None);
+    assert_eq!(
+        column_ref(select.aggregates[1].arg.as_ref().unwrap()),
+        ("orders", 2)
+    );
+
+    // Group key, then the aggregates.
+    let refs: Vec<_> = select
+        .projection
+        .iter()
+        .map(|p| column_ref(&p.expr))
+        .collect();
+    assert_eq!(refs, [("", 0), ("", 1), ("", 2)]);
+    assert_eq!(names(&select), ["user_id", "count", "s"]);
+    assert_eq!(
+        select.output_schema(),
+        Schema::new(vec![
+            Column::new("user_id", DataType::Int, true),
+            Column::new("count", DataType::BigInt, false),
+            Column::new("s", DataType::BigInt, true),
+        ])
+    );
+}
+
+#[test]
+fn aggregates_are_shared_by_having_select_list_and_order_by() {
+    let db = Db::new();
+    let select = db.select("SELECT count(*) FROM orders HAVING count(*) > 1 ORDER BY max(total)");
+    assert!(select.group_by.is_empty());
+    assert_eq!(select.aggregates.len(), 2);
+    let Some(BoundExpr {
+        kind: BoundExprKind::Binary { left, .. },
+        ..
+    }) = &select.having
+    else {
+        panic!("expected a comparison");
+    };
+    assert_eq!(column_ref(left), ("", 0));
+    assert_eq!(column_ref(&select.projection[0].expr), ("", 0));
+    assert_eq!(column_ref(&select.order_by[0].expr), ("", 1));
+    assert_eq!(
+        select.order_by[0].expr.return_type.data_type,
+        DataType::BigInt
+    );
+}
+
+#[test]
+fn having_alone_makes_one_group() {
+    let db = Db::new();
+    let select = db.select("SELECT 1 FROM users HAVING TRUE");
+    assert!(select.is_aggregate());
+    assert!(select.group_by.is_empty() && select.aggregates.is_empty());
+}
+
+#[test]
+fn group_by_keys_match_whole_expressions() {
+    let db = Db::new();
+    let select = db.select("SELECT id + 1, count(*) FROM users GROUP BY id + 1 ORDER BY id + 1");
+    assert_eq!(column_ref(&select.projection[0].expr), ("", 0));
+    assert_eq!(column_ref(&select.order_by[0].expr), ("", 0));
+
+    // `id` alone is not a key, though `id + 1` is.
+    assert_eq!(
+        db.err("SELECT id FROM users GROUP BY id + 1"),
+        PlannerError::NotGrouped("users.id".into())
+    );
+}
+
+#[test]
+fn ungrouped_columns_are_errors() {
+    let db = Db::new();
+    let not_grouped = |column: &str| PlannerError::NotGrouped(column.into());
+    assert_eq!(
+        db.err("SELECT name, count(*) FROM users"),
+        not_grouped("users.name")
+    );
+    assert_eq!(
+        db.err("SELECT * FROM users GROUP BY id"),
+        not_grouped("users.name")
+    );
+    assert_eq!(
+        db.err("SELECT id FROM users GROUP BY id HAVING score > 1"),
+        not_grouped("users.score")
+    );
+    assert_eq!(
+        db.err("SELECT id FROM users GROUP BY id ORDER BY name"),
+        not_grouped("users.name")
+    );
+}
+
+#[test]
+fn aggregates_where_they_are_not_allowed() {
+    let db = Db::new();
+    let not_allowed = |clause| PlannerError::AggregateNotAllowed { clause };
+    assert_eq!(
+        db.err("SELECT * FROM users WHERE count(*) > 1"),
+        not_allowed("WHERE")
+    );
+    assert_eq!(
+        db.err("SELECT 1 FROM users GROUP BY count(*)"),
+        not_allowed("GROUP BY")
+    );
+    assert_eq!(
+        db.err("SELECT * FROM users JOIN orders ON count(*) > 1"),
+        not_allowed("ON")
+    );
+    assert_eq!(
+        db.err("UPDATE users SET score = count(*)"),
+        not_allowed("UPDATE")
+    );
+    assert_eq!(
+        db.err("INSERT INTO orders VALUES (count(*), 1, 1)"),
+        not_allowed("VALUES")
+    );
+    assert_eq!(
+        db.err("SELECT sum(count(*)) FROM users"),
+        PlannerError::NestedAggregate
+    );
+}
+
+#[test]
+fn aggregate_argument_types() {
+    let db = Db::new();
+    let min = db.expr("min(name)").unwrap();
+    assert_eq!(min.return_type.data_type, DataType::Varchar(32));
+    assert!(min.return_type.nullable);
+    let count = db.expr("count(name)").unwrap();
+    assert_eq!(count.return_type.data_type, DataType::BigInt);
+    assert!(!count.return_type.nullable);
+    let BoundStatement::Select(select) = db.bind("SELECT sum(NULL) FROM users").unwrap() else {
+        panic!("expected a select");
+    };
+    let arg = select.aggregates[0].arg.as_ref().unwrap();
+    assert_eq!(arg.return_type.data_type, DataType::Int);
+
+    assert_eq!(
+        db.expr("sum(name)").unwrap_err(),
+        PlannerError::Value(ValueError::InvalidOperand {
+            op: "sum",
+            operand: "VARCHAR"
+        })
+    );
+    assert_eq!(
+        db.expr("max(ARRAY[1])").unwrap_err(),
+        PlannerError::Value(ValueError::InvalidOperand {
+            op: "max",
+            operand: "ARRAY"
+        })
+    );
+    assert_eq!(
+        db.expr("sum(*)").unwrap_err(),
+        PlannerError::UnknownFunction("sum(*)".into())
+    );
+    assert_eq!(
+        db.expr("upper(*)").unwrap_err(),
+        PlannerError::UnknownFunction("upper(*)".into())
+    );
+    assert_eq!(
+        db.expr("count(id, name)").unwrap_err(),
+        PlannerError::WrongArgumentCount {
+            function: "count".into(),
+            expected: 1,
+            found: 2
+        }
+    );
+}
+
+#[test]
+fn window_results_follow_the_from_row() {
+    let db = Db::new();
+    let select = db.select(
+        "SELECT name, rank() OVER (PARTITION BY active ORDER BY score DESC) AS r, \
+         sum(score) OVER () FROM users ORDER BY row_number() OVER ()",
+    );
+    assert!(!select.is_aggregate());
+    assert_eq!(select.windows.len(), 3);
+    let rank = &select.windows[0];
+    assert_eq!(rank.function, BoundWindowFunction::Rank);
+    assert_eq!(column_ref(&rank.partition_by[0]), ("users", 3));
+    assert_eq!(column_ref(&rank.order_by[0].expr), ("users", 2));
+    assert!(rank.order_by[0].desc);
+    assert!(matches!(
+        select.windows[1].function,
+        BoundWindowFunction::Aggregate(BoundAggregate {
+            function: AggregateFunction::Sum,
+            ..
+        })
+    ));
+
+    // `users` has 4 columns; the windows come after them.
+    assert_eq!(column_ref(&select.projection[0].expr), ("users", 1));
+    assert_eq!(column_ref(&select.projection[1].expr), ("", 4));
+    assert_eq!(column_ref(&select.projection[2].expr), ("", 5));
+    assert_eq!(column_ref(&select.order_by[0].expr), ("", 6));
+    assert_eq!(names(&select), ["name", "r", "sum"]);
+    assert!(!select.projection[1].expr.return_type.nullable);
+}
+
+#[test]
+fn windows_over_aggregates() {
+    let db = Db::new();
+    let select = db.select(
+        "SELECT user_id, rank() OVER (ORDER BY count(*) DESC) FROM orders GROUP BY user_id",
+    );
+    assert_eq!(select.aggregates.len(), 1);
+    // The window sorts by the aggregate's column of the aggregation row,
+    // and its own result comes after that row.
+    assert_eq!(column_ref(&select.windows[0].order_by[0].expr), ("", 1));
+    assert_eq!(column_ref(&select.projection[1].expr), ("", 2));
+
+    assert_eq!(
+        db.err("SELECT rank() OVER (ORDER BY total) FROM orders GROUP BY user_id"),
+        PlannerError::NotGrouped("orders.total".into())
+    );
+}
+
+#[test]
+fn identical_windows_are_computed_once() {
+    let db = Db::new();
+    let select = db.select("SELECT row_number() OVER (), row_number() OVER () + 1 FROM users");
+    assert_eq!(select.windows.len(), 1);
+}
+
+#[test]
+fn window_errors() {
+    let db = Db::new();
+    assert_eq!(
+        db.expr("rank()").unwrap_err(),
+        PlannerError::WindowWithoutOver("rank".into())
+    );
+    assert_eq!(
+        db.expr("upper(name) OVER ()").unwrap_err(),
+        PlannerError::NotAWindowFunction("upper".into())
+    );
+    assert_eq!(
+        db.expr("nope() OVER ()").unwrap_err(),
+        PlannerError::UnknownFunction("nope".into())
+    );
+    assert_eq!(
+        db.expr("rank(id) OVER ()").unwrap_err(),
+        PlannerError::WrongArgumentCount {
+            function: "rank".into(),
+            expected: 0,
+            found: 1
+        }
+    );
+    assert_eq!(
+        db.expr("sum(rank() OVER ()) OVER ()").unwrap_err(),
+        PlannerError::NestedWindow
+    );
+    assert_eq!(
+        db.expr("sum(rank() OVER ())").unwrap_err(),
+        PlannerError::WindowNotAllowed {
+            clause: "aggregate function calls"
+        }
+    );
+    assert_eq!(
+        db.err("SELECT * FROM users WHERE rank() OVER () = 1"),
+        PlannerError::WindowNotAllowed { clause: "WHERE" }
+    );
+    assert_eq!(
+        db.err("SELECT 1 FROM users HAVING rank() OVER () = 1"),
+        PlannerError::WindowNotAllowed { clause: "HAVING" }
+    );
+}
+
+#[test]
+fn subquery_in_from() {
+    let db = Db::new();
+    let select = db.select(
+        "SELECT t.n, o.total FROM \
+         (SELECT user_id AS n, count(*) AS c FROM orders GROUP BY user_id) t \
+         JOIN orders o ON t.n = o.user_id WHERE t.c > 1",
+    );
+    let Some(BoundFrom::Join {
+        left, on: Some(on), ..
+    }) = &select.from
+    else {
+        panic!("expected a join");
+    };
+    let BoundFrom::Subquery {
+        select: inner,
+        alias,
+    } = &**left
+    else {
+        panic!("expected a subquery");
+    };
+    assert_eq!(alias, "t");
+    assert!(inner.is_aggregate());
+
+    // `t` contributes its two output columns to the FROM row.
+    assert_eq!(column_ref(&select.projection[0].expr), ("t", 0));
+    assert_eq!(column_ref(&select.projection[1].expr), ("o", 4));
+    let BoundExprKind::Binary { left, right, .. } = &on.kind else {
+        panic!("expected a comparison");
+    };
+    assert_eq!(column_ref(left), ("t", 0));
+    assert_eq!(column_ref(right), ("o", 3));
+    assert_eq!(
+        select.output_schema(),
+        Schema::new(vec![
+            Column::new("n", DataType::Int, true),
+            Column::new("total", DataType::BigInt, true),
+        ])
+    );
+
+    assert_eq!(
+        db.err("SELECT * FROM users, (SELECT 1) AS users"),
+        PlannerError::DuplicateTable("users".into())
+    );
+    // A FROM subquery can't see the other FROM items.
+    assert_eq!(
+        db.err("SELECT * FROM users, (SELECT users.id) AS x"),
+        PlannerError::UnknownTable("users".into())
+    );
+}
+
+#[test]
+fn subqueries_in_expressions() {
+    let db = Db::new();
+    let select = db.select(
+        "SELECT (SELECT max(total) FROM orders) AS m, EXISTS (SELECT * FROM orders), \
+         id NOT IN (SELECT user_id FROM orders GROUP BY user_id HAVING count(*) > 1), \
+         (SELECT user_id FROM orders) FROM users",
+    );
+    // The subqueries' aggregates are their own.
+    assert!(!select.is_aggregate());
+    assert_eq!(names(&select), ["m", "exists", "?column?", "user_id"]);
+
+    let kinds: Vec<_> = select.projection.iter().map(|p| &p.expr.kind).collect();
+    assert!(matches!(kinds[0], BoundExprKind::Subquery(_)));
+    assert!(matches!(
+        kinds[1],
+        BoundExprKind::Exists { negated: false, .. }
+    ));
+    assert!(matches!(
+        kinds[2],
+        BoundExprKind::InSubquery { negated: true, .. }
+    ));
+
+    let types: Vec<_> = select
+        .projection
+        .iter()
+        .map(|p| (p.expr.return_type.data_type, p.expr.return_type.nullable))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            (DataType::BigInt, true),
+            (DataType::Bool, false),
+            (DataType::Bool, true),
+            (DataType::Int, true),
+        ]
+    );
+}
+
+#[test]
+fn subquery_errors() {
+    let db = Db::new();
+    assert_eq!(
+        db.expr("(SELECT id, name FROM users)").unwrap_err(),
+        PlannerError::SubqueryColumns { found: 2 }
+    );
+    assert_eq!(
+        db.expr("id IN (SELECT * FROM orders)").unwrap_err(),
+        PlannerError::SubqueryColumns { found: 3 }
+    );
+    assert_eq!(
+        db.expr("id IN (SELECT name FROM users)").unwrap_err(),
+        invalid_operands("IN", "INT", "VARCHAR")
+    );
+    assert_eq!(
+        db.err(
+            "SELECT * FROM users u WHERE EXISTS \
+             (SELECT * FROM orders o WHERE o.user_id = u.id)"
+        ),
+        PlannerError::Unsupported(
+            "correlated subquery (column u.id belongs to an outer query)".into()
+        )
+    );
+    assert_eq!(
+        db.err("SELECT (SELECT score) FROM users"),
+        PlannerError::Unsupported(
+            "correlated subquery (column score belongs to an outer query)".into()
+        )
+    );
+    // A name no query has is still just missing.
+    assert_eq!(
+        db.err("SELECT (SELECT nope FROM orders) FROM users"),
+        PlannerError::ColumnNotFound("nope".into())
+    );
+}

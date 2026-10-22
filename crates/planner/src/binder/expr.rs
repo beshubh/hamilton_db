@@ -8,75 +8,252 @@
 //! - Comparisons take two integers, two BOOLs or two VARCHARs.
 //! - AND, OR and NOT take BOOLs.
 //! - The result can be NULL if any operand can, except for IS [NOT] NULL.
+//! - `count` takes anything, `sum` integers, and `min` and `max` anything
+//!   comparable. `x IN (SELECT y ...)` needs `x = y` to be valid.
 //!
 //! A NULL literal has no type of its own. It takes the type its context
 //! asks for (the other operand, BOOL under AND, the column it is stored
 //! in) and is INT where nothing does, as in `SELECT NULL`.
 
 use common::{Column, DataType, Value, ValueError};
-use parser::{BinaryOp, Expr, UnaryOp};
+use parser::{BinaryOp, Expr, UnaryOp, WindowSpec};
 
+use super::Binder;
 use super::scope::Scope;
-use crate::bound::{BoundExpr, BoundExprKind, Function};
+use crate::bound::{
+    AggregateFunction, BoundAggregate, BoundExpr, BoundExprKind, BoundOrderBy, BoundSelect,
+    BoundWindow, BoundWindowFunction, Function,
+};
 use crate::error::{PlannerError, Result};
 
 /// Name of a result column that is not simply a table column.
 pub(crate) const UNNAMED_COLUMN: &str = "?column?";
 
-pub(super) fn bind_expr(expr: &Expr, scope: &Scope) -> Result<BoundExpr> {
-    match expr {
-        Expr::Column { table, name } => {
-            let resolved = scope.resolve(table.as_deref(), name)?;
-            Ok(BoundExpr {
-                kind: BoundExprKind::Column {
-                    table: resolved.table,
-                    idx: resolved.idx,
-                },
-                return_type: resolved.column,
-            })
-        }
-        Expr::Literal(value) => Ok(constant(value.clone())),
-        Expr::Binary { op, left, right } => {
-            bind_binary(*op, bind_expr(left, scope)?, bind_expr(right, scope)?)
-        }
-        Expr::Unary { op, expr } => bind_unary(*op, bind_expr(expr, scope)?),
-        Expr::IsNull { expr, negated } => Ok(BoundExpr {
-            kind: BoundExprKind::IsNull {
-                expr: Box::new(bind_expr(expr, scope)?),
-                negated: *negated,
-            },
-            return_type: unnamed(DataType::Bool, false),
-        }),
-        Expr::Function { name, args } => {
-            let args = args
-                .iter()
-                .map(|arg| bind_expr(arg, scope))
-                .collect::<Result<_>>()?;
-            bind_function(name, args)
-        }
-        Expr::Array(elements) => Ok(BoundExpr {
-            kind: BoundExprKind::Array(
-                elements
-                    .iter()
-                    .map(|e| bind_expr(e, scope))
-                    .collect::<Result<_>>()?,
+impl Binder<'_> {
+    pub(super) fn bind_expr(&self, expr: &Expr, scope: &Scope) -> Result<BoundExpr> {
+        match expr {
+            Expr::Column { table, name } => {
+                let resolved = scope.resolve(table.as_deref(), name)?;
+                Ok(BoundExpr {
+                    kind: BoundExprKind::Column {
+                        table: resolved.table,
+                        idx: resolved.idx,
+                    },
+                    return_type: resolved.column,
+                })
+            }
+            Expr::Literal(value) => Ok(constant(value.clone())),
+            Expr::Binary { op, left, right } => bind_binary(
+                *op,
+                self.bind_expr(left, scope)?,
+                self.bind_expr(right, scope)?,
             ),
-            return_type: unnamed(DataType::Array, false),
-        }),
+            Expr::Unary { op, expr } => bind_unary(*op, self.bind_expr(expr, scope)?),
+            Expr::IsNull { expr, negated } => Ok(BoundExpr {
+                kind: BoundExprKind::IsNull {
+                    expr: Box::new(self.bind_expr(expr, scope)?),
+                    negated: *negated,
+                },
+                return_type: unnamed(DataType::Bool, false),
+            }),
+            Expr::Function {
+                name,
+                args,
+                star,
+                over,
+            } => {
+                let args = args
+                    .iter()
+                    .map(|arg| self.bind_expr(arg, scope))
+                    .collect::<Result<_>>()?;
+                match over {
+                    Some(over) => self.bind_window(name, args, *star, over, scope),
+                    None => bind_function(name, args, *star),
+                }
+            }
+            Expr::Array(elements) => Ok(BoundExpr {
+                kind: BoundExprKind::Array(
+                    elements
+                        .iter()
+                        .map(|e| self.bind_expr(e, scope))
+                        .collect::<Result<_>>()?,
+                ),
+                return_type: unnamed(DataType::Array, false),
+            }),
+            Expr::Subquery(query) => {
+                let subquery = self.bind_select(query, Some(scope))?;
+                let column = single_column(&subquery)?;
+                Ok(BoundExpr {
+                    kind: BoundExprKind::Subquery(Box::new(subquery)),
+                    // NULL when the subquery produces no rows.
+                    return_type: unnamed(column.data_type, true),
+                })
+            }
+            Expr::Exists { subquery, negated } => Ok(BoundExpr {
+                kind: BoundExprKind::Exists {
+                    subquery: Box::new(self.bind_select(subquery, Some(scope))?),
+                    negated: *negated,
+                },
+                return_type: unnamed(DataType::Bool, false),
+            }),
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                let mut left = self.bind_expr(expr, scope)?;
+                let subquery = self.bind_select(subquery, Some(scope))?;
+                let right = single_column(&subquery)?;
+                type_null(&mut left, right.data_type);
+                let l = left.return_type.data_type;
+                if !comparable(l, right.data_type) {
+                    return Err(ValueError::InvalidOperands {
+                        op: "IN",
+                        left: l.type_name(),
+                        right: right.data_type.type_name(),
+                    }
+                    .into());
+                }
+                Ok(BoundExpr {
+                    kind: BoundExprKind::InSubquery {
+                        expr: Box::new(left),
+                        subquery: Box::new(subquery),
+                        negated: *negated,
+                    },
+                    return_type: unnamed(DataType::Bool, true),
+                })
+            }
+        }
+    }
+
+    /// Binds a WHERE, ON or HAVING condition, which must be BOOL.
+    pub(super) fn bind_condition(
+        &self,
+        expr: &Expr,
+        scope: &Scope,
+        clause: &'static str,
+    ) -> Result<BoundExpr> {
+        let mut bound = self.bind_expr(expr, scope)?;
+        type_null(&mut bound, DataType::Bool);
+        match bound.return_type.data_type {
+            DataType::Bool => Ok(bound),
+            found => Err(PlannerError::NotBoolean { clause, found }),
+        }
+    }
+
+    /// Binds a WHERE or ON condition, where aggregate and window calls are
+    /// not allowed.
+    pub(super) fn bind_filter(
+        &self,
+        expr: &Expr,
+        scope: &Scope,
+        clause: &'static str,
+    ) -> Result<BoundExpr> {
+        let bound = self.bind_condition(expr, scope, clause)?;
+        forbid_calls(&bound, clause)?;
+        Ok(bound)
+    }
+
+    /// `name(args) OVER (...)`, for an aggregate or a window-only function.
+    fn bind_window(
+        &self,
+        name: &str,
+        args: Vec<BoundExpr>,
+        star: bool,
+        over: &WindowSpec,
+        scope: &Scope,
+    ) -> Result<BoundExpr> {
+        if args.iter().any(|arg| arg.contains(&is_window)) {
+            return Err(PlannerError::NestedWindow);
+        }
+        let function = if let Some(function) = AggregateFunction::lookup(name) {
+            BoundWindowFunction::Aggregate(bind_aggregate(function, args, star)?)
+        } else if let Some(function) = BoundWindowFunction::lookup(name) {
+            if star || !args.is_empty() {
+                return Err(PlannerError::WrongArgumentCount {
+                    function: name.to_owned(),
+                    expected: 0,
+                    found: if star { 1 } else { args.len() },
+                });
+            }
+            function
+        } else if Function::lookup(name).is_some() {
+            return Err(PlannerError::NotAWindowFunction(name.to_owned()));
+        } else {
+            return Err(PlannerError::UnknownFunction(name.to_owned()));
+        };
+
+        let partition_by = over
+            .partition_by
+            .iter()
+            .map(|expr| self.bind_expr(expr, scope))
+            .collect::<Result<_>>()?;
+        let order_by = over
+            .order_by
+            .iter()
+            .map(|item| {
+                Ok(BoundOrderBy {
+                    expr: self.bind_expr(&item.expr, scope)?,
+                    desc: item.desc,
+                })
+            })
+            .collect::<Result<_>>()?;
+        let return_type = match &function {
+            BoundWindowFunction::Aggregate(aggregate) => aggregate.return_type.clone(),
+            BoundWindowFunction::Rank | BoundWindowFunction::RowNumber => {
+                unnamed(DataType::BigInt, false)
+            }
+        };
+        let window = BoundWindow {
+            function,
+            partition_by,
+            order_by,
+            return_type: return_type.clone(),
+        };
+        if window
+            .children()
+            .iter()
+            .any(|child| child.contains(&is_window))
+        {
+            return Err(PlannerError::NestedWindow);
+        }
+        Ok(BoundExpr {
+            kind: BoundExprKind::Window(Box::new(window)),
+            return_type,
+        })
     }
 }
 
-/// Binds a WHERE or ON condition, which must be BOOL.
-pub(super) fn bind_condition(
-    expr: &Expr,
-    scope: &Scope,
-    clause: &'static str,
-) -> Result<BoundExpr> {
-    let mut bound = bind_expr(expr, scope)?;
-    type_null(&mut bound, DataType::Bool);
-    match bound.return_type.data_type {
-        DataType::Bool => Ok(bound),
-        found => Err(PlannerError::NotBoolean { clause, found }),
+/// Rejects aggregate and window calls in a clause that allows neither.
+pub(super) fn forbid_calls(expr: &BoundExpr, clause: &'static str) -> Result<()> {
+    forbid_windows(expr, clause)?;
+    if expr.contains(&is_aggregate) {
+        return Err(PlannerError::AggregateNotAllowed { clause });
+    }
+    Ok(())
+}
+
+/// Rejects window calls in a clause other than the select list and ORDER BY.
+pub(super) fn forbid_windows(expr: &BoundExpr, clause: &'static str) -> Result<()> {
+    if expr.contains(&is_window) {
+        return Err(PlannerError::WindowNotAllowed { clause });
+    }
+    Ok(())
+}
+
+pub(super) fn is_aggregate(kind: &BoundExprKind) -> bool {
+    matches!(kind, BoundExprKind::Aggregate(_))
+}
+
+fn is_window(kind: &BoundExprKind) -> bool {
+    matches!(kind, BoundExprKind::Window(_))
+}
+
+/// The one output column of a scalar or IN subquery.
+fn single_column(subquery: &BoundSelect) -> Result<Column> {
+    match subquery.projection.as_slice() {
+        [item] => Ok(item.expr.return_type.clone()),
+        items => Err(PlannerError::SubqueryColumns { found: items.len() }),
     }
 }
 
@@ -170,12 +347,7 @@ fn bind_binary(op: BinaryOp, mut left: BoundExpr, mut right: BoundExpr) -> Resul
         | BinaryOp::Lt
         | BinaryOp::LtEq
         | BinaryOp::Gt
-        | BinaryOp::GtEq => match (l, r) {
-            (DataType::Int | DataType::BigInt, DataType::Int | DataType::BigInt)
-            | (DataType::Bool, DataType::Bool)
-            | (DataType::Varchar(_), DataType::Varchar(_)) => Some(DataType::Bool),
-            _ => None,
-        },
+        | BinaryOp::GtEq => comparable(l, r).then_some(DataType::Bool),
         BinaryOp::And | BinaryOp::Or => {
             (l == DataType::Bool && r == DataType::Bool).then_some(DataType::Bool)
         }
@@ -225,7 +397,41 @@ fn bind_unary(op: UnaryOp, mut expr: BoundExpr) -> Result<BoundExpr> {
     })
 }
 
-fn bind_function(name: &str, mut args: Vec<BoundExpr>) -> Result<BoundExpr> {
+/// Whether `=`, `<` and the like accept these operand types.
+fn comparable(l: DataType, r: DataType) -> bool {
+    matches!(
+        (l, r),
+        (
+            DataType::Int | DataType::BigInt,
+            DataType::Int | DataType::BigInt
+        ) | (DataType::Bool, DataType::Bool)
+            | (DataType::Varchar(_), DataType::Varchar(_))
+    )
+}
+
+/// A call without OVER: an aggregate or a scalar function.
+fn bind_function(name: &str, mut args: Vec<BoundExpr>, star: bool) -> Result<BoundExpr> {
+    if let Some(function) = AggregateFunction::lookup(name) {
+        // A window aggregate may take an aggregate, as it runs after
+        // grouping; a plain one runs on the FROM row.
+        for arg in &args {
+            if arg.contains(&is_aggregate) {
+                return Err(PlannerError::NestedAggregate);
+            }
+            forbid_windows(arg, "aggregate function calls")?;
+        }
+        let aggregate = bind_aggregate(function, args, star)?;
+        return Ok(BoundExpr {
+            return_type: aggregate.return_type.clone(),
+            kind: BoundExprKind::Aggregate(Box::new(aggregate)),
+        });
+    }
+    if BoundWindowFunction::lookup(name).is_some() {
+        return Err(PlannerError::WindowWithoutOver(name.to_owned()));
+    }
+    if star {
+        return Err(PlannerError::UnknownFunction(format!("{name}(*)")));
+    }
     let function =
         Function::lookup(name).ok_or_else(|| PlannerError::UnknownFunction(name.to_owned()))?;
     match function {
@@ -259,6 +465,60 @@ fn bind_function(name: &str, mut args: Vec<BoundExpr>) -> Result<BoundExpr> {
             })
         }
     }
+}
+
+/// `function(arg)`, or `count(*)` when `star`.
+fn bind_aggregate(
+    function: AggregateFunction,
+    mut args: Vec<BoundExpr>,
+    star: bool,
+) -> Result<BoundAggregate> {
+    if star {
+        if function != AggregateFunction::Count {
+            return Err(PlannerError::UnknownFunction(format!(
+                "{}(*)",
+                function.name()
+            )));
+        }
+        return Ok(BoundAggregate {
+            function,
+            arg: None,
+            return_type: unnamed(DataType::BigInt, false),
+        });
+    }
+    if args.len() != 1 {
+        return Err(PlannerError::WrongArgumentCount {
+            function: function.name().to_owned(),
+            expected: 1,
+            found: args.len(),
+        });
+    }
+    let mut arg = args.remove(0);
+    // A NULL argument is NULL whatever its type; INT is as good as any.
+    type_null(&mut arg, DataType::Int);
+    let ty = arg.return_type.data_type;
+    let accepted = match function {
+        AggregateFunction::Count => true,
+        AggregateFunction::Sum => matches!(ty, DataType::Int | DataType::BigInt),
+        AggregateFunction::Min | AggregateFunction::Max => comparable(ty, ty),
+    };
+    if !accepted {
+        return Err(ValueError::InvalidOperand {
+            op: function.name(),
+            operand: ty.type_name(),
+        }
+        .into());
+    }
+    let return_type = match function {
+        AggregateFunction::Count => unnamed(DataType::BigInt, false),
+        AggregateFunction::Sum => unnamed(DataType::BigInt, true),
+        AggregateFunction::Min | AggregateFunction::Max => unnamed(ty, true),
+    };
+    Ok(BoundAggregate {
+        function,
+        arg: Some(arg),
+        return_type,
+    })
 }
 
 fn constant(value: Value) -> BoundExpr {

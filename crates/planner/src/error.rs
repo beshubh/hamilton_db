@@ -61,6 +61,43 @@ pub enum PlannerError {
     #[error("ORDER BY position {position} is not in the select list")]
     OrderByPositionOutOfRange { position: i64 },
 
+    /// An aggregate call in WHERE, ON, GROUP BY, VALUES or UPDATE.
+    #[error("aggregate functions are not allowed in {clause}")]
+    AggregateNotAllowed { clause: &'static str },
+
+    #[error("aggregate function calls cannot be nested")]
+    NestedAggregate,
+
+    /// A window call anywhere but the select list and ORDER BY of a SELECT.
+    #[error("window functions are not allowed in {clause}")]
+    WindowNotAllowed { clause: &'static str },
+
+    #[error("window function calls cannot be nested")]
+    NestedWindow,
+
+    /// `rank()` or `row_number()` without OVER.
+    #[error("window function {0} requires an OVER clause")]
+    WindowWithoutOver(String),
+
+    /// OVER after a function that is neither a window function nor an
+    /// aggregate.
+    #[error("OVER specified, but {0} is not a window function nor an aggregate function")]
+    NotAWindowFunction(String),
+
+    /// In an aggregating SELECT, a column outside an aggregate that is not
+    /// a GROUP BY key.
+    #[error("column {0} must appear in the GROUP BY clause or be used in an aggregate function")]
+    NotGrouped(String),
+
+    /// A scalar or IN subquery with other than one output column.
+    #[error("subquery must return only one column, found {found}")]
+    SubqueryColumns { found: usize },
+
+    /// Something the parser accepts but the binder or planner does not
+    /// handle yet, such as a correlated subquery.
+    #[error("{0} is not supported")]
+    Unsupported(String),
+
     /// A statement that runs without a plan, such as CREATE TABLE, which
     /// goes to the catalog directly.
     #[error("{0} has no query plan")]

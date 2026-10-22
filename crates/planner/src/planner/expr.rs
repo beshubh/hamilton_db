@@ -69,6 +69,16 @@ pub(super) fn plan_expr(expr: &BoundExpr, inputs: Inputs) -> Result<AbstractExpr
             expr.return_type.data_type,
         ))?
         .into(),
+        BoundExprKind::Subquery(_)
+        | BoundExprKind::Exists { .. }
+        | BoundExprKind::InSubquery { .. } => {
+            return Err(PlannerError::Unsupported(
+                "planning a subquery in an expression".to_owned(),
+            ));
+        }
+        BoundExprKind::Aggregate(_) | BoundExprKind::Window(_) => {
+            unreachable!("the binder replaces aggregate and window calls with columns")
+        }
     };
     Ok(planned)
 }

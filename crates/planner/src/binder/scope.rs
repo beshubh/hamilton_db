@@ -3,12 +3,15 @@
 
 use common::Column;
 
-use crate::bound::BoundTable;
 use crate::error::{PlannerError, Result};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct Scope {
     tables: Vec<ScopeTable>,
+    /// The scope of the query this one is a subquery of. Its columns cannot
+    /// be used (correlated subqueries are not supported); it only makes
+    /// using one a clear error.
+    outer: Option<Box<Scope>>,
 }
 
 #[derive(Clone, Debug)]
@@ -28,14 +31,27 @@ pub(super) struct ResolvedColumn {
 }
 
 impl Scope {
-    /// Appends `table`'s columns to the row.
-    pub fn push(&mut self, table: &BoundTable) -> Result<()> {
-        if self.tables.iter().any(|t| t.alias == table.alias) {
-            return Err(PlannerError::DuplicateTable(table.alias.clone()));
+    /// An empty scope for a query, which is a subquery if `outer` is given.
+    pub fn new(outer: Option<&Scope>) -> Self {
+        Self {
+            tables: Vec::new(),
+            outer: outer.map(|outer| Box::new(outer.clone())),
+        }
+    }
+
+    pub fn outer(&self) -> Option<&Scope> {
+        self.outer.as_deref()
+    }
+
+    /// Appends the columns of a table (or subquery) called `alias` to the
+    /// row.
+    pub fn push(&mut self, alias: &str, columns: &[Column]) -> Result<()> {
+        if self.tables.iter().any(|t| t.alias == alias) {
+            return Err(PlannerError::DuplicateTable(alias.to_owned()));
         }
         self.tables.push(ScopeTable {
-            alias: table.alias.clone(),
-            columns: table.schema.columns().to_vec(),
+            alias: alias.to_owned(),
+            columns: columns.to_vec(),
             offset: self.width(),
         });
         Ok(())
@@ -51,7 +67,7 @@ impl Scope {
     }
 
     /// The number of columns in the row.
-    fn width(&self) -> usize {
+    pub fn width(&self) -> usize {
         self.tables.last().map_or(0, |t| t.offset + t.columns.len())
     }
 
@@ -68,6 +84,7 @@ impl Scope {
                     ..t.clone()
                 })
                 .collect(),
+            outer: self.outer.clone(),
         }
     }
 
@@ -81,8 +98,28 @@ impl Scope {
         }
     }
 
-    /// Resolves `name` or `table.name`.
+    /// Resolves `name` or `table.name`. A name only an outer query has is
+    /// an [`PlannerError::Unsupported`] correlated subquery.
     pub fn resolve(&self, table: Option<&str>, name: &str) -> Result<ResolvedColumn> {
+        let err = match self.resolve_here(table, name) {
+            Err(err @ (PlannerError::ColumnNotFound(_) | PlannerError::UnknownTable(_))) => err,
+            resolved => return resolved,
+        };
+        match self.outer() {
+            Some(outer) if outer.resolve(table, name).is_ok() => {
+                Err(PlannerError::Unsupported(format!(
+                    "correlated subquery (column {} belongs to an outer query)",
+                    match table {
+                        Some(alias) => format!("{alias}.{name}"),
+                        None => name.to_owned(),
+                    }
+                )))
+            }
+            _ => Err(err),
+        }
+    }
+
+    fn resolve_here(&self, table: Option<&str>, name: &str) -> Result<ResolvedColumn> {
         let candidates: Vec<&ScopeTable> = match table {
             Some(alias) => vec![self.table(alias)?],
             None => self.tables.iter().collect(),

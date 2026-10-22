@@ -14,17 +14,17 @@
 use common::{Column, DataType, Value};
 use sqlparser::ast::{
     self as sql, Assignment, AssignmentTarget, BinaryOperator, CharacterLength, ColumnDef,
-    ColumnOption, Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-    JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByKind,
+    ColumnOption, Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    Ident, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByKind,
     OrderBySort, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, TableFactor, TableObject,
-    TableWithJoins, UnaryOperator,
+    TableWithJoins, UnaryOperator, WindowType,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::ast::{
     self, BinaryOp, CreateTable, Delete, FromItem, Insert, JoinKind, OrderByItem, Select,
-    Statement, TableRef, UnaryOp, Update,
+    Statement, TableRef, UnaryOp, Update, WindowSpec,
 };
 use crate::error::{ParseError, Result};
 
@@ -40,7 +40,9 @@ fn convert_statement(stmt: &sql::Statement) -> Result<Statement> {
     match stmt {
         sql::Statement::CreateTable(create) => convert_create_table(stmt, create),
         sql::Statement::Insert(insert) => convert_insert(stmt, insert),
-        sql::Statement::Query(query) => convert_query(stmt, query),
+        sql::Statement::Query(query) => {
+            convert_query(query).map(|select| Statement::Select(Box::new(select)))
+        }
         sql::Statement::Update(update) => convert_update(stmt, update),
         sql::Statement::Delete(delete) => convert_delete(stmt, delete),
         _ => Err(unsupported(stmt)),
@@ -161,9 +163,16 @@ fn convert_insert(stmt: &sql::Statement, insert: &sql::Insert) -> Result<Stateme
     }))
 }
 
-fn convert_query(stmt: &sql::Statement, query: &sql::Query) -> Result<Statement> {
+/// A SELECT, either a whole statement or a subquery.
+fn convert_query(query: &sql::Query) -> Result<Select> {
     let SetExpr::Select(select) = query.body.as_ref() else {
-        return Err(unsupported(stmt));
+        return Err(ParseError::Unsupported(format!("`{query}`")));
+    };
+    // GROUP BY ALL and modifiers such as WITH ROLLUP render differently
+    // from this list, so the canonical check rejects them.
+    let group_by: &[Expr] = match &select.group_by {
+        GroupByExpr::Expressions(exprs, _) => exprs,
+        GroupByExpr::All(_) => &[],
     };
 
     let mut canonical = format!("SELECT {}", join(select.projection.iter()));
@@ -173,6 +182,12 @@ fn convert_query(stmt: &sql::Statement, query: &sql::Query) -> Result<Statement>
     if let Some(selection) = &select.selection {
         canonical += &format!(" WHERE {selection}");
     }
+    if !group_by.is_empty() {
+        canonical += &format!(" GROUP BY {}", join(group_by.iter()));
+    }
+    if let Some(having) = &select.having {
+        canonical += &format!(" HAVING {having}");
+    }
     if let Some(order_by) = &query.order_by {
         canonical += &format!(" {order_by}");
     }
@@ -180,9 +195,10 @@ fn convert_query(stmt: &sql::Statement, query: &sql::Query) -> Result<Statement>
         canonical += &limit.to_string();
     }
     ensure_canonical(
-        stmt,
+        query,
         &canonical,
-        "SELECT <items> [FROM <tables>] [WHERE <expr>] [ORDER BY <expr>, ...] [LIMIT <n>]",
+        "SELECT <items> [FROM <tables>] [WHERE <expr>] [GROUP BY <expr>, ...] \
+         [HAVING <expr>] [ORDER BY <expr>, ...] [LIMIT <n>]",
     )?;
 
     let projection = select
@@ -192,6 +208,8 @@ fn convert_query(stmt: &sql::Statement, query: &sql::Query) -> Result<Statement>
         .collect::<Result<_>>()?;
     let from = convert_from(&select.from)?;
     let selection = select.selection.as_ref().map(convert_expr).transpose()?;
+    let group_by = group_by.iter().map(convert_expr).collect::<Result<_>>()?;
+    let having = select.having.as_ref().map(convert_expr).transpose()?;
     let order_by = match &query.order_by {
         None => Vec::new(),
         Some(order_by) => {
@@ -206,13 +224,15 @@ fn convert_query(stmt: &sql::Statement, query: &sql::Query) -> Result<Statement>
     };
     let limit = query.limit_clause.as_ref().map(convert_limit).transpose()?;
 
-    Ok(Statement::Select(Select {
+    Ok(Select {
         projection,
         from,
         selection,
+        group_by,
+        having,
         order_by,
         limit,
-    }))
+    })
 }
 
 fn convert_select_item(item: &SelectItem) -> Result<ast::SelectItem> {
@@ -256,7 +276,7 @@ fn convert_from(from: &[TableWithJoins]) -> Result<Option<FromItem>> {
 }
 
 fn convert_table_with_joins(table: &TableWithJoins) -> Result<FromItem> {
-    let mut item = FromItem::Table(convert_table_factor(&table.relation)?);
+    let mut item = convert_from_factor(&table.relation)?;
     for join in &table.joins {
         if join.global {
             return Err(ParseError::Unsupported(format!("`{join}`")));
@@ -277,15 +297,45 @@ fn convert_table_with_joins(table: &TableWithJoins) -> Result<FromItem> {
         item = FromItem::Join {
             kind,
             left: Box::new(item),
-            right: Box::new(FromItem::Table(convert_table_factor(&join.relation)?)),
+            right: Box::new(convert_from_factor(&join.relation)?),
             on: on.map(convert_expr).transpose()?,
         };
     }
     Ok(item)
 }
 
-/// `name [[AS] alias]`. Subqueries, table functions and column aliases are
-/// not supported.
+/// A table or `(SELECT ...) [AS] alias` in FROM.
+fn convert_from_factor(factor: &TableFactor) -> Result<FromItem> {
+    let TableFactor::Derived {
+        lateral,
+        subquery,
+        alias,
+        sample,
+    } = factor
+    else {
+        return convert_table_factor(factor).map(FromItem::Table);
+    };
+    let reject =
+        || ParseError::Unsupported(format!("table `{factor}` (only (<query>) [AS] <alias>)"));
+    let Some(alias) = alias else {
+        return Err(ParseError::Unsupported(format!(
+            "subquery in FROM without an alias: `{factor}`"
+        )));
+    };
+    if *lateral || sample.is_some() || !alias.columns.is_empty() || alias.at.is_some() {
+        return Err(reject());
+    }
+    if factor.to_string() != format!("({subquery}) {alias}") {
+        return Err(reject());
+    }
+    Ok(FromItem::Subquery {
+        query: Box::new(convert_query(subquery)?),
+        alias: ident(&alias.name),
+    })
+}
+
+/// `name [[AS] alias]`. Table functions and column aliases are not
+/// supported.
 fn convert_table_factor(factor: &TableFactor) -> Result<TableRef> {
     let reject = || ParseError::Unsupported(format!("table `{factor}` (only <name> [AS <alias>])"));
     let TableFactor::Table { name, alias, .. } = factor else {
@@ -458,6 +508,20 @@ fn convert_expr(expr: &Expr) -> Result<ast::Expr> {
         Expr::Array(array) => Ok(ast::Expr::Array(
             array.elem.iter().map(convert_expr).collect::<Result<_>>()?,
         )),
+        Expr::Subquery(query) => Ok(ast::Expr::Subquery(Box::new(convert_query(query)?))),
+        Expr::Exists { subquery, negated } => Ok(ast::Expr::Exists {
+            subquery: Box::new(convert_query(subquery)?),
+            negated: *negated,
+        }),
+        Expr::InSubquery {
+            expr: inner,
+            subquery,
+            negated,
+        } => Ok(ast::Expr::InSubquery {
+            expr: Box::new(convert_expr(inner)?),
+            subquery: Box::new(convert_query(subquery)?),
+            negated: *negated,
+        }),
         _ => Err(unsupported_expr(expr)),
     }
 }
@@ -505,28 +569,70 @@ fn convert_binary_op(op: &BinaryOperator) -> Option<BinaryOp> {
     })
 }
 
-/// `name(arg, ...)` with plain positional arguments. DISTINCT, FILTER,
-/// OVER and the like render outside the rebuilt form and are rejected.
+/// `name(arg, ...)` or `name(*)` with plain positional arguments, and
+/// optionally `OVER (...)`. DISTINCT, FILTER and the like render outside the
+/// rebuilt form and are rejected.
 fn convert_function(function: &sql::Function) -> Result<ast::Expr> {
     let reject = || ParseError::Unsupported(format!("function call `{function}`"));
     let FunctionArguments::List(list) = &function.args else {
         return Err(reject());
     };
-    let args = list
-        .args
-        .iter()
-        .map(|arg| match arg {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Ok(expr),
-            _ => Err(reject()),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let canonical = format!("{}({})", function.name, join(args.iter()));
+    let star = matches!(
+        list.args.as_slice(),
+        [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
+    );
+    let args = if star {
+        Vec::new()
+    } else {
+        list.args
+            .iter()
+            .map(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Ok(expr),
+                _ => Err(reject()),
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let mut canonical = if star {
+        format!("{}(*)", function.name)
+    } else {
+        format!("{}({})", function.name, join(args.iter()))
+    };
+    let over = match &function.over {
+        None => None,
+        Some(over @ WindowType::WindowSpec(spec)) => {
+            canonical += &format!(" OVER {over}");
+            Some(convert_window(spec)?)
+        }
+        Some(WindowType::NamedWindow(_)) => return Err(reject()),
+    };
     if function.to_string() != canonical {
         return Err(reject());
     }
     Ok(ast::Expr::Function {
         name: object_name(&function.name)?,
         args: args.into_iter().map(convert_expr).collect::<Result<_>>()?,
+        star,
+        over,
+    })
+}
+
+/// `OVER ([PARTITION BY ...] [ORDER BY ...])`. Named windows and frames
+/// (`ROWS BETWEEN ...`) are not supported.
+fn convert_window(spec: &sql::WindowSpec) -> Result<WindowSpec> {
+    if spec.window_name.is_some() || spec.window_frame.is_some() {
+        return Err(ParseError::Unsupported(format!("window `({spec})`")));
+    }
+    Ok(WindowSpec {
+        partition_by: spec
+            .partition_by
+            .iter()
+            .map(convert_expr)
+            .collect::<Result<_>>()?,
+        order_by: spec
+            .order_by
+            .iter()
+            .map(convert_order_by)
+            .collect::<Result<_>>()?,
     })
 }
 
@@ -550,7 +656,7 @@ fn unsupported_expr(expr: &Expr) -> ParseError {
 
 /// Rejects `stmt` unless it renders exactly as `canonical`, i.e. it has no
 /// clauses beyond the ones the caller extracted.
-fn ensure_canonical(stmt: &sql::Statement, canonical: &str, supported: &str) -> Result<()> {
+fn ensure_canonical(stmt: &impl std::fmt::Display, canonical: &str, supported: &str) -> Result<()> {
     if stmt.to_string() == canonical {
         Ok(())
     } else {
@@ -610,7 +716,7 @@ mod tests {
 
     fn select(sql: &str) -> Select {
         match parse_one(sql).unwrap() {
-            Statement::Select(select) => select,
+            Statement::Select(select) => *select,
             other => panic!("expected SELECT, got {other:?}"),
         }
     }
@@ -774,6 +880,8 @@ mod tests {
                 projection: vec![Item::Wildcard],
                 from: Some(table("t", None)),
                 selection: None,
+                group_by: vec![],
+                having: None,
                 order_by: vec![],
                 limit: None,
             }
@@ -949,7 +1057,9 @@ mod tests {
             expr("Upper(name)"),
             ast::Expr::Function {
                 name: "upper".into(),
-                args: vec![col("name")]
+                args: vec![col("name")],
+                star: false,
+                over: None,
             }
         );
         assert_eq!(
@@ -963,13 +1073,15 @@ mod tests {
     #[test]
     fn select_rejects_unsupported_parts() {
         assert_unsupported("SELECT DISTINCT * FROM t");
-        assert_unsupported("SELECT * FROM t GROUP BY a");
-        assert_unsupported("SELECT * FROM t GROUP BY a HAVING a > 1");
+        assert_unsupported("SELECT * FROM t GROUP BY ALL");
+        assert_unsupported("SELECT a FROM t GROUP BY ROLLUP (a)");
         assert_unsupported("SELECT * FROM t ORDER BY a NULLS FIRST");
         assert_unsupported("SELECT * FROM t LIMIT 1 OFFSET 2");
         assert_unsupported("SELECT * FROM t LIMIT a");
         assert_unsupported("SELECT * FROM t AS x (a, b)");
-        assert_unsupported("SELECT * FROM (SELECT 1) AS x");
+        assert_unsupported("SELECT * FROM (SELECT 1)");
+        assert_unsupported("SELECT * FROM (SELECT 1) AS x (a)");
+        assert_unsupported("SELECT * FROM t, LATERAL (SELECT 1) AS x");
         assert_unsupported("SELECT * FROM s.t");
         assert_unsupported("SELECT * FROM t JOIN u USING (a)");
         assert_unsupported("SELECT * FROM t NATURAL JOIN u");
@@ -987,12 +1099,140 @@ mod tests {
         assert_unsupported("SELECT a.b.c FROM t");
         assert_unsupported("SELECT CAST(a AS INT) FROM t");
         assert_unsupported("SELECT a IN (1, 2) FROM t");
-        assert_unsupported("SELECT count(*) FROM t");
         assert_unsupported("SELECT count(DISTINCT a) FROM t");
         assert_unsupported("SELECT sum(a) FILTER (WHERE a > 1) FROM t");
-        assert_unsupported("SELECT row_number() OVER () FROM t");
-        assert_unsupported("SELECT (SELECT 1)");
+        assert_unsupported("SELECT count(t.*) FROM t");
+        assert_unsupported("SELECT row_number() OVER w FROM t WINDOW w AS ()");
+        assert_unsupported("SELECT sum(a) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t");
+        assert_unsupported("SELECT rank() OVER (ORDER BY a NULLS LAST) FROM t");
+        assert_unsupported("SELECT (SELECT 1 UNION SELECT 2)");
         assert_unsupported("SELECT CURRENT_TIMESTAMP");
+    }
+
+    fn func(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
+        ast::Expr::Function {
+            name: name.into(),
+            args,
+            star: false,
+            over: None,
+        }
+    }
+
+    #[test]
+    fn group_by_and_having() {
+        let s = select("SELECT a, count(*) FROM t GROUP BY a, b + 1 HAVING sum(b) > 2");
+        assert_eq!(
+            s.group_by,
+            vec![col("a"), bin(BinaryOp::Add, col("b"), lit(1))]
+        );
+        assert_eq!(
+            s.having,
+            Some(bin(BinaryOp::Gt, func("sum", vec![col("b")]), lit(2)))
+        );
+        assert_eq!(
+            s.projection[1],
+            Item::Expr {
+                expr: ast::Expr::Function {
+                    name: "count".into(),
+                    args: vec![],
+                    star: true,
+                    over: None,
+                },
+                alias: None,
+            }
+        );
+        assert_eq!(
+            select("SELECT 1 FROM t HAVING TRUE").having,
+            Some(lit(true))
+        );
+    }
+
+    #[test]
+    fn window_functions() {
+        let over = |partition_by, order_by| {
+            Some(WindowSpec {
+                partition_by,
+                order_by,
+            })
+        };
+        assert_eq!(
+            expr("rank() OVER (PARTITION BY a, b ORDER BY c DESC)"),
+            ast::Expr::Function {
+                name: "rank".into(),
+                args: vec![],
+                star: false,
+                over: over(
+                    vec![col("a"), col("b")],
+                    vec![OrderByItem {
+                        expr: col("c"),
+                        desc: true,
+                    }],
+                ),
+            }
+        );
+        assert_eq!(
+            expr("count(*) OVER ()"),
+            ast::Expr::Function {
+                name: "count".into(),
+                args: vec![],
+                star: true,
+                over: over(vec![], vec![]),
+            }
+        );
+    }
+
+    #[test]
+    fn subqueries_in_expressions() {
+        let inner = || Box::new(select("SELECT b FROM u WHERE b > 1 ORDER BY b LIMIT 3"));
+        assert_eq!(
+            expr("(SELECT b FROM u WHERE b > 1 ORDER BY b LIMIT 3)"),
+            ast::Expr::Subquery(inner())
+        );
+        assert_eq!(
+            expr("NOT EXISTS (SELECT b FROM u WHERE b > 1 ORDER BY b LIMIT 3)"),
+            ast::Expr::Exists {
+                subquery: inner(),
+                negated: true,
+            }
+        );
+        assert_eq!(
+            expr("a IN (SELECT b FROM u WHERE b > 1 ORDER BY b LIMIT 3)"),
+            ast::Expr::InSubquery {
+                expr: Box::new(col("a")),
+                subquery: inner(),
+                negated: false,
+            }
+        );
+        assert!(matches!(
+            expr("a NOT IN (SELECT b FROM u)"),
+            ast::Expr::InSubquery { negated: true, .. }
+        ));
+    }
+
+    #[test]
+    fn subquery_in_from() {
+        let s = select("SELECT x.a FROM (SELECT a FROM t GROUP BY a) AS x JOIN u ON x.a = u.a");
+        let Some(FromItem::Join { left, .. }) = s.from else {
+            panic!("expected a join");
+        };
+        assert_eq!(
+            *left,
+            FromItem::Subquery {
+                query: Box::new(select("SELECT a FROM t GROUP BY a")),
+                alias: "x".into(),
+            }
+        );
+        assert!(matches!(
+            select("SELECT * FROM (SELECT 1) y").from,
+            Some(FromItem::Subquery { alias, .. }) if alias == "y"
+        ));
+    }
+
+    #[test]
+    fn subqueries_are_checked_for_unsupported_parts() {
+        assert_unsupported("SELECT * FROM (SELECT DISTINCT a FROM t) AS x");
+        assert_unsupported("SELECT EXISTS (SELECT * FROM t LIMIT 1 OFFSET 1)");
+        assert_unsupported("SELECT a IN (SELECT 1.5) FROM t");
     }
 
     #[test]

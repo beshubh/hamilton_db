@@ -5,6 +5,7 @@
 //! operands must have types their operators accept, and values must fit the
 //! columns they are stored in. See [`crate::bound`] for what comes out.
 
+mod aggregate;
 mod expr;
 mod scope;
 #[cfg(test)]
@@ -19,7 +20,8 @@ use parser::{
     Statement, TableRef, Update,
 };
 
-use self::expr::{UNNAMED_COLUMN, assign, bind_condition, bind_expr, null_for};
+use self::aggregate::Rewriter;
+use self::expr::{UNNAMED_COLUMN, assign, forbid_calls, forbid_windows, null_for};
 use self::scope::Scope;
 use crate::bound::{
     BoundCreateTable, BoundDelete, BoundExpr, BoundExprKind, BoundFrom, BoundInsert, BoundOrderBy,
@@ -40,7 +42,7 @@ impl<'a> Binder<'a> {
         match stmt {
             Statement::CreateTable(create) => self.bind_create_table(create),
             Statement::Insert(insert) => self.bind_insert(insert),
-            Statement::Select(select) => self.bind_select(select),
+            Statement::Select(select) => self.bind_select(select, None).map(BoundStatement::Select),
             Statement::Update(update) => self.bind_update(update),
             Statement::Delete(delete) => self.bind_delete(delete),
         }
@@ -101,7 +103,11 @@ impl<'a> Binder<'a> {
                     .iter()
                     .zip(&position)
                     .map(|(column, pos)| match pos {
-                        Some(pos) => assign(bind_expr(&row[*pos], &scope)?, column),
+                        Some(pos) => {
+                            let value = self.bind_expr(&row[*pos], &scope)?;
+                            forbid_calls(&value, "VALUES")?;
+                            assign(value, column)
+                        }
                         None => null_for(column),
                     })
                     .collect()
@@ -111,8 +117,10 @@ impl<'a> Binder<'a> {
         Ok(BoundStatement::Insert(BoundInsert { table, rows }))
     }
 
-    fn bind_select(&self, select: &Select) -> Result<BoundStatement> {
-        let mut scope = Scope::default();
+    /// Binds a SELECT, which is a subquery of the query `outer` is the
+    /// scope of, if given.
+    fn bind_select(&self, select: &Select, outer: Option<&Scope>) -> Result<BoundSelect> {
+        let mut scope = Scope::new(outer);
         let from = select
             .from
             .as_ref()
@@ -121,27 +129,78 @@ impl<'a> Binder<'a> {
         let selection = select
             .selection
             .as_ref()
-            .map(|expr| bind_condition(expr, &scope, "WHERE"))
+            .map(|expr| self.bind_filter(expr, &scope, "WHERE"))
             .transpose()?;
-
-        let mut projection = Vec::new();
-        for item in &select.projection {
-            bind_select_item(item, &scope, &mut projection)?;
-        }
-
-        let order_by = select
-            .order_by
+        let group_by: Vec<BoundExpr> = select
+            .group_by
             .iter()
-            .map(|item| bind_order_by(item, &scope, &projection))
+            .map(|expr| -> Result<BoundExpr> {
+                let bound = self.bind_expr(expr, &scope)?;
+                forbid_calls(&bound, "GROUP BY")?;
+                Ok(bound)
+            })
             .collect::<Result<_>>()?;
 
-        Ok(BoundStatement::Select(BoundSelect {
+        // These are bound on the FROM row first, and moved onto the rows
+        // after grouping and windows below.
+        let having = select
+            .having
+            .as_ref()
+            .map(|expr| -> Result<BoundExpr> {
+                let bound = self.bind_condition(expr, &scope, "HAVING")?;
+                forbid_windows(&bound, "HAVING")?;
+                Ok(bound)
+            })
+            .transpose()?;
+        let mut projection = Vec::new();
+        for item in &select.projection {
+            self.bind_select_item(item, &scope, &mut projection)?;
+        }
+        let order_by: Vec<BoundOrderBy> = select
+            .order_by
+            .iter()
+            .map(|item| self.bind_order_by(item, &scope, &projection))
+            .collect::<Result<_>>()?;
+
+        let after_grouping = projection
+            .iter()
+            .map(|item| &item.expr)
+            .chain(&having)
+            .chain(order_by.iter().map(|item| &item.expr));
+        let mut rewriter =
+            Rewriter::new(&group_by, having.is_some(), after_grouping, scope.width());
+        let having = having.map(|expr| rewriter.rewrite(expr)).transpose()?;
+        let projection = projection
+            .into_iter()
+            .map(|item| {
+                Ok(BoundSelectItem {
+                    expr: rewriter.rewrite(item.expr)?,
+                    name: item.name,
+                })
+            })
+            .collect::<Result<_>>()?;
+        let order_by = order_by
+            .into_iter()
+            .map(|item| {
+                Ok(BoundOrderBy {
+                    expr: rewriter.rewrite(item.expr)?,
+                    desc: item.desc,
+                })
+            })
+            .collect::<Result<_>>()?;
+        let (aggregates, windows) = rewriter.finish();
+
+        Ok(BoundSelect {
             from,
             selection,
+            group_by,
+            aggregates,
+            having,
+            windows,
             projection,
             order_by,
             limit: select.limit,
-        }))
+        })
     }
 
     /// Binds a FROM item, adding its tables to `scope`.
@@ -149,8 +208,18 @@ impl<'a> Binder<'a> {
         match from {
             FromItem::Table(table) => {
                 let table = self.bind_table(table)?;
-                scope.push(&table)?;
+                scope.push(&table.alias, table.schema.columns())?;
                 Ok(BoundFrom::Table(table))
+            }
+            FromItem::Subquery { query, alias } => {
+                // It can't see the other FROM items, only what this query
+                // can see from outside.
+                let select = self.bind_select(query, scope.outer())?;
+                scope.push(alias, select.output_schema().columns())?;
+                Ok(BoundFrom::Subquery {
+                    select: Box::new(select),
+                    alias: alias.clone(),
+                })
             }
             FromItem::Join {
                 kind,
@@ -165,7 +234,7 @@ impl<'a> Binder<'a> {
                 // ON sees only this join's tables, not earlier FROM items.
                 let on = on
                     .as_ref()
-                    .map(|on| bind_condition(on, &scope.suffix(start), "ON"))
+                    .map(|on| self.bind_filter(on, &scope.suffix(start), "ON"))
                     .transpose()?;
                 if *kind == JoinKind::Left {
                     scope.make_nullable(right_start);
@@ -183,7 +252,7 @@ impl<'a> Binder<'a> {
     fn bind_update(&self, update: &Update) -> Result<BoundStatement> {
         let table = self.bind_table(&update.table)?;
         let mut scope = Scope::default();
-        scope.push(&table)?;
+        scope.push(&table.alias, table.schema.columns())?;
 
         let mut seen = HashSet::new();
         let assignments = update
@@ -198,13 +267,15 @@ impl<'a> Binder<'a> {
                     return Err(PlannerError::DuplicateColumn(name.clone()));
                 }
                 let column = &table.schema.columns()[idx];
-                Ok((idx, assign(bind_expr(value, &scope)?, column)?))
+                let value = self.bind_expr(value, &scope)?;
+                forbid_calls(&value, "UPDATE")?;
+                Ok((idx, assign(value, column)?))
             })
             .collect::<Result<_>>()?;
         let selection = update
             .selection
             .as_ref()
-            .map(|expr| bind_condition(expr, &scope, "WHERE"))
+            .map(|expr| self.bind_filter(expr, &scope, "WHERE"))
             .transpose()?;
 
         Ok(BoundStatement::Update(BoundUpdate {
@@ -217,11 +288,11 @@ impl<'a> Binder<'a> {
     fn bind_delete(&self, delete: &Delete) -> Result<BoundStatement> {
         let table = self.bind_table(&delete.table)?;
         let mut scope = Scope::default();
-        scope.push(&table)?;
+        scope.push(&table.alias, table.schema.columns())?;
         let selection = delete
             .selection
             .as_ref()
-            .map(|expr| bind_condition(expr, &scope, "WHERE"))
+            .map(|expr| self.bind_filter(expr, &scope, "WHERE"))
             .transpose()?;
         Ok(BoundStatement::Delete(BoundDelete { table, selection }))
     }
@@ -238,41 +309,75 @@ impl<'a> Binder<'a> {
             schema: info.schema.clone(),
         })
     }
-}
 
-/// Binds one select item, expanding `*` and `t.*` into their columns.
-fn bind_select_item(
-    item: &SelectItem,
-    scope: &Scope,
-    out: &mut Vec<BoundSelectItem>,
-) -> Result<()> {
-    let columns = match item {
-        SelectItem::Expr { expr, alias } => {
-            let bound = bind_expr(expr, scope)?;
-            let name = match alias {
-                Some(alias) => alias.clone(),
-                None => default_name(&bound),
-            };
-            out.push(BoundSelectItem { expr: bound, name });
-            return Ok(());
-        }
-        SelectItem::Wildcard if scope.is_empty() => {
-            return Err(PlannerError::WildcardWithoutFrom);
-        }
-        SelectItem::Wildcard => scope.all_columns(),
-        SelectItem::QualifiedWildcard(alias) => scope.table_columns(alias)?,
-    };
-    out.extend(columns.into_iter().map(|resolved| BoundSelectItem {
-        name: resolved.column.name.clone(),
-        expr: BoundExpr {
-            kind: BoundExprKind::Column {
-                table: resolved.table,
-                idx: resolved.idx,
+    /// Binds one select item, expanding `*` and `t.*` into their columns.
+    fn bind_select_item(
+        &self,
+        item: &SelectItem,
+        scope: &Scope,
+        out: &mut Vec<BoundSelectItem>,
+    ) -> Result<()> {
+        let columns = match item {
+            SelectItem::Expr { expr, alias } => {
+                let bound = self.bind_expr(expr, scope)?;
+                let name = match alias {
+                    Some(alias) => alias.clone(),
+                    None => default_name(&bound),
+                };
+                out.push(BoundSelectItem { expr: bound, name });
+                return Ok(());
+            }
+            SelectItem::Wildcard if scope.is_empty() => {
+                return Err(PlannerError::WildcardWithoutFrom);
+            }
+            SelectItem::Wildcard => scope.all_columns(),
+            SelectItem::QualifiedWildcard(alias) => scope.table_columns(alias)?,
+        };
+        out.extend(columns.into_iter().map(|resolved| BoundSelectItem {
+            name: resolved.column.name.clone(),
+            expr: BoundExpr {
+                kind: BoundExprKind::Column {
+                    table: resolved.table,
+                    idx: resolved.idx,
+                },
+                return_type: resolved.column,
             },
-            return_type: resolved.column,
-        },
-    }));
-    Ok(())
+        }));
+        Ok(())
+    }
+
+    /// Binds an ORDER BY item. As in Postgres, an integer literal is a
+    /// position in the select list and a bare name is first looked up among
+    /// the output column names; anything else is an expression on the FROM
+    /// row.
+    fn bind_order_by(
+        &self,
+        item: &OrderByItem,
+        scope: &Scope,
+        projection: &[BoundSelectItem],
+    ) -> Result<BoundOrderBy> {
+        let expr = match &item.expr {
+            Expr::Literal(Value::Int(n)) => select_item(projection, i64::from(*n))?,
+            Expr::Literal(Value::BigInt(n)) => select_item(projection, *n)?,
+            Expr::Column { table: None, name } => {
+                let mut matches = projection.iter().filter(|p| &p.name == name);
+                match matches.next() {
+                    None => self.bind_expr(&item.expr, scope)?,
+                    Some(first) => {
+                        if matches.any(|other| other.expr != first.expr) {
+                            return Err(PlannerError::AmbiguousColumn(name.clone()));
+                        }
+                        first.expr.clone()
+                    }
+                }
+            }
+            expr => self.bind_expr(expr, scope)?,
+        };
+        Ok(BoundOrderBy {
+            expr,
+            desc: item.desc,
+        })
+    }
 }
 
 /// The name Postgres gives an unaliased select item.
@@ -280,39 +385,12 @@ fn default_name(expr: &BoundExpr) -> String {
     match &expr.kind {
         BoundExprKind::Column { .. } => expr.return_type.name.clone(),
         BoundExprKind::Function { function, .. } => function.name().to_owned(),
+        BoundExprKind::Aggregate(aggregate) => aggregate.function.name().to_owned(),
+        BoundExprKind::Window(window) => window.function.name().to_owned(),
+        BoundExprKind::Subquery(subquery) => subquery.projection[0].name.clone(),
+        BoundExprKind::Exists { .. } => "exists".to_owned(),
         _ => UNNAMED_COLUMN.to_owned(),
     }
-}
-
-/// Binds an ORDER BY item. As in Postgres, an integer literal is a position
-/// in the select list and a bare name is first looked up among the output
-/// column names; anything else is an expression on the FROM row.
-fn bind_order_by(
-    item: &OrderByItem,
-    scope: &Scope,
-    projection: &[BoundSelectItem],
-) -> Result<BoundOrderBy> {
-    let expr = match &item.expr {
-        Expr::Literal(Value::Int(n)) => select_item(projection, i64::from(*n))?,
-        Expr::Literal(Value::BigInt(n)) => select_item(projection, *n)?,
-        Expr::Column { table: None, name } => {
-            let mut matches = projection.iter().filter(|p| &p.name == name);
-            match matches.next() {
-                None => bind_expr(&item.expr, scope)?,
-                Some(first) => {
-                    if matches.any(|other| other.expr != first.expr) {
-                        return Err(PlannerError::AmbiguousColumn(name.clone()));
-                    }
-                    first.expr.clone()
-                }
-            }
-        }
-        expr => bind_expr(expr, scope)?,
-    };
-    Ok(BoundOrderBy {
-        expr,
-        desc: item.desc,
-    })
 }
 
 /// The expression of the 1-based `position`-th select item.

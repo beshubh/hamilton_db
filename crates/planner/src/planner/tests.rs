@@ -3,7 +3,9 @@ use std::sync::Arc;
 use catalog::Catalog;
 use common::{Column, DataType, Schema};
 use execution::expressions::{AbstractExpr, Expr};
-use execution::plans::{AbstractPlanNode, JoinType, PlanNode};
+use execution::plans::{
+    AbstractPlanNode, Aggregate, JoinType, PlanNode, WindowColumn, WindowFunctionKind,
+};
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::disk::disk_manager::DiskManager;
 use tempfile::TempDir;
@@ -266,4 +268,127 @@ fn create_table_has_no_plan() {
     let db = Db::new();
     let err = db.try_plan("CREATE TABLE t (a INT)").unwrap_err();
     assert_eq!(err, PlannerError::NoPlan("CREATE TABLE"));
+}
+
+#[test]
+fn aggregation_sits_between_where_and_having() {
+    let db = Db::new();
+    let plan = db.plan(
+        "SELECT user_id, count(*) AS n FROM orders WHERE total > 0 \
+         GROUP BY user_id HAVING sum(total) > 10 ORDER BY n DESC LIMIT 5",
+    );
+    assert_eq!(
+        shape(&plan),
+        "Projection(Limit(Sort(Filter(Aggregation(Filter(SeqScan orders))))))"
+    );
+    assert_eq!(names(plan.get_output_schema()), ["user_id", "n"]);
+
+    let aggregation = plan
+        .get_child_at(0)
+        .get_child_at(0)
+        .get_child_at(0)
+        .get_child_at(0);
+    let AbstractPlanNode::AggregationPlan(aggregation) = &*aggregation else {
+        panic!("expected an aggregation");
+    };
+    assert_eq!(column_ref(&aggregation.group_bys()[0]), (0, 1));
+    assert!(matches!(aggregation.aggregates()[0], Aggregate::CountStar));
+    assert!(matches!(aggregation.aggregates()[1], Aggregate::Sum(_)));
+    // Group key, count(*), sum(total).
+    assert_eq!(aggregation.get_output_schema().len(), 3);
+
+    // Above it, columns index the aggregation row.
+    let AbstractPlanNode::ProjectionPlan(projection) = &*plan else {
+        panic!("expected a projection");
+    };
+    assert_eq!(column_ref(&projection.exprs()[1]), (0, 1));
+}
+
+#[test]
+fn aggregate_without_group_by_still_aggregates() {
+    let db = Db::new();
+    assert_eq!(
+        shape(&db.plan("SELECT count(*) FROM users")),
+        "Projection(Aggregation(SeqScan users))"
+    );
+}
+
+#[test]
+fn window_appends_its_results_to_the_row() {
+    let db = Db::new();
+    let plan = db
+        .plan("SELECT name, rank() OVER (PARTITION BY active ORDER BY score DESC) AS r FROM users");
+    assert_eq!(shape(&plan), "Projection(Window(SeqScan users))");
+    let AbstractPlanNode::WindowPlan(window) = &*plan.get_child_at(0) else {
+        panic!("expected a window");
+    };
+    assert_eq!(
+        names(window.get_output_schema()),
+        ["id", "name", "score", "active", "rank"]
+    );
+    let WindowColumn::Window(rank) = &window.columns()[4] else {
+        panic!("expected a window function");
+    };
+    assert!(matches!(rank.function, WindowFunctionKind::Rank));
+    assert_eq!(column_ref(&rank.partition_by[0]), (0, 3));
+    assert!(rank.order_by[0].desc);
+
+    let AbstractPlanNode::ProjectionPlan(projection) = &*plan else {
+        panic!("expected a projection");
+    };
+    assert_eq!(column_ref(&projection.exprs()[1]), (0, 4));
+}
+
+#[test]
+fn window_over_aggregation() {
+    let db = Db::new();
+    let plan = db
+        .plan("SELECT user_id, sum(count(*)) OVER (ORDER BY user_id) FROM orders GROUP BY user_id");
+    assert_eq!(
+        shape(&plan),
+        "Projection(Window(Aggregation(SeqScan orders)))"
+    );
+    let AbstractPlanNode::WindowPlan(window) = &*plan.get_child_at(0) else {
+        panic!("expected a window");
+    };
+    let WindowColumn::Window(sum) = &window.columns()[2] else {
+        panic!("expected a window function");
+    };
+    // sum over the aggregation row's count(*).
+    let WindowFunctionKind::Aggregate(Aggregate::Sum(arg)) = &sum.function else {
+        panic!("expected sum");
+    };
+    assert_eq!(column_ref(arg), (0, 1));
+}
+
+#[test]
+fn subquery_in_from_is_planned_inline() {
+    let db = Db::new();
+    let plan = db.plan(
+        "SELECT t.n FROM (SELECT user_id AS n FROM orders WHERE total > 1) AS t, users \
+         WHERE t.n = users.id",
+    );
+    assert_eq!(
+        shape(&plan),
+        "Projection(Filter(NestedLoopJoin(Projection(Filter(SeqScan orders)), SeqScan users)))"
+    );
+    let AbstractPlanNode::NestedLoopJoinPlan(join) = &*plan.get_child_at(0).get_child_at(0) else {
+        panic!("expected a join");
+    };
+    assert_eq!(names(join.get_output_schema())[..2], ["n", "id"]);
+}
+
+#[test]
+fn subqueries_in_expressions_are_not_planned_yet() {
+    let db = Db::new();
+    for sql in [
+        "SELECT (SELECT 1)",
+        "SELECT * FROM users WHERE EXISTS (SELECT * FROM orders)",
+        "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)",
+    ] {
+        assert!(
+            matches!(db.try_plan(sql), Err(PlannerError::Unsupported(_))),
+            "{sql}"
+        );
+    }
 }
