@@ -1,4 +1,4 @@
-use catalog::{CatalogError, TableOid};
+use catalog::{CatalogError, IndexOid, TableOid};
 use common::ValueError;
 use storage::StorageError;
 use thiserror::Error;
@@ -32,6 +32,10 @@ pub enum ExecutionError {
     /// A plan names a table the catalog does not have.
     #[error("table with oid {0} does not exist")]
     TableNotFound(TableOid),
+
+    /// A plan names an index the catalog does not have.
+    #[error("index with oid {0} does not exist")]
+    IndexNotFound(IndexOid),
 
     /// A plan whose executor has not been written yet.
     #[error("{0} plans cannot be executed yet")]
