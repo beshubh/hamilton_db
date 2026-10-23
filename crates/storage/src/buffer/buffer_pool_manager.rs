@@ -527,7 +527,7 @@ mod tests {
 
         bpm.delete_page(pid).unwrap();
         assert_eq!(bpm.get_pin_count(pid), None);
-        assert_eq!(dm.num_deletes(), 1); // loading the page gave it a slot on disk
+        assert_eq!(dm.num_deletes(), 0); // never written, so it had no slot on disk
 
         // The freed frame can hold another page.
         let other = bpm.new_page();

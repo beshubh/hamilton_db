@@ -1,7 +1,9 @@
-//! The B+tree: lookups and scans on trees built page by page, and inserts.
+//! The B+tree: lookups and scans on trees built page by page, inserts and
+//! removes.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use common::{INVALID_PAGE_ID, PageId, Rid};
 use storage::StorageError;
@@ -34,11 +36,12 @@ fn rid(n: u64) -> Rid {
     Rid::new(n as i32, n as u16 + 1)
 }
 
-struct Fixture {
+/// A tree whose leaves keep `NUM_TOMBS` tombstones.
+struct Fixture<const NUM_TOMBS: usize = 2> {
     _dir: TempDir,
     bpm: Arc<TracedBufferPoolManager>,
     header_page_id: PageId,
-    tree: Tree,
+    tree: Btree<BytewiseComparator, NUM_TOMBS>,
 }
 
 /// Key `n` padded with filler to `len` bytes. Ordered as `n`.
@@ -68,13 +71,23 @@ fn setup() -> Fixture {
 
 /// An empty tree over a buffer pool of `frames` frames.
 fn setup_with_frames(frames: usize) -> Fixture {
+    setup_with(frames)
+}
+
+/// An empty tree whose leaves keep no tombstones, so every remove takes its
+/// key out right away.
+fn setup_no_tombs(frames: usize) -> Fixture<0> {
+    setup_with(frames)
+}
+
+fn setup_with<const NUM_TOMBS: usize>(frames: usize) -> Fixture<NUM_TOMBS> {
     let dir = TempDir::new().unwrap();
     let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
     let bpm = Arc::new(TracedBufferPoolManager::new(Arc::new(
         BufferPoolManager::new(frames, dm),
     )));
     let header_page_id = bpm.new_page();
-    let tree = Tree::new("idx", header_page_id, Arc::clone(&bpm), CMP).unwrap();
+    let tree = Btree::new("idx", header_page_id, Arc::clone(&bpm), CMP).unwrap();
     Fixture {
         _dir: dir,
         bpm,
@@ -83,7 +96,7 @@ fn setup_with_frames(frames: usize) -> Fixture {
     }
 }
 
-impl Fixture {
+impl<const NUM_TOMBS: usize> Fixture<NUM_TOMBS> {
     /// Writes a leaf holding `keys` with their `rid`s, linked to `next`.
     fn leaf(&self, keys: &[u64], next: PageId) -> PageId {
         let page_id = self.bpm.new_page();
@@ -91,7 +104,7 @@ impl Fixture {
             .bpm
             .checked_write_page(page_id, AccessType::Unknown)
             .unwrap();
-        let mut page = Leaf::init(guard.get_data_mut());
+        let mut page = BtreeLeafPage::<_, NUM_TOMBS>::init(guard.get_data_mut());
         for &k in keys {
             page.insert(&key(k), rid(k), &CMP).unwrap();
         }
@@ -139,7 +152,7 @@ impl Fixture {
             .bpm
             .checked_write_page(leaf, AccessType::Unknown)
             .unwrap();
-        Leaf::new(guard.get_data_mut())
+        BtreeLeafPage::<_, NUM_TOMBS>::new(guard.get_data_mut())
             .unwrap()
             .remove(&key(k), &CMP)
             .unwrap();
@@ -170,6 +183,31 @@ impl Fixture {
             .collect()
     }
 
+    /// The root's children, or `None` if it is a leaf.
+    fn root_children(&self) -> Option<Vec<PageId>> {
+        let root = self.tree.get_root_page_id().unwrap();
+        if root == INVALID_PAGE_ID {
+            return None;
+        }
+        let guard = self
+            .bpm
+            .checked_read_page(root, AccessType::Unknown)
+            .unwrap();
+        let page = BtreeInternalPage::new(guard.get_data()).ok()?;
+        Some((0..page.size()).map(|i| page.value_at(i)).collect())
+    }
+
+    /// Bytes the entries of leaf `page_id` take.
+    fn leaf_used_space(&self, page_id: PageId) -> usize {
+        let guard = self
+            .bpm
+            .checked_read_page(page_id, AccessType::Unknown)
+            .unwrap();
+        BtreeLeafPage::<_, NUM_TOMBS>::new(guard.get_data())
+            .unwrap()
+            .used_space()
+    }
+
     /// Checks that the tree is a well-formed B+tree and returns its height,
     /// 0 for an empty tree and 1 for a root leaf:
     /// - every page's keys are in increasing order,
@@ -193,7 +231,7 @@ impl Fixture {
                 .bpm
                 .checked_read_page(*chain.last().unwrap(), AccessType::Unknown)
                 .unwrap();
-            let next = BtreeLeafPage::<_, 2>::new(guard.get_data())
+            let next = BtreeLeafPage::<_, NUM_TOMBS>::new(guard.get_data())
                 .unwrap()
                 .next_page_id();
             if next == INVALID_PAGE_ID {
@@ -237,7 +275,7 @@ impl Fixture {
         };
         let (header, _) = PageHeader::ref_from_prefix(&data[..]).unwrap();
         if header.page_type() == Ok(PageType::BTreeLeaf) {
-            let page = BtreeLeafPage::<_, 2>::new(data).unwrap();
+            let page = BtreeLeafPage::<_, NUM_TOMBS>::new(data).unwrap();
             assert!(page.size() > 0, "page {page_id}: empty leaf");
             check_keys(&(0..page.size()).map(|i| page.key_at(i)).collect::<Vec<_>>());
             leaves.push(page_id);
@@ -890,4 +928,302 @@ fn concurrent_inserts_with_splits() {
     });
     assert!(f.check() >= 3);
     assert_eq!(f.scan(), (0..THREADS * PER_THREAD).collect::<Vec<_>>());
+}
+
+#[test]
+fn remove_from_empty_tree_does_nothing() {
+    let f = setup_no_tombs(16);
+    f.bpm.start_tracing();
+    f.tree.remove(&key(10)).unwrap();
+    assert_eq!(f.bpm.take_trace(), [PageAccess::Read(f.header_page_id)]);
+    assert!(f.tree.is_empty().unwrap());
+}
+
+#[test]
+fn remove_of_missing_key_changes_nothing() {
+    let f = setup_no_tombs(16);
+    for k in [10, 20, 30] {
+        f.tree.insert(&key(k), rid(k)).unwrap();
+    }
+    f.tree.remove(&key(15)).unwrap();
+    f.tree.remove(&key(40)).unwrap();
+    assert_eq!(f.scan(), [10, 20, 30]);
+}
+
+#[test]
+fn remove_from_root_leaf_latches_only_the_leaf() {
+    let f = setup_no_tombs(16);
+    for k in [10, 20, 30] {
+        f.tree.insert(&key(k), rid(k)).unwrap();
+    }
+    let root = f.tree.get_root_page_id().unwrap();
+    f.bpm.start_tracing();
+    // A root leaf may be underfull: it only has to keep a key.
+    f.tree.remove(&key(20)).unwrap();
+    assert_eq!(
+        f.bpm.take_trace(),
+        [
+            PageAccess::Read(f.header_page_id),
+            PageAccess::Read(root),
+            PageAccess::Write(root),
+        ]
+    );
+    assert_eq!(f.scan(), [10, 30]);
+    assert_eq!(f.get(20), None);
+}
+
+#[test]
+fn removing_the_last_key_empties_the_tree() {
+    let f = setup_no_tombs(16);
+    f.tree.insert(&key(10), rid(10)).unwrap();
+    let root = f.tree.get_root_page_id().unwrap();
+    f.bpm.start_tracing();
+    f.tree.remove(&key(10)).unwrap();
+    assert_eq!(
+        f.bpm.take_trace(),
+        [
+            // The optimistic attempt finds the root leaf would be left empty.
+            PageAccess::Read(f.header_page_id),
+            PageAccess::Read(root),
+            PageAccess::Write(root),
+            PageAccess::Write(f.header_page_id),
+            PageAccess::Write(root),
+            PageAccess::Delete(root),
+        ]
+    );
+    assert!(f.tree.is_empty().unwrap());
+    assert!(f.tree.begin().unwrap().is_end());
+
+    assert!(f.tree.insert(&key(20), rid(20)).unwrap());
+    assert_eq!(f.scan(), [20]);
+}
+
+#[test]
+fn tombstoning_remove_latches_only_the_leaf() {
+    let f = setup();
+    let (root, [l1, ..]) = f.two_levels();
+    f.bpm.start_tracing();
+    // The leaf is underfull, but a tombstone frees nothing.
+    f.tree.remove(&key(20)).unwrap();
+    assert_eq!(
+        f.bpm.take_trace(),
+        [
+            PageAccess::Read(f.header_page_id),
+            PageAccess::Read(root),
+            PageAccess::Read(l1),
+            PageAccess::Write(l1),
+        ]
+    );
+    assert_eq!(f.scan(), [10, 30, 40, 50, 60, 70]);
+}
+
+/// Inserts `0..` into an empty tree until its root leaf splits, and returns
+/// how many keys that took and the two leaves.
+fn two_leaves(f: &Fixture<0>) -> (u64, PageId, PageId) {
+    let mut n = 0;
+    while f.root_children().is_none() {
+        f.tree.insert(&key(n), rid(n)).unwrap();
+        n += 1;
+    }
+    let children = f.root_children().unwrap();
+    assert_eq!(children.len(), 2);
+    (n, children[0], children[1])
+}
+
+#[test]
+fn underfull_leaf_merges_with_right_sibling() {
+    let f = setup_no_tombs(16);
+    let (n, left, right) = two_leaves(&f);
+    let mut k = 0;
+    while f.root_children().is_some() {
+        f.tree.remove(&key(k)).unwrap();
+        k += 1;
+        f.check();
+    }
+    // The right leaf merged into the left one, which is the root now.
+    assert_eq!(f.tree.get_root_page_id().unwrap(), left);
+    assert_eq!(f.bpm.get_pin_count(right), None, "right leaf not deleted");
+    assert_eq!(f.scan(), (k..n).collect::<Vec<_>>());
+}
+
+#[test]
+fn last_leaf_merges_with_left_sibling() {
+    let f = setup_no_tombs(16);
+    let (n, left, right) = two_leaves(&f);
+    let mut k = n;
+    while f.root_children().is_some() {
+        k -= 1;
+        f.tree.remove(&key(k)).unwrap();
+        f.check();
+    }
+    assert_eq!(f.tree.get_root_page_id().unwrap(), left);
+    assert_eq!(f.bpm.get_pin_count(right), None, "right leaf not deleted");
+    assert_eq!(f.scan(), (0..k).collect::<Vec<_>>());
+}
+
+#[test]
+fn underfull_leaf_takes_keys_from_a_fuller_sibling() {
+    let f = setup_no_tombs(16);
+    let (n, left, right) = two_leaves(&f);
+    // Fill the right leaf most of the way, so the two no longer fit in one.
+    let mut m = n;
+    while f.leaf_used_space(right) < 3 * BtreeLeafPage::<&[u8; PAGE_SIZE], 0>::CAPACITY / 4 {
+        f.tree.insert(&key(m), rid(m)).unwrap();
+        m += 1;
+    }
+    // Remove from the left leaf down to half full, then once more.
+    let half = BtreeLeafPage::<&[u8; PAGE_SIZE], 0>::CAPACITY / 2;
+    let entry_size = BtreeLeafPage::<&[u8; PAGE_SIZE], 0>::entry_size(8);
+    let mut k = 0;
+    while f.leaf_used_space(left) - entry_size >= half {
+        f.tree.remove(&key(k)).unwrap();
+        k += 1;
+    }
+    f.tree.remove(&key(k)).unwrap();
+    k += 1;
+    assert_eq!(f.check(), 2);
+    assert_eq!(f.root_children().unwrap(), [left, right]);
+    // Keys moved left until the two were about even.
+    let (l, r) = (f.leaf_used_space(left), f.leaf_used_space(right));
+    assert!(l >= half, "left {l} bytes");
+    assert!(
+        l.abs_diff(r) <= 2 * entry_size,
+        "left {l} bytes, right {r} bytes"
+    );
+    assert_eq!(f.scan(), (k..m).collect::<Vec<_>>());
+}
+
+/// Removes every key of a tree of 2,000 keys of 300 bytes, in `order`,
+/// checking the tree as it shrinks.
+fn remove_all<const NUM_TOMBS: usize>(f: &Fixture<NUM_TOMBS>, order: &[u64], name: &str) {
+    let n = order.len() as u64;
+    for k in 0..n {
+        f.tree.insert(&long_key(k, 300), rid(k)).unwrap();
+    }
+    assert!(f.check() >= 3, "{name}");
+    let mut left: Vec<u64> = (0..n).collect();
+    for (i, &k) in order.iter().enumerate() {
+        f.tree.remove(&long_key(k, 300)).unwrap();
+        assert_eq!(f.get_key(&long_key(k, 300)), None, "{name}: key {k}");
+        if i % 100 == 99 {
+            left.retain(|&x| !order[..=i].contains(&x));
+            f.check();
+            assert_eq!(f.scan(), left, "{name}: after {} removes", i + 1);
+        }
+    }
+    assert!(f.scan().is_empty(), "{name}");
+}
+
+#[test]
+fn many_removes_keep_the_tree_valid() {
+    for (name, order) in [
+        ("ascending", (0..2000).collect::<Vec<u64>>()),
+        ("descending", (0..2000).rev().collect()),
+        ("shuffled", shuffled(2000)),
+    ] {
+        let f = setup_no_tombs(16);
+        remove_all(&f, &order, name);
+        assert!(f.tree.is_empty().unwrap(), "{name}");
+    }
+}
+
+#[test]
+fn many_removes_with_tombstones() {
+    let f = setup();
+    remove_all(&f, &shuffled(2000), "shuffled");
+    // Tombstones may keep keys in a root leaf, but none is seen.
+    assert_eq!(f.check(), 1);
+}
+
+#[test]
+fn removes_of_mixed_key_lengths() {
+    let f = setup_no_tombs(16);
+    let len = |k: u64| 8 + (k as usize * 7919) % (Tree::MAX_KEY_SIZE - 7);
+    for k in 0..1000 {
+        f.tree.insert(&long_key(k, len(k)), rid(k)).unwrap();
+    }
+    let order = shuffled(1000);
+    for (i, &k) in order.iter().enumerate() {
+        f.tree.remove(&long_key(k, len(k))).unwrap();
+        if i % 50 == 49 {
+            f.check();
+        }
+    }
+    assert!(f.tree.is_empty().unwrap());
+}
+
+#[test]
+fn removed_keys_can_be_inserted_again() {
+    let f = setup_no_tombs(16);
+    for k in 0..1000 {
+        f.tree.insert(&long_key(k, 300), rid(k)).unwrap();
+    }
+    for k in (0..1000).filter(|k| k % 3 != 0) {
+        f.tree.remove(&long_key(k, 300)).unwrap();
+    }
+    f.check();
+    assert_eq!(
+        f.scan(),
+        (0..1000).filter(|k| k % 3 == 0).collect::<Vec<_>>()
+    );
+    for k in (0..1000).filter(|k| k % 3 != 0) {
+        assert!(f.tree.insert(&long_key(k, 300), rid(k)).unwrap());
+    }
+    f.check();
+    assert_eq!(f.scan(), (0..1000).collect::<Vec<_>>());
+}
+
+#[test]
+fn concurrent_removes_inserts_and_scans() {
+    const N: u64 = 3000;
+    let f = setup_no_tombs(256);
+    for k in 0..N {
+        f.tree.insert(&long_key(k, 200), rid(k)).unwrap();
+    }
+    let done = AtomicBool::new(false);
+    /// Stops the scans when dropped, so a writer that panics does not leave
+    /// them running forever.
+    struct Stop<'a>(&'a AtomicBool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, AtomicOrdering::Release);
+        }
+    }
+    std::thread::scope(|s| {
+        let stop = Stop(&done);
+        let mut writers = Vec::new();
+        // Keys with `k % 8` in 0..4 are removed, 4..6 inserted again after
+        // being removed, and 6..8 stay.
+        for t in 0..6 {
+            let f = &f;
+            writers.push(s.spawn(move || {
+                for k in (0..N).filter(|k| k % 8 == t) {
+                    f.tree.remove(&long_key(k, 200)).unwrap();
+                    assert_eq!(f.get_key(&long_key(k, 200)), None, "key {k}");
+                }
+                if t >= 4 {
+                    for k in (0..N).filter(|k| k % 8 == t) {
+                        assert!(f.tree.insert(&long_key(k, 200), rid(k)).unwrap());
+                    }
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let (f, done) = (&f, &done);
+            s.spawn(move || {
+                while !done.load(AtomicOrdering::Acquire) {
+                    let keys = f.scan();
+                    assert!(keys.windows(2).all(|w| w[0] < w[1]), "scan out of order");
+                    let staying = keys.iter().filter(|k| *k % 8 >= 6).count() as u64;
+                    assert_eq!(staying, (0..N).filter(|k| k % 8 >= 6).count() as u64);
+                }
+            });
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        drop(stop);
+    });
+    f.check();
+    assert_eq!(f.scan(), (0..N).filter(|k| k % 8 >= 4).collect::<Vec<_>>());
 }

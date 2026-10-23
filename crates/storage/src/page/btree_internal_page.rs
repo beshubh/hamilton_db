@@ -300,6 +300,69 @@ impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>> BtreeInternalPage<BufT> {
         separator
     }
 
+    /// Moves every child to the end of `left`, the page before this one,
+    /// with `middle_key`, the parent's key between the two pages, as the key
+    /// of this page's first child. Leaves this page empty.
+    ///
+    /// # Panics
+    /// If the children do not fit in `left`.
+    pub fn move_all_to<LeftBufT: DerefMut<Target = [u8; PAGE_SIZE]>>(
+        &mut self,
+        left: &mut BtreeInternalPage<LeftBufT>,
+        middle_key: &[u8],
+    ) {
+        for index in 0..self.size() {
+            let key = if index == 0 {
+                middle_key
+            } else {
+                LAYOUT.key(&self.data, index)
+            };
+            let end = left.size();
+            LAYOUT.insert(&mut left.data, end, key, LAYOUT.value(&self.data, index));
+        }
+        LAYOUT.truncate(&mut self.data, 0);
+    }
+
+    /// Moves the first child to the end of `left`, the page before this one,
+    /// with `middle_key`, the parent's key between the two pages, as its key.
+    /// This page's key 1 is dropped: it is the new key between the pages,
+    /// which the caller puts in the parent.
+    ///
+    /// # Panics
+    /// If this page has fewer than 2 children or the child does not fit in
+    /// `left`.
+    pub fn move_first_to_end_of<LeftBufT: DerefMut<Target = [u8; PAGE_SIZE]>>(
+        &mut self,
+        left: &mut BtreeInternalPage<LeftBufT>,
+        middle_key: &[u8],
+    ) {
+        let (_, child) = self.remove_first();
+        let end = left.size();
+        LAYOUT.insert(&mut left.data, end, middle_key, I32::new(child).as_bytes());
+    }
+
+    /// Moves the last child to the front of `right`, the page after this
+    /// one, with `middle_key`, the parent's key between the two pages, as the
+    /// key between it and `right`'s old first child. The moved child's key is
+    /// dropped: it is the new key between the pages, which the caller puts
+    /// in the parent.
+    ///
+    /// # Panics
+    /// If this page has fewer than 2 children, `right` is empty, or the
+    /// child does not fit in `right`.
+    pub fn move_last_to_front_of<RightBufT: DerefMut<Target = [u8; PAGE_SIZE]>>(
+        &mut self,
+        right: &mut BtreeInternalPage<RightBufT>,
+        middle_key: &[u8],
+    ) {
+        let last = self.size() - 1;
+        self.check_key_index(last);
+        assert!(right.size() > 0, "move into an empty internal page");
+        LAYOUT.insert(&mut right.data, 0, &[], LAYOUT.value(&self.data, last));
+        LAYOUT.set_key(&mut right.data, 1, middle_key);
+        LAYOUT.truncate(&mut self.data, last);
+    }
+
     fn write_value(&mut self, index: usize, page_id: PageId) {
         LAYOUT
             .value_mut(&mut self.data, index)

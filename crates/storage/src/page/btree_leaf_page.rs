@@ -178,6 +178,25 @@ impl<BufT: Deref<Target = [u8; PAGE_SIZE]>, const NUM_TOMBS: usize> BtreeLeafPag
             .then(|| self.read_value(index))
     }
 
+    /// Bytes `remove(key)` would free: those of the entry it removes for
+    /// good, which is `key`'s with `NUM_TOMBS = 0` and the oldest tombstoned
+    /// key's when the tombstone buffer is full. 0 if it only tombstones
+    /// `key`, or if `key` is missing or already tombstoned.
+    pub fn bytes_freed_by_remove(&self, key: &[u8], cmp: &impl KeyComparator) -> usize {
+        let index = self.key_index(key, cmp);
+        if !self.holds_at(index, key, cmp) || self.is_tombstone(index) {
+            return 0;
+        }
+        let removed = if NUM_TOMBS == 0 {
+            index
+        } else if self.num_tombstones() == NUM_TOMBS {
+            self.read_tomb(0)
+        } else {
+            return 0;
+        };
+        Self::entry_size(Self::LAYOUT.key(&self.data, removed).len())
+    }
+
     /// Index of the first key `>= key`, tombstoned or not, or `size` if there
     /// is none. A range scan starts here.
     pub fn key_index(&self, key: &[u8], cmp: &impl KeyComparator) -> usize {
@@ -358,6 +377,82 @@ impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>, const NUM_TOMBS: usize>
 
         right.set_next_page_id(self.next_page_id());
         self.set_next_page_id(right_page_id);
+    }
+
+    /// Moves every key to the end of `left`, the leaf before this one, and
+    /// links `left` to this page's next leaf, leaving this page empty.
+    ///
+    /// # Panics
+    /// If either page holds tombstones (purge them first) or the keys do not
+    /// fit in `left`.
+    pub fn move_all_to<LeftBufT: DerefMut<Target = [u8; PAGE_SIZE]>>(
+        &mut self,
+        left: &mut BtreeLeafPage<LeftBufT, NUM_TOMBS>,
+    ) {
+        self.assert_no_tombstones();
+        left.assert_no_tombstones();
+        for index in 0..self.size() {
+            let end = left.size();
+            Self::LAYOUT.insert(
+                &mut left.data,
+                end,
+                Self::LAYOUT.key(&self.data, index),
+                Self::LAYOUT.value(&self.data, index),
+            );
+        }
+        Self::LAYOUT.truncate(&mut self.data, 0);
+        left.set_next_page_id(self.next_page_id());
+    }
+
+    /// Moves the first key to the end of `left`, the leaf before this one.
+    ///
+    /// # Panics
+    /// If this page is empty, either page holds tombstones, or the key does
+    /// not fit in `left`.
+    pub fn move_first_to_end_of<LeftBufT: DerefMut<Target = [u8; PAGE_SIZE]>>(
+        &mut self,
+        left: &mut BtreeLeafPage<LeftBufT, NUM_TOMBS>,
+    ) {
+        self.assert_no_tombstones();
+        left.assert_no_tombstones();
+        self.check_index(0);
+        let end = left.size();
+        Self::LAYOUT.insert(
+            &mut left.data,
+            end,
+            Self::LAYOUT.key(&self.data, 0),
+            Self::LAYOUT.value(&self.data, 0),
+        );
+        Self::LAYOUT.remove(&mut self.data, 0);
+    }
+
+    /// Moves the last key to the front of `right`, the leaf after this one.
+    ///
+    /// # Panics
+    /// If this page is empty, either page holds tombstones, or the key does
+    /// not fit in `right`.
+    pub fn move_last_to_front_of<RightBufT: DerefMut<Target = [u8; PAGE_SIZE]>>(
+        &mut self,
+        right: &mut BtreeLeafPage<RightBufT, NUM_TOMBS>,
+    ) {
+        self.assert_no_tombstones();
+        right.assert_no_tombstones();
+        let last = self.size().checked_sub(1).expect("move from an empty leaf");
+        Self::LAYOUT.insert(
+            &mut right.data,
+            0,
+            Self::LAYOUT.key(&self.data, last),
+            Self::LAYOUT.value(&self.data, last),
+        );
+        Self::LAYOUT.truncate(&mut self.data, last);
+    }
+
+    fn assert_no_tombstones(&self) {
+        assert_eq!(
+            self.num_tombstones(),
+            0,
+            "move keys of a leaf with tombstones"
+        );
     }
 
     /// Removes slot `index` and its tombstone, if any. Tombstones follow

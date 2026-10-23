@@ -21,6 +21,14 @@
 //! pessimistic way: it write-latches from the header page down, releasing
 //! everything above a page that is safe (one a split below cannot reach),
 //! splits the leaf and carries the split up through the pages still held.
+//!
+//! A remove works the same way. The optimistic one removes from the leaf if
+//! that leaves it at least half full (a root leaf only has to keep a key).
+//! The pessimistic one rebalances an underfull page with a sibling, the
+//! right one if it has one: the two merge if they fit in one page, and
+//! otherwise keys move from the sibling until the two are about even. A
+//! merge takes a key out of the parent, which may leave it underfull in
+//! turn, and a root left with one child gives way to that child.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -186,7 +194,7 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     /// Returns `None`, changing nothing, if the tree is empty or the leaf
     /// has no room for `key`: either needs the pessimistic insert.
     fn insert_optimistic(&self, key: &[u8], rid: Rid) -> Result<Option<bool>> {
-        let Some(mut guard) = self.find_leaf_mut(key)? else {
+        let Some((mut guard, _)) = self.find_leaf_mut(key)? else {
             return Ok(None);
         };
         let mut leaf = LeafPageMut::<NUM_TOMBS>::new(guard.get_data_mut())?;
@@ -352,8 +360,267 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
 
     /// Removes `key`, if the tree holds it.
     pub fn remove(&self, key: &[u8]) -> Result<()> {
-        let _ = key;
-        todo!("B+tree remove")
+        if self.remove_optimistic(key)? {
+            return Ok(());
+        }
+        self.remove_pessimistic(key)
+    }
+
+    /// Removes `key` from its leaf, holding only read latches above it.
+    /// Returns `false`, changing nothing, if that would leave the leaf
+    /// underfull, or a root leaf empty: either needs the pessimistic remove.
+    fn remove_optimistic(&self, key: &[u8]) -> Result<bool> {
+        let Some((mut guard, is_root)) = self.find_leaf_mut(key)? else {
+            return Ok(true);
+        };
+        let mut leaf = LeafPageMut::<NUM_TOMBS>::new(guard.get_data_mut())?;
+        if !self.is_leaf_remove_safe(&leaf, key, is_root) {
+            return Ok(false);
+        }
+        leaf.remove(key, &self.comparator);
+        Ok(true)
+    }
+
+    /// Removes `key` holding write latches from the header page down, so it
+    /// can merge pages all the way up to the root.
+    ///
+    /// On the way down, reaching a safe page releases every page above it,
+    /// the header page included: rebalancing stops there, so they do not
+    /// change.
+    fn remove_pessimistic(&self, key: &[u8]) -> Result<()> {
+        let mut ctx = Context::new();
+        let header = self
+            .bpm
+            .checked_write_page(self.header_page_id, AccessType::Index)?;
+        ctx.root_page_id = BtreeHeaderPage::new(header.get_data())?.root_page_id();
+        if ctx.root_page_id == INVALID_PAGE_ID {
+            return Ok(());
+        }
+        ctx.header_page = Some(header);
+
+        let mut guard = self
+            .bpm
+            .checked_write_page(ctx.root_page_id, AccessType::Index)?;
+        if self.is_remove_safe(guard.get_data(), key, true)? {
+            ctx.header_page = None;
+        }
+        while page_type(guard.get_data()) != Ok(PageType::BTreeLeaf) {
+            let child_page_id = InternalPage::new(guard.get_data())?.lookup(key, &self.comparator);
+            let child = self
+                .bpm
+                .checked_write_page(child_page_id, AccessType::Index)?;
+            if self.is_remove_safe(child.get_data(), key, false)? {
+                ctx.header_page = None;
+                ctx.write_set.clear();
+                // Assigning drops the current page's guard after the
+                // child's is taken.
+                guard = child;
+            } else {
+                ctx.write_set
+                    .push_back(std::mem::replace(&mut guard, child));
+            }
+        }
+
+        let removed =
+            LeafPageMut::<NUM_TOMBS>::new(guard.get_data_mut())?.remove(key, &self.comparator);
+        if removed.is_none() {
+            return Ok(());
+        }
+        self.rebalance(&mut ctx, guard)
+    }
+
+    /// Fixes up the tree after a remove, from the leaf in `guard` up through
+    /// the write set: an underfull page is rebalanced with a sibling, which
+    /// may leave its parent underfull in turn, and an empty root leaf or a
+    /// root with one child is dropped.
+    fn rebalance(&self, ctx: &mut Context, mut guard: WritePageGuard) -> Result<()> {
+        loop {
+            if ctx.is_root_page(guard.page_id()) {
+                return self.shrink_root(ctx, guard);
+            }
+            if !Self::is_underfull(guard.get_data())? {
+                return Ok(());
+            }
+            // An underfull page whose parent was released was already
+            // underfull and lost nothing: it is left as it is.
+            let Some(mut parent) = ctx.write_set.pop_back() else {
+                return Ok(());
+            };
+            self.rebalance_child(&mut parent, guard)?;
+            guard = parent;
+        }
+    }
+
+    /// Drops the root in `guard` if it is a leaf with no keys, leaving the
+    /// tree empty, or an internal page with one child, which becomes the
+    /// root.
+    fn shrink_root(&self, ctx: &mut Context, guard: WritePageGuard) -> Result<()> {
+        let new_root_page_id = if page_type(guard.get_data()) == Ok(PageType::BTreeLeaf) {
+            if LeafPage::<NUM_TOMBS>::new(guard.get_data())?.size() > 0 {
+                return Ok(());
+            }
+            INVALID_PAGE_ID
+        } else {
+            let root = InternalPage::new(guard.get_data())?;
+            if root.size() > 1 {
+                return Ok(());
+            }
+            root.value_at(0)
+        };
+        let header = ctx
+            .header_page
+            .as_mut()
+            .expect("the header page is held while the root may go");
+        BtreeHeaderPage::new(header.get_data_mut())?.set_root_page_id(new_root_page_id);
+        let page_id = guard.page_id();
+        drop(guard);
+        self.delete_unlinked_page(page_id)
+    }
+
+    /// Deletes a page the tree no longer links to, whose write latch this
+    /// thread held after unlinking it.
+    ///
+    /// Another thread may still pin it for a moment: a page guard releases
+    /// its latch before its pin, so a scan that just moved past the page can
+    /// be between the two. Nothing can reach the page any more, so that pin
+    /// is about to go, and the delete is retried until it does.
+    fn delete_unlinked_page(&self, page_id: PageId) -> Result<()> {
+        loop {
+            match self.bpm.delete_page(page_id) {
+                Err(StorageError::PagePinned(_)) => std::thread::yield_now(),
+                result => return result,
+            }
+        }
+    }
+
+    /// Rebalances `child`, an underfull child of `parent`, with its right
+    /// sibling, or with its left one if it is the last child. A page that is
+    /// its parent's only child is left as it is.
+    fn rebalance_child(&self, parent: &mut WritePageGuard, child: WritePageGuard) -> Result<()> {
+        let mut parent = InternalPageMut::new(parent.get_data_mut())?;
+        let index = parent
+            .value_index(child.page_id())
+            .expect("an underfull page is a child of the page above it in the write set");
+        if index + 1 < parent.size() {
+            let right = self
+                .bpm
+                .checked_write_page(parent.value_at(index + 1), AccessType::Index)?;
+            self.merge_or_redistribute(&mut parent, index + 1, child, right, true)
+        } else if index > 0 {
+            // Scans latch leaves left to right, so latching the left sibling
+            // while holding the child could deadlock with one. The parent's
+            // write latch keeps both pages as they are meanwhile.
+            let child_page_id = child.page_id();
+            drop(child);
+            let left = self
+                .bpm
+                .checked_write_page(parent.value_at(index - 1), AccessType::Index)?;
+            let child = self
+                .bpm
+                .checked_write_page(child_page_id, AccessType::Index)?;
+            self.merge_or_redistribute(&mut parent, index, left, child, false)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Rebalances two adjacent children of `parent`, `KEY(sep_index)` being
+    /// the key between them, of which the left one is underfull if
+    /// `left_is_underfull` and the right one otherwise. If they fit in one
+    /// page, the right one merges into the left and is deleted. If not, keys
+    /// move to the underfull one until the two are about even, as long as
+    /// the parent has room for the new key between them.
+    fn merge_or_redistribute(
+        &self,
+        parent: &mut InternalPageMut,
+        sep_index: usize,
+        mut left_guard: WritePageGuard,
+        mut right_guard: WritePageGuard,
+        left_is_underfull: bool,
+    ) -> Result<()> {
+        let right_page_id = right_guard.page_id();
+        let merged = if page_type(left_guard.get_data()) == Ok(PageType::BTreeLeaf) {
+            let mut left = LeafPageMut::<NUM_TOMBS>::new(left_guard.get_data_mut())?;
+            let mut right = LeafPageMut::<NUM_TOMBS>::new(right_guard.get_data_mut())?;
+            // Moving a key would lose its tombstone.
+            left.purge_tombstones();
+            right.purge_tombstones();
+            if left.used_space() + right.used_space() <= LeafPage::<NUM_TOMBS>::CAPACITY {
+                right.move_all_to(&mut left);
+                true
+            } else {
+                redistribute_leaves(parent, sep_index, &mut left, &mut right, left_is_underfull)?;
+                false
+            }
+        } else {
+            let mut left = InternalPageMut::new(left_guard.get_data_mut())?;
+            let mut right = InternalPageMut::new(right_guard.get_data_mut())?;
+            let middle_key = parent.key_at(sep_index).to_vec();
+            if left.used_space() + right.used_space() + middle_key.len() <= InternalPage::CAPACITY {
+                right.move_all_to(&mut left, &middle_key);
+                true
+            } else {
+                redistribute_internals(
+                    parent,
+                    sep_index,
+                    &mut left,
+                    &mut right,
+                    left_is_underfull,
+                )?;
+                false
+            }
+        };
+        if merged {
+            parent.remove_at(sep_index);
+            drop(right_guard);
+            self.delete_unlinked_page(right_page_id)?;
+        }
+        Ok(())
+    }
+
+    /// Whether a page other than the root is less than half full.
+    fn is_underfull(data: &[u8; PAGE_SIZE]) -> Result<bool> {
+        if page_type(data) == Ok(PageType::BTreeLeaf) {
+            Ok(LeafPage::<NUM_TOMBS>::new(data)?.is_underfull())
+        } else {
+            Ok(InternalPage::new(data)?.is_underfull())
+        }
+    }
+
+    /// Whether removing `key` under the page in `data` cannot leave it
+    /// underfull, or leave a root without keys or with one child.
+    fn is_remove_safe(&self, data: &[u8; PAGE_SIZE], key: &[u8], is_root: bool) -> Result<bool> {
+        if page_type(data) == Ok(PageType::BTreeLeaf) {
+            let leaf = LeafPage::<NUM_TOMBS>::new(data)?;
+            return Ok(self.is_leaf_remove_safe(&leaf, key, is_root));
+        }
+        let page = InternalPage::new(data)?;
+        // Rebalancing a child takes at most one key of at most
+        // `MAX_KEY_SIZE` out of the page, or shortens one by as much.
+        Ok(if is_root {
+            page.size() > 2
+        } else {
+            page.used_space()
+                >= InternalPage::CAPACITY / 2 + InternalPage::entry_size(Self::MAX_KEY_SIZE)
+        })
+    }
+
+    /// Whether removing `key` from `leaf` cannot leave it underfull, or empty
+    /// for a root leaf.
+    fn is_leaf_remove_safe<BufT: std::ops::Deref<Target = [u8; PAGE_SIZE]>>(
+        &self,
+        leaf: &BtreeLeafPage<BufT, NUM_TOMBS>,
+        key: &[u8],
+        is_root: bool,
+    ) -> bool {
+        let freed = leaf.bytes_freed_by_remove(key, &self.comparator);
+        if freed == 0 {
+            true
+        } else if is_root {
+            leaf.size() > 1
+        } else {
+            leaf.used_space() - freed >= LeafPage::<NUM_TOMBS>::CAPACITY / 2
+        }
     }
 
     /// An iterator over every key in the tree, in increasing order.
@@ -399,14 +666,16 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     }
 
     /// Descends to the leaf whose range holds `key` like `find_leaf`, but
-    /// returns it write-latched. Returns `None` if the tree is empty.
+    /// returns it write-latched, with whether it is the root. Returns `None`
+    /// if the tree is empty.
     ///
     /// A page's type is only known once it is latched, so the leaf is first
     /// read-latched like the pages above it, then released and write-latched.
     /// Its parent (or the header page, for a root leaf) stays read-latched
     /// meanwhile, and a leaf cannot be split or merged away without a write
-    /// latch on that page, so it is still the leaf for `key`.
-    fn find_leaf_mut(&self, key: &[u8]) -> Result<Option<WritePageGuard>> {
+    /// latch on that page, so it is still the leaf for `key`. Nor can it stop
+    /// or start being the root while it is latched.
+    fn find_leaf_mut(&self, key: &[u8]) -> Result<Option<(WritePageGuard, bool)>> {
         let header = self
             .bpm
             .checked_read_page(self.header_page_id, AccessType::Index)?;
@@ -414,6 +683,7 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
         if page_id == INVALID_PAGE_ID {
             return Ok(None);
         }
+        let root_page_id = page_id;
         let mut parent = header;
         loop {
             let guard = self.bpm.checked_read_page(page_id, AccessType::Index)?;
@@ -421,13 +691,98 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
                 drop(guard);
                 let leaf = self.bpm.checked_write_page(page_id, AccessType::Index)?;
                 drop(parent);
-                return Ok(Some(leaf));
+                return Ok(Some((leaf, page_id == root_page_id)));
             }
             page_id = InternalPage::new(guard.get_data())?.lookup(key, &self.comparator);
             // Assigning drops the parent's guard only after the child's is
             // taken.
             parent = guard;
         }
+    }
+}
+
+/// Moves keys to the underfull one of two adjacent leaves, `KEY(sep_index)`
+/// of `parent` being the key between them, from the front or the back of the
+/// other one, until one more would leave it the fuller of the two, or the
+/// parent has no room for the new key between them.
+fn redistribute_leaves<const NUM_TOMBS: usize>(
+    parent: &mut InternalPageMut,
+    sep_index: usize,
+    left: &mut LeafPageMut<NUM_TOMBS>,
+    right: &mut LeafPageMut<NUM_TOMBS>,
+    left_is_underfull: bool,
+) -> Result<()> {
+    let entry_size = LeafPage::<NUM_TOMBS>::entry_size;
+    if left_is_underfull {
+        while right.size() >= 2 {
+            let moved = entry_size(right.key_at(0).len());
+            if left.used_space() + moved > right.used_space() - moved
+                || !try_set_key(parent, sep_index, right.key_at(1))?
+            {
+                break;
+            }
+            right.move_first_to_end_of(left);
+        }
+    } else {
+        while left.size() >= 2 {
+            let last = left.size() - 1;
+            let moved = entry_size(left.key_at(last).len());
+            if right.used_space() + moved > left.used_space() - moved
+                || !try_set_key(parent, sep_index, left.key_at(last))?
+            {
+                break;
+            }
+            left.move_last_to_front_of(right);
+        }
+    }
+    Ok(())
+}
+
+/// `redistribute_leaves` for internal pages, whose children move through
+/// the parent: the key between the pages comes down as the moved child's
+/// key, and the key it had goes up in its place.
+fn redistribute_internals(
+    parent: &mut InternalPageMut,
+    sep_index: usize,
+    left: &mut InternalPageMut,
+    right: &mut InternalPageMut,
+    left_is_underfull: bool,
+) -> Result<()> {
+    let entry_size = InternalPage::entry_size;
+    if left_is_underfull {
+        while right.size() >= 2 {
+            let middle_key = parent.key_at(sep_index).to_vec();
+            if left.used_space() + entry_size(middle_key.len())
+                > right.used_space() - entry_size(right.key_at(1).len())
+                || !try_set_key(parent, sep_index, right.key_at(1))?
+            {
+                break;
+            }
+            right.move_first_to_end_of(left, &middle_key);
+        }
+    } else {
+        while left.size() >= 2 {
+            let middle_key = parent.key_at(sep_index).to_vec();
+            let last = left.size() - 1;
+            if right.used_space() + entry_size(middle_key.len())
+                > left.used_space() - entry_size(left.key_at(last).len())
+                || !try_set_key(parent, sep_index, left.key_at(last))?
+            {
+                break;
+            }
+            left.move_last_to_front_of(right, &middle_key);
+        }
+    }
+    Ok(())
+}
+
+/// Sets `KEY(index)` of `page` to `key`, or returns `false`, changing
+/// nothing, if the page has no room for it.
+fn try_set_key(page: &mut InternalPageMut, index: usize, key: &[u8]) -> Result<bool> {
+    match page.set_key_at(index, key) {
+        Ok(()) => Ok(true),
+        Err(StorageError::PageFull) => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
