@@ -12,6 +12,7 @@ use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::buffer::traced_buffer_pool_manager::{PageAccess, TracedBufferPoolManager};
 use storage::disk::disk_manager::DiskManager;
 use storage::index::btree::Btree;
+use storage::index::index_iter::IndexIterator;
 use storage::page::PAGE_SIZE;
 use storage::page::btree_header_page::BtreeHeaderPage;
 use storage::page::btree_internal_page::BtreeInternalPage;
@@ -34,6 +35,17 @@ fn key(n: u64) -> [u8; 8] {
 
 fn rid(n: u64) -> Rid {
     Rid::new(n as i32, n as u16 + 1)
+}
+
+/// The keys `iter` yields, as numbers, checking each one's record id.
+fn collect<const NUM_TOMBS: usize>(iter: IndexIterator<NUM_TOMBS>) -> Vec<u64> {
+    iter.map(|entry| {
+        let (k, r) = entry.unwrap();
+        let k = u64::from_be_bytes(k[..8].try_into().unwrap());
+        assert_eq!(r, rid(k));
+        k
+    })
+    .collect()
 }
 
 /// A tree whose leaves keep `NUM_TOMBS` tombstones.
@@ -171,16 +183,12 @@ impl<const NUM_TOMBS: usize> Fixture<NUM_TOMBS> {
     }
 
     fn scan(&self) -> Vec<u64> {
-        self.tree
-            .begin()
-            .unwrap()
-            .map(|entry| {
-                let (k, r) = entry.unwrap();
-                let k = u64::from_be_bytes(k[..8].try_into().unwrap());
-                assert_eq!(r, rid(k));
-                k
-            })
-            .collect()
+        collect(self.tree.begin().unwrap())
+    }
+
+    /// The keys `>= k`, by `begin_at`.
+    fn scan_from(&self, k: u64) -> Vec<u64> {
+        collect(self.tree.begin_at(&key(k)).unwrap())
     }
 
     /// The root's children, or `None` if it is a leaf.
@@ -446,6 +454,77 @@ fn iterator_pins_only_its_current_leaf() {
     drop(iter);
     for page_id in [f.header_page_id, root, l1, l2, l3] {
         assert_eq!(pins(page_id), 0, "page {page_id}");
+    }
+}
+
+#[test]
+fn begin_at_starts_at_the_first_key_not_below() {
+    let f = setup();
+    f.two_levels();
+    let all = [10, 20, 30, 40, 50, 60, 70];
+    assert_eq!(f.scan_from(0), all);
+    assert_eq!(f.scan_from(10), all);
+    assert_eq!(f.scan_from(20), all[1..]);
+    // Between keys of a leaf.
+    assert_eq!(f.scan_from(15), all[1..]);
+    // The separator itself, on the right leaf.
+    assert_eq!(f.scan_from(40), all[3..]);
+    assert_eq!(f.scan_from(70), [70]);
+    assert!(f.scan_from(71).is_empty());
+}
+
+#[test]
+fn begin_at_past_a_leafs_last_key_moves_to_the_next_leaf() {
+    let f = setup();
+    let (root, [l1, l2, _]) = f.two_levels();
+    f.bpm.start_tracing();
+    // 35 belongs in the first leaf, which has nothing `>= 35`.
+    let mut iter = f.tree.begin_at(&key(35)).unwrap();
+    assert_eq!(
+        f.bpm.take_trace(),
+        [
+            PageAccess::Read(f.header_page_id),
+            PageAccess::Read(root),
+            PageAccess::Read(l1),
+        ]
+    );
+    assert_eq!(iter.next().unwrap().unwrap(), (key(40).to_vec(), rid(40)));
+    assert_eq!(f.bpm.take_trace(), [PageAccess::Read(l2)]);
+}
+
+#[test]
+fn begin_at_skips_tombstoned_keys() {
+    let f = setup();
+    let (_, [l1, l2, _]) = f.two_levels();
+    f.remove(l1, 20);
+    f.remove(l2, 40);
+    f.remove(l2, 50);
+    assert_eq!(f.scan_from(20), [30, 60, 70]);
+    assert_eq!(f.scan_from(40), [60, 70]);
+}
+
+#[test]
+fn begin_at_on_empty_tree() {
+    let f = setup();
+    assert!(f.tree.begin_at(&key(10)).unwrap().is_end());
+}
+
+#[test]
+fn begin_at_on_a_large_tree() {
+    let f = setup_no_tombs(16);
+    for k in shuffled(2000) {
+        f.tree.insert(&long_key(k * 2, 300), rid(k * 2)).unwrap();
+    }
+    assert!(f.check() >= 3);
+    for k in (0..4001u64).step_by(37) {
+        // The keys are the even numbers below 4000.
+        let first = k.next_multiple_of(2);
+        let keys = collect(f.tree.begin_at(&long_key(k, 300)).unwrap());
+        assert_eq!(
+            keys,
+            (first..4000).step_by(2).collect::<Vec<_>>(),
+            "from {k}"
+        );
     }
 }
 

@@ -87,17 +87,21 @@ impl fmt::Display for IndexMetadata {
 }
 
 /// An index from keys to the record ids of the rows that have them. Keys are
-/// tuples in the index's key schema, as `Tuple::to_key` builds them.
+/// tuples in the index's key schema, as `Tuple::to_key` builds them. A
+/// primary key index is unique, holding a key for at most one row. In any
+/// other index, any number of rows may share a key.
 #[enum_dispatch]
 pub trait IndexTrait {
     fn metadata(&self) -> &IndexMetadata;
 
     /// Adds `key` pointing to `rid`. Returns `false`, changing nothing, if
-    /// the index already holds `key`.
+    /// the index already holds `key` for `rid`, or for any row in a unique
+    /// index.
     // TODO: take the transaction once there are transactions.
     fn insert_entry(&self, key: &Tuple, rid: Rid) -> Result<bool>;
 
-    /// Removes `key`, if the index holds it.
+    /// Removes `key` for `rid`, if the index holds it. Other rows with
+    /// `key` keep their entries.
     fn delete_entry(&self, key: &Tuple, rid: Rid) -> Result<()>;
 
     /// Appends the record ids of the rows with `key` to `result`.

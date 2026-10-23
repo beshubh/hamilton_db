@@ -1,7 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use common::{PageId, SlotId};
+use common::{PageId, SlotId, ValueError};
 use thiserror::Error;
 
 use crate::page::page_header::PageType;
@@ -79,4 +79,8 @@ pub enum StorageError {
     /// The disk scheduler's worker thread exited before finishing a request.
     #[error("disk scheduler worker exited")]
     DiskSchedulerShutDown,
+
+    /// Values that do not fit a schema, such as a scan bound for an index.
+    #[error(transparent)]
+    Value(#[from] ValueError),
 }

@@ -1,7 +1,8 @@
 use std::cmp::Ordering;
+use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::sync::Arc;
 
-use common::{Column, DataType, Rid, Schema, Tuple, Value};
+use common::{Column, DataType, Rid, Schema, Tuple, Value, ValueError};
 use storage::StorageError;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::disk::disk_manager::DiskManager;
@@ -102,17 +103,20 @@ struct IndexFixture {
     index: Index,
 }
 
-/// An empty index on `(name, age)` of `table_schema`.
-fn name_age_index() -> IndexFixture {
+/// An empty index on the columns of `table_schema` at `key_attrs`.
+fn index_on(name: &str, key_attrs: Vec<usize>, is_primary_key: bool) -> IndexFixture {
     let dir = TempDir::new().unwrap();
     let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
     let bpm = Arc::new(BufferPoolManager::new(32, dm));
     let header_page_id = bpm.new_page();
-    let key_schema = Arc::new(Schema::new(vec![
-        Column::new("name", DataType::Varchar(2000), true),
-        Column::new("age", DataType::Int, true),
-    ]));
-    let metadata = IndexMetadata::new("users_name_age", "users", vec![2, 1], key_schema, false);
+    let table = table_schema();
+    let key_schema = Arc::new(Schema::new(
+        key_attrs
+            .iter()
+            .map(|&i| table.columns()[i].clone())
+            .collect(),
+    ));
+    let metadata = IndexMetadata::new(name, "users", key_attrs, key_schema, is_primary_key);
     let index = BtreeIndex::new(metadata, header_page_id, bpm).unwrap();
     IndexFixture {
         _dir: dir,
@@ -120,11 +124,38 @@ fn name_age_index() -> IndexFixture {
     }
 }
 
+/// An empty index on `(name, age)` of `table_schema`.
+fn name_age_index() -> IndexFixture {
+    index_on("users_name_age", vec![2, 1], false)
+}
+
+/// An empty index on `age` of `table_schema`.
+fn age_index() -> IndexFixture {
+    index_on("users_age", vec![1], false)
+}
+
+/// An empty primary key index on `age` of `table_schema`.
+fn age_pk_index() -> IndexFixture {
+    index_on("users_age_pk", vec![1], true)
+}
+
 impl IndexFixture {
+    fn btree(&self) -> &BtreeIndex {
+        let Index::BtreeIndex(index) = &self.index;
+        index
+    }
+
     fn key(&self, row: &Tuple) -> Tuple {
         let meta = self.index.metadata();
         row.to_key(&table_schema(), meta.key_schema(), meta.key_attrs())
             .unwrap()
+    }
+
+    fn insert(&self, row: &Tuple, rid: Rid) {
+        assert!(
+            self.index.insert_entry(&self.key(row), rid).unwrap(),
+            "{rid}"
+        );
     }
 
     fn lookup(&self, row: &Tuple) -> Vec<Rid> {
@@ -133,20 +164,36 @@ impl IndexFixture {
         result
     }
 
-    /// Every key in the index, in order, decoded as `(name, age)`.
-    fn keys(&self) -> Vec<(Value, Value)> {
-        let Index::BtreeIndex(index) = &self.index;
+    fn range(&self, lower: Bound<&[Value]>, upper: Bound<&[Value]>) -> Vec<Rid> {
+        self.btree()
+            .scan_range(lower, upper)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Every entry in the index, in order, as its key decoded as values and
+    /// its record id.
+    fn entries(&self) -> Vec<(Vec<Value>, Rid)> {
         let key_schema = self.index.metadata().key_schema();
-        index
+        self.btree()
             .tree()
             .begin()
             .unwrap()
             .map(|entry| {
-                let values = Tuple::from_bytes(entry.unwrap().0)
-                    .decode(key_schema)
-                    .unwrap();
-                (values[0].clone(), values[1].clone())
+                let (entry, rid) = entry.unwrap();
+                let key = self.btree().tree().comparator().key_of(&entry);
+                let values = Tuple::from_bytes(key.to_vec()).decode(key_schema).unwrap();
+                (values, rid)
             })
+            .collect()
+    }
+
+    /// Every key in the index, in order, decoded as `(name, age)`.
+    fn keys(&self) -> Vec<(Value, Value)> {
+        self.entries()
+            .into_iter()
+            .map(|(values, _)| (values[0].clone(), values[1].clone()))
             .collect()
     }
 }
@@ -170,34 +217,52 @@ fn insert_then_scan_key() {
 }
 
 #[test]
-fn insert_of_existing_key_changes_nothing() {
+fn insert_of_existing_entry_changes_nothing() {
     let f = name_age_index();
     let key = f.key(&row(1, Some(30), "alice"));
     assert!(f.index.insert_entry(&key, rid(1)).unwrap());
-    // Another row with the same key columns.
-    assert!(
-        !f.index
-            .insert_entry(&f.key(&row(2, Some(30), "alice")), rid(2))
-            .unwrap()
-    );
+    assert!(!f.index.insert_entry(&key, rid(1)).unwrap());
     assert_eq!(f.lookup(&row(1, Some(30), "alice")), [rid(1)]);
+    assert_eq!(f.entries().len(), 1);
 }
 
 #[test]
-fn delete_entry_removes_the_key() {
+fn rows_with_the_same_key_are_all_found_in_rid_order() {
     let f = name_age_index();
-    let (alice, bob) = (row(1, Some(30), "alice"), row(2, Some(25), "bob"));
-    f.index.insert_entry(&f.key(&alice), rid(1)).unwrap();
-    f.index.insert_entry(&f.key(&bob), rid(2)).unwrap();
+    // Other rows with the same key columns, inserted out of order.
+    for n in [3, 1, 4, 2] {
+        f.insert(&row(n, Some(30), "alice"), rid(n));
+    }
+    f.insert(&row(9, Some(31), "alice"), rid(9));
+    assert_eq!(
+        f.lookup(&row(0, Some(30), "alice")),
+        [rid(1), rid(2), rid(3), rid(4)]
+    );
+    assert_eq!(f.lookup(&row(0, Some(31), "alice")), [rid(9)]);
+}
 
-    f.index.delete_entry(&f.key(&alice), rid(1)).unwrap();
-    assert!(f.lookup(&alice).is_empty());
-    assert_eq!(f.lookup(&bob), [rid(2)]);
-    // Deleting a missing key is a no-op.
-    f.index.delete_entry(&f.key(&alice), rid(1)).unwrap();
+#[test]
+fn null_keys_do_not_collide() {
+    let f = age_index();
+    for n in 0..3 {
+        f.insert(&row(n, None, ""), rid(n));
+    }
+    f.insert(&row(3, Some(1), ""), rid(3));
+    assert_eq!(f.lookup(&row(0, None, "")), [rid(0), rid(1), rid(2)]);
+}
 
-    assert!(f.index.insert_entry(&f.key(&alice), rid(3)).unwrap());
-    assert_eq!(f.lookup(&alice), [rid(3)]);
+#[test]
+fn delete_entry_removes_only_that_row() {
+    let f = name_age_index();
+    let alice = row(0, Some(30), "alice");
+    for n in 0..3 {
+        f.insert(&alice, rid(n));
+    }
+    f.index.delete_entry(&f.key(&alice), rid(1)).unwrap();
+    assert_eq!(f.lookup(&alice), [rid(0), rid(2)]);
+    // A record id the key is not held for is a no-op.
+    f.index.delete_entry(&f.key(&alice), rid(7)).unwrap();
+    assert_eq!(f.lookup(&alice), [rid(0), rid(2)]);
 }
 
 #[test]
@@ -271,4 +336,417 @@ fn key_over_max_size_is_rejected() {
         matches!(err, StorageError::KeyTooLarge { max, .. } if max == BtreeIndex::MAX_KEY_SIZE)
     );
     assert!(f.lookup(&long).is_empty());
+
+    // The longest key that is accepted, with room left for the record id.
+    let empty_len = f.key(&row(1, Some(1), "")).len();
+    let longest = row(
+        1,
+        Some(1),
+        &"x".repeat(BtreeIndex::MAX_KEY_SIZE - empty_len),
+    );
+    assert_eq!(f.key(&longest).len(), BtreeIndex::MAX_KEY_SIZE);
+    f.insert(&longest, rid(1));
+    f.insert(&longest, rid(2));
+    assert_eq!(f.lookup(&longest), [rid(1), rid(2)]);
+}
+
+/// Every entry of `f` with its key, as `(key, entry)`.
+fn raw_entries(f: &IndexFixture) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let tree = f.btree().tree();
+    tree.begin()
+        .unwrap()
+        .map(|e| {
+            let entry = e.unwrap().0;
+            (tree.comparator().key_of(&entry).to_vec(), entry)
+        })
+        .collect()
+}
+
+#[test]
+fn entries_end_in_their_record_id() {
+    let f = age_index();
+    f.insert(&row(0, Some(30), ""), Rid::new(0x0102_0304, 0x0506));
+    let [(key, entry)] = &raw_entries(&f)[..] else {
+        panic!("not one entry");
+    };
+    assert_eq!(key, f.key(&row(0, Some(30), "")).data());
+    assert_eq!(entry[key.len()..], [4, 3, 2, 1, 6, 5]);
+}
+
+#[test]
+fn primary_key_entries_are_the_key_alone() {
+    let f = age_pk_index();
+    f.insert(&row(0, Some(30), ""), rid(7));
+    let [(key, entry)] = &raw_entries(&f)[..] else {
+        panic!("not one entry");
+    };
+    assert_eq!(key, entry);
+    assert_eq!(key, f.key(&row(0, Some(30), "")).data());
+    assert_eq!(f.lookup(&row(0, Some(30), "")), [rid(7)]);
+}
+
+#[test]
+fn primary_key_rejects_an_existing_key() {
+    let f = age_pk_index();
+    let key = f.key(&row(1, Some(30), ""));
+    assert!(f.index.insert_entry(&key, rid(1)).unwrap());
+    assert!(!f.index.insert_entry(&key, rid(2)).unwrap());
+    assert!(!f.index.insert_entry(&key, rid(1)).unwrap());
+    assert_eq!(f.lookup(&row(0, Some(30), "")), [rid(1)]);
+    // NULLs are equal, so they collide too.
+    let null = f.key(&row(3, None, ""));
+    assert!(f.index.insert_entry(&null, rid(3)).unwrap());
+    assert!(!f.index.insert_entry(&null, rid(4)).unwrap());
+    assert_eq!(f.lookup(&row(0, None, "")), [rid(3)]);
+}
+
+#[test]
+fn primary_key_delete_frees_the_key() {
+    let f = age_pk_index();
+    let key = f.key(&row(1, Some(30), ""));
+    f.insert(&row(1, Some(30), ""), rid(1));
+    f.index.delete_entry(&key, rid(1)).unwrap();
+    assert!(f.lookup(&row(0, Some(30), "")).is_empty());
+    assert!(f.index.insert_entry(&key, rid(2)).unwrap());
+    assert_eq!(f.lookup(&row(0, Some(30), "")), [rid(2)]);
+}
+
+#[test]
+fn primary_key_range_scans() {
+    let f = age_pk_index();
+    for (n, age) in [(0, 30), (1, 10), (2, 40), (3, 20)] {
+        f.insert(&row(n, Some(age), ""), rid(n));
+    }
+    f.insert(&row(4, None, ""), rid(4));
+    let (a10, a15, a20, a30, a40) = (age(10), age(15), age(20), age(30), age(40));
+
+    assert_eq!(f.range(Unbounded, Unbounded), rids(&[4, 1, 3, 0, 2]));
+    assert_eq!(f.range(Included(&a20), Unbounded), rids(&[3, 0, 2]));
+    assert_eq!(f.range(Excluded(&a20), Unbounded), rids(&[0, 2]));
+    // A bound the index does not hold.
+    assert_eq!(f.range(Excluded(&a15), Unbounded), rids(&[3, 0, 2]));
+    assert_eq!(f.range(Included(&a15), Unbounded), rids(&[3, 0, 2]));
+    assert_eq!(f.range(Unbounded, Excluded(&a20)), rids(&[4, 1]));
+    assert_eq!(f.range(Unbounded, Included(&a20)), rids(&[4, 1, 3]));
+    assert_eq!(f.range(Included(&a10), Excluded(&a40)), rids(&[1, 3, 0]));
+    assert_eq!(f.range(Excluded(&a10), Excluded(&a30)), rids(&[3]));
+    assert!(f.range(Excluded(&a40), Unbounded).is_empty());
+}
+
+#[test]
+fn primary_key_of_max_size() {
+    let f = index_on("users_name_pk", vec![2], true);
+    let empty_len = f.key(&row(1, None, "")).len();
+    let longest = row(1, None, &"x".repeat(BtreeIndex::MAX_KEY_SIZE - empty_len));
+    assert_eq!(f.key(&longest).len(), BtreeIndex::MAX_KEY_SIZE);
+    f.insert(&longest, rid(1));
+    assert_eq!(f.lookup(&longest), [rid(1)]);
+    let too_long = row(
+        1,
+        None,
+        &"x".repeat(BtreeIndex::MAX_KEY_SIZE - empty_len + 1),
+    );
+    assert!(f.index.insert_entry(&f.key(&too_long), rid(2)).is_err());
+}
+
+#[test]
+fn many_primary_keys_split_and_merge() {
+    let f = index_on("users_name_pk", vec![2], true);
+    let name = |n: i32| format!("{n:05}{}", "x".repeat((n as usize * 37) % 700));
+    for n in 0..2000 {
+        f.insert(&row(n, None, &name(n)), rid(n));
+    }
+    for n in (0..2000).filter(|n| n % 4 != 0) {
+        f.index
+            .delete_entry(&f.key(&row(n, None, &name(n))), rid(n))
+            .unwrap();
+    }
+    assert_eq!(
+        f.range(Unbounded, Unbounded),
+        (0..2000)
+            .filter(|n| n % 4 == 0)
+            .map(rid)
+            .collect::<Vec<_>>()
+    );
+    for n in 0..2000 {
+        let expected = if n % 4 == 0 { vec![rid(n)] } else { vec![] };
+        assert_eq!(f.lookup(&row(0, None, &name(n))), expected, "row {n}");
+    }
+}
+
+/// An index on `age` holding, in order:
+///
+/// ```text
+/// age  NULL NULL  20  25  30  30  30  40  40
+/// rid     6    7   3   8   0   1   2   4   5
+/// ```
+fn ages() -> IndexFixture {
+    let f = age_index();
+    let ages = [30, 30, 30, 20, 40, 40, -1, -1, 25];
+    for n in [2, 7, 0, 5, 3, 8, 1, 6, 4] {
+        let age = ages[n as usize];
+        f.insert(&row(n, (age >= 0).then_some(age), ""), rid(n));
+    }
+    f
+}
+
+fn age(age: i32) -> [Value; 1] {
+    [Value::Int(age)]
+}
+
+fn rids(ns: &[i32]) -> Vec<Rid> {
+    ns.iter().map(|&n| rid(n)).collect()
+}
+
+#[test]
+fn range_scans() {
+    let f = ages();
+    let (a20, a21, a30, a31, a39, a40) = (age(20), age(21), age(30), age(31), age(39), age(40));
+
+    // The whole index.
+    assert_eq!(
+        f.range(Unbounded, Unbounded),
+        rids(&[6, 7, 3, 8, 0, 1, 2, 4, 5])
+    );
+    // `>= 30` and `> 30`.
+    assert_eq!(f.range(Included(&a30), Unbounded), rids(&[0, 1, 2, 4, 5]));
+    assert_eq!(f.range(Excluded(&a30), Unbounded), rids(&[4, 5]));
+    // `< 30` and `<= 30`, NULLs first.
+    assert_eq!(f.range(Unbounded, Excluded(&a30)), rids(&[6, 7, 3, 8]));
+    assert_eq!(
+        f.range(Unbounded, Included(&a30)),
+        rids(&[6, 7, 3, 8, 0, 1, 2])
+    );
+    // Between, with bounds held and not held.
+    assert_eq!(
+        f.range(Included(&a20), Included(&a30)),
+        rids(&[3, 8, 0, 1, 2])
+    );
+    assert_eq!(f.range(Included(&a20), Excluded(&a30)), rids(&[3, 8]));
+    assert_eq!(f.range(Excluded(&a20), Excluded(&a40)), rids(&[8, 0, 1, 2]));
+    assert_eq!(f.range(Included(&a21), Excluded(&a40)), rids(&[8, 0, 1, 2]));
+    // Nothing in range.
+    assert!(f.range(Included(&a31), Excluded(&a39)).is_empty());
+    assert!(f.range(Excluded(&a40), Unbounded).is_empty());
+    assert!(f.range(Included(&a30), Excluded(&a30)).is_empty());
+}
+
+#[test]
+fn range_scan_of_empty_index() {
+    let f = age_index();
+    assert!(f.range(Unbounded, Unbounded).is_empty());
+    assert!(f.range(Included(&age(1)), Unbounded).is_empty());
+}
+
+#[test]
+fn many_rows_with_one_key_span_leaves() {
+    let f = name_age_index();
+    let name = "x".repeat(500);
+    let shared = row(0, Some(1), &name);
+    for n in 0..2000 {
+        f.insert(&shared, rid(n));
+    }
+    // Keys on either side.
+    f.insert(&row(0, Some(0), &name), rid(5000));
+    f.insert(&row(0, Some(2), &name), rid(5001));
+    assert_eq!(f.lookup(&shared), (0..2000).map(rid).collect::<Vec<_>>());
+
+    for n in (0..2000).filter(|n| n % 3 != 0) {
+        f.index.delete_entry(&f.key(&shared), rid(n)).unwrap();
+    }
+    assert_eq!(
+        f.lookup(&shared),
+        (0..2000)
+            .filter(|n| n % 3 == 0)
+            .map(rid)
+            .collect::<Vec<_>>()
+    );
+    let key = [Value::from(name.as_str()), Value::Int(1)];
+    assert_eq!(f.range(Excluded(&key), Unbounded), [rid(5001)]);
+    assert_eq!(f.range(Unbounded, Excluded(&key)), [rid(5000)]);
+}
+
+/// A `(name, age)` index holding, in order:
+///
+/// ```text
+/// name  alice  alice  alice  bob   bob  bob  carol
+/// age      25     30     30  NULL   40   40     20
+/// rid       1      0      5     3    2    6      4
+/// ```
+fn names_and_ages() -> IndexFixture {
+    let f = name_age_index();
+    let rows = [
+        (0, "alice", Some(30)),
+        (1, "alice", Some(25)),
+        (2, "bob", Some(40)),
+        (3, "bob", None),
+        (4, "carol", Some(20)),
+        (5, "alice", Some(30)),
+        (6, "bob", Some(40)),
+    ];
+    for (n, name, age) in rows {
+        f.insert(&row(n, age, name), rid(n));
+    }
+    f
+}
+
+fn name(name: &str) -> [Value; 1] {
+    [Value::from(name)]
+}
+
+fn name_age(name: &str, age: i32) -> [Value; 2] {
+    [Value::from(name), Value::Int(age)]
+}
+
+#[test]
+fn range_scans_on_a_key_prefix() {
+    let f = names_and_ages();
+    let (alice, bob, carol) = (name("alice"), name("bob"), name("carol"));
+
+    // `name = 'alice'`.
+    assert_eq!(
+        f.range(Included(&alice), Included(&alice)),
+        rids(&[1, 0, 5])
+    );
+    // `name > 'alice'` and `name >= 'bob'`.
+    assert_eq!(f.range(Excluded(&alice), Unbounded), rids(&[3, 2, 6, 4]));
+    assert_eq!(f.range(Included(&bob), Unbounded), rids(&[3, 2, 6, 4]));
+    // `name < 'bob'` and `name <= 'bob'`.
+    assert_eq!(f.range(Unbounded, Excluded(&bob)), rids(&[1, 0, 5]));
+    assert_eq!(
+        f.range(Unbounded, Included(&bob)),
+        rids(&[1, 0, 5, 3, 2, 6])
+    );
+    // `name > 'alice' AND name < 'carol'`.
+    assert_eq!(
+        f.range(Excluded(&alice), Excluded(&carol)),
+        rids(&[3, 2, 6])
+    );
+    // Names the index does not hold.
+    assert_eq!(
+        f.range(Excluded(&name("b")), Unbounded),
+        rids(&[3, 2, 6, 4])
+    );
+    assert_eq!(
+        f.range(Included(&name("b")), Excluded(&name("c"))),
+        rids(&[3, 2, 6])
+    );
+    assert!(
+        f.range(Included(&name("bo")), Excluded(&name("bob")))
+            .is_empty()
+    );
+    assert!(f.range(Excluded(&carol), Unbounded).is_empty());
+}
+
+#[test]
+fn bounds_of_different_lengths() {
+    let f = names_and_ages();
+    let (alice, bob) = (name("alice"), name("bob"));
+    // `name = 'alice' AND age > 25`.
+    assert_eq!(
+        f.range(Excluded(&name_age("alice", 25)), Included(&alice)),
+        rids(&[0, 5])
+    );
+    // `name = 'bob' AND age >= 30`: NULL sorts first, so it is left out.
+    assert_eq!(
+        f.range(Included(&name_age("bob", 30)), Included(&bob)),
+        rids(&[2, 6])
+    );
+    // `(name, age) >= ('alice', 30) AND name < 'bob'`.
+    assert_eq!(
+        f.range(Included(&name_age("alice", 30)), Excluded(&bob)),
+        rids(&[0, 5])
+    );
+    // `(name, age) > ('alice', 30)`, up to every `bob`.
+    assert_eq!(
+        f.range(Excluded(&name_age("alice", 30)), Included(&bob)),
+        rids(&[3, 2, 6])
+    );
+}
+
+#[test]
+fn empty_prefix_bounds_every_key() {
+    let f = names_and_ages();
+    let all = rids(&[1, 0, 5, 3, 2, 6, 4]);
+    assert_eq!(f.range(Included(&[]), Included(&[])), all);
+    assert_eq!(f.range(Unbounded, Unbounded), all);
+    assert!(f.range(Excluded(&[]), Unbounded).is_empty());
+    assert!(f.range(Unbounded, Excluded(&[])).is_empty());
+}
+
+#[test]
+fn bad_bounds_are_rejected() {
+    let f = names_and_ages();
+    let too_long = [Value::from("alice"), Value::Int(30), Value::Int(1)];
+    let Err(err) = f.btree().scan_range(Included(&too_long), Unbounded) else {
+        panic!("a bound longer than the key");
+    };
+    assert!(matches!(
+        err,
+        StorageError::Value(ValueError::ColumnCountMismatch {
+            expected: 2,
+            found: 3
+        })
+    ));
+    let wrong_type = [Value::Int(1)];
+    assert!(matches!(
+        f.btree().scan_range(Unbounded, Included(&wrong_type)),
+        Err(StorageError::Value(_))
+    ));
+}
+
+#[test]
+fn primary_key_range_scans_on_a_key_prefix() {
+    let f = index_on("users_name_age_pk", vec![2, 1], true);
+    let rows = [
+        (0, "alice", 30),
+        (1, "alice", 25),
+        (2, "bob", 40),
+        (3, "carol", 20),
+    ];
+    for (n, name, age) in rows {
+        f.insert(&row(n, Some(age), name), rid(n));
+    }
+    let alice = name("alice");
+    assert_eq!(f.range(Included(&alice), Included(&alice)), rids(&[1, 0]));
+    assert_eq!(f.range(Excluded(&alice), Unbounded), rids(&[2, 3]));
+    assert_eq!(
+        f.range(Excluded(&name_age("alice", 25)), Excluded(&name("carol"))),
+        rids(&[0, 2])
+    );
+}
+
+#[test]
+fn prefix_scans_across_many_leaves() {
+    for is_primary_key in [false, true] {
+        let f = index_on("users_name_age", vec![2, 1], is_primary_key);
+        // 50 names of 300 bytes, each with ages 0..40.
+        let name_of = |i: i32| format!("{i:03}{}", "x".repeat(300));
+        let mut order: Vec<i32> = (0..2000).collect();
+        order.sort_by_key(|n| (n * 7919) % 2000);
+        for n in order {
+            f.insert(&row(n, Some(n % 40), &name_of(n / 40)), rid(n));
+        }
+        let (lo, hi) = (name(&name_of(10)), name(&name_of(12)));
+        assert_eq!(
+            f.range(Included(&lo), Included(&lo)),
+            (400..440).map(rid).collect::<Vec<_>>(),
+            "primary key {is_primary_key}"
+        );
+        assert_eq!(
+            f.range(Excluded(&lo), Excluded(&hi)),
+            (440..480).map(rid).collect::<Vec<_>>(),
+            "primary key {is_primary_key}"
+        );
+        assert_eq!(
+            f.range(Excluded(&lo), Unbounded),
+            (440..2000).map(rid).collect::<Vec<_>>(),
+            "primary key {is_primary_key}"
+        );
+        assert_eq!(
+            f.range(Unbounded, Excluded(&lo)),
+            (0..400).map(rid).collect::<Vec<_>>(),
+            "primary key {is_primary_key}"
+        );
+    }
 }

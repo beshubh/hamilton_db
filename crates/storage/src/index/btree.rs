@@ -167,7 +167,7 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     /// Appends the record id of `key` to `result` and returns `true`, or
     /// returns `false` if the tree does not hold `key`.
     pub fn get_value(&self, key: &[u8], result: &mut Vec<Rid>) -> Result<bool> {
-        let Some(guard) = self.find_leaf(Some(key))? else {
+        let Some(guard) = self.find_leaf(Some(key), &self.comparator)? else {
             return Ok(false);
         };
         let leaf = LeafPage::<NUM_TOMBS>::new(guard.get_data())?;
@@ -625,8 +625,38 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
 
     /// An iterator over every key in the tree, in increasing order.
     pub fn begin(&self) -> Result<IndexIterator<NUM_TOMBS>> {
-        let leaf = self.find_leaf(None)?;
+        let leaf = self.find_leaf(None, &self.comparator)?;
         Ok(IndexIterator::new(Arc::clone(&self.bpm), leaf, 0))
+    }
+
+    /// An iterator over the keys `>= key`, in increasing order. `key` need
+    /// not be in the tree.
+    pub fn begin_at(&self, key: &[u8]) -> Result<IndexIterator<NUM_TOMBS>> {
+        self.begin_at_by(key, &self.comparator)
+    }
+
+    /// An iterator over the keys that `cmp` orders `>= target`, in
+    /// increasing order.
+    ///
+    /// `cmp` is only ever asked to compare a key of the tree with `target`,
+    /// as `cmp.compare(key, target)`. It must place `target` somewhere in
+    /// the tree's order: no key it orders `>= target` may sort before one it
+    /// orders `< target`. A comparator that compares only some of a key, and
+    /// never answers `Equal`, can seek to the start or the end of the keys
+    /// that share that part.
+    pub fn begin_at_by(
+        &self,
+        target: &[u8],
+        cmp: &impl KeyComparator,
+    ) -> Result<IndexIterator<NUM_TOMBS>> {
+        let Some(guard) = self.find_leaf(Some(target), cmp)? else {
+            return Ok(self.end());
+        };
+        // Every key `>= target` is on this leaf or a later one. If they are
+        // all on later ones, the iterator starts past this leaf's last slot
+        // and moves on.
+        let idx = LeafPage::<NUM_TOMBS>::new(guard.get_data())?.key_index(target, cmp);
+        Ok(IndexIterator::new(Arc::clone(&self.bpm), Some(guard), idx))
     }
 
     /// An iterator that is already past the last key.
@@ -634,10 +664,14 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
         IndexIterator::new(Arc::clone(&self.bpm), None, 0)
     }
 
-    /// Descends from the root to the leaf whose range holds `key`, or to the
-    /// leftmost leaf for `None`, and returns it read-latched. Returns `None`
-    /// if the tree is empty.
-    fn find_leaf(&self, key: Option<&[u8]>) -> Result<Option<ReadPageGuard>> {
+    /// Descends from the root to the leaf whose range holds `key` as `cmp`
+    /// orders it, or to the leftmost leaf for `None`, and returns it
+    /// read-latched. Returns `None` if the tree is empty.
+    fn find_leaf(
+        &self,
+        key: Option<&[u8]>,
+        cmp: &impl KeyComparator,
+    ) -> Result<Option<ReadPageGuard>> {
         let header = self
             .bpm
             .checked_read_page(self.header_page_id, AccessType::Index)?;
@@ -654,7 +688,7 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
             let child = {
                 let page = InternalPage::new(guard.get_data())?;
                 match key {
-                    Some(key) => page.lookup(key, &self.comparator),
+                    Some(key) => page.lookup(key, cmp),
                     None => page.value_at(0),
                 }
             };
