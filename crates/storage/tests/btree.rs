@@ -1,5 +1,4 @@
-//! The read side of the B+tree, on trees built page by page since `insert`
-//! is not written yet.
+//! The B+tree: lookups and scans on trees built page by page, and inserts.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -42,12 +41,37 @@ struct Fixture {
     tree: Tree,
 }
 
+/// Key `n` padded with filler to `len` bytes. Ordered as `n`.
+fn long_key(n: u64, len: usize) -> Vec<u8> {
+    let mut k = key(n).to_vec();
+    k.resize(len, b'x');
+    k
+}
+
+/// `0..n` in an order that jumps all over, the same every run.
+fn shuffled(n: u64) -> Vec<u64> {
+    let mut keys: Vec<u64> = (0..n).collect();
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    for i in (1..keys.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        keys.swap(i, (state % (i as u64 + 1)) as usize);
+    }
+    keys
+}
+
 /// An empty tree.
 fn setup() -> Fixture {
+    setup_with_frames(16)
+}
+
+/// An empty tree over a buffer pool of `frames` frames.
+fn setup_with_frames(frames: usize) -> Fixture {
     let dir = TempDir::new().unwrap();
     let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
     let bpm = Arc::new(TracedBufferPoolManager::new(Arc::new(
-        BufferPoolManager::new(16, dm),
+        BufferPoolManager::new(frames, dm),
     )));
     let header_page_id = bpm.new_page();
     let tree = Tree::new("idx", header_page_id, Arc::clone(&bpm), CMP).unwrap();
@@ -122,8 +146,12 @@ impl Fixture {
     }
 
     fn get(&self, k: u64) -> Option<Rid> {
+        self.get_key(&key(k))
+    }
+
+    fn get_key(&self, k: &[u8]) -> Option<Rid> {
         let mut result = Vec::new();
-        let found = self.tree.get_value(&key(k), &mut result).unwrap();
+        let found = self.tree.get_value(k, &mut result).unwrap();
         assert_eq!(found, !result.is_empty());
         assert!(result.len() <= 1);
         result.pop()
@@ -135,11 +163,109 @@ impl Fixture {
             .unwrap()
             .map(|entry| {
                 let (k, r) = entry.unwrap();
-                let k = u64::from_be_bytes(k.try_into().unwrap());
+                let k = u64::from_be_bytes(k[..8].try_into().unwrap());
                 assert_eq!(r, rid(k));
                 k
             })
             .collect()
+    }
+
+    /// Checks that the tree is a well-formed B+tree and returns its height,
+    /// 0 for an empty tree and 1 for a root leaf:
+    /// - every page's keys are in increasing order,
+    /// - every key lies within the bounds its parents' separators set,
+    /// - every internal page has at least 2 children,
+    /// - every leaf is at the same depth, and
+    /// - the leaves are linked left to right in the same order.
+    ///
+    /// Also checks that no page is left pinned.
+    fn check(&self) -> usize {
+        let root = self.tree.get_root_page_id().unwrap();
+        if root == INVALID_PAGE_ID {
+            return 0;
+        }
+        let mut leaves = Vec::new();
+        let height = self.check_page(root, None, None, &mut leaves);
+
+        let mut chain = vec![leaves[0]];
+        loop {
+            let guard = self
+                .bpm
+                .checked_read_page(*chain.last().unwrap(), AccessType::Unknown)
+                .unwrap();
+            let next = BtreeLeafPage::<_, 2>::new(guard.get_data())
+                .unwrap()
+                .next_page_id();
+            if next == INVALID_PAGE_ID {
+                break;
+            }
+            chain.push(next);
+        }
+        assert_eq!(chain, leaves, "leaf chain");
+
+        assert_eq!(self.bpm.get_pin_count(self.header_page_id).unwrap_or(0), 0);
+        for &page_id in &leaves {
+            assert_eq!(self.bpm.get_pin_count(page_id).unwrap_or(0), 0);
+        }
+        height
+    }
+
+    /// Checks the subtree under `page_id`, whose keys must be in `lo..hi`,
+    /// appends its leaves and returns its height.
+    fn check_page(
+        &self,
+        page_id: PageId,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        leaves: &mut Vec<PageId>,
+    ) -> usize {
+        let guard = self
+            .bpm
+            .checked_read_page(page_id, AccessType::Unknown)
+            .unwrap();
+        let data = guard.get_data();
+        let check_keys = |keys: &[&[u8]]| {
+            for pair in keys.windows(2) {
+                assert!(pair[0] < pair[1], "page {page_id}: keys out of order");
+            }
+            for &k in keys {
+                assert!(
+                    lo.is_none_or(|lo| lo <= k) && hi.is_none_or(|hi| k < hi),
+                    "page {page_id}: key out of its parent's bounds"
+                );
+            }
+        };
+        let (header, _) = PageHeader::ref_from_prefix(&data[..]).unwrap();
+        if header.page_type() == Ok(PageType::BTreeLeaf) {
+            let page = BtreeLeafPage::<_, 2>::new(data).unwrap();
+            assert!(page.size() > 0, "page {page_id}: empty leaf");
+            check_keys(&(0..page.size()).map(|i| page.key_at(i)).collect::<Vec<_>>());
+            leaves.push(page_id);
+            return 1;
+        }
+        let page = BtreeInternalPage::new(data).unwrap();
+        let size = page.size();
+        assert!(
+            size >= 2,
+            "page {page_id}: internal page with {size} children"
+        );
+        check_keys(&(1..size).map(|i| page.key_at(i)).collect::<Vec<_>>());
+        let heights: Vec<usize> = (0..size)
+            .map(|i| {
+                let child_lo = if i == 0 { lo } else { Some(page.key_at(i)) };
+                let child_hi = if i + 1 < size {
+                    Some(page.key_at(i + 1))
+                } else {
+                    hi
+                };
+                self.check_page(page.value_at(i), child_lo, child_hi, leaves)
+            })
+            .collect();
+        assert!(
+            heights.iter().all(|&h| h == heights[0]),
+            "page {page_id}: leaves at different depths"
+        );
+        heights[0] + 1
     }
 }
 
@@ -422,4 +548,346 @@ fn split_leaf_under_new_root() {
     }
     let keys: Vec<Vec<u8>> = f.tree.begin().unwrap().map(|e| e.unwrap().0).collect();
     assert_eq!(keys, (0..count).map(long_key).collect::<Vec<_>>());
+}
+
+#[test]
+fn insert_into_empty_tree_starts_a_root_leaf() {
+    let f = setup();
+    f.bpm.start_tracing();
+    assert!(f.tree.insert(&key(10), rid(10)).unwrap());
+    let root = f.tree.get_root_page_id().unwrap();
+    assert_eq!(
+        f.bpm.take_trace(),
+        [
+            // The optimistic attempt finds the tree empty.
+            PageAccess::Read(f.header_page_id),
+            PageAccess::Write(f.header_page_id),
+            PageAccess::New(root),
+            PageAccess::Write(root),
+            // `get_root_page_id`.
+            PageAccess::Read(f.header_page_id),
+        ]
+    );
+    let guard = f.bpm.checked_read_page(root, AccessType::Unknown).unwrap();
+    let (header, _) = PageHeader::ref_from_prefix(&guard.get_data()[..]).unwrap();
+    assert_eq!(header.page_type(), Ok(PageType::BTreeLeaf));
+    drop(guard);
+    assert_eq!(f.get(10), Some(rid(10)));
+    assert_eq!(f.scan(), [10]);
+}
+
+#[test]
+fn inserts_keep_keys_in_order() {
+    let f = setup();
+    for k in [50, 10, 40, 20, 30] {
+        assert!(f.tree.insert(&key(k), rid(k)).unwrap(), "key {k}");
+    }
+    assert_eq!(f.scan(), [10, 20, 30, 40, 50]);
+    for k in [10, 20, 30, 40, 50] {
+        assert_eq!(f.get(k), Some(rid(k)), "key {k}");
+    }
+    assert_eq!(f.get(25), None);
+}
+
+#[test]
+fn insert_of_existing_key_changes_nothing() {
+    let f = setup();
+    assert!(f.tree.insert(&key(10), rid(10)).unwrap());
+    assert!(!f.tree.insert(&key(10), rid(99)).unwrap());
+    assert_eq!(f.get(10), Some(rid(10)));
+    assert_eq!(f.scan(), [10]);
+}
+
+#[test]
+fn insert_rejects_keys_over_max_size() {
+    let f = setup();
+    f.bpm.start_tracing();
+    let too_long = vec![0; Tree::MAX_KEY_SIZE + 1];
+    let err = f.tree.insert(&too_long, rid(1)).unwrap_err();
+    assert!(matches!(
+        err,
+        StorageError::KeyTooLarge { size, max }
+            if size == Tree::MAX_KEY_SIZE + 1 && max == Tree::MAX_KEY_SIZE
+    ));
+    // Rejected before touching any page.
+    assert!(f.bpm.take_trace().is_empty());
+    assert!(f.tree.is_empty().unwrap());
+
+    let longest = vec![0; Tree::MAX_KEY_SIZE];
+    assert!(f.tree.insert(&longest, rid(1)).unwrap());
+    let mut result = Vec::new();
+    assert!(f.tree.get_value(&longest, &mut result).unwrap());
+    assert_eq!(result, [rid(1)]);
+}
+
+#[test]
+fn insert_write_latches_only_the_leaf() {
+    let f = setup();
+    let (root, [_, l2, _]) = f.two_levels();
+    f.bpm.start_tracing();
+    assert!(f.tree.insert(&key(45), rid(45)).unwrap());
+    assert_eq!(
+        f.bpm.take_trace(),
+        [
+            PageAccess::Read(f.header_page_id),
+            PageAccess::Read(root),
+            PageAccess::Read(l2),
+            PageAccess::Write(l2),
+        ]
+    );
+    assert_eq!(f.scan(), [10, 20, 30, 40, 45, 50, 60, 70]);
+}
+
+#[test]
+fn insert_into_root_leaf() {
+    let f = setup();
+    let leaf = f.leaf(&[10, 30], INVALID_PAGE_ID);
+    f.set_root(leaf);
+    f.bpm.start_tracing();
+    assert!(f.tree.insert(&key(20), rid(20)).unwrap());
+    assert_eq!(
+        f.bpm.take_trace(),
+        [
+            PageAccess::Read(f.header_page_id),
+            PageAccess::Read(leaf),
+            PageAccess::Write(leaf),
+        ]
+    );
+    assert_eq!(f.scan(), [10, 20, 30]);
+}
+
+#[test]
+fn insert_revives_tombstoned_key() {
+    let f = setup();
+    let (_, [l1, _, _]) = f.two_levels();
+    f.remove(l1, 20);
+    assert_eq!(f.get(20), None);
+    assert!(f.tree.insert(&key(20), rid(20)).unwrap());
+    assert_eq!(f.get(20), Some(rid(20)));
+    assert_eq!(f.scan(), [10, 20, 30, 40, 50, 60, 70]);
+}
+
+#[test]
+fn insert_releases_every_page() {
+    let f = setup();
+    let (root, [l1, l2, l3]) = f.two_levels();
+    for k in [15, 45, 65] {
+        assert!(f.tree.insert(&key(k), rid(k)).unwrap());
+    }
+    for page_id in [f.header_page_id, root, l1, l2, l3] {
+        assert_eq!(
+            f.bpm.get_pin_count(page_id).unwrap_or(0),
+            0,
+            "page {page_id}"
+        );
+    }
+}
+
+#[test]
+fn concurrent_inserts_into_one_leaf() {
+    const THREADS: u64 = 8;
+    const PER_THREAD: u64 = 20;
+    let f = setup();
+    std::thread::scope(|s| {
+        for t in 0..THREADS {
+            let tree = &f.tree;
+            s.spawn(move || {
+                for i in 0..PER_THREAD {
+                    // Interleaved, so every thread inserts all over the leaf.
+                    let k = i * THREADS + t;
+                    assert!(tree.insert(&key(k), rid(k)).unwrap(), "key {k}");
+                }
+            });
+        }
+    });
+    let all: Vec<u64> = (0..THREADS * PER_THREAD).collect();
+    assert_eq!(f.scan(), all);
+}
+
+#[test]
+fn full_root_leaf_splits_under_a_new_root() {
+    let f = setup();
+    let mut n = 0;
+    while f.tree.get_root_page_id().unwrap() == INVALID_PAGE_ID || f.check() == 1 {
+        assert!(f.tree.insert(&key(n), rid(n)).unwrap());
+        n += 1;
+    }
+    assert_eq!(f.check(), 2);
+    let root = f.tree.get_root_page_id().unwrap();
+    let guard = f.bpm.checked_read_page(root, AccessType::Unknown).unwrap();
+    assert_eq!(BtreeInternalPage::new(guard.get_data()).unwrap().size(), 2);
+    drop(guard);
+    assert_eq!(f.scan(), (0..n).collect::<Vec<_>>());
+    for k in 0..n {
+        assert_eq!(f.get(k), Some(rid(k)), "key {k}");
+    }
+}
+
+#[test]
+fn split_latches_from_the_header_down() {
+    let f = setup();
+    let leaf = f.leaf(&[], INVALID_PAGE_ID);
+    f.set_root(leaf);
+    let mut n = 0;
+    {
+        let mut guard = f.bpm.checked_write_page(leaf, AccessType::Unknown).unwrap();
+        let mut page = Leaf::init(guard.get_data_mut());
+        while page.insert(&key(n), rid(n), &CMP).is_ok() {
+            n += 1;
+        }
+    }
+    f.bpm.start_tracing();
+    assert!(f.tree.insert(&key(n), rid(n)).unwrap());
+    let trace = f.bpm.take_trace();
+    let root = f.tree.get_root_page_id().unwrap();
+    let PageAccess::New(right) = trace[5] else {
+        panic!("no new leaf in {trace:?}");
+    };
+    assert_eq!(
+        trace,
+        [
+            // The optimistic attempt finds the leaf full.
+            PageAccess::Read(f.header_page_id),
+            PageAccess::Read(leaf),
+            PageAccess::Write(leaf),
+            PageAccess::Write(f.header_page_id),
+            PageAccess::Write(leaf),
+            PageAccess::New(right),
+            PageAccess::Write(right),
+            PageAccess::New(root),
+            PageAccess::Write(root),
+        ]
+    );
+    assert_eq!(f.check(), 2);
+    assert_eq!(f.scan(), (0..=n).collect::<Vec<_>>());
+}
+
+#[test]
+fn split_stops_at_a_parent_with_room() {
+    let f = setup();
+    let (root, [l1, ..]) = f.two_levels();
+    // 16-byte keys between 10 and 20, so they all belong in the first leaf.
+    let between = |n: u64| [key(10), key(n)].concat();
+    let mut n = 0;
+    {
+        let mut guard = f.bpm.checked_write_page(l1, AccessType::Unknown).unwrap();
+        let mut page = Leaf::new(guard.get_data_mut()).unwrap();
+        while page.insert(&between(n), rid(n), &CMP).is_ok() {
+            n += 1;
+        }
+    }
+    f.bpm.start_tracing();
+    assert!(f.tree.insert(&between(n), rid(n)).unwrap());
+    let trace = f.bpm.take_trace();
+    let PageAccess::New(right) = trace[7] else {
+        panic!("no new leaf in {trace:?}");
+    };
+    assert_eq!(
+        trace,
+        [
+            PageAccess::Read(f.header_page_id),
+            PageAccess::Read(root),
+            PageAccess::Read(l1),
+            PageAccess::Write(l1),
+            // The root has room for a separator, so the header page is
+            // released once the root is latched and it stays the root.
+            PageAccess::Write(f.header_page_id),
+            PageAccess::Write(root),
+            PageAccess::Write(l1),
+            PageAccess::New(right),
+            PageAccess::Write(right),
+        ]
+    );
+    assert_eq!(f.tree.get_root_page_id().unwrap(), root);
+    assert_eq!(f.check(), 2);
+    let guard = f.bpm.checked_read_page(root, AccessType::Unknown).unwrap();
+    assert_eq!(BtreeInternalPage::new(guard.get_data()).unwrap().size(), 4);
+    drop(guard);
+    for k in 0..=n {
+        assert_eq!(f.get_key(&between(k)), Some(rid(k)), "key {k}");
+    }
+    for k in [10, 20, 30, 40, 50, 60, 70] {
+        assert_eq!(f.get(k), Some(rid(k)), "key {k}");
+    }
+}
+
+#[test]
+fn many_inserts_build_a_valid_tree() {
+    for (name, order) in [
+        ("ascending", (0..2000).collect::<Vec<u64>>()),
+        ("descending", (0..2000).rev().collect()),
+        ("shuffled", shuffled(2000)),
+    ] {
+        let f = setup();
+        for &k in &order {
+            assert!(
+                f.tree.insert(&long_key(k, 300), rid(k)).unwrap(),
+                "{name}: key {k}"
+            );
+        }
+        let height = f.check();
+        assert!(height >= 3, "{name}: height {height}");
+        assert_eq!(f.scan(), (0..2000).collect::<Vec<_>>(), "{name}");
+        for k in 0..2000 {
+            assert_eq!(
+                f.get_key(&long_key(k, 300)),
+                Some(rid(k)),
+                "{name}: key {k}"
+            );
+            assert!(!f.tree.insert(&long_key(k, 300), rid(k + 1)).unwrap());
+        }
+    }
+}
+
+#[test]
+fn inserts_of_mixed_key_lengths() {
+    let f = setup();
+    let len = |k: u64| 8 + (k as usize * 7919) % (Tree::MAX_KEY_SIZE - 7);
+    for k in shuffled(1000) {
+        assert!(
+            f.tree.insert(&long_key(k, len(k)), rid(k)).unwrap(),
+            "key {k}"
+        );
+    }
+    assert!(f.check() >= 3);
+    assert_eq!(f.scan(), (0..1000).collect::<Vec<_>>());
+    for k in 0..1000 {
+        assert_eq!(f.get_key(&long_key(k, len(k))), Some(rid(k)), "key {k}");
+    }
+}
+
+#[test]
+fn inserts_of_max_size_keys() {
+    let f = setup();
+    for k in shuffled(300) {
+        assert!(
+            f.tree
+                .insert(&long_key(k, Tree::MAX_KEY_SIZE), rid(k))
+                .unwrap()
+        );
+    }
+    assert!(f.check() >= 4);
+    assert_eq!(f.scan(), (0..300).collect::<Vec<_>>());
+}
+
+#[test]
+fn concurrent_inserts_with_splits() {
+    const THREADS: u64 = 8;
+    const PER_THREAD: u64 = 400;
+    let f = setup_with_frames(128);
+    std::thread::scope(|s| {
+        for t in 0..THREADS {
+            let f = &f;
+            s.spawn(move || {
+                for i in 0..PER_THREAD {
+                    let k = i * THREADS + t;
+                    let key = long_key(k, 200);
+                    assert!(f.tree.insert(&key, rid(k)).unwrap(), "key {k}");
+                    assert_eq!(f.get_key(&key), Some(rid(k)), "key {k}");
+                }
+            });
+        }
+    });
+    assert!(f.check() >= 3);
+    assert_eq!(f.scan(), (0..THREADS * PER_THREAD).collect::<Vec<_>>());
 }
