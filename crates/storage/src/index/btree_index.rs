@@ -93,18 +93,19 @@ impl IndexTrait for BtreeIndex {
         &self.metadata
     }
 
+    /// Fails with `KeyTooLarge` if the encoded key is longer than
+    /// `MAX_KEY_SIZE`.
     fn insert_entry(&self, key: &Tuple, rid: Rid) -> Result<bool> {
-        let _ = (key, rid);
-        todo!("encode the key and call Btree::insert")
+        self.tree.insert(key.data(), rid)
     }
 
-    fn delete_entry(&self, key: &Tuple, rid: Rid) -> Result<()> {
-        let _ = (key, rid);
-        todo!("encode the key and call Btree::remove")
+    /// Keys are unique, so `key` is removed whatever record id it has.
+    fn delete_entry(&self, key: &Tuple, _rid: Rid) -> Result<()> {
+        self.tree.remove(key.data())
     }
 
     fn scan_key(&self, key: &Tuple, result: &mut Vec<Rid>) -> Result<()> {
-        let _ = (key, result);
-        todo!("encode the key and call Btree::get_value")
+        self.tree.get_value(key.data(), result)?;
+        Ok(())
     }
 }
