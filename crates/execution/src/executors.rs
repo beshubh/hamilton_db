@@ -11,8 +11,8 @@
 //! own.
 //!
 //! So far there are executors for CREATE TABLE, CREATE INDEX, INSERT ...
-//! VALUES, DELETE, and SELECT ... WHERE through a table or an index scan;
-//! other plans fail with [`ExecutionError::NoExecutor`]. There are no
+//! VALUES, UPDATE, DELETE, and SELECT ... WHERE through a table or an index
+//! scan; other plans fail with [`ExecutionError::NoExecutor`]. There are no
 //! transactions yet, so every write is committed as soon as it is made.
 
 mod create_index;
@@ -26,6 +26,7 @@ mod seq_scan;
 #[cfg(test)]
 #[path = "../tests/util/executors.rs"]
 mod test_util;
+mod update;
 mod values;
 
 pub use create_index::CreateIndexExecutor;
@@ -36,6 +37,7 @@ pub use index_scan::IndexScanExecutor;
 pub use insert::InsertExecutor;
 pub use projection::ProjectionExecutor;
 pub use seq_scan::SeqScanExecutor;
+pub use update::UpdateExecutor;
 pub use values::ValuesExecutor;
 
 use std::sync::Arc;
@@ -82,6 +84,7 @@ pub enum AbstractExecutor {
     IndexScanExecutor,
     ValuesExecutor,
     InsertExecutor,
+    UpdateExecutor,
     DeleteExecutor,
     FilterExecutor,
     ProjectionExecutor,
@@ -124,7 +127,11 @@ pub fn create_executor(
             let table = table(ctx, plan.table_oid())?;
             IndexScanExecutor::new(plan.clone(), table, index(ctx, plan.index_oid())?).into()
         }
-        AbstractPlanNode::UpdatePlan(_) => return Err(ExecutionError::NoExecutor("Update")),
+        AbstractPlanNode::UpdatePlan(plan) => {
+            let table = table(ctx, plan.table_oid())?;
+            let indexes = ctx.catalog().table_indexes(&table.name);
+            UpdateExecutor::new(plan.clone(), table, indexes, child(plan.child())?).into()
+        }
         AbstractPlanNode::NestedLoopJoinPlan(_) => {
             return Err(ExecutionError::NoExecutor("NestedLoopJoin"));
         }

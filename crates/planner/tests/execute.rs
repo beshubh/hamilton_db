@@ -4,13 +4,14 @@
 use std::sync::Arc;
 
 use catalog::Catalog;
-use common::Value;
+use common::{Tuple, Value};
 use execution::ExecutionError;
 use execution::execution_context::ExecutionContext;
 use execution::executors::{Executor, create_executor};
 use planner::{Binder, Planner, PlannerError};
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::disk::disk_manager::DiskManager;
+use storage::index::IndexTrait;
 use tempfile::TempDir;
 
 struct Db {
@@ -208,10 +209,101 @@ fn plans_without_executors_are_rejected() {
         db.try_plan("SELECT a FROM t ORDER BY a"),
         Err(ExecutionError::NoExecutor("Sort"))
     ));
+}
+
+#[test]
+fn update_sets_columns_from_the_old_row() {
+    let db = Db::new();
+    db.run("CREATE TABLE users (id INT NOT NULL, name VARCHAR(16), score BIGINT)");
+    db.run("INSERT INTO users VALUES (1, 'ann', 10), (2, 'bo', 20), (3, NULL, 30)");
+
+    // INT literals are cast to BIGINT; a column not set keeps its value.
+    assert_eq!(
+        db.run("UPDATE users SET score = score + id * 100, name = upper(name) WHERE id >= 2"),
+        count(2)
+    );
+    // Updated rows are moved to the end of the table.
+    assert_eq!(
+        db.run("SELECT * FROM users"),
+        [
+            vec![Value::Int(1), Value::from("ann"), Value::BigInt(10)],
+            vec![Value::Int(2), Value::from("BO"), Value::BigInt(220)],
+            vec![Value::Int(3), Value::Null, Value::BigInt(330)],
+        ]
+    );
+    assert_eq!(db.run("UPDATE users SET name = 'x' WHERE id > 9"), count(0));
+    assert_eq!(db.run("UPDATE users SET score = NULL"), count(3));
     assert!(matches!(
-        db.try_plan("UPDATE t SET a = 1"),
-        Err(ExecutionError::NoExecutor("Update"))
+        db.try_run("UPDATE users SET id = id - 1, name = 'y' WHERE id = 1 OR 10 / (id - 2) > 0"),
+        Err(ExecutionError::Value(_))
     ));
+    assert_eq!(
+        db.run("SELECT id, name FROM users WHERE score IS NULL"),
+        [
+            vec![Value::Int(1), Value::from("ann")],
+            vec![Value::Int(2), Value::from("BO")],
+            vec![Value::Int(3), Value::Null],
+        ]
+    );
+}
+
+#[test]
+fn update_keeps_primary_keys_unique() {
+    let db = Db::new();
+    db.run("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(16))");
+    db.run("CREATE INDEX users_name ON users (name)");
+    db.run("INSERT INTO users VALUES (1, 'ann'), (2, 'bo'), (3, 'cy')");
+
+    // Every key shifts onto the next row's: unique once the statement ends.
+    assert_eq!(db.run("UPDATE users SET id = id + 1"), count(3));
+    assert_duplicate_key(
+        db.try_run("UPDATE users SET id = 4 WHERE name = 'ann'"),
+        "users_pkey",
+        "(id)=(4)",
+    );
+    assert_duplicate_key(
+        db.try_run("UPDATE users SET id = 9 WHERE id < 4"),
+        "users_pkey",
+        "(id)=(9)",
+    );
+    assert_eq!(
+        db.run("UPDATE users SET name = 'dee' WHERE id = 2"),
+        count(1)
+    );
+    assert_eq!(
+        db.run("SELECT * FROM users"),
+        [
+            vec![Value::Int(3), Value::from("bo")],
+            vec![Value::Int(4), Value::from("cy")],
+            vec![Value::Int(2), Value::from("dee")],
+        ]
+    );
+
+    // Both indexes point at the rows' new versions.
+    let catalog = db.ctx.catalog();
+    let table = catalog.get_table("users").unwrap();
+    let lookup = |index: &str, key: Value| {
+        let index = catalog.get_index(index).unwrap();
+        let key = Tuple::encode(&index.key_schema, &[key]).unwrap();
+        let mut rids = Vec::new();
+        index.index.scan_key(&key, &mut rids).unwrap();
+        rids.into_iter()
+            .map(|rid| {
+                table
+                    .heap
+                    .get(rid)
+                    .unwrap()
+                    .1
+                    .decode(&table.schema)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let dee = vec![vec![Value::Int(2), Value::from("dee")]];
+    assert_eq!(lookup("users_pkey", Value::Int(2)), dee);
+    assert_eq!(lookup("users_name", Value::from("dee")), dee);
+    assert!(lookup("users_pkey", Value::Int(1)).is_empty());
+    assert!(lookup("users_name", Value::from("ann")).is_empty());
 }
 
 #[test]

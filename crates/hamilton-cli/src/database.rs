@@ -169,10 +169,17 @@ mod tests {
             ]
         );
         assert_eq!(
-            one(&db, "DELETE FROM t WHERE name IS NULL"),
+            one(&db, "UPDATE t SET name = 'z' WHERE id >= 2"),
+            Output::Count {
+                command: "UPDATE",
+                count: 2
+            }
+        );
+        assert_eq!(
+            one(&db, "DELETE FROM t WHERE name = 'z'"),
             Output::Count {
                 command: "DELETE",
-                count: 1
+                count: 2
             }
         );
     }
