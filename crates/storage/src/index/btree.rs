@@ -1,4 +1,4 @@
-//! A B+tree mapping fixed-size keys to record ids.
+//! A B+tree mapping variable-length keys to record ids.
 //!
 //! The tree is entered through its header page (`BtreeHeaderPage`), which
 //! holds the root page id. Internal pages route a key to the child whose
@@ -6,12 +6,16 @@
 //! left to right for scans. Keys are unique, as the tree's comparator
 //! decides: two keys it orders as equal are the same key.
 //!
+//! Pages split by bytes, not by key count: a page is full when the next key
+//! does not fit, and splits into halves holding about the same number of
+//! bytes. A key may be at most `MAX_KEY_SIZE` bytes, which guarantees each
+//! half has room for it.
+//!
 //! Readers descend holding at most two read latches: a child's is taken
 //! before its parent's is released (latch crabbing), so a writer can never
 //! slip in between.
 
 use std::collections::VecDeque;
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use common::{INVALID_PAGE_ID, PageId, Rid};
@@ -23,14 +27,14 @@ use crate::error::Result;
 use crate::index::index_iter::IndexIterator;
 use crate::page::PAGE_SIZE;
 use crate::page::btree_header_page::BtreeHeaderPage;
-use crate::page::btree_internal_page::{BtreeInternalPage, BtreeKey, KeyComparator};
+use crate::page::btree_internal_page::BtreeInternalPage;
 use crate::page::btree_leaf_page::BtreeLeafPage;
+use crate::page::btree_page::KeyComparator;
 use crate::page::page_guard::{ReadPageGuard, WritePageGuard};
 use crate::page::page_header::{PageHeader, PageType};
 
-type InternalPage<'a, KeyT> = BtreeInternalPage<&'a [u8; PAGE_SIZE], KeyT>;
-type LeafPage<'a, KeyT, const NUM_TOMBS: usize> =
-    BtreeLeafPage<&'a [u8; PAGE_SIZE], KeyT, NUM_TOMBS>;
+type InternalPage<'a> = BtreeInternalPage<&'a [u8; PAGE_SIZE]>;
+type LeafPage<'a, const NUM_TOMBS: usize> = BtreeLeafPage<&'a [u8; PAGE_SIZE], NUM_TOMBS>;
 
 /// The pages an insert or remove holds on its way down the tree.
 ///
@@ -66,56 +70,39 @@ impl Context {
     }
 }
 
-/// A B+tree with keys of type `KeyT`, ordered by `CmpT`, whose leaves keep
-/// up to `NUM_TOMBS` tombstones.
+/// A B+tree whose keys are ordered by `CmpT` and whose leaves keep up to
+/// `NUM_TOMBS` tombstones.
 ///
-/// A tree must always be opened with the `KeyT` and `NUM_TOMBS` it was built
-/// with, since both decide where the arrays sit in its pages, and with a
-/// comparator that orders keys the same way, since its pages are sorted by it.
-pub struct Btree<KeyT, CmpT, const NUM_TOMBS: usize = 0> {
+/// A tree must always be opened with the `NUM_TOMBS` it was built with,
+/// since it decides where a leaf's slots sit, and with a comparator that
+/// orders keys the same way, since its pages are sorted by it.
+pub struct Btree<CmpT, const NUM_TOMBS: usize = 0> {
     index_name: String,
     bpm: Arc<TracedBufferPoolManager>,
     comparator: CmpT,
-    leaf_max_size: usize,
-    internal_max_size: usize,
     header_page_id: PageId,
-    _key: PhantomData<KeyT>,
 }
 
-impl<KeyT: BtreeKey, CmpT: KeyComparator<KeyT>, const NUM_TOMBS: usize>
-    Btree<KeyT, CmpT, NUM_TOMBS>
-{
+impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
+    /// The longest key the tree accepts. Keys are copied into internal pages
+    /// as separators, so it is the smaller of the two pages' limits.
+    pub const MAX_KEY_SIZE: usize = {
+        let leaf = LeafPage::<NUM_TOMBS>::MAX_KEY_SIZE;
+        let internal = InternalPage::MAX_KEY_SIZE;
+        if leaf < internal { leaf } else { internal }
+    };
+
     /// Opens the tree whose header page is `header_page_id`. A header page
     /// that was allocated but never written, as the catalog leaves it, is
     /// formatted as an empty tree first.
     ///
-    /// New leaves split once they hold more than `leaf_max_size` keys and
-    /// new internal pages once they hold more than `internal_max_size`
-    /// children. Pages already in the tree keep the sizes they were made with.
-    ///
     /// Fails with `UnexpectedPageType` if the page is some other kind of page.
-    ///
-    /// # Panics
-    /// If either max size is less than 2 or more than fits on a page.
     pub fn new(
         index_name: impl Into<String>,
         header_page_id: PageId,
         bpm: Arc<TracedBufferPoolManager>,
         comparator: CmpT,
-        leaf_max_size: usize,
-        internal_max_size: usize,
     ) -> Result<Self> {
-        let leaf_slots = BtreeLeafPage::<&[u8; PAGE_SIZE], KeyT, NUM_TOMBS>::SLOT_CNT;
-        assert!(
-            (2..=leaf_slots).contains(&leaf_max_size),
-            "leaf max size {leaf_max_size} out of range 2..={leaf_slots}"
-        );
-        let internal_slots = BtreeInternalPage::<&[u8; PAGE_SIZE], KeyT>::SLOT_CNT;
-        assert!(
-            (2..=internal_slots).contains(&internal_max_size),
-            "internal max size {internal_max_size} out of range 2..={internal_slots}"
-        );
-
         let mut guard = bpm.checked_write_page(header_page_id, AccessType::Index)?;
         if page_type(guard.get_data()) == Ok(PageType::Invalid) {
             BtreeHeaderPage::init(guard.get_data_mut());
@@ -128,10 +115,7 @@ impl<KeyT: BtreeKey, CmpT: KeyComparator<KeyT>, const NUM_TOMBS: usize>
             index_name: index_name.into(),
             bpm,
             comparator,
-            leaf_max_size,
-            internal_max_size,
             header_page_id,
-            _key: PhantomData,
         })
     }
 
@@ -145,14 +129,6 @@ impl<KeyT: BtreeKey, CmpT: KeyComparator<KeyT>, const NUM_TOMBS: usize>
 
     pub fn comparator(&self) -> &CmpT {
         &self.comparator
-    }
-
-    pub fn leaf_max_size(&self) -> usize {
-        self.leaf_max_size
-    }
-
-    pub fn internal_max_size(&self) -> usize {
-        self.internal_max_size
     }
 
     /// The buffer pool the tree reads and writes its pages through.
@@ -174,11 +150,11 @@ impl<KeyT: BtreeKey, CmpT: KeyComparator<KeyT>, const NUM_TOMBS: usize>
 
     /// Appends the record id of `key` to `result` and returns `true`, or
     /// returns `false` if the tree does not hold `key`.
-    pub fn get_value(&self, key: &KeyT, result: &mut Vec<Rid>) -> Result<bool> {
+    pub fn get_value(&self, key: &[u8], result: &mut Vec<Rid>) -> Result<bool> {
         let Some(guard) = self.find_leaf(Some(key))? else {
             return Ok(false);
         };
-        let leaf = LeafPage::<KeyT, NUM_TOMBS>::new(guard.get_data())?;
+        let leaf = LeafPage::<NUM_TOMBS>::new(guard.get_data())?;
         let Some(rid) = leaf.lookup(key, &self.comparator) else {
             return Ok(false);
         };
@@ -188,32 +164,34 @@ impl<KeyT: BtreeKey, CmpT: KeyComparator<KeyT>, const NUM_TOMBS: usize>
 
     /// Inserts `key` with `rid`. Returns `false`, changing nothing, if the
     /// tree already holds `key`.
-    pub fn insert(&self, key: KeyT, rid: Rid) -> Result<bool> {
+    ///
+    /// Fails with `KeyTooLarge` if `key` is longer than `MAX_KEY_SIZE`.
+    pub fn insert(&self, key: &[u8], rid: Rid) -> Result<bool> {
         let _ = (key, rid);
         todo!("B+tree insert")
     }
 
     /// Removes `key`, if the tree holds it.
-    pub fn remove(&self, key: &KeyT) -> Result<()> {
+    pub fn remove(&self, key: &[u8]) -> Result<()> {
         let _ = key;
         todo!("B+tree remove")
     }
 
     /// An iterator over every key in the tree, in increasing order.
-    pub fn begin(&self) -> Result<IndexIterator<KeyT, NUM_TOMBS>> {
+    pub fn begin(&self) -> Result<IndexIterator<NUM_TOMBS>> {
         let leaf = self.find_leaf(None)?;
         Ok(IndexIterator::new(Arc::clone(&self.bpm), leaf, 0))
     }
 
     /// An iterator that is already past the last key.
-    pub fn end(&self) -> IndexIterator<KeyT, NUM_TOMBS> {
+    pub fn end(&self) -> IndexIterator<NUM_TOMBS> {
         IndexIterator::new(Arc::clone(&self.bpm), None, 0)
     }
 
     /// Descends from the root to the leaf whose range holds `key`, or to the
     /// leftmost leaf for `None`, and returns it read-latched. Returns `None`
     /// if the tree is empty.
-    fn find_leaf(&self, key: Option<&KeyT>) -> Result<Option<ReadPageGuard>> {
+    fn find_leaf(&self, key: Option<&[u8]>) -> Result<Option<ReadPageGuard>> {
         let header = self
             .bpm
             .checked_read_page(self.header_page_id, AccessType::Index)?;
@@ -228,7 +206,7 @@ impl<KeyT: BtreeKey, CmpT: KeyComparator<KeyT>, const NUM_TOMBS: usize>
 
         while page_type(guard.get_data()) != Ok(PageType::BTreeLeaf) {
             let child = {
-                let page = InternalPage::<KeyT>::new(guard.get_data())?;
+                let page = InternalPage::new(guard.get_data())?;
                 match key {
                     Some(key) => page.lookup(key, &self.comparator),
                     None => page.value_at(0),

@@ -8,23 +8,14 @@ use crate::buffer::traced_buffer_pool_manager::TracedBufferPoolManager;
 use crate::error::Result;
 use crate::index::btree::Btree;
 use crate::index::{IndexMetadata, IndexTrait};
-use crate::page::PAGE_SIZE;
-use crate::page::btree_internal_page::{BtreeInternalPage, KeyComparator};
-use crate::page::btree_leaf_page::BtreeLeafPage;
+use crate::page::btree_page::KeyComparator;
 
-/// Bytes in a key stored in a `BtreeIndex`.
-pub const INDEX_KEY_SIZE: usize = 16;
+type Tree = Btree<KeySchemaComparator>;
 
-/// A key as a `BtreeIndex` stores it: the key tuple's encoding
-/// (`Tuple::to_key`), zero-padded. `KeySchemaComparator` orders it.
-// TODO: build these from key tuples, rejecting ones longer than INDEX_KEY_SIZE.
-pub type IndexKey = [u8; INDEX_KEY_SIZE];
-
-type Tree = Btree<IndexKey, KeySchemaComparator>;
-
-/// Orders `IndexKey`s by decoding them with an index's key schema and
-/// comparing column by column, as `Value::compare` orders values. NULL sorts
-/// before every other value, and NULLs are equal to each other.
+/// Orders index keys, which are key tuples as `Tuple::to_key` encodes them,
+/// by decoding them with the index's key schema and comparing column by
+/// column, as `Value::compare` orders values. NULL sorts before every other
+/// value, and NULLs are equal to each other.
 ///
 /// # Panics
 /// If a key does not decode with the key schema, or a column holds a type
@@ -39,10 +30,8 @@ impl KeySchemaComparator {
     }
 }
 
-impl KeyComparator<IndexKey> for KeySchemaComparator {
-    fn compare(&self, a: &IndexKey, b: &IndexKey) -> Ordering {
-        // Columns are found through the schema's offsets, so the padding is
-        // never read.
+impl KeyComparator for KeySchemaComparator {
+    fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
         let (a, b) = (Tuple::from_bytes(a.to_vec()), Tuple::from_bytes(b.to_vec()));
         for idx in 0..self.key_schema.len() {
             let decode = |key: &Tuple| {
@@ -67,16 +56,19 @@ impl KeyComparator<IndexKey> for KeySchemaComparator {
     }
 }
 
-/// An index stored in a B+tree.
+/// An index stored in a B+tree. Its keys are key tuples as
+/// `Tuple::to_key` encodes them.
 pub struct BtreeIndex {
     metadata: IndexMetadata,
     tree: Tree,
 }
 
 impl BtreeIndex {
+    /// The longest encoded key tuple the index accepts.
+    pub const MAX_KEY_SIZE: usize = Tree::MAX_KEY_SIZE;
+
     /// Opens the index whose B+tree header page is `header_page_id`,
-    /// formatting it as an empty tree if it was never written. Pages are
-    /// filled as far as they can be before they split.
+    /// formatting it as an empty tree if it was never written.
     pub fn new(
         metadata: IndexMetadata,
         header_page_id: PageId,
@@ -87,13 +79,11 @@ impl BtreeIndex {
             header_page_id,
             Arc::new(TracedBufferPoolManager::new(bpm)),
             KeySchemaComparator::new(Arc::clone(metadata.key_schema())),
-            BtreeLeafPage::<&[u8; PAGE_SIZE], IndexKey, 0>::SLOT_CNT,
-            BtreeInternalPage::<&[u8; PAGE_SIZE], IndexKey>::SLOT_CNT,
         )?;
         Ok(Self { metadata, tree })
     }
 
-    pub fn tree(&self) -> &Btree<IndexKey, KeySchemaComparator> {
+    pub fn tree(&self) -> &Btree<KeySchemaComparator> {
         &self.tree
     }
 }

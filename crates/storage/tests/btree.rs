@@ -13,19 +13,21 @@ use storage::disk::disk_manager::DiskManager;
 use storage::index::btree::Btree;
 use storage::page::PAGE_SIZE;
 use storage::page::btree_header_page::BtreeHeaderPage;
-use storage::page::btree_internal_page::{BtreeInternalPage, KeyComparator, OrdComparator};
+use storage::page::btree_internal_page::BtreeInternalPage;
 use storage::page::btree_leaf_page::BtreeLeafPage;
+use storage::page::btree_page::{BytewiseComparator, KeyComparator};
 use storage::page::page_header::{PageHeader, PageType};
 use tempfile::TempDir;
 use zerocopy::FromBytes;
 
-/// Big-endian, so byte order matches numeric order.
-type Key = [u8; 8];
-type Tree = Btree<Key, OrdComparator, 2>;
-type Leaf<'a> = BtreeLeafPage<&'a mut [u8; PAGE_SIZE], Key, 2>;
-type Internal<'a> = BtreeInternalPage<&'a mut [u8; PAGE_SIZE], Key>;
+type Tree = Btree<BytewiseComparator, 2>;
+type Leaf<'a> = BtreeLeafPage<&'a mut [u8; PAGE_SIZE], 2>;
+type Internal<'a> = BtreeInternalPage<&'a mut [u8; PAGE_SIZE]>;
 
-fn key(n: u64) -> Key {
+const CMP: BytewiseComparator = BytewiseComparator;
+
+/// Big-endian, so byte order matches numeric order.
+fn key(n: u64) -> [u8; 8] {
     n.to_be_bytes()
 }
 
@@ -40,7 +42,7 @@ struct Fixture {
     tree: Tree,
 }
 
-/// An empty tree whose pages split above 4 entries.
+/// An empty tree.
 fn setup() -> Fixture {
     let dir = TempDir::new().unwrap();
     let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
@@ -48,7 +50,7 @@ fn setup() -> Fixture {
         BufferPoolManager::new(16, dm),
     )));
     let header_page_id = bpm.new_page();
-    let tree = Tree::new("idx", header_page_id, Arc::clone(&bpm), OrdComparator, 4, 4).unwrap();
+    let tree = Tree::new("idx", header_page_id, Arc::clone(&bpm), CMP).unwrap();
     Fixture {
         _dir: dir,
         bpm,
@@ -65,9 +67,9 @@ impl Fixture {
             .bpm
             .checked_write_page(page_id, AccessType::Unknown)
             .unwrap();
-        let mut page = Leaf::init(guard.get_data_mut(), 4);
+        let mut page = Leaf::init(guard.get_data_mut());
         for &k in keys {
-            page.insert(key(k), rid(k), &OrdComparator).unwrap();
+            page.insert(&key(k), rid(k), &CMP).unwrap();
         }
         page.set_next_page_id(next);
         page_id
@@ -100,9 +102,9 @@ impl Fixture {
                 .bpm
                 .checked_write_page(root, AccessType::Unknown)
                 .unwrap();
-            let mut page = Internal::init(guard.get_data_mut(), 4);
-            page.populate_new_root(l1, key(40), l2);
-            page.insert(key(60), l3, &OrdComparator).unwrap();
+            let mut page = Internal::init(guard.get_data_mut());
+            page.populate_new_root(l1, &key(40), l2).unwrap();
+            page.insert(&key(60), l3, &CMP).unwrap();
         }
         self.set_root(root);
         (root, [l1, l2, l3])
@@ -115,7 +117,7 @@ impl Fixture {
             .unwrap();
         Leaf::new(guard.get_data_mut())
             .unwrap()
-            .remove(&key(k), &OrdComparator)
+            .remove(&key(k), &CMP)
             .unwrap();
     }
 
@@ -133,7 +135,7 @@ impl Fixture {
             .unwrap()
             .map(|entry| {
                 let (k, r) = entry.unwrap();
-                let k = u64::from_be_bytes(k);
+                let k = u64::from_be_bytes(k.try_into().unwrap());
                 assert_eq!(r, rid(k));
                 k
             })
@@ -156,15 +158,7 @@ fn new_tree_is_empty() {
 fn reopen_keeps_root() {
     let f = setup();
     let (root, _) = f.two_levels();
-    let tree = Tree::new(
-        "idx",
-        f.header_page_id,
-        Arc::clone(&f.bpm),
-        OrdComparator,
-        4,
-        4,
-    )
-    .unwrap();
+    let tree = Tree::new("idx", f.header_page_id, Arc::clone(&f.bpm), CMP).unwrap();
     assert_eq!(tree.get_root_page_id().unwrap(), root);
     assert!(!tree.is_empty().unwrap());
 }
@@ -173,7 +167,7 @@ fn reopen_keeps_root() {
 fn new_rejects_other_page_types() {
     let f = setup();
     let leaf = f.leaf(&[], INVALID_PAGE_ID);
-    let Err(err) = Tree::new("idx", leaf, Arc::clone(&f.bpm), OrdComparator, 4, 4) else {
+    let Err(err) = Tree::new("idx", leaf, Arc::clone(&f.bpm), CMP) else {
         panic!("a leaf page opened as a header page");
     };
     assert!(matches!(
@@ -187,20 +181,6 @@ fn new_rejects_other_page_types() {
     let guard = f.bpm.checked_read_page(leaf, AccessType::Unknown).unwrap();
     let (header, _) = PageHeader::ref_from_prefix(&guard.get_data()[..]).unwrap();
     assert_eq!(header.page_type(), Ok(PageType::BTreeLeaf));
-}
-
-#[test]
-#[should_panic(expected = "leaf max size 1 out of range")]
-fn new_rejects_tiny_pages() {
-    let f = setup();
-    let _ = Tree::new(
-        "idx",
-        f.header_page_id,
-        Arc::clone(&f.bpm),
-        OrdComparator,
-        1,
-        4,
-    );
 }
 
 #[test]
@@ -308,9 +288,10 @@ fn iterator_pins_only_its_current_leaf() {
 /// Orders little-endian `u32`s numerically, which their bytes do not.
 struct LittleEndian;
 
-impl KeyComparator<[u8; 4]> for LittleEndian {
-    fn compare(&self, a: &[u8; 4], b: &[u8; 4]) -> Ordering {
-        u32::from_le_bytes(*a).cmp(&u32::from_le_bytes(*b))
+impl KeyComparator for LittleEndian {
+    fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+        let num = |k: &[u8]| u32::from_le_bytes(k.try_into().unwrap());
+        num(a).cmp(&num(b))
     }
 }
 
@@ -318,15 +299,8 @@ impl KeyComparator<[u8; 4]> for LittleEndian {
 fn tree_orders_keys_with_its_comparator() {
     let f = setup();
     let header_page_id = f.bpm.new_page();
-    let tree = Btree::<[u8; 4], LittleEndian>::new(
-        "le",
-        header_page_id,
-        Arc::clone(&f.bpm),
-        LittleEndian,
-        4,
-        4,
-    )
-    .unwrap();
+    let tree =
+        Btree::<LittleEndian>::new("le", header_page_id, Arc::clone(&f.bpm), LittleEndian).unwrap();
     let write = |page_id| {
         f.bpm
             .checked_write_page(page_id, AccessType::Unknown)
@@ -345,19 +319,17 @@ fn tree_orders_keys_with_its_comparator() {
         (left, [2, 1], right),
     ] {
         let mut guard = write(page_id);
-        let mut page = BtreeLeafPage::<_, [u8; 4], 0>::init(guard.get_data_mut(), 4);
+        let mut page = BtreeLeafPage::<_, 0>::init(guard.get_data_mut());
         for k in keys {
-            page.insert(k.to_le_bytes(), rid(k.into()), &LittleEndian)
+            page.insert(&k.to_le_bytes(), rid(k.into()), &LittleEndian)
                 .unwrap();
         }
         page.set_next_page_id(next);
     }
     let root = f.bpm.new_page();
-    BtreeInternalPage::<_, [u8; 4]>::init(write(root).get_data_mut(), 4).populate_new_root(
-        left,
-        256u32.to_le_bytes(),
-        right,
-    );
+    BtreeInternalPage::init(write(root).get_data_mut())
+        .populate_new_root(left, &256u32.to_le_bytes(), right)
+        .unwrap();
     BtreeHeaderPage::new(write(header_page_id).get_data_mut())
         .unwrap()
         .set_root_page_id(root);
@@ -365,7 +337,7 @@ fn tree_orders_keys_with_its_comparator() {
     let keys: Vec<u32> = tree
         .begin()
         .unwrap()
-        .map(|entry| u32::from_le_bytes(entry.unwrap().0))
+        .map(|entry| u32::from_le_bytes(entry.unwrap().0.try_into().unwrap()))
         .collect();
     assert_eq!(keys, [1, 2, 256, 300]);
     for k in [1u32, 2, 256, 300] {
@@ -381,4 +353,73 @@ fn tree_orders_keys_with_its_comparator() {
             .get_value(&3u32.to_le_bytes(), &mut Vec::new())
             .unwrap()
     );
+}
+
+#[test]
+fn keys_of_different_lengths() {
+    let f = setup();
+    let leaf = f.bpm.new_page();
+    {
+        let mut guard = f.bpm.checked_write_page(leaf, AccessType::Unknown).unwrap();
+        let mut page = Leaf::init(guard.get_data_mut());
+        for (n, k) in ["pear", "", "apple", "app"].into_iter().enumerate() {
+            page.insert(k.as_bytes(), rid(n as u64), &CMP).unwrap();
+        }
+    }
+    f.set_root(leaf);
+
+    let keys: Vec<Vec<u8>> = f.tree.begin().unwrap().map(|e| e.unwrap().0).collect();
+    assert_eq!(keys, [&b""[..], b"app", b"apple", b"pear"]);
+    let mut result = Vec::new();
+    assert!(f.tree.get_value(b"apple", &mut result).unwrap());
+    assert_eq!(result, [rid(2)]);
+    assert!(!f.tree.get_value(b"appl", &mut Vec::new()).unwrap());
+}
+
+/// Builds a tree the way an insert that splits the root leaf will: fill a
+/// leaf, split it by bytes, and put the right half's first key in a new root.
+#[test]
+fn split_leaf_under_new_root() {
+    let f = setup();
+    let write = |page_id| {
+        f.bpm
+            .checked_write_page(page_id, AccessType::Unknown)
+            .unwrap()
+    };
+    // Keys of 8 to 200 bytes that order as their number.
+    let long_key = |n: u64| {
+        let mut k = key(n).to_vec();
+        k.resize(8 + (n as usize * 37) % 193, b'x');
+        k
+    };
+
+    let (left, right) = (f.bpm.new_page(), f.bpm.new_page());
+    let mut count = 0;
+    let mut left_guard = write(left);
+    let mut left_page = Leaf::init(left_guard.get_data_mut());
+    while left_page.insert(&long_key(count), rid(count), &CMP).is_ok() {
+        count += 1;
+    }
+    let mut right_guard = write(right);
+    let mut right_page = Leaf::init(right_guard.get_data_mut());
+    left_page.split_to(&mut right_page, right);
+    let separator = right_page.key_at(0).to_vec();
+    drop((left_guard, right_guard));
+
+    let root = f.bpm.new_page();
+    Internal::init(write(root).get_data_mut())
+        .populate_new_root(left, &separator, right)
+        .unwrap();
+    f.set_root(root);
+
+    for n in 0..count {
+        let mut result = Vec::new();
+        assert!(
+            f.tree.get_value(&long_key(n), &mut result).unwrap(),
+            "key {n}"
+        );
+        assert_eq!(result, [rid(n)]);
+    }
+    let keys: Vec<Vec<u8>> = f.tree.begin().unwrap().map(|e| e.unwrap().0).collect();
+    assert_eq!(keys, (0..count).map(long_key).collect::<Vec<_>>());
 }

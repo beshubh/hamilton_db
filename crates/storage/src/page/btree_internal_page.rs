@@ -1,119 +1,66 @@
-//! B+tree internal page.
+//! B+tree internal page, routing variable-length keys to child pages.
 //!
 //! ```text
 //! +----------------------------------------------------------------+
 //! | PageHeader (lsn, checksum, page_type)                     16 B |
-//! | InternalHeader (size, max_size)                            4 B |
+//! | SlottedHeader (size, key_start, hole_bytes)                6 B |
 //! +----------------------------------------------------------------+
-//! | KEY(0) (invalid) | KEY(1) | KEY(2) | ... | KEY(SLOT_CNT - 1)   |
+//! | SLOT(0) | SLOT(1) | ... | SLOT(size - 1)    grows toward the end → |
 //! +----------------------------------------------------------------+
-//! | PAGE_ID(0) | PAGE_ID(1) | PAGE_ID(2) | ... | PAGE_ID(SLOT_CNT - 1) |
+//! |                          free space                            |
+//! +----------------------------------------------------------------+
+//! |              ← key bytes, grow toward the start                |
 //! +----------------------------------------------------------------+
 //! ```
 //!
+//! `SLOT(i)` holds where `KEY(i)` is and the child page id `PAGE_ID(i)`
+//! (8 B). The slotted layout, shared with leaf pages, is described in
+//! `btree_page`.
+//!
 //! `size` counts children, so a page with `n + 1` children holds `n` keys,
-//! in increasing order. `PAGE_ID(i)` points to the subtree whose keys `K`
-//! satisfy `KEY(i) <= K < KEY(i + 1)`. The leftmost child has no lower bound,
-//! so `KEY(0)` is never read: every search and lookup ignores it.
-//!
-//! Both arrays are sized for the most children a page can hold (`SLOT_CNT`),
-//! which depends on the key size. Keys are any fixed-size type that can be
-//! copied to and from bytes (`BtreeKey`); page ids are little-endian. Nothing
-//! is aligned, so a page can be viewed from any byte buffer.
-//!
-//! The page does not know how its keys are ordered: every call that searches
-//! takes the tree's `KeyComparator`, so the order can depend on runtime state
-//! such as an index's key schema.
+//! in increasing order as the tree's `KeyComparator` orders them.
+//! `PAGE_ID(i)` points to the subtree whose keys `K` satisfy
+//! `KEY(i) <= K < KEY(i + 1)`. The leftmost child has no lower bound, so
+//! `KEY(0)` is empty and never read.
 
-use std::cmp::Ordering;
-use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut, Range};
+use std::ops::{Deref, DerefMut};
 
 use common::PageId;
-use zerocopy::byteorder::little_endian::{I32, U16};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+use zerocopy::byteorder::little_endian::I32;
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::error::{Result, StorageError};
 use crate::page::PAGE_SIZE;
+use crate::page::btree_page::{KeyComparator, SLOTTED_HEADER_END, SlotLayout, check_key_size};
 use crate::page::page_header::{PageHeader, PageType};
 
-const _: () = assert!(PAGE_SIZE <= u16::MAX as usize);
+const LAYOUT: SlotLayout = SlotLayout::new(SLOTTED_HEADER_END, size_of::<I32>());
 
-const INTERNAL_HEADER_OFFSET: usize = PageHeader::SIZE;
-const KEYS_OFFSET: usize = INTERNAL_HEADER_OFFSET + size_of::<InternalHeader>();
-const PAGE_ID_SIZE: usize = size_of::<I32>();
-
-/// A key stored in a B+tree page: fixed-size and copied in and out as raw
-/// bytes. A `KeyComparator` orders it.
-pub trait BtreeKey: FromBytes + IntoBytes + Immutable + Copy {}
-
-impl<T: FromBytes + IntoBytes + Immutable + Copy> BtreeKey for T {}
-
-/// Orders the keys of a B+tree.
-///
-/// It must be a total order, and a tree must always be used with the same
-/// one: its pages are sorted by it. Keys that compare equal are the same key,
-/// even if their bytes differ.
-pub trait KeyComparator<KeyT> {
-    fn compare(&self, a: &KeyT, b: &KeyT) -> Ordering;
-}
-
-/// Orders keys by their `Ord` impl, such as big-endian byte arrays, whose
-/// byte order is their numeric order.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct OrdComparator;
-
-impl<KeyT: Ord> KeyComparator<KeyT> for OrdComparator {
-    fn compare(&self, a: &KeyT, b: &KeyT) -> Ordering {
-        a.cmp(b)
-    }
-}
-
-#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
-#[repr(C)]
-struct InternalHeader {
-    /// Number of children.
-    size: U16,
-    /// Most children the page may hold before it has to split.
-    max_size: U16,
-}
-
-const _: () = assert!(size_of::<InternalHeader>() == 4);
-
-/// A view of a B+tree internal page with keys of type `KeyT` over borrowed
-/// page bytes `BufT`, such as `guard.get_data()` (read-only) or
-/// `guard.get_data_mut()` (read-write).
-pub struct BtreeInternalPage<BufT, KeyT> {
+/// A view of a B+tree internal page over borrowed page bytes `BufT`, such as
+/// `guard.get_data()` (read-only) or `guard.get_data_mut()` (read-write).
+pub struct BtreeInternalPage<BufT> {
     data: BufT,
-    _key: PhantomData<KeyT>,
 }
 
-impl<BufT, KeyT> BtreeInternalPage<BufT, KeyT> {
-    /// The most children a page can hold.
-    pub const SLOT_CNT: usize = (PAGE_SIZE - KEYS_OFFSET) / (size_of::<KeyT>() + PAGE_ID_SIZE);
+impl<BufT> BtreeInternalPage<BufT> {
+    /// Bytes for entries in an empty page.
+    pub const CAPACITY: usize = LAYOUT.capacity();
 
-    const PAGE_IDS_OFFSET: usize = KEYS_OFFSET + Self::SLOT_CNT * size_of::<KeyT>();
+    /// The longest key the page accepts.
+    pub const MAX_KEY_SIZE: usize = LAYOUT.max_key_size();
 
-    fn key_range(index: usize) -> Range<usize> {
-        let start = KEYS_OFFSET + index * size_of::<KeyT>();
-        start..start + size_of::<KeyT>()
-    }
-
-    fn value_range(index: usize) -> Range<usize> {
-        let start = Self::PAGE_IDS_OFFSET + index * PAGE_ID_SIZE;
-        start..start + PAGE_ID_SIZE
+    /// Bytes an entry with a key of `key_len` bytes takes: its slot and key.
+    pub const fn entry_size(key_len: usize) -> usize {
+        LAYOUT.entry_size(key_len)
     }
 }
 
-impl<BufT: Deref<Target = [u8; PAGE_SIZE]>, KeyT: BtreeKey> BtreeInternalPage<BufT, KeyT> {
+impl<BufT: Deref<Target = [u8; PAGE_SIZE]>> BtreeInternalPage<BufT> {
     /// Views `data` as an internal page, checking its page type.
     pub fn new(data: BufT) -> Result<Self> {
         let (header, _) = PageHeader::read_from_prefix(&data[..]).unwrap();
         match header.page_type() {
-            Ok(PageType::BTreeInternal) => Ok(Self {
-                data,
-                _key: PhantomData,
-            }),
+            Ok(PageType::BTreeInternal) => Ok(Self { data }),
             Ok(other) => Err(StorageError::UnexpectedPageType {
                 expected: PageType::BTreeInternal,
                 found: other as u32,
@@ -127,27 +74,35 @@ impl<BufT: Deref<Target = [u8; PAGE_SIZE]>, KeyT: BtreeKey> BtreeInternalPage<Bu
 
     /// Number of children. The page holds one key fewer.
     pub fn size(&self) -> usize {
-        self.header().size.get() as usize
+        LAYOUT.size(&self.data)
     }
 
-    pub fn max_size(&self) -> usize {
-        self.header().max_size.get() as usize
+    /// Bytes a new entry can use.
+    pub fn free_space(&self) -> usize {
+        LAYOUT.free_space(&self.data)
     }
 
-    /// Fewest children a non-root page may hold before it has to borrow from
+    /// Bytes the entries take.
+    pub fn used_space(&self) -> usize {
+        LAYOUT.used_space(&self.data)
+    }
+
+    /// Whether a key of `key_len` bytes and its child can be inserted
+    /// without a split.
+    pub fn has_room_for(&self, key_len: usize) -> bool {
+        Self::entry_size(key_len) <= self.free_space()
+    }
+
+    /// Whether a non-root page is less than half full and has to borrow from
     /// or merge with a sibling.
-    pub fn min_size(&self) -> usize {
-        self.max_size().div_ceil(2)
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.size() >= self.max_size()
+    pub fn is_underfull(&self) -> bool {
+        self.used_space() < Self::CAPACITY / 2
     }
 
     /// The key at `index`, which must be in `1..size`: key 0 is invalid.
-    pub fn key_at(&self, index: usize) -> KeyT {
+    pub fn key_at(&self, index: usize) -> &[u8] {
         self.check_key_index(index);
-        self.read_key(index)
+        LAYOUT.key(&self.data, index)
     }
 
     /// The child at `index`, which must be in `0..size`.
@@ -166,17 +121,17 @@ impl<BufT: Deref<Target = [u8; PAGE_SIZE]>, KeyT: BtreeKey> BtreeInternalPage<Bu
     ///
     /// # Panics
     /// If the page has no children.
-    pub fn lookup(&self, key: &KeyT, cmp: &impl KeyComparator<KeyT>) -> PageId {
+    pub fn lookup(&self, key: &[u8], cmp: &impl KeyComparator) -> PageId {
         assert!(self.size() > 0, "lookup in an empty internal page");
         self.read_value(self.upper_bound(key, cmp) - 1)
     }
 
     /// Index of the first key `> key` in `1..size`, or `size` if there is none.
-    fn upper_bound(&self, key: &KeyT, cmp: &impl KeyComparator<KeyT>) -> usize {
+    fn upper_bound(&self, key: &[u8], cmp: &impl KeyComparator) -> usize {
         let (mut lo, mut hi) = (1, self.size().max(1));
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if cmp.compare(&self.read_key(mid), key).is_le() {
+            if cmp.compare(LAYOUT.key(&self.data, mid), key).is_le() {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -185,12 +140,8 @@ impl<BufT: Deref<Target = [u8; PAGE_SIZE]>, KeyT: BtreeKey> BtreeInternalPage<Bu
         lo
     }
 
-    fn read_key(&self, index: usize) -> KeyT {
-        KeyT::read_from_bytes(&self.data[Self::key_range(index)]).unwrap()
-    }
-
     fn read_value(&self, index: usize) -> PageId {
-        I32::read_from_bytes(&self.data[Self::value_range(index)])
+        I32::read_from_bytes(LAYOUT.value(&self.data, index))
             .unwrap()
             .get()
     }
@@ -210,81 +161,44 @@ impl<BufT: Deref<Target = [u8; PAGE_SIZE]>, KeyT: BtreeKey> BtreeInternalPage<Bu
             self.size()
         );
     }
-
-    fn header(&self) -> &InternalHeader {
-        InternalHeader::ref_from_bytes(&self.data[INTERNAL_HEADER_OFFSET..KEYS_OFFSET]).unwrap()
-    }
 }
 
-impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>, KeyT: BtreeKey> BtreeInternalPage<BufT, KeyT> {
-    /// Formats `data` as an empty internal page that splits once it holds
-    /// more than `max_size` children.
+impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>> BtreeInternalPage<BufT> {
+    /// Formats `data` as an empty internal page.
+    pub fn init(mut data: BufT) -> Self {
+        PageHeader::init(&mut data, PageType::BTreeInternal);
+        LAYOUT.init(&mut data);
+        Self { data }
+    }
+
+    /// Makes this empty page a root with two children split by `key`.
+    ///
+    /// Fails with `KeyTooLarge` if `key` is longer than `MAX_KEY_SIZE`.
     ///
     /// # Panics
-    /// If `max_size` is less than 2 or more than `SLOT_CNT`.
-    pub fn init(mut data: BufT, max_size: usize) -> Self {
-        Self::check_max_size(max_size);
-        PageHeader::init(&mut data, PageType::BTreeInternal);
-        let header = InternalHeader {
-            size: 0.into(),
-            max_size: (max_size as u16).into(),
-        };
-        header
-            .write_to(&mut data[INTERNAL_HEADER_OFFSET..KEYS_OFFSET])
-            .unwrap();
-        Self {
-            data,
-            _key: PhantomData,
-        }
-    }
-
-    /// Makes this page a root with two children split by `key`.
-    pub fn populate_new_root(&mut self, left: PageId, key: KeyT, right: PageId) {
-        self.set_size(2);
-        self.write_value(0, left);
-        self.write_key(1, key);
-        self.write_value(1, right);
-    }
-
-    /// # Panics
-    /// If `size` is more than `max_size`.
-    pub fn set_size(&mut self, size: usize) {
-        assert!(
-            size <= self.max_size(),
-            "size {size} exceeds max size {}",
-            self.max_size()
-        );
-        self.header_mut().size = (size as u16).into();
-    }
-
-    /// # Panics
-    /// If the new size is negative or more than `max_size`.
-    pub fn change_size_by(&mut self, amount: isize) {
-        let size = self
-            .size()
-            .checked_add_signed(amount)
-            .expect("size would become negative");
-        self.set_size(size);
-    }
-
-    /// # Panics
-    /// If `max_size` is less than 2, more than `SLOT_CNT` or less than the
-    /// current size.
-    pub fn set_max_size(&mut self, max_size: usize) {
-        Self::check_max_size(max_size);
-        assert!(
-            max_size >= self.size(),
-            "max size {max_size} is less than size {}",
-            self.size()
-        );
-        self.header_mut().max_size = (max_size as u16).into();
+    /// If the page is not empty.
+    pub fn populate_new_root(&mut self, left: PageId, key: &[u8], right: PageId) -> Result<()> {
+        assert_eq!(self.size(), 0, "populate a root that is not empty");
+        check_key_size(key, Self::MAX_KEY_SIZE)?;
+        LAYOUT.insert(&mut self.data, 0, &[], I32::new(left).as_bytes());
+        LAYOUT.insert(&mut self.data, 1, key, I32::new(right).as_bytes());
+        Ok(())
     }
 
     /// Replaces the key at `index`, which must be in `1..size`. The caller
     /// keeps the keys in order.
-    pub fn set_key_at(&mut self, index: usize, key: KeyT) {
+    ///
+    /// Fails with `KeyTooLarge` if `key` is longer than `MAX_KEY_SIZE`, and
+    /// with `PageFull` if it is longer than the old key by more than the free
+    /// space.
+    pub fn set_key_at(&mut self, index: usize, key: &[u8]) -> Result<()> {
         self.check_key_index(index);
-        self.write_key(index, key);
+        check_key_size(key, Self::MAX_KEY_SIZE)?;
+        if key.len() > self.free_space() + LAYOUT.key(&self.data, index).len() {
+            return Err(StorageError::PageFull);
+        }
+        LAYOUT.set_key(&mut self.data, index, key);
+        Ok(())
     }
 
     /// Replaces the child at `index`, which must be in `0..size`.
@@ -296,26 +210,21 @@ impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>, KeyT: BtreeKey> BtreeInternalPage
     /// Inserts `key` with `child` as its right child, after any equal keys,
     /// and returns the index they were stored at.
     ///
-    /// Fails with `PageFull` if the page already holds `max_size` children;
-    /// the caller splits it first.
+    /// Fails with `KeyTooLarge` if `key` is longer than `MAX_KEY_SIZE`, and
+    /// with `PageFull` if the entry does not fit; the caller splits the page
+    /// first.
     ///
     /// # Panics
     /// If the page has no children: the leftmost child has no key, so it has
     /// to be set with `populate_new_root` or `push_front`.
-    pub fn insert(
-        &mut self,
-        key: KeyT,
-        child: PageId,
-        cmp: &impl KeyComparator<KeyT>,
-    ) -> Result<usize> {
+    pub fn insert(&mut self, key: &[u8], child: PageId, cmp: &impl KeyComparator) -> Result<usize> {
         assert!(self.size() > 0, "insert into an empty internal page");
-        if self.is_full() {
+        check_key_size(key, Self::MAX_KEY_SIZE)?;
+        if !self.has_room_for(key.len()) {
             return Err(StorageError::PageFull);
         }
-        let index = self.upper_bound(&key, cmp);
-        self.shift_right(index);
-        self.write_key(index, key);
-        self.write_value(index, child);
+        let index = self.upper_bound(key, cmp);
+        LAYOUT.insert(&mut self.data, index, key, I32::new(child).as_bytes());
         Ok(index)
     }
 
@@ -324,7 +233,10 @@ impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>, KeyT: BtreeKey> BtreeInternalPage
     /// leftmost one and its key is no longer read.
     pub fn remove_at(&mut self, index: usize) {
         self.check_value_index(index);
-        self.shift_left(index);
+        LAYOUT.remove(&mut self.data, index);
+        if index == 0 && self.size() > 0 {
+            LAYOUT.set_key(&mut self.data, 0, &[]);
+        }
     }
 
     /// Removes the leftmost child and the key after it, and returns them as
@@ -333,72 +245,64 @@ impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>, KeyT: BtreeKey> BtreeInternalPage
     ///
     /// # Panics
     /// If the page has fewer than 2 children.
-    pub fn remove_first(&mut self) -> (KeyT, PageId) {
+    pub fn remove_first(&mut self) -> (Vec<u8>, PageId) {
         assert!(self.size() >= 2, "remove_first needs at least 2 children");
-        let removed = (self.read_key(1), self.read_value(0));
-        self.shift_left(0);
+        let removed = (self.key_at(1).to_vec(), self.read_value(0));
+        self.remove_at(0);
         removed
     }
 
     /// Makes `child` the new leftmost child, with `key` between it and the
     /// old leftmost child. Used to take a child from the left sibling, with
-    /// the separator coming down from the parent as `key`.
+    /// the separator coming down from the parent as `key`. On an empty page
+    /// `key` is not stored.
     ///
-    /// Fails with `PageFull` if the page already holds `max_size` children.
-    pub fn push_front(&mut self, key: KeyT, child: PageId) -> Result<()> {
-        if self.is_full() {
+    /// Fails with `KeyTooLarge` if `key` is longer than `MAX_KEY_SIZE`, and
+    /// with `PageFull` if the entry does not fit.
+    pub fn push_front(&mut self, key: &[u8], child: PageId) -> Result<()> {
+        if self.size() == 0 {
+            LAYOUT.insert(&mut self.data, 0, &[], I32::new(child).as_bytes());
+            return Ok(());
+        }
+        check_key_size(key, Self::MAX_KEY_SIZE)?;
+        if !self.has_room_for(key.len()) {
             return Err(StorageError::PageFull);
         }
-        self.shift_right(0);
-        self.write_value(0, child);
-        if self.size() > 1 {
-            self.write_key(1, key);
-        }
+        LAYOUT.insert(&mut self.data, 0, &[], I32::new(child).as_bytes());
+        LAYOUT.set_key(&mut self.data, 1, key);
         Ok(())
     }
 
-    /// Moves the keys and children at `index..size` one slot right and grows
-    /// the page by one, leaving slot `index` to be written.
-    fn shift_right(&mut self, index: usize) {
-        let size = self.size();
-        let key_size = size_of::<KeyT>();
-        let keys = Self::key_range(index).start..Self::key_range(size).start;
-        self.data.copy_within(keys.clone(), keys.start + key_size);
-        let values = Self::value_range(index).start..Self::value_range(size).start;
-        self.data
-            .copy_within(values.clone(), values.start + PAGE_ID_SIZE);
-        self.set_size(size + 1);
-    }
-
-    /// Moves the keys and children at `index + 1..size` one slot left over
-    /// slot `index` and shrinks the page by one.
-    fn shift_left(&mut self, index: usize) {
-        let size = self.size();
-        let keys = Self::key_range(index + 1).start..Self::key_range(size).start;
-        self.data.copy_within(keys, Self::key_range(index).start);
-        let values = Self::value_range(index + 1).start..Self::value_range(size).start;
-        self.data
-            .copy_within(values, Self::value_range(index).start);
-        self.set_size(size - 1);
-    }
-
-    fn write_key(&mut self, index: usize, key: KeyT) {
-        self.data[Self::key_range(index)].copy_from_slice(key.as_bytes());
+    /// Moves the upper half of the children, by bytes, to `right`, an empty
+    /// internal page, and returns the key between the two halves. That key
+    /// goes up to the parent: it is left in neither page, and the child that
+    /// was to its right becomes `right`'s leftmost child.
+    ///
+    /// # Panics
+    /// If `right` is not empty or this page has fewer than 2 children.
+    pub fn split_to<RightBufT: DerefMut<Target = [u8; PAGE_SIZE]>>(
+        &mut self,
+        right: &mut BtreeInternalPage<RightBufT>,
+    ) -> Vec<u8> {
+        assert_eq!(right.size(), 0, "split into a page that is not empty");
+        let at = LAYOUT.split_index(&self.data);
+        let separator = LAYOUT.key(&self.data, at).to_vec();
+        LAYOUT.insert(&mut right.data, 0, &[], LAYOUT.value(&self.data, at));
+        for index in at + 1..self.size() {
+            LAYOUT.insert(
+                &mut right.data,
+                index - at,
+                LAYOUT.key(&self.data, index),
+                LAYOUT.value(&self.data, index),
+            );
+        }
+        LAYOUT.truncate(&mut self.data, at);
+        separator
     }
 
     fn write_value(&mut self, index: usize, page_id: PageId) {
-        self.data[Self::value_range(index)].copy_from_slice(I32::new(page_id).as_bytes());
-    }
-
-    fn check_max_size(max_size: usize) {
-        assert!(
-            (2..=Self::SLOT_CNT).contains(&max_size),
-            "max size {max_size} out of range 2..={}",
-            Self::SLOT_CNT
-        );
-    }
-
-    fn header_mut(&mut self) -> &mut InternalHeader {
-        InternalHeader::mut_from_bytes(&mut self.data[INTERNAL_HEADER_OFFSET..KEYS_OFFSET]).unwrap()
+        LAYOUT
+            .value_mut(&mut self.data, index)
+            .copy_from_slice(I32::new(page_id).as_bytes());
     }
 }

@@ -1,4 +1,3 @@
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use common::{INVALID_PAGE_ID, Rid};
@@ -6,12 +5,11 @@ use common::{INVALID_PAGE_ID, Rid};
 use crate::buffer::arc_replacer::AccessType;
 use crate::buffer::traced_buffer_pool_manager::TracedBufferPoolManager;
 use crate::error::Result;
-use crate::page::btree_internal_page::BtreeKey;
 use crate::page::btree_leaf_page::BtreeLeafPage;
 use crate::page::page_guard::ReadPageGuard;
 
-/// Iterates over the live keys of a B+tree in increasing order, with their
-/// record ids, following the leaves' `next_page_id` links. Tombstoned keys
+/// Iterates over the live keys of a B+tree in increasing order, copied out
+/// with their record ids, following the leaves' `next_page_id` links. Tombstoned keys
 /// are skipped.
 ///
 /// The current leaf stays read-latched until the iterator moves past it or
@@ -19,16 +17,15 @@ use crate::page::page_guard::ReadPageGuard;
 /// so leaves are always latched left to right.
 ///
 /// After an error the iterator is done.
-pub struct IndexIterator<KeyT, const NUM_TOMBS: usize = 0> {
+pub struct IndexIterator<const NUM_TOMBS: usize = 0> {
     bpm: Arc<TracedBufferPoolManager>,
     /// The leaf being read, or `None` once the iterator is done.
     guard: Option<ReadPageGuard>,
     /// Next slot to read on that leaf.
     idx: usize,
-    _key: PhantomData<KeyT>,
 }
 
-impl<KeyT: BtreeKey, const NUM_TOMBS: usize> IndexIterator<KeyT, NUM_TOMBS> {
+impl<const NUM_TOMBS: usize> IndexIterator<NUM_TOMBS> {
     /// Starts at slot `idx` of `leaf`, or is already done for `None`.
     pub(crate) fn new(
         bpm: Arc<TracedBufferPoolManager>,
@@ -39,7 +36,6 @@ impl<KeyT: BtreeKey, const NUM_TOMBS: usize> IndexIterator<KeyT, NUM_TOMBS> {
             bpm,
             guard: leaf,
             idx,
-            _key: PhantomData,
         }
     }
 
@@ -50,14 +46,14 @@ impl<KeyT: BtreeKey, const NUM_TOMBS: usize> IndexIterator<KeyT, NUM_TOMBS> {
     }
 
     /// Moves to the next live key, latching later leaves as needed.
-    fn advance(&mut self) -> Result<Option<(KeyT, Rid)>> {
+    fn advance(&mut self) -> Result<Option<(Vec<u8>, Rid)>> {
         while let Some(guard) = &self.guard {
-            let leaf = BtreeLeafPage::<_, KeyT, NUM_TOMBS>::new(guard.get_data())?;
+            let leaf = BtreeLeafPage::<_, NUM_TOMBS>::new(guard.get_data())?;
             while self.idx < leaf.size() {
                 let idx = self.idx;
                 self.idx += 1;
                 if !leaf.is_tombstone(idx) {
-                    return Ok(Some((leaf.key_at(idx), leaf.value_at(idx))));
+                    return Ok(Some((leaf.key_at(idx).to_vec(), leaf.value_at(idx))));
                 }
             }
             let next_page_id = leaf.next_page_id();
@@ -72,8 +68,8 @@ impl<KeyT: BtreeKey, const NUM_TOMBS: usize> IndexIterator<KeyT, NUM_TOMBS> {
     }
 }
 
-impl<KeyT: BtreeKey, const NUM_TOMBS: usize> Iterator for IndexIterator<KeyT, NUM_TOMBS> {
-    type Item = Result<(KeyT, Rid)>;
+impl<const NUM_TOMBS: usize> Iterator for IndexIterator<NUM_TOMBS> {
+    type Item = Result<(Vec<u8>, Rid)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.advance() {

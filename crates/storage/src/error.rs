@@ -64,6 +64,10 @@ pub enum StorageError {
     #[error("duplicate key")]
     DuplicateKey,
 
+    /// The key is too long for a B+tree page.
+    #[error("key of {size} bytes is longer than the maximum of {max}")]
+    KeyTooLarge { size: usize, max: usize },
+
     /// The tuple is too large to fit on any page.
     #[error("tuple of {size} bytes is larger than the maximum of {max}")]
     TupleTooLarge { size: usize, max: usize },

@@ -5,23 +5,22 @@ use common::{Column, DataType, Schema, Tuple, Value};
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::disk::disk_manager::DiskManager;
 use storage::index::IndexMetadata;
-use storage::index::btree_index::{BtreeIndex, INDEX_KEY_SIZE, IndexKey, KeySchemaComparator};
-use storage::page::btree_internal_page::KeyComparator;
+use storage::index::btree_index::{BtreeIndex, KeySchemaComparator};
+use storage::page::btree_page::KeyComparator;
 use tempfile::TempDir;
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Column::new("id", DataType::Int, true),
-        Column::new("name", DataType::Varchar(7), true),
+        Column::new("name", DataType::Varchar(16), true),
     ]))
 }
 
-fn key(schema: &Schema, id: Option<i32>, name: &str) -> IndexKey {
+fn key(schema: &Schema, id: Option<i32>, name: &str) -> Vec<u8> {
     let id = id.map_or(Value::Null, Value::Int);
-    let tuple = Tuple::encode(schema, &[id, Value::from(name)]).unwrap();
-    let mut key = [0; INDEX_KEY_SIZE];
-    key[..tuple.len()].copy_from_slice(tuple.data());
-    key
+    Tuple::encode(schema, &[id, Value::from(name)])
+        .unwrap()
+        .into_data()
 }
 
 #[test]
@@ -53,13 +52,22 @@ fn nulls_are_equal() {
 }
 
 #[test]
-fn padding_is_not_compared() {
-    let schema = schema();
+fn long_strings_compare_by_value() {
+    let schema = Arc::new(Schema::new(vec![Column::new(
+        "name",
+        DataType::Varchar(900),
+        false,
+    )]));
     let cmp = KeySchemaComparator::new(Arc::clone(&schema));
-    let a = key(&schema, Some(1), "a");
-    let mut b = a;
-    b[INDEX_KEY_SIZE - 1] = 0xff;
-    assert_eq!(cmp.compare(&a, &b), Ordering::Equal);
+    let encode = |s: &str| {
+        Tuple::encode(&schema, &[Value::from(s)])
+            .unwrap()
+            .into_data()
+    };
+    let (a, b) = (encode(&"a".repeat(800)), encode("b"));
+    assert!(a.len() > 800 && a.len() <= BtreeIndex::MAX_KEY_SIZE);
+    assert_eq!(cmp.compare(&a, &b), Ordering::Less);
+    assert_eq!(cmp.compare(&a, &a.clone()), Ordering::Equal);
 }
 
 #[test]
