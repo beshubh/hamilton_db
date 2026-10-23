@@ -178,11 +178,15 @@ impl DiskManager {
     }
 
     /// Reads the page into `page_data`. A page that has never been written
-    /// reads as all zeroes.
+    /// reads as all zeroes. It gets no slot until it is written: a slot
+    /// freed by `delete_page` still holds the deleted page's bytes.
     pub fn read_page(&self, page_id: PageId, page_data: &mut [u8; PAGE_SIZE]) -> Result<()> {
         check_page_id(page_id)?;
         let mut state = self.state.lock();
-        let offset = state.offset_or_allocate(page_id)?;
+        let Some(offset) = state.pages.get(&page_id).map(|entry| entry.offset) else {
+            page_data.fill(0);
+            return Ok(());
+        };
 
         state.db_io.seek(SeekFrom::Start(offset))?;
         let n = read_full(&mut state.db_io, page_data)?;
@@ -551,6 +555,16 @@ mod tests {
         let mut buf = page_filled(0);
         dm.read_page(1, &mut buf).unwrap();
         assert_eq!(buf, page_filled(2));
+    }
+
+    #[test]
+    fn unwritten_page_reads_as_zeroes_after_a_delete() {
+        let (_dir, dm) = setup();
+        dm.write_page(0, &page_filled(1)).unwrap();
+        dm.delete_page(0);
+        let mut data = page_filled(9);
+        dm.read_page(1, &mut data).unwrap();
+        assert_eq!(data, [0; PAGE_SIZE]);
     }
 
     #[test]
