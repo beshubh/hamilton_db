@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use catalog::TableInfo;
+use catalog::{IndexInfo, TableInfo};
 use common::{Rid, Schema, Tuple};
+use storage::index::IndexTrait;
 use storage::table::table_page::INVALID_UNDO_PTR;
 
-use super::{AbstractExecutor, COMMIT_TS, Executor, count_row};
+use super::{AbstractExecutor, COMMIT_TS, Executor, count_row, index_keys};
 use crate::Result;
 use crate::plans::{DeletePlan, PlanNode};
 
@@ -15,12 +16,12 @@ use crate::plans::{DeletePlan, PlanNode};
 /// There are no transactions to roll back yet, so it finds every row before
 /// deleting any: a WHERE that fails to evaluate deletes nothing.
 ///
-/// A delete only marks the tuple deleted. There is no undo log yet, so the
-/// tuple gets no undo entry, and no index entries are removed: storage has no
-/// B+ tree yet.
+/// A delete marks the tuple deleted and removes its entries from the table's
+/// indexes. There is no undo log yet, so the tuple gets no undo entry.
 pub struct DeleteExecutor {
     plan: DeletePlan,
     table: Arc<TableInfo>,
+    indexes: Vec<Arc<IndexInfo>>,
     child: Box<AbstractExecutor>,
     child_tuples: Vec<Tuple>,
     child_rids: Vec<Rid>,
@@ -28,10 +29,16 @@ pub struct DeleteExecutor {
 }
 
 impl DeleteExecutor {
-    pub fn new(plan: DeletePlan, table: Arc<TableInfo>, child: Box<AbstractExecutor>) -> Self {
+    pub fn new(
+        plan: DeletePlan,
+        table: Arc<TableInfo>,
+        indexes: Vec<Arc<IndexInfo>>,
+        child: Box<AbstractExecutor>,
+    ) -> Self {
         Self {
             plan,
             table,
+            indexes,
             child,
             child_tuples: Vec::new(),
             child_rids: Vec::new(),
@@ -64,12 +71,16 @@ impl Executor for DeleteExecutor {
             .next(&mut self.child_tuples, &mut self.child_rids, batch_size)?
         {
             debug_assert_eq!(self.child_rids.len(), self.child_tuples.len());
-            found.append(&mut self.child_rids);
+            found.extend(self.child_rids.drain(..).zip(self.child_tuples.drain(..)));
         }
-        for &rid in &found {
+        for (rid, tuple) in &found {
             self.table
                 .heap
-                .mark_delete(rid, COMMIT_TS, INVALID_UNDO_PTR)?;
+                .mark_delete(*rid, COMMIT_TS, INVALID_UNDO_PTR)?;
+            let keys = index_keys(&self.table, &self.indexes, tuple)?;
+            for (index, key) in self.indexes.iter().zip(&keys) {
+                index.index.delete_entry(key, *rid)?;
+            }
         }
         tuples.push(count_row(self.plan.get_output_schema(), found.len())?);
         Ok(true)
@@ -110,6 +121,19 @@ mod tests {
             db.users_rows(),
             [user(1, Some("user 1")), user(2, Some("user 2"))]
         );
+    }
+
+    #[test]
+    fn removes_the_rows_from_the_indexes() {
+        let db = Db::new();
+        db.catalog()
+            .create_index("users_name", "users", &["name"])
+            .unwrap();
+        db.insert_numbered(5);
+        let id_above_2 = compare(ComparisonOp::Gt, column(0), int(2));
+        delete(&db, Some(FilterPlan::new(id_above_2, db.scan(None))));
+        assert_eq!(db.index_lookup("users_name", &["user 2".into()]).len(), 1);
+        assert!(db.index_lookup("users_name", &["user 3".into()]).is_empty());
     }
 
     #[test]

@@ -12,9 +12,9 @@ pub mod planner;
 
 pub use binder::Binder;
 pub use bound::{
-    AggregateFunction, BoundAggregate, BoundCreateTable, BoundDelete, BoundExpr, BoundExprKind,
-    BoundFrom, BoundInsert, BoundOrderBy, BoundSelect, BoundSelectItem, BoundStatement, BoundTable,
-    BoundUpdate, BoundWindow, BoundWindowFunction, Function,
+    AggregateFunction, BoundAggregate, BoundCreateIndex, BoundCreateTable, BoundDelete, BoundExpr,
+    BoundExprKind, BoundFrom, BoundInsert, BoundOrderBy, BoundSelect, BoundSelectItem,
+    BoundStatement, BoundTable, BoundUpdate, BoundWindow, BoundWindowFunction, Function,
 };
 pub use error::{PlannerError, Result};
 pub use planner::Planner;

@@ -16,9 +16,9 @@ use catalog::Catalog;
 use common::Schema;
 use execution::expressions::{AbstractExpr, ColumnValueExpr};
 use execution::plans::{
-    AbstractPlanNode, Aggregate, AggregationPlan, CreateTablePlan, DeletePlan, FilterPlan,
-    InsertPlan, JoinType, LimitPlan, NestedLoopJoinPlan, OrderBy, PlanNode, ProjectionPlan,
-    SeqScanPlan, SortPlan, UpdatePlan, ValuesPlan, WindowColumn, WindowFunction,
+    AbstractPlanNode, Aggregate, AggregationPlan, CreateIndexPlan, CreateTablePlan, DeletePlan,
+    FilterPlan, InsertPlan, JoinType, LimitPlan, NestedLoopJoinPlan, OrderBy, PlanNode,
+    ProjectionPlan, SeqScanPlan, SortPlan, UpdatePlan, ValuesPlan, WindowColumn, WindowFunction,
     WindowFunctionKind, WindowPlan,
 };
 use parser::JoinKind;
@@ -45,8 +45,14 @@ impl<'a> Planner<'a> {
     /// The root of the plan for `stmt`.
     pub fn plan(&self, stmt: &BoundStatement) -> Result<Arc<AbstractPlanNode>> {
         let plan = match stmt {
-            BoundStatement::CreateTable(create) => {
-                CreateTablePlan::new(&create.name, create.schema.clone()).into()
+            BoundStatement::CreateTable(create) => CreateTablePlan::new(
+                &create.name,
+                create.schema.clone(),
+                create.primary_key.clone(),
+            )
+            .into(),
+            BoundStatement::CreateIndex(create) => {
+                CreateIndexPlan::new(&create.name, &create.table, create.columns.clone()).into()
             }
             BoundStatement::Insert(insert) => self.plan_insert(insert)?,
             BoundStatement::Select(select) => self.plan_select(select)?,

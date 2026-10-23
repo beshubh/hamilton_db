@@ -87,6 +87,7 @@ impl Database {
         }
         let command = match bound {
             BoundStatement::CreateTable(_) => return Ok(Output::Done("CREATE TABLE")),
+            BoundStatement::CreateIndex(_) => return Ok(Output::Done("CREATE INDEX")),
             BoundStatement::Select(_) => {
                 let columns = executor.get_output_schema().columns().to_vec();
                 return Ok(Output::Rows { columns, rows });
@@ -174,6 +175,26 @@ mod tests {
                 count: 1
             }
         );
+    }
+
+    #[test]
+    fn creates_indexes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(8))")
+            .unwrap();
+        assert_eq!(
+            one(&db, "CREATE INDEX t_name ON t (name)"),
+            Output::Done("CREATE INDEX")
+        );
+        db.close().unwrap();
+
+        let db = Database::open(&path).unwrap();
+        let indexes = db.ctx.catalog().table_indexes("t");
+        let names: Vec<_> = indexes.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["t_pkey", "t_name"]);
+        assert!(indexes[0].is_primary_key);
     }
 
     #[test]

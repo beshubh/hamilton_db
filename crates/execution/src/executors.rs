@@ -10,11 +10,12 @@
 //! pulls as many batches from the children as it needs to produce one of its
 //! own.
 //!
-//! So far there are executors for CREATE TABLE, INSERT ... VALUES, DELETE and
-//! SELECT ... WHERE; other plans fail with [`ExecutionError::NoExecutor`].
-//! There are no transactions yet, so every write is committed as soon as it
-//! is made.
+//! So far there are executors for CREATE TABLE, CREATE INDEX, INSERT ...
+//! VALUES, DELETE and SELECT ... WHERE; other plans fail with
+//! [`ExecutionError::NoExecutor`]. There are no transactions yet, so every
+//! write is committed as soon as it is made.
 
+mod create_index;
 mod create_table;
 mod delete;
 mod filter;
@@ -26,6 +27,7 @@ mod seq_scan;
 mod test_util;
 mod values;
 
+pub use create_index::CreateIndexExecutor;
 pub use create_table::CreateTableExecutor;
 pub use delete::DeleteExecutor;
 pub use filter::FilterExecutor;
@@ -36,7 +38,7 @@ pub use values::ValuesExecutor;
 
 use std::sync::Arc;
 
-use catalog::{TableInfo, TableOid};
+use catalog::{IndexInfo, TableInfo, TableOid};
 use common::{Rid, Schema, Tuple, Value};
 use enum_dispatch::enum_dispatch;
 
@@ -73,6 +75,7 @@ pub trait Executor {
 #[enum_dispatch(Executor)]
 pub enum AbstractExecutor {
     CreateTableExecutor,
+    CreateIndexExecutor,
     SeqScanExecutor,
     ValuesExecutor,
     InsertExecutor,
@@ -91,22 +94,23 @@ pub fn create_executor(
         AbstractPlanNode::CreateTablePlan(plan) => {
             CreateTableExecutor::new(Arc::clone(ctx), plan.clone()).into()
         }
+        AbstractPlanNode::CreateIndexPlan(plan) => {
+            CreateIndexExecutor::new(Arc::clone(ctx), plan.clone()).into()
+        }
         AbstractPlanNode::SeqScanPlan(plan) => {
             SeqScanExecutor::new(plan.clone(), table(ctx, plan.table_oid())?).into()
         }
         AbstractPlanNode::ValuesPlan(plan) => ValuesExecutor::new(plan.clone()).into(),
-        AbstractPlanNode::InsertPlan(plan) => InsertExecutor::new(
-            plan.clone(),
-            table(ctx, plan.table_oid())?,
-            child(plan.child())?,
-        )
-        .into(),
-        AbstractPlanNode::DeletePlan(plan) => DeleteExecutor::new(
-            plan.clone(),
-            table(ctx, plan.table_oid())?,
-            child(plan.child())?,
-        )
-        .into(),
+        AbstractPlanNode::InsertPlan(plan) => {
+            let table = table(ctx, plan.table_oid())?;
+            let indexes = ctx.catalog().table_indexes(&table.name);
+            InsertExecutor::new(plan.clone(), table, indexes, child(plan.child())?).into()
+        }
+        AbstractPlanNode::DeletePlan(plan) => {
+            let table = table(ctx, plan.table_oid())?;
+            let indexes = ctx.catalog().table_indexes(&table.name);
+            DeleteExecutor::new(plan.clone(), table, indexes, child(plan.child())?).into()
+        }
         AbstractPlanNode::FilterPlan(plan) => {
             FilterExecutor::new(plan.clone(), child(plan.child())?).into()
         }
@@ -140,6 +144,31 @@ fn table(ctx: &ExecutionContext, oid: TableOid) -> Result<Arc<TableInfo>> {
     ctx.catalog()
         .get_table_by_oid(oid)
         .ok_or(ExecutionError::TableNotFound(oid))
+}
+
+/// The key of `tuple`, a row of `table`, in each of `indexes`.
+fn index_keys(table: &TableInfo, indexes: &[Arc<IndexInfo>], tuple: &Tuple) -> Result<Vec<Tuple>> {
+    indexes
+        .iter()
+        .map(|index| Ok(tuple.to_key(&table.schema, &index.key_schema, &index.key_columns)?))
+        .collect()
+}
+
+/// The error for `key` already being in the primary key `index`.
+fn duplicate_key(index: &IndexInfo, key: &Tuple) -> ExecutionError {
+    let columns = index.key_schema.columns().iter().map(|c| c.name.as_str());
+    let values = match key.decode(&index.key_schema) {
+        Ok(values) => values.iter().map(ToString::to_string).collect(),
+        Err(_) => vec!["?".to_owned()],
+    };
+    ExecutionError::DuplicateKey {
+        index: index.name.clone(),
+        key: format!(
+            "({})=({})",
+            columns.collect::<Vec<_>>().join(", "),
+            values.join(", ")
+        ),
+    }
 }
 
 /// Whether `tuple` passes `predicate`: only TRUE does, not FALSE or NULL.

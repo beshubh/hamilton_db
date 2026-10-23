@@ -35,6 +35,7 @@ impl Db {
                     Column::new("score", DataType::BigInt, false),
                     Column::new("active", DataType::Bool, true),
                 ]),
+                &[],
             )
             .unwrap();
         catalog
@@ -45,6 +46,7 @@ impl Db {
                     Column::new("user_id", DataType::Int, true),
                     Column::new("total", DataType::BigInt, true),
                 ]),
+                &[],
             )
             .unwrap();
         Self { _dir: dir, catalog }
@@ -662,10 +664,75 @@ fn create_table() {
 }
 
 #[test]
+fn create_table_with_primary_key() {
+    let db = Db::new();
+    let BoundStatement::CreateTable(create) = db
+        .bind("CREATE TABLE t (a INT, b INT NULL, c INT, PRIMARY KEY (b, a))")
+        .unwrap()
+    else {
+        panic!("expected CREATE TABLE");
+    };
+    assert_eq!(create.primary_key, ["b", "a"]);
+    // Primary key columns are NOT NULL even if declared NULL.
+    assert_eq!(
+        create.schema,
+        Schema::new(vec![
+            Column::new("a", DataType::Int, false),
+            Column::new("b", DataType::Int, false),
+            Column::new("c", DataType::Int, true),
+        ])
+    );
+
+    assert_eq!(
+        db.err("CREATE TABLE t (a INT, PRIMARY KEY (b))"),
+        PlannerError::ColumnNotFound("b".into())
+    );
+    assert_eq!(
+        db.err("CREATE TABLE t (a INT, PRIMARY KEY (a, a))"),
+        PlannerError::DuplicateColumn("a".into())
+    );
+}
+
+#[test]
+fn create_index() {
+    let db = Db::new();
+    let BoundStatement::CreateIndex(create) = db
+        .bind("CREATE INDEX users_name ON users (name, id)")
+        .unwrap()
+    else {
+        panic!("expected CREATE INDEX");
+    };
+    assert_eq!(create.name, "users_name");
+    assert_eq!(create.table, "users");
+    assert_eq!(create.columns, ["name", "id"]);
+
+    assert_eq!(
+        db.err("CREATE INDEX i ON missing (id)"),
+        PlannerError::TableNotFound("missing".into())
+    );
+    assert_eq!(
+        db.err("CREATE INDEX i ON users (nope)"),
+        PlannerError::ColumnNotFound("nope".into())
+    );
+    assert_eq!(
+        db.err("CREATE INDEX i ON users (id, name, id)"),
+        PlannerError::DuplicateColumn("id".into())
+    );
+    db.catalog
+        .create_index("users_id", "users", &["id"])
+        .unwrap();
+    assert_eq!(
+        db.err("CREATE INDEX users_id ON orders (id)"),
+        PlannerError::IndexExists("users_id".into())
+    );
+}
+
+#[test]
 fn every_statement_kind_binds() {
     let db = Db::new();
     let stmts = parser::parse(
-        "CREATE TABLE t (a INT); INSERT INTO orders VALUES (1, 2, 3); \
+        "CREATE TABLE t (a INT); CREATE INDEX i ON orders (id); \
+         INSERT INTO orders VALUES (1, 2, 3); \
          SELECT * FROM orders; UPDATE orders SET total = 0; DELETE FROM orders",
     )
     .unwrap();
@@ -675,6 +742,7 @@ fn every_statement_kind_binds() {
         let same_kind = matches!(
             (stmt, &bound),
             (Statement::CreateTable(_), BoundStatement::CreateTable(_))
+                | (Statement::CreateIndex(_), BoundStatement::CreateIndex(_))
                 | (Statement::Insert(_), BoundStatement::Insert(_))
                 | (Statement::Select(_), BoundStatement::Select(_))
                 | (Statement::Update(_), BoundStatement::Update(_))

@@ -7,6 +7,8 @@ use parking_lot::RwLock;
 use storage::StorageError;
 use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
+use storage::index::btree_index::BtreeIndex;
+use storage::index::{Index, IndexMetadata};
 use storage::table::table_heap::TableHeap;
 
 use crate::error::{CatalogError, Result};
@@ -51,7 +53,6 @@ impl fmt::Debug for TableInfo {
 }
 
 /// A B+ tree index on some columns of a table.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexInfo {
     pub oid: IndexOid,
     pub name: String,
@@ -63,6 +64,25 @@ pub struct IndexInfo {
     pub key_schema: Schema,
     /// Header page of the index's B+ tree.
     pub header_page_id: PageId,
+    /// Whether this is its table's primary key, which is unique.
+    pub is_primary_key: bool,
+    /// The one open handle on the index's B+ tree.
+    pub index: Arc<Index>,
+}
+
+impl fmt::Debug for IndexInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IndexInfo")
+            .field("oid", &self.oid)
+            .field("name", &self.name)
+            .field("table_oid", &self.table_oid)
+            .field("table_name", &self.table_name)
+            .field("key_columns", &self.key_columns)
+            .field("key_schema", &self.key_schema)
+            .field("header_page_id", &self.header_page_id)
+            .field("is_primary_key", &self.is_primary_key)
+            .finish()
+    }
 }
 
 /// The tables and indexes of the database.
@@ -195,6 +215,7 @@ impl Catalog {
             let key_schema = key_schema(&table.schema, &key).ok_or_else(|| {
                 CatalogError::Corrupt(format!("index {} has a bad key column", row.name))
             })?;
+            let index = open_index(&bpm, table, &row, &key, &key_schema)?;
             let info = IndexInfo {
                 oid: row.oid,
                 name: row.name,
@@ -203,6 +224,8 @@ impl Catalog {
                 key_columns: key,
                 key_schema,
                 header_page_id: row.header_page_id,
+                is_primary_key: row.is_primary_key,
+                index,
             };
             state.add_index(Arc::new(info)).map_err(corrupt)?;
         }
@@ -216,7 +239,16 @@ impl Catalog {
     }
 
     /// Creates a table with an empty heap. Column names must be unique.
-    pub fn create_table(&self, name: &str, schema: Schema) -> Result<Arc<TableInfo>> {
+    ///
+    /// A non-empty `primary_key` names the table's primary key columns, in
+    /// key order, which must be NOT NULL. The table is then created with a
+    /// primary key index on them, named `<name>_pkey`.
+    pub fn create_table(
+        &self,
+        name: &str,
+        schema: Schema,
+        primary_key: &[&str],
+    ) -> Result<Arc<TableInfo>> {
         check_name(name)?;
         let mut seen = HashSet::new();
         for column in schema.columns() {
@@ -232,10 +264,30 @@ impl Catalog {
                 .into());
             }
         }
+        let pkey = if primary_key.is_empty() {
+            None
+        } else {
+            let key = resolve_key(name, &schema, primary_key)?;
+            if let Some(column) = key
+                .iter()
+                .map(|&i| &schema.columns()[i])
+                .find(|c| c.nullable)
+            {
+                return Err(CatalogError::NullablePrimaryKey(column.name.clone()));
+            }
+            let index_name = format!("{name}_pkey");
+            check_name(&index_name)?;
+            Some((index_name, key))
+        };
 
         let mut state = self.state.write();
         if state.table_names.contains_key(name) {
             return Err(CatalogError::TableExists(name.to_owned()));
+        }
+        if let Some((index_name, _)) = &pkey
+            && state.index_names.contains_key(index_name)
+        {
+            return Err(CatalogError::IndexExists(index_name.clone()));
         }
         // Taken before writing any rows, so a failed create's rows are never
         // mistaken for a later table's.
@@ -263,6 +315,9 @@ impl Catalog {
             heap: Arc::new(heap),
         });
         state.add_table(Arc::clone(&info))?;
+        if let Some((index_name, key)) = pkey {
+            self.add_index(&mut state, &index_name, &info, key, true)?;
+        }
         Ok(info)
     }
 
@@ -276,7 +331,8 @@ impl Catalog {
 
     /// Records an index on `key_columns` of `table_name` and allocates the
     /// header page for its B+ tree. Index names are unique across the
-    /// database.
+    /// database. The index is not a primary key: a table gets that only when
+    /// it is created.
     pub fn create_index(
         &self,
         name: &str,
@@ -284,10 +340,6 @@ impl Catalog {
         key_columns: &[&str],
     ) -> Result<Arc<IndexInfo>> {
         check_name(name)?;
-        if key_columns.is_empty() {
-            return Err(CatalogError::EmptyIndexKey);
-        }
-
         let mut state = self.state.write();
         if state.index_names.contains_key(name) {
             return Err(CatalogError::IndexExists(name.to_owned()));
@@ -296,32 +348,35 @@ impl Catalog {
             .table(table_name)
             .cloned()
             .ok_or_else(|| CatalogError::TableNotFound(table_name.to_owned()))?;
-        let mut key = Vec::with_capacity(key_columns.len());
-        for &column in key_columns {
-            let idx =
-                table
-                    .schema
-                    .index_of(column)
-                    .ok_or_else(|| CatalogError::ColumnNotFound {
-                        table: table_name.to_owned(),
-                        column: column.to_owned(),
-                    })?;
-            if key.contains(&idx) {
-                return Err(CatalogError::DuplicateColumn(column.to_owned()));
-            }
-            key.push(idx);
-        }
+        let key = resolve_key(table_name, &table.schema, key_columns)?;
+        self.add_index(&mut state, name, &table, key, false)
+    }
+
+    /// Writes out a new index on the `key` columns of `table`, whose name the
+    /// caller has checked is free.
+    fn add_index(
+        &self,
+        state: &mut CatalogState,
+        name: &str,
+        table: &TableInfo,
+        key: Vec<usize>,
+        is_primary_key: bool,
+    ) -> Result<Arc<IndexInfo>> {
         let key_schema = key_schema(&table.schema, &key).expect("key columns were resolved");
 
         let oid = state.next_index_oid;
         state.next_index_oid += 1;
 
-        // Dirty the page so it is written out and keeps its id across a
-        // restart, even before the B+ tree formats it.
-        let header_page_id = self.bpm.new_page();
-        self.bpm
-            .checked_write_page(header_page_id, AccessType::Index)?
-            .get_data_mut();
+        let row = IndexRow {
+            oid,
+            name: name.to_owned(),
+            table_oid: table.oid,
+            header_page_id: self.bpm.new_page(),
+            is_primary_key,
+        };
+        // Opening the tree formats its header page, which dirties it, so it
+        // is written out and keeps its id across a restart.
+        let index = open_index(&self.bpm, table, &row, &key, &key_schema)?;
 
         for (position, &column) in key.iter().enumerate() {
             self.system.insert_index_column(&IndexColumnRow {
@@ -330,12 +385,7 @@ impl Catalog {
                 column,
             })?;
         }
-        self.system.insert_index(&IndexRow {
-            oid,
-            name: name.to_owned(),
-            table_oid: table.oid,
-            header_page_id,
-        })?;
+        self.system.insert_index(&row)?;
 
         let info = Arc::new(IndexInfo {
             oid,
@@ -344,7 +394,9 @@ impl Catalog {
             table_name: table.name.clone(),
             key_columns: key,
             key_schema,
-            header_page_id,
+            header_page_id: row.header_page_id,
+            is_primary_key,
+            index,
         });
         state.add_index(Arc::clone(&info))?;
         Ok(info)
@@ -381,6 +433,48 @@ fn check_name(name: &str) -> Result<()> {
         return Err(CatalogError::InvalidName(name.to_owned()));
     }
     Ok(())
+}
+
+/// Opens the B+ tree of the index `row` describes, on the `key` columns of
+/// `table`.
+fn open_index(
+    bpm: &Arc<BufferPoolManager>,
+    table: &TableInfo,
+    row: &IndexRow,
+    key: &[usize],
+    key_schema: &Schema,
+) -> Result<Arc<Index>> {
+    let metadata = IndexMetadata::new(
+        row.name.clone(),
+        table.name.clone(),
+        key.to_vec(),
+        Arc::new(key_schema.clone()),
+        row.is_primary_key,
+    );
+    let index = BtreeIndex::new(metadata, row.header_page_id, Arc::clone(bpm))?;
+    Ok(Arc::new(index.into()))
+}
+
+/// The positions in `schema` of `columns`, the key of an index on table
+/// `table_name`.
+fn resolve_key(table_name: &str, schema: &Schema, columns: &[&str]) -> Result<Vec<usize>> {
+    if columns.is_empty() {
+        return Err(CatalogError::EmptyIndexKey);
+    }
+    let mut key = Vec::with_capacity(columns.len());
+    for &column in columns {
+        let idx = schema
+            .index_of(column)
+            .ok_or_else(|| CatalogError::ColumnNotFound {
+                table: table_name.to_owned(),
+                column: column.to_owned(),
+            })?;
+        if key.contains(&idx) {
+            return Err(CatalogError::DuplicateColumn(column.to_owned()));
+        }
+        key.push(idx);
+    }
+    Ok(key)
 }
 
 /// The columns of `schema` at `key`, or `None` if one is out of range.
@@ -460,6 +554,11 @@ mod tests {
         ])
     }
 
+    /// Checks that `a` and `b` describe the same index.
+    fn assert_same_index(a: &IndexInfo, b: &IndexInfo) {
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    }
+
     fn names(indexes: &[Arc<IndexInfo>]) -> Vec<&str> {
         indexes.iter().map(|i| i.name.as_str()).collect()
     }
@@ -480,7 +579,7 @@ mod tests {
     #[test]
     fn create_and_get_table() {
         let db = Db::new(8);
-        let created = db.catalog.create_table("users", users()).unwrap();
+        let created = db.catalog.create_table("users", users(), &[]).unwrap();
         let got = db.catalog.get_table("users").unwrap();
         assert!(Arc::ptr_eq(&created, &got));
         assert!(Arc::ptr_eq(
@@ -499,7 +598,7 @@ mod tests {
         drop(guard);
         assert_eq!(got.heap.iter().unwrap().count(), 0);
 
-        let other = db.catalog.create_table("orders", users()).unwrap();
+        let other = db.catalog.create_table("orders", users(), &[]).unwrap();
         assert_ne!(other.oid, created.oid);
         assert_ne!(other.first_page_id(), created.first_page_id());
     }
@@ -507,9 +606,9 @@ mod tests {
     #[test]
     fn create_table_rejects_bad_definitions() {
         let db = Db::new(8);
-        db.catalog.create_table("users", users()).unwrap();
+        db.catalog.create_table("users", users(), &[]).unwrap();
         assert!(matches!(
-            db.catalog.create_table("users", users()),
+            db.catalog.create_table("users", users(), &[]),
             Err(CatalogError::TableExists(name)) if name == "users"
         ));
 
@@ -518,26 +617,26 @@ mod tests {
             Column::new("a", DataType::Bool, false),
         ]);
         assert!(matches!(
-            db.catalog.create_table("t", dup),
+            db.catalog.create_table("t", dup, &[]),
             Err(CatalogError::DuplicateColumn(name)) if name == "a"
         ));
         assert!(matches!(
-            db.catalog.create_table("", users()),
+            db.catalog.create_table("", users(), &[]),
             Err(CatalogError::InvalidName(_))
         ));
         let long = "x".repeat(MAX_NAME_LEN as usize + 1);
         assert!(matches!(
-            db.catalog.create_table(&long, users()),
+            db.catalog.create_table(&long, users(), &[]),
             Err(CatalogError::InvalidName(_))
         ));
         let long_column = Schema::new(vec![Column::new(&long, DataType::Int, false)]);
         assert!(matches!(
-            db.catalog.create_table("t", long_column),
+            db.catalog.create_table("t", long_column, &[]),
             Err(CatalogError::InvalidName(_))
         ));
         let array = Schema::new(vec![Column::new("xs", DataType::Array, false)]);
         assert!(matches!(
-            db.catalog.create_table("t", array),
+            db.catalog.create_table("t", array, &[]),
             Err(CatalogError::Value(ValueError::NotStorable { .. }))
         ));
         assert!(db.catalog.get_table("t").is_none());
@@ -546,7 +645,7 @@ mod tests {
     #[test]
     fn create_and_get_index() {
         let db = Db::new(8);
-        let table = db.catalog.create_table("users", users()).unwrap();
+        let table = db.catalog.create_table("users", users(), &[]).unwrap();
         let index = db
             .catalog
             .create_index("users_name_id", "users", &["name", "id"])
@@ -575,7 +674,7 @@ mod tests {
     #[test]
     fn create_index_rejects_bad_definitions() {
         let db = Db::new(8);
-        db.catalog.create_table("users", users()).unwrap();
+        db.catalog.create_table("users", users(), &[]).unwrap();
         db.catalog
             .create_index("users_id", "users", &["id"])
             .unwrap();
@@ -603,10 +702,65 @@ mod tests {
     }
 
     #[test]
+    fn create_table_with_primary_key() {
+        let db = Db::new(8);
+        let table = db
+            .catalog
+            .create_table("users", users(), &["score", "id"])
+            .unwrap();
+        let [pkey] = db.catalog.table_indexes("users").try_into().unwrap();
+        assert_eq!(pkey.name, "users_pkey");
+        assert!(pkey.is_primary_key);
+        assert_eq!(pkey.table_oid, table.oid);
+        assert_eq!(pkey.key_columns, vec![2, 0]);
+
+        let index = db
+            .catalog
+            .create_index("users_name", "users", &["name"])
+            .unwrap();
+        assert!(!index.is_primary_key);
+
+        let db = db.restart();
+        assert_same_index(&db.catalog.get_index("users_pkey").unwrap(), &pkey);
+        assert_same_index(&db.catalog.get_index("users_name").unwrap(), &index);
+    }
+
+    #[test]
+    fn create_table_rejects_bad_primary_keys() {
+        let db = Db::new(8);
+        assert!(matches!(
+            db.catalog.create_table("t", users(), &["nope"]),
+            Err(CatalogError::ColumnNotFound { column, .. }) if column == "nope"
+        ));
+        assert!(matches!(
+            db.catalog.create_table("t", users(), &["id", "id"]),
+            Err(CatalogError::DuplicateColumn(name)) if name == "id"
+        ));
+        assert!(matches!(
+            db.catalog.create_table("t", users(), &["name"]),
+            Err(CatalogError::NullablePrimaryKey(name)) if name == "name"
+        ));
+        let long = "x".repeat(MAX_NAME_LEN as usize);
+        assert!(matches!(
+            db.catalog.create_table(&long, users(), &["id"]),
+            Err(CatalogError::InvalidName(name)) if name == format!("{long}_pkey")
+        ));
+        db.catalog.create_table("other", users(), &[]).unwrap();
+        db.catalog.create_index("t_pkey", "other", &["id"]).unwrap();
+        assert!(matches!(
+            db.catalog.create_table("t", users(), &["id"]),
+            Err(CatalogError::IndexExists(name)) if name == "t_pkey"
+        ));
+        // Nothing was created by the failed attempts.
+        assert!(db.catalog.get_table("t").is_none());
+        assert!(db.catalog.get_table(&long).is_none());
+    }
+
+    #[test]
     fn lists_indexes_of_a_table() {
         let db = Db::new(8);
-        db.catalog.create_table("users", users()).unwrap();
-        db.catalog.create_table("orders", users()).unwrap();
+        db.catalog.create_table("users", users(), &[]).unwrap();
+        db.catalog.create_table("orders", users(), &[]).unwrap();
         db.catalog
             .create_index("users_id", "users", &["id"])
             .unwrap();
@@ -622,7 +776,7 @@ mod tests {
             ["users_id", "users_name"]
         );
         assert_eq!(names(&db.catalog.table_indexes("orders")), ["orders_id"]);
-        db.catalog.create_table("empty", users()).unwrap();
+        db.catalog.create_table("empty", users(), &[]).unwrap();
         assert!(db.catalog.table_indexes("empty").is_empty());
         assert!(db.catalog.table_indexes("missing").is_empty());
     }
@@ -630,8 +784,11 @@ mod tests {
     #[test]
     fn survives_restart() {
         let db = Db::new(8);
-        let users_info = db.catalog.create_table("users", users()).unwrap();
-        let empty = db.catalog.create_table("empty", Schema::default()).unwrap();
+        let users_info = db.catalog.create_table("users", users(), &[]).unwrap();
+        let empty = db
+            .catalog
+            .create_table("empty", Schema::default(), &[])
+            .unwrap();
         let users_id = db
             .catalog
             .create_index("users_id", "users", &["id"])
@@ -660,10 +817,10 @@ mod tests {
         assert_eq!(empty_after.oid, empty.oid);
         assert!(empty_after.schema.is_empty());
 
-        assert_eq!(*db.catalog.get_index("users_id").unwrap(), *users_id);
-        assert_eq!(
-            *db.catalog.get_index("users_name_active").unwrap(),
-            *users_name
+        assert_same_index(&db.catalog.get_index("users_id").unwrap(), &users_id);
+        assert_same_index(
+            &db.catalog.get_index("users_name_active").unwrap(),
+            &users_name,
         );
         assert_eq!(
             names(&db.catalog.table_indexes("users")),
@@ -671,7 +828,7 @@ mod tests {
         );
 
         // New objects get fresh oids and pages after the restart.
-        let orders = db.catalog.create_table("orders", users()).unwrap();
+        let orders = db.catalog.create_table("orders", users(), &[]).unwrap();
         assert!(orders.oid > empty.oid);
         assert!(orders.first_page_id() > users_name.header_page_id);
         let orders_id = db
@@ -682,7 +839,7 @@ mod tests {
 
         let db = db.restart();
         assert_eq!(db.catalog.get_table("orders").unwrap().oid, orders.oid);
-        assert_eq!(*db.catalog.get_index("orders_id").unwrap(), *orders_id);
+        assert_same_index(&db.catalog.get_index("orders_id").unwrap(), &orders_id);
     }
 
     #[test]
@@ -690,7 +847,7 @@ mod tests {
         let db = Db::new(4);
         for i in 0..200 {
             let name = format!("table_{i}");
-            db.catalog.create_table(&name, users()).unwrap();
+            db.catalog.create_table(&name, users(), &[]).unwrap();
             db.catalog
                 .create_index(&format!("{name}_id"), &name, &["id"])
                 .unwrap();
@@ -723,7 +880,7 @@ mod tests {
 
         let db = db.restart();
         assert!(db.catalog.get_table_by_oid(orphan_oid).is_none());
-        let table = db.catalog.create_table("users", users()).unwrap();
+        let table = db.catalog.create_table("users", users(), &[]).unwrap();
         assert!(table.oid > orphan_oid);
 
         let db = db.restart();

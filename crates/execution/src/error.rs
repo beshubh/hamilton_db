@@ -24,6 +24,11 @@ pub enum ExecutionError {
     #[error(transparent)]
     Catalog(#[from] CatalogError),
 
+    /// A row's key is already in a primary key index, or is another
+    /// inserted row's. `key` is `(columns)=(values)`.
+    #[error("duplicate key value violates primary key {index}: {key} already exists")]
+    DuplicateKey { index: String, key: String },
+
     /// A plan names a table the catalog does not have.
     #[error("table with oid {0} does not exist")]
     TableNotFound(TableOid),

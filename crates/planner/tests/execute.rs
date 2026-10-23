@@ -32,21 +32,27 @@ impl Db {
 
     /// Runs one statement, returning its rows.
     fn run(&self, sql: &str) -> Vec<Vec<Value>> {
+        self.try_run(sql).unwrap()
+    }
+
+    /// Runs one statement, which must bind and plan, returning its rows or
+    /// the error that stopped its executors.
+    fn try_run(&self, sql: &str) -> Result<Vec<Vec<Value>>, ExecutionError> {
         let mut stmts = parser::parse(sql).unwrap();
         assert_eq!(stmts.len(), 1, "{sql}");
         let catalog = self.ctx.catalog();
         let bound = Binder::new(catalog).bind(&stmts.remove(0)).unwrap();
         let plan = Planner::new(catalog).plan(&bound).unwrap();
-        let mut executor = create_executor(&self.ctx, &plan).unwrap();
-        executor.init().unwrap();
+        let mut executor = create_executor(&self.ctx, &plan)?;
+        executor.init()?;
         let (mut tuples, mut rids) = (Vec::new(), Vec::new());
         let mut rows = Vec::new();
-        while executor.next(&mut tuples, &mut rids, 3).unwrap() {
+        while executor.next(&mut tuples, &mut rids, 3)? {
             for tuple in &tuples {
-                rows.push(tuple.decode(executor.get_output_schema()).unwrap());
+                rows.push(tuple.decode(executor.get_output_schema())?);
             }
         }
-        rows
+        Ok(rows)
     }
 
     fn try_plan(&self, sql: &str) -> Result<(), ExecutionError> {
@@ -105,6 +111,93 @@ fn create_insert_select_delete() {
     );
     assert_eq!(db.run("DELETE FROM users"), count(3));
     assert!(db.run("SELECT id FROM users").is_empty());
+}
+
+#[test]
+fn create_table_with_primary_key_and_index() {
+    let db = Db::new();
+    db.run("CREATE TABLE users (id INT, name VARCHAR(16), PRIMARY KEY (id))");
+    assert!(db.run("CREATE INDEX users_name ON users (name)").is_empty());
+
+    let catalog = db.ctx.catalog();
+    let table = catalog.get_table("users").unwrap();
+    assert!(!table.schema.column(0).unwrap().nullable);
+    let indexes = catalog.table_indexes("users");
+    let summary: Vec<_> = indexes
+        .iter()
+        .map(|index| {
+            (
+                index.name.as_str(),
+                index.key_columns.clone(),
+                index.is_primary_key,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("users_pkey", vec![0], true),
+            ("users_name", vec![1], false)
+        ]
+    );
+}
+
+fn assert_duplicate_key(result: Result<Vec<Vec<Value>>, ExecutionError>, index: &str, key: &str) {
+    match result {
+        Err(ExecutionError::DuplicateKey { index: i, key: k }) if i == index && k == key => {}
+        other => panic!("expected a duplicate {key} in {index}, got {other:?}"),
+    }
+}
+
+#[test]
+fn primary_key_rejects_duplicates() {
+    let db = Db::new();
+    db.run("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(16))");
+    assert_eq!(db.run("INSERT INTO users VALUES (1, 'ann')"), count(1));
+
+    assert_duplicate_key(
+        db.try_run("INSERT INTO users VALUES (1, 'bo')"),
+        "users_pkey",
+        "(id)=(1)",
+    );
+    // A duplicate within one statement, or anywhere in it, inserts nothing.
+    assert_duplicate_key(
+        db.try_run("INSERT INTO users VALUES (2, 'bo'), (2, 'cy')"),
+        "users_pkey",
+        "(id)=(2)",
+    );
+    assert_duplicate_key(
+        db.try_run("INSERT INTO users VALUES (3, 'cy'), (1, 'dee')"),
+        "users_pkey",
+        "(id)=(1)",
+    );
+    assert_eq!(
+        db.run("SELECT * FROM users"),
+        [vec![Value::Int(1), Value::from("ann")]]
+    );
+
+    // A deleted row's key can be used again.
+    assert_eq!(db.run("DELETE FROM users WHERE id = 1"), count(1));
+    assert_eq!(db.run("INSERT INTO users VALUES (1, 'bo')"), count(1));
+    assert_eq!(
+        db.run("SELECT * FROM users"),
+        [vec![Value::Int(1), Value::from("bo")]]
+    );
+}
+
+#[test]
+fn composite_primary_key_rejects_duplicates_of_the_whole_key() {
+    let db = Db::new();
+    db.run("CREATE TABLE t (a INT, b VARCHAR(8), PRIMARY KEY (a, b))");
+    assert_eq!(
+        db.run("INSERT INTO t VALUES (1, 'x'), (1, 'y'), (2, 'x')"),
+        count(3)
+    );
+    assert_duplicate_key(
+        db.try_run("INSERT INTO t VALUES (1, 'y')"),
+        "t_pkey",
+        "(a, b)=(1, y)",
+    );
 }
 
 #[test]

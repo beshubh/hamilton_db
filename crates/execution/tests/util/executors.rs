@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use catalog::{Catalog, TableInfo};
-use common::{Column, DataType, Schema, Tuple, Value};
+use common::{Column, DataType, Rid, Schema, Tuple, Value};
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::disk::disk_manager::DiskManager;
+use storage::index::IndexTrait;
 use tempfile::TempDir;
 
 use super::{Executor, create_executor};
@@ -36,7 +37,7 @@ impl Db {
         let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
         let bpm = Arc::new(BufferPoolManager::new(NUM_FRAMES, dm));
         let catalog = Catalog::open(bpm).unwrap();
-        let users = catalog.create_table("users", users_schema()).unwrap();
+        let users = catalog.create_table("users", users_schema(), &[]).unwrap();
         Self {
             _dir: dir,
             ctx: Arc::new(ExecutionContext::new(Arc::new(catalog))),
@@ -100,6 +101,15 @@ impl Db {
     pub fn scan(&self, filter: Option<AbstractExpr>) -> Arc<AbstractPlanNode> {
         let scan = SeqScanPlan::new(self.users.oid, "users", users_schema(), filter);
         Arc::new(scan.into())
+    }
+
+    /// The record ids index `name` holds for the key made of `values`.
+    pub fn index_lookup(&self, name: &str, values: &[Value]) -> Vec<Rid> {
+        let index = self.catalog().get_index(name).unwrap();
+        let key = Tuple::encode(&index.key_schema, values).unwrap();
+        let mut rids = Vec::new();
+        index.index.scan_key(&key, &mut rids).unwrap();
+        rids
     }
 
     /// The users table's rows, in storage order.

@@ -16,6 +16,9 @@ pub enum ParseError {
     #[error("integer {0} is out of range")]
     IntegerOutOfRange(String),
 
+    #[error("multiple primary keys for table {0} are not allowed")]
+    MultiplePrimaryKeys(String),
+
     #[error("VARCHAR length {0} must be between 1 and {max}", max = u32::MAX)]
     InvalidVarcharLength(u64),
 }

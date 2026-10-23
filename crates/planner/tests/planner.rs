@@ -38,6 +38,7 @@ impl Db {
                     Column::new("score", DataType::BigInt, false),
                     Column::new("active", DataType::Bool, true),
                 ]),
+                &[],
             )
             .unwrap();
         catalog
@@ -48,6 +49,7 @@ impl Db {
                     Column::new("user_id", DataType::Int, true),
                     Column::new("total", DataType::BigInt, true),
                 ]),
+                &[],
             )
             .unwrap();
         Self { _dir: dir, catalog }
@@ -72,6 +74,7 @@ impl Db {
 fn shape(plan: &AbstractPlanNode) -> String {
     let name = match plan {
         AbstractPlanNode::CreateTablePlan(_) => "CreateTable",
+        AbstractPlanNode::CreateIndexPlan(_) => "CreateIndex",
         AbstractPlanNode::SeqScanPlan(scan) => return format!("SeqScan {}", scan.table_name()),
         AbstractPlanNode::IndexScanPlan(_) => "IndexScan",
         AbstractPlanNode::ValuesPlan(_) => "Values",
@@ -272,6 +275,26 @@ fn create_table() {
     };
     assert_eq!(create.table_name(), "t");
     assert_eq!(names(create.table_schema()), ["a", "b"]);
+    assert!(create.primary_key().is_empty());
+    assert!(create.get_output_schema().is_empty());
+
+    let plan = db.plan("CREATE TABLE t (a INT, b INT, PRIMARY KEY (b, a))");
+    let AbstractPlanNode::CreateTablePlan(create) = &*plan else {
+        panic!("{plan:?}");
+    };
+    assert_eq!(create.primary_key(), ["b", "a"]);
+}
+
+#[test]
+fn create_index() {
+    let db = Db::new();
+    let plan = db.plan("CREATE INDEX users_name ON users (name, id)");
+    let AbstractPlanNode::CreateIndexPlan(create) = &*plan else {
+        panic!("{plan:?}");
+    };
+    assert_eq!(create.index_name(), "users_name");
+    assert_eq!(create.table_name(), "users");
+    assert_eq!(create.key_columns(), ["name", "id"]);
     assert!(create.get_output_schema().is_empty());
 }
 

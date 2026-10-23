@@ -7,7 +7,8 @@ use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::plans::{CreateTablePlan, PlanNode};
 
-/// Creates the table on the first call to `next`. Produces no rows.
+/// Creates the table, and its primary key index, on the first call to
+/// `next`. Produces no rows.
 pub struct CreateTableExecutor {
     ctx: Arc<ExecutionContext>,
     plan: CreateTablePlan,
@@ -40,9 +41,13 @@ impl Executor for CreateTableExecutor {
         rids.clear();
         if !self.done {
             self.done = true;
-            self.ctx
-                .catalog()
-                .create_table(self.plan.table_name(), self.plan.table_schema().clone())?;
+            let primary_key: Vec<&str> =
+                self.plan.primary_key().iter().map(String::as_str).collect();
+            self.ctx.catalog().create_table(
+                self.plan.table_name(),
+                self.plan.table_schema().clone(),
+                &primary_key,
+            )?;
         }
         Ok(false)
     }
@@ -63,18 +68,30 @@ mod tests {
     #[test]
     fn creates_the_table() {
         let db = Db::new();
-        let rows = db.run(CreateTablePlan::new("t", users_schema()).into());
+        let rows = db.run(CreateTablePlan::new("t", users_schema(), vec![]).into());
         assert!(rows.unwrap().is_empty());
         let table = db.catalog().get_table("t").unwrap();
         assert_eq!(table.schema, users_schema());
         assert_eq!(table.heap.iter().unwrap().count(), 0);
+        assert!(db.catalog().table_indexes("t").is_empty());
+    }
+
+    #[test]
+    fn creates_the_primary_key_index() {
+        let db = Db::new();
+        let plan = CreateTablePlan::new("t", users_schema(), vec!["id".into()]);
+        db.run(plan.into()).unwrap();
+        let [pkey] = db.catalog().table_indexes("t").try_into().unwrap();
+        assert_eq!(pkey.name, "t_pkey");
+        assert!(pkey.is_primary_key);
+        assert_eq!(pkey.key_columns, [0]);
     }
 
     #[test]
     fn existing_table_fails() {
         let db = Db::new();
         let err = db
-            .run(CreateTablePlan::new("users", users_schema()).into())
+            .run(CreateTablePlan::new("users", users_schema(), vec![]).into())
             .unwrap_err();
         assert!(matches!(
             err,

@@ -15,16 +15,17 @@ use common::{Column, DataType, Value};
 use sqlparser::ast::{
     self as sql, Assignment, AssignmentTarget, BinaryOperator, CharacterLength, ColumnDef,
     ColumnOption, Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    Ident, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByKind,
-    OrderBySort, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, TableFactor, TableObject,
+    Ident, IndexColumn, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart,
+    OrderByKind, OrderByOptions, OrderBySort, PrimaryKeyConstraint, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, TableConstraint, TableFactor, TableObject,
     TableWithJoins, UnaryOperator, WindowType,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::ast::{
-    self, BinaryOp, CreateTable, Delete, FromItem, Insert, JoinKind, OrderByItem, Select,
-    Statement, TableRef, UnaryOp, Update, WindowSpec,
+    self, BinaryOp, CreateIndex, CreateTable, Delete, FromItem, Insert, JoinKind, OrderByItem,
+    Select, Statement, TableRef, UnaryOp, Update, WindowSpec,
 };
 use crate::error::{ParseError, Result};
 
@@ -39,6 +40,7 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
 fn convert_statement(stmt: &sql::Statement) -> Result<Statement> {
     match stmt {
         sql::Statement::CreateTable(create) => convert_create_table(stmt, create),
+        sql::Statement::CreateIndex(create) => convert_create_index(stmt, create),
         sql::Statement::Insert(insert) => convert_insert(stmt, insert),
         sql::Statement::Query(query) => {
             convert_query(query).map(|select| Statement::Select(Box::new(select)))
@@ -56,36 +58,51 @@ fn convert_create_table(stmt: &sql::Statement, create: &sql::CreateTable) -> Res
     if create.query.is_some() {
         return Err(ParseError::Unsupported("CREATE TABLE ... AS".into()));
     }
-    if !create.constraints.is_empty() {
-        return Err(ParseError::Unsupported("table constraints".into()));
-    }
     if create.columns.is_empty() {
         return Err(ParseError::Unsupported("a table with no columns".into()));
     }
 
-    let canonical = format!(
-        "CREATE TABLE {} ({})",
-        create.name,
-        join(create.columns.iter())
-    );
+    let elements = create
+        .columns
+        .iter()
+        .map(ToString::to_string)
+        .chain(create.constraints.iter().map(ToString::to_string));
+    let canonical = format!("CREATE TABLE {} ({})", create.name, join(elements));
     ensure_canonical(
         stmt,
         &canonical,
-        "CREATE TABLE <name> (<column> <type>, ...)",
+        "CREATE TABLE <name> (<column> <type>, ... [, PRIMARY KEY (<column>, ...)])",
     )?;
 
+    let name = object_name(&create.name)?;
+    let mut columns = Vec::with_capacity(create.columns.len());
+    let mut primary_keys = Vec::new();
+    for column in &create.columns {
+        let (column, primary_key) = convert_column(column)?;
+        if primary_key {
+            primary_keys.push(vec![column.name.clone()]);
+        }
+        columns.push(column);
+    }
+    for constraint in &create.constraints {
+        primary_keys.push(convert_primary_key(constraint)?);
+    }
+    let primary_key = match primary_keys.len() {
+        0 => Vec::new(),
+        1 => primary_keys.remove(0),
+        _ => return Err(ParseError::MultiplePrimaryKeys(name)),
+    };
     Ok(Statement::CreateTable(CreateTable {
-        name: object_name(&create.name)?,
-        columns: create
-            .columns
-            .iter()
-            .map(convert_column)
-            .collect::<Result<_>>()?,
+        name,
+        columns,
+        primary_key,
     }))
 }
 
-fn convert_column(column: &ColumnDef) -> Result<Column> {
+/// The column, and whether it is declared `PRIMARY KEY`.
+fn convert_column(column: &ColumnDef) -> Result<(Column, bool)> {
     let mut nullable = true;
+    let mut primary_key = false;
     for option in &column.options {
         match &option.option {
             _ if option.name.is_some() => {
@@ -95,16 +112,97 @@ fn convert_column(column: &ColumnDef) -> Result<Column> {
             }
             ColumnOption::Null => nullable = true,
             ColumnOption::NotNull => nullable = false,
+            ColumnOption::PrimaryKey(PrimaryKeyConstraint {
+                name: None,
+                index_name: None,
+                index_type: None,
+                columns,
+                include,
+                index_options,
+                characteristics: None,
+            }) if columns.is_empty() && include.is_empty() && index_options.is_empty() => {
+                primary_key = true;
+            }
             _ => {
                 return Err(ParseError::Unsupported(format!("column option `{option}`")));
             }
         }
     }
-    Ok(Column::new(
+    let column = Column::new(
         ident(&column.name),
         convert_data_type(&column.data_type)?,
         nullable,
-    ))
+    );
+    Ok((column, primary_key))
+}
+
+/// The columns of a `PRIMARY KEY (col, ...)` table constraint, the only
+/// kind supported.
+fn convert_primary_key(constraint: &TableConstraint) -> Result<Vec<String>> {
+    match constraint {
+        TableConstraint::PrimaryKey(PrimaryKeyConstraint {
+            name: None,
+            index_name: None,
+            index_type: None,
+            columns,
+            include,
+            index_options,
+            characteristics: None,
+        }) if include.is_empty() && index_options.is_empty() => {
+            columns.iter().map(index_column).collect()
+        }
+        _ => Err(ParseError::Unsupported(format!(
+            "table constraint `{constraint}`"
+        ))),
+    }
+}
+
+fn convert_create_index(stmt: &sql::Statement, create: &sql::CreateIndex) -> Result<Statement> {
+    let Some(name) = &create.name else {
+        return Err(ParseError::Unsupported(
+            "CREATE INDEX without a name".into(),
+        ));
+    };
+    let canonical = format!(
+        "CREATE INDEX {name} ON {}({})",
+        create.table_name,
+        join(create.columns.iter())
+    );
+    ensure_canonical(
+        stmt,
+        &canonical,
+        "CREATE INDEX <name> ON <table> (<column>, ...)",
+    )?;
+    Ok(Statement::CreateIndex(CreateIndex {
+        name: object_name(name)?,
+        table: object_name(&create.table_name)?,
+        columns: create
+            .columns
+            .iter()
+            .map(index_column)
+            .collect::<Result<_>>()?,
+    }))
+}
+
+/// A key column of an index or primary key: a column name, with no sort
+/// order or operator class.
+fn index_column(column: &IndexColumn) -> Result<String> {
+    match column {
+        IndexColumn {
+            column:
+                sql::OrderByExpr {
+                    expr: Expr::Identifier(id),
+                    options:
+                        OrderByOptions {
+                            sort: None,
+                            nulls_first: None,
+                        },
+                    with_fill: None,
+                },
+            operator_class: None,
+        } => Ok(ident(id)),
+        _ => Err(ParseError::Unsupported(format!("index column `{column}`"))),
+    }
 }
 
 fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
@@ -778,8 +876,80 @@ mod tests {
                     Column::new("big", DataType::BigInt, true),
                     Column::new("ok", DataType::Bool, true),
                 ],
+                primary_key: vec![],
             })
         );
+    }
+
+    fn primary_key(sql: &str) -> Vec<String> {
+        match parse_one(sql).unwrap() {
+            Statement::CreateTable(create) => create.primary_key,
+            other => panic!("expected CREATE TABLE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_table_with_primary_key() {
+        assert_eq!(primary_key("CREATE TABLE t (id INT PRIMARY KEY)"), ["id"]);
+        assert_eq!(
+            primary_key("CREATE TABLE t (a INT NOT NULL PRIMARY KEY, b INT)"),
+            ["a"]
+        );
+        assert_eq!(
+            primary_key("CREATE TABLE t (a INT, B INT, PRIMARY KEY (b, a))"),
+            ["b", "a"]
+        );
+        // Columns declared PRIMARY KEY keep their nullability here; the
+        // binder makes them NOT NULL.
+        let Statement::CreateTable(create) =
+            parse_one("CREATE TABLE t (id INT PRIMARY KEY)").unwrap()
+        else {
+            panic!("expected CREATE TABLE");
+        };
+        assert!(create.columns[0].nullable);
+    }
+
+    #[test]
+    fn create_table_rejects_more_than_one_primary_key() {
+        for sql in [
+            "CREATE TABLE t (a INT PRIMARY KEY, b INT PRIMARY KEY)",
+            "CREATE TABLE t (a INT PRIMARY KEY, b INT, PRIMARY KEY (b))",
+            "CREATE TABLE t (a INT, PRIMARY KEY (a), PRIMARY KEY (a))",
+        ] {
+            assert!(
+                matches!(parse_one(sql), Err(ParseError::MultiplePrimaryKeys(t)) if t == "t"),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_index() {
+        assert_eq!(
+            parse_one("CREATE INDEX Users_Name ON Users (name, \"Id\")").unwrap(),
+            Statement::CreateIndex(CreateIndex {
+                name: "users_name".into(),
+                table: "users".into(),
+                columns: vec!["name".into(), "Id".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn create_index_rejects_unsupported_parts() {
+        assert_unsupported("CREATE INDEX ON t (a)");
+        assert_unsupported("CREATE UNIQUE INDEX i ON t (a)");
+        assert_unsupported("CREATE INDEX IF NOT EXISTS i ON t (a)");
+        assert_unsupported("CREATE INDEX CONCURRENTLY i ON t (a)");
+        assert_unsupported("CREATE INDEX i ON t USING hash (a)");
+        assert_unsupported("CREATE INDEX i ON t (a DESC)");
+        assert_unsupported("CREATE INDEX i ON t (a NULLS FIRST)");
+        assert_unsupported("CREATE INDEX i ON t (lower(a))");
+        assert_unsupported("CREATE INDEX i ON t (a text_pattern_ops)");
+        assert_unsupported("CREATE INDEX i ON t (a) INCLUDE (b)");
+        assert_unsupported("CREATE INDEX i ON t (a) WHERE a > 0");
+        assert_unsupported("CREATE INDEX i ON s.t (a)");
+        assert_unsupported("CREATE INDEX s.i ON t (a)");
     }
 
     #[test]
@@ -796,9 +966,15 @@ mod tests {
     #[test]
     fn create_table_rejects_unsupported_parts() {
         assert_unsupported("CREATE TABLE IF NOT EXISTS t (id INT)");
-        assert_unsupported("CREATE TABLE t (id INT PRIMARY KEY)");
         assert_unsupported("CREATE TABLE t (id INT DEFAULT 1)");
-        assert_unsupported("CREATE TABLE t (id INT, PRIMARY KEY (id))");
+        assert_unsupported("CREATE TABLE t (id INT UNIQUE)");
+        assert_unsupported("CREATE TABLE t (id INT CONSTRAINT pk PRIMARY KEY)");
+        assert_unsupported("CREATE TABLE t (id INT PRIMARY KEY DEFERRABLE)");
+        assert_unsupported("CREATE TABLE t (id INT, CONSTRAINT pk PRIMARY KEY (id))");
+        assert_unsupported("CREATE TABLE t (id INT, PRIMARY KEY (id DESC))");
+        assert_unsupported("CREATE TABLE t (id INT, PRIMARY KEY (id) INCLUDE (id))");
+        assert_unsupported("CREATE TABLE t (id INT, UNIQUE (id))");
+        assert_unsupported("CREATE TABLE t (id INT, CHECK (id > 0))");
         assert_unsupported("CREATE TABLE t (x TEXT)");
         assert_unsupported("CREATE TABLE t (x VARCHAR)");
         assert_unsupported("CREATE TEMPORARY TABLE t (id INT)");
@@ -1299,7 +1475,7 @@ mod tests {
     #[test]
     fn other_statements_are_unsupported() {
         assert_unsupported("DROP TABLE t");
-        assert_unsupported("CREATE INDEX i ON t (id)");
+        assert_unsupported("DROP INDEX i");
     }
 
     #[test]

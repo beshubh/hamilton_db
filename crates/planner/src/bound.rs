@@ -27,6 +27,7 @@ use parser::{BinaryOp, JoinKind, UnaryOp};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundStatement {
     CreateTable(BoundCreateTable),
+    CreateIndex(BoundCreateIndex),
     Insert(BoundInsert),
     Select(BoundSelect),
     Update(BoundUpdate),
@@ -36,7 +37,18 @@ pub enum BoundStatement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundCreateTable {
     pub name: String,
+    /// Primary key columns are NOT NULL.
     pub schema: Schema,
+    /// The primary key columns, in key order. Empty for no primary key.
+    pub primary_key: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundCreateIndex {
+    pub name: String,
+    pub table: String,
+    /// The key columns, in key order: distinct columns of the table.
+    pub columns: Vec<String>,
 }
 
 /// A table resolved in the catalog.

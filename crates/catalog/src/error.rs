@@ -34,6 +34,9 @@ pub enum CatalogError {
     #[error("an index needs at least one key column")]
     EmptyIndexKey,
 
+    #[error("primary key column {0} must be NOT NULL")]
+    NullablePrimaryKey(String),
+
     #[error("name {0:?} is empty or longer than {MAX_NAME_LEN} bytes")]
     InvalidName(String),
 

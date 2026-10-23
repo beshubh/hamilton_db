@@ -26,7 +26,7 @@ use crate::error::{CatalogError, Result};
 pub const CATALOG_PAGE_ID: PageId = 0;
 
 const MAGIC: u64 = u64::from_le_bytes(*b"HAMDBCAT");
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]

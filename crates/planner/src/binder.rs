@@ -14,16 +14,17 @@ use std::collections::HashSet;
 use catalog::Catalog;
 use common::{Schema, Value, ValueError};
 use parser::{
-    CreateTable, Delete, Expr, FromItem, Insert, JoinKind, OrderByItem, Select, SelectItem,
-    Statement, TableRef, Update,
+    CreateIndex, CreateTable, Delete, Expr, FromItem, Insert, JoinKind, OrderByItem, Select,
+    SelectItem, Statement, TableRef, Update,
 };
 
 use self::aggregate::Rewriter;
 use self::expr::{UNNAMED_COLUMN, assign, forbid_calls, forbid_windows, null_for};
 use self::scope::Scope;
 use crate::bound::{
-    BoundCreateTable, BoundDelete, BoundExpr, BoundExprKind, BoundFrom, BoundInsert, BoundOrderBy,
-    BoundSelect, BoundSelectItem, BoundStatement, BoundTable, BoundUpdate,
+    BoundCreateIndex, BoundCreateTable, BoundDelete, BoundExpr, BoundExprKind, BoundFrom,
+    BoundInsert, BoundOrderBy, BoundSelect, BoundSelectItem, BoundStatement, BoundTable,
+    BoundUpdate,
 };
 use crate::error::{PlannerError, Result};
 
@@ -39,6 +40,7 @@ impl<'a> Binder<'a> {
     pub fn bind(&self, stmt: &Statement) -> Result<BoundStatement> {
         match stmt {
             Statement::CreateTable(create) => self.bind_create_table(create),
+            Statement::CreateIndex(create) => self.bind_create_index(create),
             Statement::Insert(insert) => self.bind_insert(insert),
             Statement::Select(select) => self.bind_select(select, None).map(BoundStatement::Select),
             Statement::Update(update) => self.bind_update(update),
@@ -47,13 +49,49 @@ impl<'a> Binder<'a> {
     }
 
     /// The catalog checks the column names when the table is created.
+    /// Primary key columns are made NOT NULL, as in Postgres.
     fn bind_create_table(&self, create: &CreateTable) -> Result<BoundStatement> {
         if self.catalog.get_table(&create.name).is_some() {
             return Err(PlannerError::TableExists(create.name.clone()));
         }
+        let mut columns = create.columns.clone();
+        for (i, name) in create.primary_key.iter().enumerate() {
+            if create.primary_key[..i].contains(name) {
+                return Err(PlannerError::DuplicateColumn(name.clone()));
+            }
+            let column = columns
+                .iter_mut()
+                .find(|column| column.name == *name)
+                .ok_or_else(|| PlannerError::ColumnNotFound(name.clone()))?;
+            column.nullable = false;
+        }
         Ok(BoundStatement::CreateTable(BoundCreateTable {
             name: create.name.clone(),
-            schema: Schema::new(create.columns.clone()),
+            schema: Schema::new(columns),
+            primary_key: create.primary_key.clone(),
+        }))
+    }
+
+    fn bind_create_index(&self, create: &CreateIndex) -> Result<BoundStatement> {
+        if self.catalog.get_index(&create.name).is_some() {
+            return Err(PlannerError::IndexExists(create.name.clone()));
+        }
+        let table = self.bind_table(&TableRef {
+            name: create.table.clone(),
+            alias: None,
+        })?;
+        for (i, name) in create.columns.iter().enumerate() {
+            if table.schema.index_of(name).is_none() {
+                return Err(PlannerError::ColumnNotFound(name.clone()));
+            }
+            if create.columns[..i].contains(name) {
+                return Err(PlannerError::DuplicateColumn(name.clone()));
+            }
+        }
+        Ok(BoundStatement::CreateIndex(BoundCreateIndex {
+            name: create.name.clone(),
+            table: table.name,
+            columns: create.columns.clone(),
         }))
     }
 

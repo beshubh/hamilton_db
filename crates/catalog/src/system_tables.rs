@@ -4,7 +4,8 @@
 //! tables         (oid INT, name VARCHAR, first_page_id INT)
 //! columns        (table_oid INT, position INT, name VARCHAR, type_id INT,
 //!                 max_len INT, nullable BOOL)
-//! indexes        (oid INT, name VARCHAR, table_oid INT, header_page_id INT)
+//! indexes        (oid INT, name VARCHAR, table_oid INT, header_page_id INT,
+//!                 is_primary_key BOOL)
 //! index_columns  (index_oid INT, position INT, column INT)
 //! ```
 //!
@@ -61,6 +62,7 @@ static INDEXES_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
         name_column("name"),
         int_column("table_oid"),
         int_column("header_page_id"),
+        Column::new("is_primary_key", DataType::Bool, false),
     ])
 });
 
@@ -92,6 +94,7 @@ pub(crate) struct IndexRow {
     pub name: String,
     pub table_oid: TableOid,
     pub header_page_id: PageId,
+    pub is_primary_key: bool,
 }
 
 /// A row of `index_columns`: key column `position` of index `index_oid` is
@@ -167,6 +170,7 @@ impl SystemTables {
             Value::Varchar(row.name.clone()),
             oid_value(row.table_oid),
             Value::Int(row.header_page_id),
+            Value::Bool(row.is_primary_key),
         ];
         insert(&self.indexes, &INDEXES_SCHEMA, &values)
     }
@@ -193,13 +197,10 @@ impl SystemTables {
     pub fn scan_columns(&self) -> Result<Vec<ColumnRow>> {
         scan(&self.columns, &COLUMNS_SCHEMA, |values| {
             let data_type = decode_type(as_int(&values[3])?, as_int(&values[4])?)?;
-            let Value::Bool(nullable) = values[5] else {
-                return Err(corrupt_value(&values[5]));
-            };
             Ok(ColumnRow {
                 table_oid: as_oid(&values[0])?,
                 position: as_index(&values[1])?,
-                column: Column::new(as_string(&values[2])?, data_type, nullable),
+                column: Column::new(as_string(&values[2])?, data_type, as_bool(&values[5])?),
             })
         })
     }
@@ -211,6 +212,7 @@ impl SystemTables {
                 name: as_string(&values[1])?,
                 table_oid: as_oid(&values[2])?,
                 header_page_id: as_int(&values[3])?,
+                is_primary_key: as_bool(&values[4])?,
             })
         })
     }
@@ -287,6 +289,13 @@ fn as_oid(value: &Value) -> Result<u32> {
 
 fn as_index(value: &Value) -> Result<usize> {
     usize::try_from(as_int(value)?).map_err(|_| corrupt_value(value))
+}
+
+fn as_bool(value: &Value) -> Result<bool> {
+    match *value {
+        Value::Bool(b) => Ok(b),
+        _ => Err(corrupt_value(value)),
+    }
 }
 
 fn as_string(value: &Value) -> Result<String> {

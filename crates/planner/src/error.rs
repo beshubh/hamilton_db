@@ -18,6 +18,9 @@ pub enum PlannerError {
     #[error("table {0} already exists")]
     TableExists(String),
 
+    #[error("index {0} already exists")]
+    IndexExists(String),
+
     /// A qualifier (`t.a`, `t.*`) names no table in FROM.
     #[error("missing FROM entry for table {0}")]
     UnknownTable(String),
@@ -33,7 +36,8 @@ pub enum PlannerError {
     #[error("column reference {0} is ambiguous")]
     AmbiguousColumn(String),
 
-    /// An INSERT column list or an UPDATE names a column twice.
+    /// An INSERT column list, an UPDATE, an index key or a primary key
+    /// names a column twice.
     #[error("column {0} is specified more than once")]
     DuplicateColumn(String),
 

@@ -10,18 +10,32 @@ use common::{Column, Value};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Statement {
     CreateTable(CreateTable),
+    CreateIndex(CreateIndex),
     Insert(Insert),
     Select(Box<Select>),
     Update(Update),
     Delete(Delete),
 }
 
-/// `CREATE TABLE name (col type [NULL | NOT NULL], ...)`
+/// `CREATE TABLE name (col type [NULL | NOT NULL] [PRIMARY KEY], ...
+/// [, PRIMARY KEY (col, ...)])`
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateTable {
     pub name: String,
     /// Columns are nullable unless declared `NOT NULL`.
     pub columns: Vec<Column>,
+    /// The primary key columns, in key order, whether declared on a column
+    /// or as a table constraint. Empty if the table has no primary key.
+    pub primary_key: Vec<String>,
+}
+
+/// `CREATE INDEX name ON table (col, ...)`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateIndex {
+    pub name: String,
+    pub table: String,
+    /// The key columns, in key order.
+    pub columns: Vec<String>,
 }
 
 /// `INSERT INTO table [(col, ...)] VALUES (...), (...)`

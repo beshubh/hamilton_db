@@ -14,10 +14,11 @@ inside.
 - **Tables**: row-oriented table heaps; each tuple is stored whole in a page slot.
 - **MVCC** (in progress): tuple versions chained through an undo log, with
   vacuum reclaiming deleted rows.
-- **Catalog**: table and column metadata, kept in system tables.
+- **Catalog**: table, column and index metadata, kept in system tables.
 - **SQL**: parsing with the Postgres dialect, a binder that type-checks
-  queries, and an expression engine. The parser handles `CREATE TABLE`,
-  `INSERT`, `SELECT`, `UPDATE` and `DELETE`; executors are next.
+  queries, and an expression engine. The parser handles `CREATE TABLE`
+  (with a `PRIMARY KEY`), `CREATE INDEX`, `INSERT`, `SELECT`, `UPDATE` and
+  `DELETE`; executors are next.
 - **Types**: `INT`, `BIGINT`, `BOOL` and `VARCHAR(n)`.
 
 ## Layout
