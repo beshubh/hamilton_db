@@ -8,9 +8,12 @@ anyhow.workspace = true
 catalog = { path = "../catalog" }
 common = { path = "../common" }
 execution = { path = "../execution" }
+nu-ansi-term = "0.50.3"
 parser = { path = "../parser" }
 planner = { path = "../planner" }
+reedline = "0.52.1"
 storage = { path = "../storage" }
 
 [dev-dependencies]
+strip-ansi-escapes = "0.2.1"
 tempfile = "3.27.0"

@@ -37,6 +37,7 @@ pub enum Output {
 pub struct Database {
     disk: Arc<DiskManager>,
     bpm: Arc<BufferPoolManager>,
+    catalog: Arc<Catalog>,
     ctx: Arc<ExecutionContext>,
 }
 
@@ -46,12 +47,17 @@ impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let disk = Arc::new(DiskManager::new(path)?);
         let bpm = Arc::new(BufferPoolManager::new(NUM_FRAMES, Arc::clone(&disk)));
-        let catalog = Catalog::open(Arc::clone(&bpm))?;
+        let catalog = Arc::new(Catalog::open(Arc::clone(&bpm))?);
         Ok(Self {
             disk,
             bpm,
-            ctx: Arc::new(ExecutionContext::new(Arc::new(catalog))),
+            ctx: Arc::new(ExecutionContext::new(Arc::clone(&catalog))),
+            catalog,
         })
+    }
+
+    pub fn catalog(&self) -> &Arc<Catalog> {
+        &self.catalog
     }
 
     /// Runs the statements in `sql` in order, stopping at the first that
