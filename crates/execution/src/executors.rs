@@ -15,7 +15,7 @@
 //!
 //! So far there are executors for CREATE TABLE, CREATE INDEX, INSERT ...
 //! VALUES, UPDATE, DELETE, SELECT ... WHERE through a table or an index
-//! scan, and nested loop and index nested loop joins; other plans fail with
+//! scan, LIMIT, and nested loop, index nested loop and hash joins; other plans fail with
 //! [`ExecutionError::NoExecutor`]. There are no transactions yet, so every
 //! write is committed as soon as it is made.
 
@@ -26,6 +26,7 @@ mod filter;
 mod hash_join;
 mod index_scan;
 mod insert;
+mod limit;
 mod nested_index_join;
 mod nested_loop_join;
 mod projection;
@@ -43,6 +44,7 @@ pub use filter::FilterExecutor;
 pub use hash_join::HashJoinExecutor;
 pub use index_scan::IndexScanExecutor;
 pub use insert::InsertExecutor;
+pub use limit::LimitExecutor;
 pub use nested_index_join::NestedIndexJoinExecutor;
 pub use nested_loop_join::NestedLoopJoinExecutor;
 pub use projection::ProjectionExecutor;
@@ -98,6 +100,7 @@ pub enum AbstractExecutor {
     DeleteExecutor,
     FilterExecutor,
     ProjectionExecutor,
+    LimitExecutor,
     NestedLoopJoinExecutor,
     NestedIndexJoinExecutor,
     HashJoinExecutor,
@@ -140,6 +143,9 @@ pub fn create_executor(
         AbstractPlanNode::ProjectionPlan(plan) => {
             ProjectionExecutor::new(Arc::clone(ctx), plan.clone(), child(plan.child())?).into()
         }
+        AbstractPlanNode::LimitPlan(plan) => {
+            LimitExecutor::new(Arc::clone(ctx), plan.clone(), child(plan.child())?).into()
+        }
         AbstractPlanNode::NestedLoopJoinPlan(plan) => {
             let (left, right) = (child(plan.left())?, child(plan.right())?);
             NestedLoopJoinExecutor::new(Arc::clone(ctx), plan.clone(), left, right).into()
@@ -156,7 +162,6 @@ pub fn create_executor(
         }
         AbstractPlanNode::WindowPlan(_) => return Err(ExecutionError::NoExecutor("Window")),
         AbstractPlanNode::SortPlan(_) => return Err(ExecutionError::NoExecutor("Sort")),
-        AbstractPlanNode::LimitPlan(_) => return Err(ExecutionError::NoExecutor("Limit")),
         AbstractPlanNode::TopNPlan(_) => return Err(ExecutionError::NoExecutor("TopN")),
         AbstractPlanNode::TopNPerGroupPlan(_) => {
             return Err(ExecutionError::NoExecutor("TopNPerGroup"));
@@ -208,16 +213,16 @@ mod tests {
     use super::create_executor;
     use super::test_util::{Db, users_schema};
     use crate::ExecutionError;
-    use crate::plans::{LimitPlan, SeqScanPlan, ValuesPlan};
+    use crate::plans::{SeqScanPlan, SortPlan, ValuesPlan};
 
     #[test]
     fn plans_without_executors_fail() {
         let db = Db::new();
         let values = Arc::new(ValuesPlan::new(users_schema(), vec![]).into());
-        let limit = LimitPlan::new(1, values).into();
+        let sort = SortPlan::new(vec![], values).into();
         assert!(matches!(
-            create_executor(&db.ctx, &limit),
-            Err(ExecutionError::NoExecutor("Limit"))
+            create_executor(&db.ctx, &sort),
+            Err(ExecutionError::NoExecutor("Sort"))
         ));
     }
 
