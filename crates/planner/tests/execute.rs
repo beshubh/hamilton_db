@@ -21,13 +21,22 @@ struct Db {
 
 impl Db {
     fn new() -> Self {
+        Self::with_ctx(|ctx| ctx)
+    }
+
+    /// A database whose joins get `frames` buffers.
+    fn with_join_frames(frames: usize) -> Self {
+        Self::with_ctx(|ctx| ctx.with_join_frames(frames))
+    }
+
+    fn with_ctx(configure: impl FnOnce(ExecutionContext) -> ExecutionContext) -> Self {
         let dir = TempDir::new().unwrap();
         let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
         let bpm = Arc::new(BufferPoolManager::new(8, dm));
         let catalog = Arc::new(Catalog::open(bpm).unwrap());
         Self {
             _dir: dir,
-            ctx: Arc::new(ExecutionContext::new(catalog)),
+            ctx: Arc::new(configure(ExecutionContext::new(catalog))),
         }
     }
 
@@ -315,4 +324,234 @@ fn binding_sees_tables_created_by_earlier_statements() {
     db.run("CREATE TABLE t (a INT)");
     db.run("INSERT INTO t VALUES (7)");
     assert_eq!(db.run("SELECT a FROM t"), [vec![Value::Int(7)]]);
+}
+
+/// Rows in a fixed order, for queries whose order SQL leaves open. There is
+/// no ORDER BY to run yet.
+fn sorted(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    rows.sort_by_key(|row| format!("{row:?}"));
+    rows
+}
+
+fn int(v: i32) -> Value {
+    Value::Int(v)
+}
+
+fn text(s: &str) -> Value {
+    Value::from(s)
+}
+
+/// `users (id, name)` with ann, bo and cy, and `orders (id, user_id, item)`
+/// with two orders for ann, one for cy, and one with no user.
+fn shop() -> Db {
+    let db = Db::new();
+    db.run("CREATE TABLE users (id INT NOT NULL, name VARCHAR(16))");
+    db.run("CREATE TABLE orders (id INT NOT NULL, user_id INT, item VARCHAR(16))");
+    db.run("INSERT INTO users VALUES (1, 'ann'), (2, 'bo'), (3, 'cy')");
+    db.run(
+        "INSERT INTO orders VALUES (10, 1, 'pen'), (11, 3, 'ink'), (12, NULL, 'box'), (13, 1, 'cap')",
+    );
+    db
+}
+
+#[test]
+fn inner_join() {
+    let db = shop();
+    let expected = sorted(vec![
+        vec![text("ann"), text("pen")],
+        vec![text("ann"), text("cap")],
+        vec![text("cy"), text("ink")],
+    ]);
+    for sql in [
+        "SELECT u.name, o.item FROM users u JOIN orders o ON u.id = o.user_id",
+        "SELECT name, item FROM users INNER JOIN orders ON users.id = orders.user_id",
+        // The same join written with a comma and WHERE.
+        "SELECT u.name, o.item FROM users u, orders o WHERE u.id = o.user_id",
+    ] {
+        assert_eq!(sorted(db.run(sql)), expected, "{sql}");
+    }
+
+    // WHERE filters the joined rows; expressions read both sides.
+    assert_eq!(
+        sorted(db.run(
+            "SELECT u.id * 100 + o.id, upper(o.item) FROM users u JOIN orders o \
+             ON u.id = o.user_id WHERE o.item <> 'cap' AND u.name IS NOT NULL"
+        )),
+        sorted(vec![
+            vec![int(110), text("PEN")],
+            vec![int(311), text("INK")],
+        ])
+    );
+}
+
+/// Bo has no orders, and the order without a user matches no one: NULL = 1
+/// is not TRUE.
+#[test]
+fn left_join_pads_with_nulls() {
+    let db = shop();
+    assert_eq!(
+        sorted(db.run("SELECT u.name, o.item FROM users u LEFT JOIN orders o ON u.id = o.user_id")),
+        sorted(vec![
+            vec![text("ann"), text("pen")],
+            vec![text("ann"), text("cap")],
+            vec![text("bo"), Value::Null],
+            vec![text("cy"), text("ink")],
+        ])
+    );
+    // WHERE runs after the join, so it sees the padding: users without
+    // orders.
+    assert_eq!(
+        db.run(
+            "SELECT u.name FROM users u LEFT OUTER JOIN orders o ON u.id = o.user_id \
+             WHERE o.id IS NULL"
+        ),
+        [vec![text("bo")]]
+    );
+    // A condition in ON only decides what matches; every user stays.
+    assert_eq!(
+        sorted(db.run(
+            "SELECT u.name, o.item FROM users u LEFT JOIN orders o \
+             ON u.id = o.user_id AND o.item = 'ink'"
+        )),
+        sorted(vec![
+            vec![text("ann"), Value::Null],
+            vec![text("bo"), Value::Null],
+            vec![text("cy"), text("ink")],
+        ])
+    );
+}
+
+#[test]
+fn cross_join_pairs_every_row() {
+    let db = shop();
+    for sql in [
+        "SELECT * FROM users CROSS JOIN orders",
+        "SELECT * FROM users, orders",
+        "SELECT * FROM users JOIN orders ON TRUE",
+    ] {
+        assert_eq!(db.run(sql).len(), 3 * 4, "{sql}");
+    }
+    assert!(
+        db.run("SELECT * FROM users JOIN orders ON FALSE")
+            .is_empty()
+    );
+}
+
+#[test]
+fn star_expands_both_sides() {
+    let db = shop();
+    assert_eq!(
+        sorted(
+            db.run("SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE o.item = 'ink'")
+        ),
+        [vec![int(3), text("cy"), int(11), int(3), text("ink")]]
+    );
+    assert_eq!(
+        sorted(db.run("SELECT o.*, u.name FROM users u JOIN orders o ON u.id = o.user_id")),
+        sorted(vec![
+            vec![int(10), int(1), text("pen"), text("ann")],
+            vec![int(11), int(3), text("ink"), text("cy")],
+            vec![int(13), int(1), text("cap"), text("ann")],
+        ])
+    );
+}
+
+/// The second ON reads a column of the first join's left side, and the
+/// WHERE one of each table.
+#[test]
+fn three_way_join() {
+    let db = shop();
+    db.run("CREATE TABLE ratings (user_id INT, stars INT)");
+    db.run("INSERT INTO ratings VALUES (1, 5), (3, 2), (3, 4)");
+    assert_eq!(
+        sorted(db.run(
+            "SELECT u.name, o.item, r.stars FROM users u \
+             JOIN orders o ON u.id = o.user_id \
+             JOIN ratings r ON r.user_id = u.id \
+             WHERE r.stars > 1 AND o.id < 13"
+        )),
+        sorted(vec![
+            vec![text("ann"), text("pen"), int(5)],
+            vec![text("cy"), text("ink"), int(2)],
+            vec![text("cy"), text("ink"), int(4)],
+        ])
+    );
+    // LEFT JOINs one after the other: bo has neither orders nor ratings.
+    assert_eq!(
+        sorted(db.run(
+            "SELECT u.name, o.item, r.stars FROM users u \
+             LEFT JOIN orders o ON u.id = o.user_id AND o.item = 'pen' \
+             LEFT JOIN ratings r ON r.user_id = u.id AND r.stars = 5"
+        )),
+        sorted(vec![
+            vec![text("ann"), text("pen"), int(5)],
+            vec![text("bo"), Value::Null, Value::Null],
+            vec![text("cy"), Value::Null, Value::Null],
+        ])
+    );
+}
+
+/// `a, b JOIN c ON ...` joins b and c first, so the ON's columns are
+/// counted from b, not from a.
+#[test]
+fn comma_binds_looser_than_join() {
+    let db = shop();
+    db.run("CREATE TABLE colors (name VARCHAR(8))");
+    db.run("INSERT INTO colors VALUES ('red'), ('blue')");
+    assert_eq!(
+        sorted(db.run(
+            "SELECT c.name, u.name, o.item FROM colors c, users u \
+             JOIN orders o ON u.id = o.user_id WHERE o.item = 'ink'"
+        )),
+        sorted(vec![
+            vec![text("blue"), text("cy"), text("ink")],
+            vec![text("red"), text("cy"), text("ink")],
+        ])
+    );
+}
+
+#[test]
+fn self_join() {
+    let db = shop();
+    assert_eq!(
+        sorted(db.run("SELECT a.name, b.name FROM users a JOIN users b ON a.id + 1 = b.id")),
+        sorted(vec![
+            vec![text("ann"), text("bo")],
+            vec![text("bo"), text("cy")],
+        ])
+    );
+}
+
+#[test]
+fn join_with_a_subquery() {
+    let db = shop();
+    assert_eq!(
+        sorted(db.run(
+            "SELECT s.label, o.item FROM \
+             (SELECT id, upper(name) AS label FROM users WHERE id > 1) AS s \
+             JOIN orders o ON s.id = o.user_id"
+        )),
+        [vec![text("CY"), text("ink")]]
+    );
+}
+
+/// Few join frames and many rows: the outer side takes several blocks,
+/// and the inner side is scanned again for each.
+#[test]
+fn join_across_many_blocks() {
+    let db = Db::with_join_frames(3);
+    db.run("CREATE TABLE a (id INT NOT NULL, label VARCHAR(32))");
+    db.run("CREATE TABLE b (id INT NOT NULL)");
+    let rows: Vec<_> = (1..=500)
+        .map(|id| format!("({id}, 'row number {id:0>10}')"))
+        .collect();
+    db.run(&format!("INSERT INTO a VALUES {}", rows.join(", ")));
+    let rows: Vec<_> = (1..=500).step_by(7).map(|id| format!("({id})")).collect();
+    db.run(&format!("INSERT INTO b VALUES {}", rows.join(", ")));
+
+    let joined = db.run("SELECT a.id, b.id FROM a JOIN b ON a.id = b.id");
+    assert_eq!(joined.len(), 72);
+    assert!(joined.iter().all(|row| row[0] == row[1]));
+    let padded = db.run("SELECT a.id FROM a LEFT JOIN b ON a.id = b.id WHERE b.id IS NULL");
+    assert_eq!(padded.len(), 500 - 72);
 }

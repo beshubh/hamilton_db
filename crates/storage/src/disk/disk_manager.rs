@@ -46,6 +46,7 @@ struct DiskState {
     page_capacity: usize,
     /// Whether the metadata changed since it was last saved.
     meta_dirty: bool,
+    num_reads: usize,
     num_writes: usize,
     num_deletes: usize,
 }
@@ -83,6 +84,7 @@ impl DiskManager {
             free_slots: Vec::new(),
             page_capacity: (db_len / PAGE_SIZE).max(DEFAULT_DB_IO_SIZE),
             meta_dirty: false,
+            num_reads: 0,
             num_writes: 0,
             num_deletes: 0,
         };
@@ -191,6 +193,7 @@ impl DiskManager {
         state.db_io.seek(SeekFrom::Start(offset))?;
         let n = read_full(&mut state.db_io, page_data)?;
         page_data[n..].fill(0);
+        state.num_reads += 1;
         Ok(())
     }
 
@@ -243,6 +246,12 @@ impl DiskManager {
     /// Whether a log flush is in progress.
     pub fn flush_state(&self) -> bool {
         self.flush_log.load(Ordering::Acquire)
+    }
+
+    /// Pages read from the db file. Reads of pages never written are not
+    /// counted, as they do not touch the file.
+    pub fn num_reads(&self) -> usize {
+        self.state.lock().num_reads
     }
 
     pub fn num_writes(&self) -> usize {

@@ -27,6 +27,9 @@ pub const BATCH_SIZE: usize = 2;
 /// `users (id INT NOT NULL, name VARCHAR(32))`.
 pub struct Db {
     _dir: TempDir,
+    pub disk: Arc<DiskManager>,
+    pub bpm: Arc<BufferPoolManager>,
+    catalog: Arc<Catalog>,
     pub ctx: Arc<ExecutionContext>,
     pub users: Arc<TableInfo>,
 }
@@ -34,19 +37,28 @@ pub struct Db {
 impl Db {
     pub fn new() -> Self {
         let dir = TempDir::new().unwrap();
-        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = Arc::new(BufferPoolManager::new(NUM_FRAMES, dm));
-        let catalog = Catalog::open(bpm).unwrap();
+        let disk = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
+        let bpm = Arc::new(BufferPoolManager::new(NUM_FRAMES, Arc::clone(&disk)));
+        let catalog = Arc::new(Catalog::open(Arc::clone(&bpm)).unwrap());
         let users = catalog.create_table("users", users_schema(), &[]).unwrap();
         Self {
             _dir: dir,
-            ctx: Arc::new(ExecutionContext::new(Arc::new(catalog))),
+            disk,
+            bpm,
+            ctx: Arc::new(ExecutionContext::new(Arc::clone(&catalog))),
+            catalog,
             users,
         }
     }
 
+    /// Gives the joins of later plans `frames` buffers.
+    pub fn set_join_frames(&mut self, frames: usize) {
+        let ctx = ExecutionContext::new(Arc::clone(&self.catalog)).with_join_frames(frames);
+        self.ctx = Arc::new(ctx);
+    }
+
     pub fn catalog(&self) -> &Catalog {
-        self.ctx.catalog()
+        &self.catalog
     }
 
     /// Runs `plan` to the end and decodes the rows it produces.

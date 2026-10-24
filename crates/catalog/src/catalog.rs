@@ -329,6 +329,13 @@ impl Catalog {
         self.state.read().tables.get(&oid).cloned()
     }
 
+    /// Every table, in name order.
+    pub fn tables(&self) -> Vec<Arc<TableInfo>> {
+        let mut tables: Vec<_> = self.state.read().tables.values().cloned().collect();
+        tables.sort_by(|a, b| a.name.cmp(&b.name));
+        tables
+    }
+
     /// Records an index on `key_columns` of `table_name` and allocates the
     /// header page for its B+ tree. Index names are unique across the
     /// database. The index is not a primary key: a table gets that only when
@@ -601,6 +608,10 @@ mod tests {
         let other = db.catalog.create_table("orders", users(), &[]).unwrap();
         assert_ne!(other.oid, created.oid);
         assert_ne!(other.first_page_id(), created.first_page_id());
+
+        let tables = db.catalog.tables();
+        let names: Vec<_> = tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["orders", "users"]);
     }
 
     #[test]

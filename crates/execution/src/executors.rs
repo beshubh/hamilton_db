@@ -11,9 +11,10 @@
 //! own.
 //!
 //! So far there are executors for CREATE TABLE, CREATE INDEX, INSERT ...
-//! VALUES, UPDATE, DELETE, and SELECT ... WHERE through a table or an index
-//! scan; other plans fail with [`ExecutionError::NoExecutor`]. There are no
-//! transactions yet, so every write is committed as soon as it is made.
+//! VALUES, UPDATE, DELETE, SELECT ... WHERE through a table or an index
+//! scan, and nested loop and index nested loop joins; other plans fail with
+//! [`ExecutionError::NoExecutor`]. There are no transactions yet, so every
+//! write is committed as soon as it is made.
 
 mod create_index;
 mod create_table;
@@ -21,6 +22,8 @@ mod delete;
 mod filter;
 mod index_scan;
 mod insert;
+mod nested_index_join;
+mod nested_loop_join;
 mod projection;
 mod seq_scan;
 #[cfg(test)]
@@ -35,6 +38,8 @@ pub use delete::DeleteExecutor;
 pub use filter::FilterExecutor;
 pub use index_scan::IndexScanExecutor;
 pub use insert::InsertExecutor;
+pub use nested_index_join::NestedIndexJoinExecutor;
+pub use nested_loop_join::NestedLoopJoinExecutor;
 pub use projection::ProjectionExecutor;
 pub use seq_scan::SeqScanExecutor;
 pub use update::UpdateExecutor;
@@ -88,6 +93,8 @@ pub enum AbstractExecutor {
     DeleteExecutor,
     FilterExecutor,
     ProjectionExecutor,
+    NestedLoopJoinExecutor,
+    NestedIndexJoinExecutor,
 }
 
 /// The executor for `plan` and, below it, for each of its children.
@@ -132,12 +139,15 @@ pub fn create_executor(
             let indexes = ctx.catalog().table_indexes(&table.name);
             UpdateExecutor::new(plan.clone(), table, indexes, child(plan.child())?).into()
         }
-        AbstractPlanNode::NestedLoopJoinPlan(_) => {
-            return Err(ExecutionError::NoExecutor("NestedLoopJoin"));
+        AbstractPlanNode::NestedLoopJoinPlan(plan) => {
+            let (left, right) = (child(plan.left())?, child(plan.right())?);
+            NestedLoopJoinExecutor::new(plan.clone(), left, right, ctx.join_frames()).into()
         }
         AbstractPlanNode::HashJoinPlan(_) => return Err(ExecutionError::NoExecutor("HashJoin")),
-        AbstractPlanNode::NestedIndexJoinPlan(_) => {
-            return Err(ExecutionError::NoExecutor("NestedIndexJoin"));
+        AbstractPlanNode::NestedIndexJoinPlan(plan) => {
+            let table = table(ctx, plan.inner_table_oid())?;
+            let index = index(ctx, plan.index_oid())?;
+            NestedIndexJoinExecutor::new(plan.clone(), child(plan.outer())?, table, index).into()
         }
         AbstractPlanNode::AggregationPlan(_) => {
             return Err(ExecutionError::NoExecutor("Aggregation"));
