@@ -23,6 +23,10 @@ pub(super) enum Inputs {
     One,
     /// A join: the index is into the left row followed by the right row.
     Join { left_len: usize },
+    /// The right input of a join on its own, such as for a hash join's right
+    /// keys: the index is into the left row followed by the right row, but
+    /// only columns of the right row are read.
+    RightOfJoin { left_len: usize },
 }
 
 pub(super) fn plan_expr(expr: &BoundExpr, inputs: Inputs) -> Result<AbstractExpr> {
@@ -30,6 +34,13 @@ pub(super) fn plan_expr(expr: &BoundExpr, inputs: Inputs) -> Result<AbstractExpr
         BoundExprKind::Column { idx, .. } => {
             let (tuple_idx, col_idx) = match inputs {
                 Inputs::Join { left_len } if *idx >= left_len => (1, idx - left_len),
+                Inputs::RightOfJoin { left_len } => {
+                    let idx = idx.checked_sub(left_len);
+                    (
+                        0,
+                        idx.expect("an expression on the right input reads a left column"),
+                    )
+                }
                 _ => (0, *idx),
             };
             ColumnValueExpr::new(tuple_idx, col_idx, expr.return_type.clone()).into()
@@ -83,7 +94,11 @@ pub(super) fn plan_expr(expr: &BoundExpr, inputs: Inputs) -> Result<AbstractExpr
     Ok(planned)
 }
 
-fn plan_binary(op: BinaryOp, left: AbstractExpr, right: AbstractExpr) -> Result<AbstractExpr> {
+pub(super) fn plan_binary(
+    op: BinaryOp,
+    left: AbstractExpr,
+    right: AbstractExpr,
+) -> Result<AbstractExpr> {
     built(match op {
         BinaryOp::Add => arithmetic(ArithmeticOp::Add, left, right),
         BinaryOp::Sub => arithmetic(ArithmeticOp::Sub, left, right),

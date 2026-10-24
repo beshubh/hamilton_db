@@ -20,6 +20,9 @@ pub enum PageType {
     CatalogHeader = 5,
     /// Locates a B+tree's root page.
     BTreeHeader = 6,
+    /// Rows an operator writes out while it runs, such as a hash join's
+    /// partitions.
+    IntermediateResult = 7,
 }
 
 impl TryFrom<u32> for PageType {
@@ -34,6 +37,7 @@ impl TryFrom<u32> for PageType {
             4 => Self::Directory,
             5 => Self::CatalogHeader,
             6 => Self::BTreeHeader,
+            7 => Self::IntermediateResult,
             other => return Err(other),
         })
     }

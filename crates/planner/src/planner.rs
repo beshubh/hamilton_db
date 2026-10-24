@@ -1,9 +1,17 @@
 //! Turns bound statements into plan trees for the execution engine.
 //!
-//! The planner builds the plain plan for each statement: scans, nested loop
-//! joins, a filter for WHERE, aggregation, a filter for HAVING, windows,
-//! then sort, limit and projection. Choosing better operators (hash joins,
-//! index scans, top-N) is left to rewrites of that tree.
+//! The planner builds the plain plan for each statement: scans, hash joins,
+//! a filter for WHERE, aggregation, a filter for HAVING, windows, then sort,
+//! limit and projection. Choosing better operators (index scans, index
+//! nested loop joins, top-N) is left to rewrites of that tree.
+//!
+//! Every join is a hash join. The `left = right` equalities ANDed together
+//! in its ON condition are its keys, and the rest of the condition is
+//! checked on the pairs whose keys match. A join without such equalities,
+//! such as a cross join, has no keys: every row lands in the same partition,
+//! and the join compares every pair, like a block nested loop join. WHERE
+//! conditions are not moved into joins, so `FROM a, b WHERE a.x = b.y` is a
+//! cross join under a filter.
 //!
 //! Subqueries in FROM are planned as part of the tree. Subqueries in
 //! expressions are bound but not planned yet.
@@ -17,16 +25,16 @@ use common::Schema;
 use execution::expressions::{AbstractExpr, ColumnValueExpr};
 use execution::plans::{
     AbstractPlanNode, Aggregate, AggregationPlan, CreateIndexPlan, CreateTablePlan, DeletePlan,
-    FilterPlan, InsertPlan, JoinType, LimitPlan, NestedLoopJoinPlan, OrderBy, PlanNode,
-    ProjectionPlan, SeqScanPlan, SortPlan, UpdatePlan, ValuesPlan, WindowColumn, WindowFunction,
+    FilterPlan, HashJoinPlan, InsertPlan, JoinType, LimitPlan, OrderBy, PlanNode, ProjectionPlan,
+    SeqScanPlan, SortPlan, UpdatePlan, ValuesPlan, WindowColumn, WindowFunction,
     WindowFunctionKind, WindowPlan,
 };
-use parser::JoinKind;
+use parser::{BinaryOp, JoinKind};
 
-use self::expr::{Inputs, plan_expr};
+use self::expr::{Inputs, plan_binary, plan_expr};
 use crate::bound::{
-    AggregateFunction, BoundAggregate, BoundDelete, BoundExpr, BoundFrom, BoundInsert,
-    BoundOrderBy, BoundSelect, BoundStatement, BoundTable, BoundUpdate, BoundWindow,
+    AggregateFunction, BoundAggregate, BoundDelete, BoundExpr, BoundExprKind, BoundFrom,
+    BoundInsert, BoundOrderBy, BoundSelect, BoundStatement, BoundTable, BoundUpdate, BoundWindow,
     BoundWindowFunction,
 };
 use crate::error::Result;
@@ -106,9 +114,8 @@ impl<'a> Planner<'a> {
         Ok(ProjectionPlan::new(select.output_schema(), exprs, plan).into())
     }
 
-    /// Scans for tables, the subquery's plan for a subquery, and nested loop
-    /// joins for joins; their output is the FROM row of
-    /// [`BoundFrom::schema`].
+    /// Scans for tables, the subquery's plan for a subquery, and hash joins
+    /// for joins; their output is the FROM row of [`BoundFrom::schema`].
     fn plan_from(&self, from: &BoundFrom) -> Result<Arc<AbstractPlanNode>> {
         let plan = match from {
             BoundFrom::Table(table) => return Ok(scan(table)),
@@ -121,15 +128,28 @@ impl<'a> Planner<'a> {
             } => {
                 let left = self.plan_from(left)?;
                 let right = self.plan_from(right)?;
-                let inputs = Inputs::Join {
-                    left_len: left.get_output_schema().len(),
-                };
-                let on = on.as_ref().map(|on| plan_expr(on, inputs)).transpose()?;
+                let left_len = left.get_output_schema().len();
                 let join_type = match kind {
                     JoinKind::Cross | JoinKind::Inner => JoinType::Inner,
                     JoinKind::Left => JoinType::Left,
                 };
-                NestedLoopJoinPlan::new(join_type, left, right, on)
+                let (mut left_keys, mut right_keys, mut rest) = (vec![], vec![], vec![]);
+                for conjunct in on.iter().flat_map(conjuncts) {
+                    match join_keys(conjunct, left_len) {
+                        Some((left_key, right_key)) => {
+                            left_keys.push(plan_expr(left_key, Inputs::One)?);
+                            right_keys
+                                .push(plan_expr(right_key, Inputs::RightOfJoin { left_len })?);
+                        }
+                        None => rest.push(plan_expr(conjunct, Inputs::Join { left_len })?),
+                    }
+                }
+                let predicate = rest
+                    .into_iter()
+                    .map(Ok)
+                    .reduce(|l, r| plan_binary(BinaryOp::And, l?, r?))
+                    .transpose()?;
+                HashJoinPlan::new(join_type, left, right, left_keys, right_keys, predicate)
             }
         };
         Ok(Arc::new(plan.into()))
@@ -172,6 +192,70 @@ impl<'a> Planner<'a> {
     fn plan_delete(&self, delete: &BoundDelete) -> Result<AbstractPlanNode> {
         let child = filtered_scan(&delete.table, delete.selection.as_ref())?;
         Ok(DeletePlan::new(delete.table.oid, child).into())
+    }
+}
+
+/// The expressions ANDed together in `expr`, or `expr` itself.
+fn conjuncts(expr: &BoundExpr) -> Vec<&BoundExpr> {
+    match &expr.kind {
+        BoundExprKind::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            let mut all = conjuncts(left);
+            all.extend(conjuncts(right));
+            all
+        }
+        _ => vec![expr],
+    }
+}
+
+/// If `expr` is `a = b` with one side reading only left columns of a join
+/// and the other only right columns, the two sides as a hash join's
+/// `(left key, right key)`. Columns of the join row below `left_len` are
+/// the left row's.
+fn join_keys(expr: &BoundExpr, left_len: usize) -> Option<(&BoundExpr, &BoundExpr)> {
+    let BoundExprKind::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    match (join_side(left, left_len)?, join_side(right, left_len)?) {
+        (JoinSide::Left, JoinSide::Right) => Some((left, right)),
+        (JoinSide::Right, JoinSide::Left) => Some((right, left)),
+        _ => None,
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum JoinSide {
+    Left,
+    Right,
+}
+
+/// The side of a join whose columns `expr` reads, or `None` if it reads
+/// both, neither, or has a subquery.
+fn join_side(expr: &BoundExpr, left_len: usize) -> Option<JoinSide> {
+    let has_subquery = expr.contains(&|kind| {
+        matches!(
+            kind,
+            BoundExprKind::Subquery(_)
+                | BoundExprKind::Exists { .. }
+                | BoundExprKind::InSubquery { .. }
+        )
+    });
+    let reads_left =
+        expr.contains(&|kind| matches!(kind, BoundExprKind::Column { idx, .. } if *idx < left_len));
+    let reads_right = expr
+        .contains(&|kind| matches!(kind, BoundExprKind::Column { idx, .. } if *idx >= left_len));
+    match (has_subquery, reads_left, reads_right) {
+        (false, true, false) => Some(JoinSide::Left),
+        (false, false, true) => Some(JoinSide::Right),
+        _ => None,
     }
 }
 

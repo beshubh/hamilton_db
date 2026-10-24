@@ -4,6 +4,7 @@ pub fn add(left: u64, right: u64) -> u64 {
 
 pub mod config;
 pub mod error;
+pub mod hash;
 pub mod ids;
 pub mod rid;
 pub mod schema;

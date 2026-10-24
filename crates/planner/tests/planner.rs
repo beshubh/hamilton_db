@@ -4,7 +4,7 @@ use catalog::Catalog;
 use common::{Column, DataType, Schema};
 use execution::expressions::{AbstractExpr, Expr};
 use execution::plans::{
-    AbstractPlanNode, Aggregate, JoinType, PlanNode, WindowColumn, WindowFunctionKind,
+    AbstractPlanNode, Aggregate, HashJoinPlan, JoinType, PlanNode, WindowColumn, WindowFunctionKind,
 };
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::disk::disk_manager::DiskManager;
@@ -139,21 +139,31 @@ fn select_without_from_projects_one_empty_row() {
     assert!(values.rows()[0].is_empty());
 }
 
+/// The hash join `plan` is, or the one under `plan`'s filter.
+fn hash_join(plan: Arc<AbstractPlanNode>) -> HashJoinPlan {
+    match &*plan {
+        AbstractPlanNode::HashJoinPlan(join) => join.clone(),
+        AbstractPlanNode::FilterPlan(_) => hash_join(plan.get_child_at(0)),
+        other => panic!("expected a hash join, got {other:?}"),
+    }
+}
+
+/// Each key reads its own side's row on its own, so the right key's column
+/// is counted from the start of the right row.
 #[test]
-fn join_condition_reads_each_side() {
+fn join_condition_becomes_hash_keys() {
     let db = Db::new();
     let plan = db.plan("SELECT o.total FROM users u LEFT JOIN orders o ON u.id = o.user_id");
     assert_eq!(
         shape(&plan),
-        "Projection(NestedLoopJoin(SeqScan users, SeqScan orders))"
+        "Projection(HashJoin(SeqScan users, SeqScan orders))"
     );
-    let AbstractPlanNode::NestedLoopJoinPlan(join) = &*plan.get_child_at(0) else {
-        panic!("expected a join");
-    };
+    let join = hash_join(plan.get_child_at(0));
     assert_eq!(join.join_type(), JoinType::Left);
-    let on = join.predicate().unwrap().children();
-    assert_eq!(column_ref(&on[0]), (0, 0));
-    assert_eq!(column_ref(&on[1]), (1, 1));
+    assert_eq!(join.left_keys().len(), 1);
+    assert_eq!(column_ref(&join.left_keys()[0]), (0, 0));
+    assert_eq!(column_ref(&join.right_keys()[0]), (0, 1));
+    assert!(join.predicate().is_none());
 
     // Above the join, columns index the whole FROM row; a LEFT JOIN's right
     // side is nullable.
@@ -172,13 +182,49 @@ fn nested_join_splits_on_its_own_left_side() {
         "SELECT * FROM users u JOIN orders o ON u.id = o.user_id \
          JOIN users v ON o.id = v.id",
     );
-    let AbstractPlanNode::NestedLoopJoinPlan(outer) = &*plan.get_child_at(0) else {
-        panic!("expected a join");
-    };
-    let on = outer.predicate().unwrap().children();
-    assert_eq!(column_ref(&on[0]), (0, 4));
-    assert_eq!(column_ref(&on[1]), (1, 0));
+    let outer = hash_join(plan.get_child_at(0));
+    assert_eq!(column_ref(&outer.left_keys()[0]), (0, 4));
+    assert_eq!(column_ref(&outer.right_keys()[0]), (0, 0));
     assert_eq!(plan.get_output_schema().len(), 11);
+}
+
+/// Equalities ANDed together are keys whichever way round they are
+/// written; the rest of the condition is the predicate, reading both rows.
+#[test]
+fn join_keys_and_the_rest_of_the_condition() {
+    let db = Db::new();
+    let plan = db.plan(
+        "SELECT * FROM users u JOIN orders o \
+         ON o.user_id = u.id AND o.total > 10 AND u.score = o.total + 1",
+    );
+    let join = hash_join(plan.get_child_at(0));
+    let left_keys: Vec<_> = join.left_keys().iter().map(column_ref).collect();
+    assert_eq!(left_keys, [(0, 0), (0, 2)]);
+    assert_eq!(column_ref(&join.right_keys()[0]), (0, 1));
+    let AbstractExpr::ArithmeticExpr(total_plus_one) = &join.right_keys()[1] else {
+        panic!("expected o.total + 1, got {:?}", join.right_keys()[1]);
+    };
+    assert_eq!(column_ref(&total_plus_one.children()[0]), (0, 2));
+
+    let total_over_10 = join.predicate().unwrap().children();
+    assert_eq!(column_ref(&total_over_10[0]), (1, 2));
+}
+
+/// Without an equality between the two sides there are no keys: `OR`,
+/// comparisons other than `=`, and `=` on one side only.
+#[test]
+fn join_without_keys() {
+    let db = Db::new();
+    for on in [
+        "u.id = o.user_id OR u.id = o.id",
+        "u.id < o.user_id",
+        "u.id = 1 AND o.id = o.user_id",
+    ] {
+        let plan = db.plan(&format!("SELECT * FROM users u JOIN orders o ON {on}"));
+        let join = hash_join(plan.get_child_at(0));
+        assert!(join.left_keys().is_empty(), "{on}");
+        assert!(join.predicate().is_some(), "{on}");
+    }
 }
 
 #[test]
@@ -187,12 +233,11 @@ fn cross_join_is_an_inner_join_without_a_condition() {
     let plan = db.plan("SELECT * FROM users, orders WHERE users.id = orders.user_id");
     assert_eq!(
         shape(&plan),
-        "Projection(Filter(NestedLoopJoin(SeqScan users, SeqScan orders)))"
+        "Projection(Filter(HashJoin(SeqScan users, SeqScan orders)))"
     );
-    let AbstractPlanNode::NestedLoopJoinPlan(join) = &*plan.get_child_at(0).get_child_at(0) else {
-        panic!("expected a join");
-    };
+    let join = hash_join(plan.get_child_at(0));
     assert_eq!(join.join_type(), JoinType::Inner);
+    assert!(join.left_keys().is_empty());
     assert!(join.predicate().is_none());
 }
 
@@ -398,11 +443,9 @@ fn subquery_in_from_is_planned_inline() {
     );
     assert_eq!(
         shape(&plan),
-        "Projection(Filter(NestedLoopJoin(Projection(Filter(SeqScan orders)), SeqScan users)))"
+        "Projection(Filter(HashJoin(Projection(Filter(SeqScan orders)), SeqScan users)))"
     );
-    let AbstractPlanNode::NestedLoopJoinPlan(join) = &*plan.get_child_at(0).get_child_at(0) else {
-        panic!("expected a join");
-    };
+    let join = hash_join(plan.get_child_at(0));
     assert_eq!(names(join.get_output_schema())[..2], ["n", "id"]);
 }
 

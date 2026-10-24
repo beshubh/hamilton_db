@@ -171,6 +171,10 @@ impl Catalog {
         })
     }
 
+    pub fn bpm(&self) -> &BufferPoolManager {
+        &self.bpm
+    }
+
     /// Reads the system tables into memory. Rows left by a create that did
     /// not finish (columns of a table with no `tables` row, and so on) are
     /// skipped, but their oids are not reused.

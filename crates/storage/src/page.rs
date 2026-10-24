@@ -7,6 +7,7 @@ pub mod btree_header_page;
 pub mod btree_internal_page;
 pub mod btree_leaf_page;
 pub mod btree_page;
+pub mod intermediate_result_page;
 pub mod page_guard;
 pub mod page_header;
 
