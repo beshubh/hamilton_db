@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use common::{Rid, Schema, Tuple};
 
 use super::{AbstractExecutor, Executor, passes};
 use crate::Result;
+use crate::execution_context::ExecutionContext;
 use crate::plans::{FilterPlan, PlanNode};
 
 /// Produces the child's rows that pass the plan's predicate.
@@ -13,7 +16,11 @@ pub struct FilterExecutor {
 }
 
 impl FilterExecutor {
-    pub fn new(plan: FilterPlan, child: Box<AbstractExecutor>) -> Self {
+    pub fn new(
+        _ctx: Arc<ExecutionContext>,
+        plan: FilterPlan,
+        child: Box<AbstractExecutor>,
+    ) -> Self {
         Self {
             plan,
             child,

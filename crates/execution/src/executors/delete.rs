@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use catalog::{IndexInfo, TableInfo};
 use common::{Rid, Schema, Tuple};
 use storage::index::IndexTrait;
 use storage::table::table_page::INVALID_UNDO_PTR;
 
 use super::{AbstractExecutor, COMMIT_TS, Executor, count_row, index_keys};
 use crate::Result;
+use crate::execution_context::ExecutionContext;
 use crate::plans::{DeletePlan, PlanNode};
 
 /// Deletes all of the child's rows on the first call to `next`, and produces
@@ -19,9 +19,8 @@ use crate::plans::{DeletePlan, PlanNode};
 /// A delete marks the tuple deleted and removes its entries from the table's
 /// indexes. There is no undo log yet, so the tuple gets no undo entry.
 pub struct DeleteExecutor {
+    ctx: Arc<ExecutionContext>,
     plan: DeletePlan,
-    table: Arc<TableInfo>,
-    indexes: Vec<Arc<IndexInfo>>,
     child: Box<AbstractExecutor>,
     child_tuples: Vec<Tuple>,
     child_rids: Vec<Rid>,
@@ -29,16 +28,10 @@ pub struct DeleteExecutor {
 }
 
 impl DeleteExecutor {
-    pub fn new(
-        plan: DeletePlan,
-        table: Arc<TableInfo>,
-        indexes: Vec<Arc<IndexInfo>>,
-        child: Box<AbstractExecutor>,
-    ) -> Self {
+    pub fn new(ctx: Arc<ExecutionContext>, plan: DeletePlan, child: Box<AbstractExecutor>) -> Self {
         Self {
+            ctx,
             plan,
-            table,
-            indexes,
             child,
             child_tuples: Vec::new(),
             child_rids: Vec::new(),
@@ -65,6 +58,8 @@ impl Executor for DeleteExecutor {
             return Ok(false);
         }
         self.done = true;
+        let table = self.ctx.table(self.plan.table_oid())?;
+        let indexes = self.ctx.catalog().table_indexes(&table.name);
         let mut found = Vec::new();
         while self
             .child
@@ -74,11 +69,9 @@ impl Executor for DeleteExecutor {
             found.extend(self.child_rids.drain(..).zip(self.child_tuples.drain(..)));
         }
         for (rid, tuple) in &found {
-            self.table
-                .heap
-                .mark_delete(*rid, COMMIT_TS, INVALID_UNDO_PTR)?;
-            let keys = index_keys(&self.table, &self.indexes, tuple)?;
-            for (index, key) in self.indexes.iter().zip(&keys) {
+            table.heap.mark_delete(*rid, COMMIT_TS, INVALID_UNDO_PTR)?;
+            let keys = index_keys(&table, &indexes, tuple)?;
+            for (index, key) in indexes.iter().zip(&keys) {
                 index.index.delete_entry(key, *rid)?;
             }
         }

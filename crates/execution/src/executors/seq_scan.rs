@@ -1,19 +1,19 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use catalog::TableInfo;
 use common::{Rid, Schema, Tuple};
 use storage::table::table_iterator::TableIterator;
 
 use super::{Executor, passes};
 use crate::Result;
+use crate::execution_context::ExecutionContext;
 use crate::plans::{PlanNode, SeqScanPlan};
 
 /// Reads the live rows of a table in storage order, a page at a time,
 /// keeping those that pass the plan's filter.
 pub struct SeqScanExecutor {
+    ctx: Arc<ExecutionContext>,
     plan: SeqScanPlan,
-    table: Arc<TableInfo>,
     /// Set by `init`.
     iter: Option<TableIterator>,
     /// Rows of the page read last that have not been produced yet.
@@ -21,10 +21,10 @@ pub struct SeqScanExecutor {
 }
 
 impl SeqScanExecutor {
-    pub fn new(plan: SeqScanPlan, table: Arc<TableInfo>) -> Self {
+    pub fn new(ctx: Arc<ExecutionContext>, plan: SeqScanPlan) -> Self {
         Self {
+            ctx,
             plan,
-            table,
             iter: None,
             rows: VecDeque::new(),
         }
@@ -33,7 +33,8 @@ impl SeqScanExecutor {
 
 impl Executor for SeqScanExecutor {
     fn init(&mut self) -> Result<()> {
-        self.iter = Some(self.table.heap.iter()?);
+        let table = self.ctx.table(self.plan.table_oid())?;
+        self.iter = Some(table.heap.iter()?);
         self.rows.clear();
         Ok(())
     }

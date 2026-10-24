@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use catalog::{IndexInfo, TableInfo};
+use catalog::IndexInfo;
 use common::{Rid, Schema, Tuple};
 use storage::index::IndexTrait;
 use storage::table::table_page::{INVALID_UNDO_PTR, TupleMeta};
 
 use super::{AbstractExecutor, COMMIT_TS, Executor, count_row, duplicate_key, index_keys};
 use crate::Result;
+use crate::execution_context::ExecutionContext;
 use crate::expressions::Expr;
 use crate::plans::{PlanNode, UpdatePlan};
 
@@ -29,9 +30,8 @@ use crate::plans::{PlanNode, UpdatePlan};
 /// is no undo log yet, so the old tuple gets no undo entry.
 // TODO: update in place, keeping the rid, once there is an undo log.
 pub struct UpdateExecutor {
+    ctx: Arc<ExecutionContext>,
     plan: UpdatePlan,
-    table: Arc<TableInfo>,
-    indexes: Vec<Arc<IndexInfo>>,
     child: Box<AbstractExecutor>,
     child_tuples: Vec<Tuple>,
     child_rids: Vec<Rid>,
@@ -39,16 +39,10 @@ pub struct UpdateExecutor {
 }
 
 impl UpdateExecutor {
-    pub fn new(
-        plan: UpdatePlan,
-        table: Arc<TableInfo>,
-        indexes: Vec<Arc<IndexInfo>>,
-        child: Box<AbstractExecutor>,
-    ) -> Self {
+    pub fn new(ctx: Arc<ExecutionContext>, plan: UpdatePlan, child: Box<AbstractExecutor>) -> Self {
         Self {
+            ctx,
             plan,
-            table,
-            indexes,
             child,
             child_tuples: Vec::new(),
             child_rids: Vec::new(),
@@ -75,6 +69,8 @@ impl Executor for UpdateExecutor {
             return Ok(false);
         }
         self.done = true;
+        let table = self.ctx.table(self.plan.table_oid())?;
+        let indexes = self.ctx.catalog().table_indexes(&table.name);
         let mut found = Vec::new();
         while self
             .child
@@ -93,30 +89,28 @@ impl Executor for UpdateExecutor {
                     .iter()
                     .map(|expr| expr.evaluate(old, child_schema))
                     .collect::<Result<Vec<_>>>()?;
-                Ok(Tuple::encode(&self.table.schema, &values)?)
+                Ok(Tuple::encode(&table.schema, &values)?)
             })
             .collect::<Result<Vec<_>>>()?;
         let old_keys = found
             .iter()
-            .map(|(_, old)| index_keys(&self.table, &self.indexes, old))
+            .map(|(_, old)| index_keys(&table, &indexes, old))
             .collect::<Result<Vec<_>>>()?;
         let new_keys = new_rows
             .iter()
-            .map(|new| index_keys(&self.table, &self.indexes, new))
+            .map(|new| index_keys(&table, &indexes, new))
             .collect::<Result<Vec<_>>>()?;
-        self.check_primary_keys(&found, &new_keys)?;
+        check_primary_keys(&indexes, &found, &new_keys)?;
 
         for ((rid, _), keys) in found.iter().zip(&old_keys) {
-            for (index, key) in self.indexes.iter().zip(keys) {
+            for (index, key) in indexes.iter().zip(keys) {
                 index.index.delete_entry(key, *rid)?;
             }
         }
         for (((rid, _), new), keys) in found.iter().zip(&new_rows).zip(&new_keys) {
-            self.table
-                .heap
-                .mark_delete(*rid, COMMIT_TS, INVALID_UNDO_PTR)?;
-            let new_rid = self.table.heap.insert(&TupleMeta::new(COMMIT_TS), new)?;
-            for (index, key) in self.indexes.iter().zip(keys) {
+            table.heap.mark_delete(*rid, COMMIT_TS, INVALID_UNDO_PTR)?;
+            let new_rid = table.heap.insert(&TupleMeta::new(COMMIT_TS), new)?;
+            for (index, key) in indexes.iter().zip(keys) {
                 if !index.index.insert_entry(key, new_rid)? {
                     return Err(duplicate_key(index, key));
                 }
@@ -131,34 +125,36 @@ impl Executor for UpdateExecutor {
     }
 }
 
-impl UpdateExecutor {
-    /// Fails if, once every row in `found` is updated, two rows would share
-    /// a key in a primary key index: a new key that is also another updated
-    /// row's new key, or a row's key that is not being updated. `new_keys`
-    /// holds each updated row's new key in each index.
-    fn check_primary_keys(&self, found: &[(Rid, Tuple)], new_keys: &[Vec<Tuple>]) -> Result<()> {
-        let updated: HashSet<Rid> = found.iter().map(|(rid, _)| *rid).collect();
-        let mut rids = Vec::new();
-        for (i, index) in self.indexes.iter().enumerate() {
-            if !index.is_primary_key {
-                continue;
+/// Fails if, once every row in `found` is updated, two rows would share a
+/// key in a primary key index: a new key that is also another updated row's
+/// new key, or a row's key that is not being updated. `new_keys` holds each
+/// updated row's new key in each of `indexes`.
+fn check_primary_keys(
+    indexes: &[Arc<IndexInfo>],
+    found: &[(Rid, Tuple)],
+    new_keys: &[Vec<Tuple>],
+) -> Result<()> {
+    let updated: HashSet<Rid> = found.iter().map(|(rid, _)| *rid).collect();
+    let mut rids = Vec::new();
+    for (i, index) in indexes.iter().enumerate() {
+        if !index.is_primary_key {
+            continue;
+        }
+        let mut seen = HashSet::new();
+        for row_keys in new_keys {
+            let key = &row_keys[i];
+            if !seen.insert(key.data()) {
+                return Err(duplicate_key(index, key));
             }
-            let mut seen = HashSet::new();
-            for row_keys in new_keys {
-                let key = &row_keys[i];
-                if !seen.insert(key.data()) {
-                    return Err(duplicate_key(index, key));
-                }
-                rids.clear();
-                index.index.scan_key(key, &mut rids)?;
-                // The rows being updated give up their old keys.
-                if rids.iter().any(|rid| !updated.contains(rid)) {
-                    return Err(duplicate_key(index, key));
-                }
+            rids.clear();
+            index.index.scan_key(key, &mut rids)?;
+            // The rows being updated give up their old keys.
+            if rids.iter().any(|rid| !updated.contains(rid)) {
+                return Err(duplicate_key(index, key));
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,10 +1,13 @@
 //! Executors: the operators that run a plan tree.
 //!
 //! [`create_executor`] builds one executor per plan node, each owning the
-//! executors of its children. Like plans and expressions, every executor is a
-//! variant of [`AbstractExecutor`], and `enum_dispatch` forwards
-//! [`Executor`] calls to the variant. Each executor lives in its own module
-//! under `executors/`.
+//! executors of its children. An executor is built from the statement's
+//! [`ExecutionContext`], its plan and its children's executors, and finds
+//! anything else it needs, such as the tables and indexes its plan names,
+//! through the context when it runs. Like plans and expressions, every
+//! executor is a variant of [`AbstractExecutor`], and `enum_dispatch`
+//! forwards [`Executor`] calls to the variant. Each executor lives in its own
+//! module under `executors/`.
 //!
 //! Rows are pulled from the root in batches: each call to [`Executor::next`]
 //! pulls as many batches from the children as it needs to produce one of its
@@ -20,6 +23,7 @@ mod create_index;
 mod create_table;
 mod delete;
 mod filter;
+mod hash_join;
 mod index_scan;
 mod insert;
 mod nested_index_join;
@@ -36,6 +40,7 @@ pub use create_index::CreateIndexExecutor;
 pub use create_table::CreateTableExecutor;
 pub use delete::DeleteExecutor;
 pub use filter::FilterExecutor;
+pub use hash_join::HashJoinExecutor;
 pub use index_scan::IndexScanExecutor;
 pub use insert::InsertExecutor;
 pub use nested_index_join::NestedIndexJoinExecutor;
@@ -47,7 +52,7 @@ pub use values::ValuesExecutor;
 
 use std::sync::Arc;
 
-use catalog::{IndexInfo, IndexOid, TableInfo, TableOid};
+use catalog::{IndexInfo, TableInfo};
 use common::{Rid, Schema, Tuple, Value};
 use enum_dispatch::enum_dispatch;
 
@@ -95,6 +100,7 @@ pub enum AbstractExecutor {
     ProjectionExecutor,
     NestedLoopJoinExecutor,
     NestedIndexJoinExecutor,
+    HashJoinExecutor,
 }
 
 /// The executor for `plan` and, below it, for each of its children.
@@ -111,43 +117,39 @@ pub fn create_executor(
             CreateIndexExecutor::new(Arc::clone(ctx), plan.clone()).into()
         }
         AbstractPlanNode::SeqScanPlan(plan) => {
-            SeqScanExecutor::new(plan.clone(), table(ctx, plan.table_oid())?).into()
-        }
-        AbstractPlanNode::ValuesPlan(plan) => ValuesExecutor::new(plan.clone()).into(),
-        AbstractPlanNode::InsertPlan(plan) => {
-            let table = table(ctx, plan.table_oid())?;
-            let indexes = ctx.catalog().table_indexes(&table.name);
-            InsertExecutor::new(plan.clone(), table, indexes, child(plan.child())?).into()
-        }
-        AbstractPlanNode::DeletePlan(plan) => {
-            let table = table(ctx, plan.table_oid())?;
-            let indexes = ctx.catalog().table_indexes(&table.name);
-            DeleteExecutor::new(plan.clone(), table, indexes, child(plan.child())?).into()
-        }
-        AbstractPlanNode::FilterPlan(plan) => {
-            FilterExecutor::new(plan.clone(), child(plan.child())?).into()
-        }
-        AbstractPlanNode::ProjectionPlan(plan) => {
-            ProjectionExecutor::new(plan.clone(), child(plan.child())?).into()
+            SeqScanExecutor::new(Arc::clone(ctx), plan.clone()).into()
         }
         AbstractPlanNode::IndexScanPlan(plan) => {
-            let table = table(ctx, plan.table_oid())?;
-            IndexScanExecutor::new(plan.clone(), table, index(ctx, plan.index_oid())?).into()
+            IndexScanExecutor::new(Arc::clone(ctx), plan.clone()).into()
+        }
+        AbstractPlanNode::ValuesPlan(plan) => {
+            ValuesExecutor::new(Arc::clone(ctx), plan.clone()).into()
+        }
+        AbstractPlanNode::InsertPlan(plan) => {
+            InsertExecutor::new(Arc::clone(ctx), plan.clone(), child(plan.child())?).into()
         }
         AbstractPlanNode::UpdatePlan(plan) => {
-            let table = table(ctx, plan.table_oid())?;
-            let indexes = ctx.catalog().table_indexes(&table.name);
-            UpdateExecutor::new(plan.clone(), table, indexes, child(plan.child())?).into()
+            UpdateExecutor::new(Arc::clone(ctx), plan.clone(), child(plan.child())?).into()
+        }
+        AbstractPlanNode::DeletePlan(plan) => {
+            DeleteExecutor::new(Arc::clone(ctx), plan.clone(), child(plan.child())?).into()
+        }
+        AbstractPlanNode::FilterPlan(plan) => {
+            FilterExecutor::new(Arc::clone(ctx), plan.clone(), child(plan.child())?).into()
+        }
+        AbstractPlanNode::ProjectionPlan(plan) => {
+            ProjectionExecutor::new(Arc::clone(ctx), plan.clone(), child(plan.child())?).into()
         }
         AbstractPlanNode::NestedLoopJoinPlan(plan) => {
             let (left, right) = (child(plan.left())?, child(plan.right())?);
-            NestedLoopJoinExecutor::new(plan.clone(), left, right, ctx.join_frames()).into()
+            NestedLoopJoinExecutor::new(Arc::clone(ctx), plan.clone(), left, right).into()
         }
-        AbstractPlanNode::HashJoinPlan(_) => return Err(ExecutionError::NoExecutor("HashJoin")),
         AbstractPlanNode::NestedIndexJoinPlan(plan) => {
-            let table = table(ctx, plan.inner_table_oid())?;
-            let index = index(ctx, plan.index_oid())?;
-            NestedIndexJoinExecutor::new(plan.clone(), child(plan.outer())?, table, index).into()
+            NestedIndexJoinExecutor::new(Arc::clone(ctx), plan.clone(), child(plan.outer())?).into()
+        }
+        AbstractPlanNode::HashJoinPlan(plan) => {
+            let (left, right) = (child(plan.left())?, child(plan.right())?);
+            HashJoinExecutor::new(Arc::clone(ctx), plan.clone(), left, right).into()
         }
         AbstractPlanNode::AggregationPlan(_) => {
             return Err(ExecutionError::NoExecutor("Aggregation"));
@@ -161,18 +163,6 @@ pub fn create_executor(
         }
     };
     Ok(executor)
-}
-
-fn table(ctx: &ExecutionContext, oid: TableOid) -> Result<Arc<TableInfo>> {
-    ctx.catalog()
-        .get_table_by_oid(oid)
-        .ok_or(ExecutionError::TableNotFound(oid))
-}
-
-fn index(ctx: &ExecutionContext, oid: IndexOid) -> Result<Arc<IndexInfo>> {
-    ctx.catalog()
-        .get_index_by_oid(oid)
-        .ok_or(ExecutionError::IndexNotFound(oid))
 }
 
 /// The key of `tuple`, a row of `table`, in each of `indexes`.
@@ -231,12 +221,13 @@ mod tests {
         ));
     }
 
+    /// Executors find their tables when they run, not when they are built.
     #[test]
     fn unknown_table_fails() {
         let db = Db::new();
         let scan = SeqScanPlan::new(999, "gone", users_schema(), None).into();
         assert!(matches!(
-            create_executor(&db.ctx, &scan),
+            db.run(scan),
             Err(ExecutionError::TableNotFound(999))
         ));
     }

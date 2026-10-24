@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use common::{Rid, Schema, Tuple, Value};
 use storage::page::PAGE_SIZE;
 
 use super::{AbstractExecutor, Executor};
 use crate::Result;
+use crate::execution_context::ExecutionContext;
 use crate::expressions::Expr;
 use crate::plans::{JoinType, NestedLoopJoinPlan, PlanNode};
 
@@ -148,19 +150,17 @@ impl Output<'_> {
 }
 
 impl NestedLoopJoinExecutor {
-    /// Panics if `join_frames` is below 3.
     pub fn new(
+        ctx: Arc<ExecutionContext>,
         plan: NestedLoopJoinPlan,
         left: Box<AbstractExecutor>,
         right: Box<AbstractExecutor>,
-        join_frames: usize,
     ) -> Self {
-        assert!(join_frames >= 3, "a join needs at least 3 frames");
         Self {
             plan,
             outer: Box::new(Input::new(left)),
             inner: Box::new(Input::new(right)),
-            outer_block_size: (join_frames - 2) * PAGE_SIZE,
+            outer_block_size: (ctx.join_frames() - 2) * PAGE_SIZE,
             outer_block: Vec::new(),
             matched: Vec::new(),
             inner_block: Vec::new(),

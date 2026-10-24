@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use catalog::{IndexInfo, TableInfo};
 use common::{Rid, Schema, Tuple, Value};
 use storage::index::IndexTrait;
 
 use super::{AbstractExecutor, Executor};
 use crate::Result;
+use crate::execution_context::ExecutionContext;
 use crate::expressions::Expr;
 use crate::plans::{JoinType, NestedIndexJoinPlan, PlanNode};
 
@@ -29,10 +29,9 @@ use crate::plans::{JoinType, NestedIndexJoinPlan, PlanNode};
 /// rows wait in `output` until `next` returns them. That holds every joined
 /// row of one outer row in memory at once.
 pub struct NestedIndexJoinExecutor {
+    ctx: Arc<ExecutionContext>,
     plan: NestedIndexJoinPlan,
     outer: Box<AbstractExecutor>,
-    table: Arc<TableInfo>,
-    index: Arc<IndexInfo>,
     /// The current block of outer rows.
     outer_block: Vec<Tuple>,
     outer_rids: Vec<Rid>,
@@ -44,16 +43,14 @@ pub struct NestedIndexJoinExecutor {
 
 impl NestedIndexJoinExecutor {
     pub fn new(
+        ctx: Arc<ExecutionContext>,
         plan: NestedIndexJoinPlan,
         outer: Box<AbstractExecutor>,
-        table: Arc<TableInfo>,
-        index: Arc<IndexInfo>,
     ) -> Self {
         Self {
+            ctx,
             plan,
             outer,
-            table,
-            index,
             outer_block: Vec::new(),
             outer_rids: Vec::new(),
             next_outer: 0,
@@ -82,9 +79,10 @@ impl NestedIndexJoinExecutor {
     fn join_outer_row(&mut self, outer: &Tuple) -> Result<()> {
         let outer_schema = self.outer.get_output_schema();
         let inner_schema = self.plan.inner_schema();
+        let table = self.ctx.table(self.plan.inner_table_oid())?;
         let mut matched = false;
         for rid in self.index_lookup(outer)? {
-            let (meta, inner) = self.table.heap.get(rid)?;
+            let (meta, inner) = table.heap.get(rid)?;
             if meta.is_deleted {
                 continue;
             }
@@ -119,10 +117,11 @@ impl NestedIndexJoinExecutor {
             .iter()
             .map(|expr| expr.evaluate(outer, self.outer.get_output_schema()))
             .collect::<Result<Vec<_>>>()?;
+        let index = self.ctx.index(self.plan.index_oid())?;
         let mut rids = Vec::new();
         if !values.iter().any(Value::is_null) {
-            let key = Tuple::encode(&self.index.key_schema, &values)?;
-            self.index.index.scan_key(&key, &mut rids)?;
+            let key = Tuple::encode(&index.key_schema, &values)?;
+            index.index.scan_key(&key, &mut rids)?;
         }
         Ok(rids)
     }
@@ -456,9 +455,12 @@ mod tests {
         assert!(reads < 10, "{reads} reads, orders has {n} pages");
     }
 
+    /// The index is looked up for each outer row, so the outer side needs
+    /// one.
     #[test]
     fn unknown_index_fails() {
         let db = Db::new();
+        db.insert_numbered(1);
         let schema = Schema::new(vec![Column::new("id", DataType::Int, false)]);
         let join = NestedIndexJoinPlan::new(
             JoinType::Inner,
@@ -471,7 +473,7 @@ mod tests {
             None,
         );
         assert!(matches!(
-            create_executor(&db.ctx, &join.into()),
+            db.run(join.into()),
             Err(ExecutionError::IndexNotFound(999))
         ));
     }

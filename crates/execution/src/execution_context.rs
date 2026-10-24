@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use catalog::Catalog;
+use catalog::{Catalog, IndexInfo, IndexOid, TableInfo, TableOid};
+
+use crate::error::{ExecutionError, Result};
 
 /// How many buffer frames a join gets by default; see
 /// [`ExecutionContext::join_frames`].
@@ -33,6 +35,20 @@ impl ExecutionContext {
 
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// The table a plan names by `oid`.
+    pub fn table(&self, oid: TableOid) -> Result<Arc<TableInfo>> {
+        self.catalog
+            .get_table_by_oid(oid)
+            .ok_or(ExecutionError::TableNotFound(oid))
+    }
+
+    /// The index a plan names by `oid`.
+    pub fn index(&self, oid: IndexOid) -> Result<Arc<IndexInfo>> {
+        self.catalog
+            .get_index_by_oid(oid)
+            .ok_or(ExecutionError::IndexNotFound(oid))
     }
 
     /// The `B` page-sized buffers a join may hold its rows in, on top of the

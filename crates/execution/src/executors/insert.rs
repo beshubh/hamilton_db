@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use catalog::{IndexInfo, TableInfo};
+use catalog::IndexInfo;
 use common::{Rid, Schema, Tuple};
 use storage::index::IndexTrait;
 use storage::table::table_page::TupleMeta;
 
 use super::{AbstractExecutor, COMMIT_TS, Executor, count_row, duplicate_key, index_keys};
 use crate::Result;
+use crate::execution_context::ExecutionContext;
 use crate::plans::{InsertPlan, PlanNode};
 
 /// Inserts all of the child's rows, and their entries in each of the table's
@@ -20,9 +21,8 @@ use crate::plans::{InsertPlan, PlanNode};
 /// from storage part way through, such as a key too long for its index,
 /// still leaves the rows before it inserted.
 pub struct InsertExecutor {
+    ctx: Arc<ExecutionContext>,
     plan: InsertPlan,
-    table: Arc<TableInfo>,
-    indexes: Vec<Arc<IndexInfo>>,
     child: Box<AbstractExecutor>,
     child_tuples: Vec<Tuple>,
     child_rids: Vec<Rid>,
@@ -30,16 +30,10 @@ pub struct InsertExecutor {
 }
 
 impl InsertExecutor {
-    pub fn new(
-        plan: InsertPlan,
-        table: Arc<TableInfo>,
-        indexes: Vec<Arc<IndexInfo>>,
-        child: Box<AbstractExecutor>,
-    ) -> Self {
+    pub fn new(ctx: Arc<ExecutionContext>, plan: InsertPlan, child: Box<AbstractExecutor>) -> Self {
         Self {
+            ctx,
             plan,
-            table,
-            indexes,
             child,
             child_tuples: Vec::new(),
             child_rids: Vec::new(),
@@ -66,6 +60,8 @@ impl Executor for InsertExecutor {
             return Ok(false);
         }
         self.done = true;
+        let table = self.ctx.table(self.plan.table_oid())?;
+        let indexes = self.ctx.catalog().table_indexes(&table.name);
         let mut rows = Vec::new();
         while self
             .child
@@ -76,12 +72,12 @@ impl Executor for InsertExecutor {
         // The child's rows are already in the table's layout.
         let keys = rows
             .iter()
-            .map(|tuple| index_keys(&self.table, &self.indexes, tuple))
+            .map(|tuple| index_keys(&table, &indexes, tuple))
             .collect::<Result<Vec<_>>>()?;
-        self.check_primary_keys(&keys)?;
+        check_primary_keys(&indexes, &keys)?;
         for (tuple, keys) in rows.iter().zip(&keys) {
-            let rid = self.table.heap.insert(&TupleMeta::new(COMMIT_TS), tuple)?;
-            for (index, key) in self.indexes.iter().zip(keys) {
+            let rid = table.heap.insert(&TupleMeta::new(COMMIT_TS), tuple)?;
+            for (index, key) in indexes.iter().zip(keys) {
                 if !index.index.insert_entry(key, rid)? {
                     return Err(duplicate_key(index, key));
                 }
@@ -96,27 +92,25 @@ impl Executor for InsertExecutor {
     }
 }
 
-impl InsertExecutor {
-    /// Fails if a row's key in a primary key index is already in the index,
-    /// or is also an earlier row's. `keys` holds each row's key in each
-    /// index.
-    fn check_primary_keys(&self, keys: &[Vec<Tuple>]) -> Result<()> {
-        let mut rids = Vec::new();
-        for (i, index) in self.indexes.iter().enumerate() {
-            if !index.is_primary_key {
-                continue;
-            }
-            let mut seen = HashSet::new();
-            for row_keys in keys {
-                let key = &row_keys[i];
-                index.index.scan_key(key, &mut rids)?;
-                if !rids.is_empty() || !seen.insert(key.data()) {
-                    return Err(duplicate_key(index, key));
-                }
+/// Fails if a row's key in a primary key index is already in the index, or
+/// is also an earlier row's. `keys` holds each row's key in each of
+/// `indexes`.
+fn check_primary_keys(indexes: &[Arc<IndexInfo>], keys: &[Vec<Tuple>]) -> Result<()> {
+    let mut rids = Vec::new();
+    for (i, index) in indexes.iter().enumerate() {
+        if !index.is_primary_key {
+            continue;
+        }
+        let mut seen = HashSet::new();
+        for row_keys in keys {
+            let key = &row_keys[i];
+            index.index.scan_key(key, &mut rids)?;
+            if !rids.is_empty() || !seen.insert(key.data()) {
+                return Err(duplicate_key(index, key));
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 #[cfg(test)]

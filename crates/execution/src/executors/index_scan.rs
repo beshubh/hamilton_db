@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use catalog::{IndexInfo, TableInfo};
 use common::{Rid, Schema, Tuple, Value};
 use storage::index::btree_index::KeySchemaComparator;
 use storage::index::{Index, IndexTrait};
@@ -10,6 +9,7 @@ use storage::page::btree_page::KeyComparator;
 
 use super::{Executor, passes};
 use crate::Result;
+use crate::execution_context::ExecutionContext;
 use crate::expressions::{AbstractExpr, Expr};
 use crate::plans::{IndexScanPlan, IndexScanRange, KeyBound, PlanNode};
 
@@ -22,26 +22,25 @@ use crate::plans::{IndexScanPlan, IndexScanRange, KeyBound, PlanNode};
 /// blocking any writer to the index above it, and would let an UPDATE above
 /// it see a row again after moving it further along the index.
 pub struct IndexScanExecutor {
+    ctx: Arc<ExecutionContext>,
     plan: IndexScanPlan,
-    table: Arc<TableInfo>,
-    index: Arc<IndexInfo>,
     /// Record ids of the rows not produced yet, in key order. Set by `init`.
     rids: VecDeque<Rid>,
 }
 
 impl IndexScanExecutor {
-    pub fn new(plan: IndexScanPlan, table: Arc<TableInfo>, index: Arc<IndexInfo>) -> Self {
+    pub fn new(ctx: Arc<ExecutionContext>, plan: IndexScanPlan) -> Self {
         Self {
+            ctx,
             plan,
-            table,
-            index,
             rids: VecDeque::new(),
         }
     }
 
     /// The record ids of the entries in the plan's range, in key order.
     fn scan_index(&self) -> Result<Vec<Rid>> {
-        let Index::BtreeIndex(btree) = &*self.index.index;
+        let index = self.ctx.index(self.plan.index_oid())?;
+        let Index::BtreeIndex(btree) = &*index.index;
         let mut rids = Vec::new();
         match self.plan.range() {
             IndexScanRange::Full => {
@@ -50,7 +49,7 @@ impl IndexScanExecutor {
                 }
             }
             IndexScanRange::Points(points) => {
-                let key_schema = &self.index.key_schema;
+                let key_schema = &index.key_schema;
                 let mut keys = points
                     .iter()
                     .map(|key| Ok(Tuple::encode(key_schema, &evaluate(key)?)?))
@@ -87,11 +86,12 @@ impl Executor for IndexScanExecutor {
     ) -> Result<bool> {
         tuples.clear();
         rids.clear();
+        let table = self.ctx.table(self.plan.table_oid())?;
         while tuples.len() < batch_size {
             let Some(rid) = self.rids.pop_front() else {
                 break;
             };
-            let (meta, tuple) = self.table.heap.get(rid)?;
+            let (meta, tuple) = table.heap.get(rid)?;
             if meta.is_deleted {
                 continue;
             }
@@ -360,7 +360,7 @@ mod tests {
             None,
         );
         assert!(matches!(
-            create_executor(&db.ctx, &plan.into()),
+            db.run(plan.into()),
             Err(ExecutionError::IndexNotFound(999))
         ));
     }

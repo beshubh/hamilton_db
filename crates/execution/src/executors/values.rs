@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use common::{Rid, Schema, Tuple};
 
 use super::Executor;
 use crate::Result;
+use crate::execution_context::ExecutionContext;
 use crate::expressions::Expr;
 use crate::plans::{PlanNode, ValuesPlan};
 
@@ -14,7 +17,7 @@ pub struct ValuesExecutor {
 }
 
 impl ValuesExecutor {
-    pub fn new(plan: ValuesPlan) -> Self {
+    pub fn new(_ctx: Arc<ExecutionContext>, plan: ValuesPlan) -> Self {
         Self { plan, next_row: 0 }
     }
 }

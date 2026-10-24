@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use common::{Rid, Schema, Tuple};
 
 use super::{AbstractExecutor, Executor};
 use crate::Result;
+use crate::execution_context::ExecutionContext;
 use crate::expressions::Expr;
 use crate::plans::{PlanNode, ProjectionPlan};
 
@@ -15,7 +18,11 @@ pub struct ProjectionExecutor {
 }
 
 impl ProjectionExecutor {
-    pub fn new(plan: ProjectionPlan, child: Box<AbstractExecutor>) -> Self {
+    pub fn new(
+        _ctx: Arc<ExecutionContext>,
+        plan: ProjectionPlan,
+        child: Box<AbstractExecutor>,
+    ) -> Self {
         Self {
             plan,
             child,
