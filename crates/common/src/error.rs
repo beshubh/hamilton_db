@@ -35,6 +35,10 @@ pub enum ValueError {
     #[error("integer out of range")]
     Overflow,
 
+    /// The result of DOUBLE arithmetic is too large to be finite.
+    #[error("value out of range: overflow")]
+    DoubleOverflow,
+
     #[error("division by zero")]
     DivisionByZero,
 

@@ -1,6 +1,6 @@
 use common::{Column, DataType, Schema, Tuple, Value, ValueError};
 
-use super::{AbstractExpr, Expr, UNNAMED_COLUMN, type_name};
+use super::{AbstractExpr, Expr, UNNAMED_COLUMN, is_number, type_name};
 use crate::Result;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,10 +35,10 @@ impl ArithmeticOp {
     }
 }
 
-/// `left <op> right` over integers.
+/// `left <op> right` over numbers; `%` only over integers.
 ///
-/// The result is INT if both sides are INT and BIGINT otherwise, and is NULL
-/// if either side is NULL (see [`Value`]).
+/// The result is INT if both sides are INT, DOUBLE if either side is DOUBLE
+/// and BIGINT otherwise, and is NULL if either side is NULL (see [`Value`]).
 #[derive(Clone, Debug)]
 pub struct ArithmeticExpr {
     op: ArithmeticOp,
@@ -48,7 +48,7 @@ pub struct ArithmeticExpr {
 }
 
 impl ArithmeticExpr {
-    /// Fails if either side is not an integer type.
+    /// Fails if either side is not a number, or not an integer for `%`.
     pub fn new(op: ArithmeticOp, left: AbstractExpr, right: AbstractExpr) -> Result<Self> {
         let (l, r) = (left.return_type(), right.return_type());
         let data_type = match (l.data_type, r.data_type) {
@@ -56,6 +56,7 @@ impl ArithmeticExpr {
             (DataType::Int | DataType::BigInt, DataType::Int | DataType::BigInt) => {
                 DataType::BigInt
             }
+            (l, r) if is_number(l) && is_number(r) && op != ArithmeticOp::Rem => DataType::Double,
             _ => {
                 return Err(ValueError::InvalidOperands {
                     op: op.symbol(),

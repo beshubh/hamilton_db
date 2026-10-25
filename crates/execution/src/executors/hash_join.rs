@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use common::hash::hash_values;
+use common::hash::{hash_values, partition_index};
 use common::{INVALID_PAGE_ID, PageId, Rid, Schema, Tuple, Value};
 
 use super::intermediate_result::{IntermediatePages, IntermediateResult};
@@ -390,12 +390,6 @@ impl HashJoinExecutor {
         }
         Ok(())
     }
-}
-
-/// The partition, out of `partitions`, a row whose keys hash to `hash` goes
-/// to.
-fn partition_index(hash: u64, partitions: usize) -> usize {
-    (hash % partitions as u64) as usize
 }
 
 /// Whether two keys without NULLs are equal under `=`, which compares an INT

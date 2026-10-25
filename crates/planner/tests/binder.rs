@@ -335,6 +335,46 @@ fn comparison_and_logic_types() {
 }
 
 #[test]
+fn double_types() {
+    let db = Db::new();
+    for expr in ["id + 1.5", "score / 2.0", "1e3 * 1.5", "-1.5"] {
+        let double = db.expr(expr).unwrap();
+        assert_eq!(double.return_type.data_type, DataType::Double, "{expr}");
+    }
+    assert_eq!(
+        db.expr("id < 1.5").unwrap().return_type.data_type,
+        DataType::Bool
+    );
+    assert_eq!(
+        db.expr("1.5 % id").unwrap_err(),
+        invalid_operands("%", "DOUBLE", "INT")
+    );
+    assert_eq!(
+        db.expr("name = 1.5").unwrap_err(),
+        invalid_operands("=", "VARCHAR", "DOUBLE")
+    );
+}
+
+#[test]
+fn doubles_are_rounded_into_integer_columns() {
+    let db = Db::new();
+    let BoundStatement::Insert(insert) = db
+        .bind("INSERT INTO users VALUES (2.5, 'a', 3.5, TRUE)")
+        .unwrap()
+    else {
+        panic!("expected an insert");
+    };
+    let rows = &insert.rows;
+    // Ties go to the even neighbour.
+    assert_eq!(constant_of(&rows[0][0]), &Value::Int(2));
+    assert_eq!(constant_of(&rows[0][2]), &Value::BigInt(4));
+    assert_eq!(
+        db.err("INSERT INTO users VALUES (3e9, 'a', 1, TRUE)"),
+        PlannerError::Value(ValueError::Overflow)
+    );
+}
+
+#[test]
 fn null_literals_take_their_context_type() {
     let db = Db::new();
     let cases = [
@@ -899,6 +939,20 @@ fn aggregate_argument_types() {
     };
     let arg = select.aggregates[0].arg.as_ref().unwrap();
     assert_eq!(arg.return_type.data_type, DataType::Int);
+    let sum = db.expr("sum(id * 1.5)").unwrap();
+    assert_eq!(sum.return_type.data_type, DataType::Double);
+    for expr in ["avg(id)", "avg(score)", "avg(1.5)"] {
+        let avg = db.expr(expr).unwrap();
+        assert_eq!(avg.return_type.data_type, DataType::Double, "{expr}");
+        assert!(avg.return_type.nullable);
+    }
+    assert_eq!(
+        db.expr("avg(name)").unwrap_err(),
+        PlannerError::Value(ValueError::InvalidOperand {
+            op: "avg",
+            operand: "VARCHAR"
+        })
+    );
 
     assert_eq!(
         db.expr("sum(name)").unwrap_err(),

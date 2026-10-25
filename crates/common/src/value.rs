@@ -1,16 +1,22 @@
 //! SQL values and their types.
 //!
 //! Operators follow SQL semantics: a NULL operand makes the result NULL
-//! (except where AND / OR can decide without it), and INT is widened to
-//! BIGINT when the two are mixed. NULL is untyped, so `NULL + 'a'` is NULL
-//! rather than a type error; catching that is left to the planner.
+//! (except where AND / OR can decide without it), INT is widened to BIGINT
+//! when the two are mixed, and an integer mixed with a DOUBLE is widened to
+//! DOUBLE. NULL is untyped, so `NULL + 'a'` is NULL rather than a type error;
+//! catching that is left to the planner.
 //!
-//! `==` on [`Value`] is structural identity (`NULL == NULL`, and
-//! `Int(1) != BigInt(1)`). SQL comparison is [`Value::compare`] and the
-//! `cmp_*` methods.
+//! DOUBLE follows PostgreSQL's `double precision`: arithmetic that would
+//! give an infinity fails instead, so no value is ever infinite or NaN, and
+//! `-0` equals `0`.
+//!
+//! `==` on [`Value`] is structural identity (`NULL == NULL`,
+//! `Int(1) != BigInt(1)`, and doubles are equal when their bits are). SQL
+//! comparison is [`Value::compare`] and the `cmp_*` methods.
 
 use std::cmp::Ordering;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use crate::error::{Result, ValueError};
 
@@ -21,6 +27,8 @@ pub enum DataType {
     Int,
     /// 64-bit signed integer.
     BigInt,
+    /// 64-bit IEEE 754 floating point, PostgreSQL's `double precision`.
+    Double,
     Bool,
     /// UTF-8 string of at most this many bytes.
     Varchar(u32),
@@ -36,6 +44,7 @@ impl DataType {
         match self {
             DataType::Int => "INT",
             DataType::BigInt => "BIGINT",
+            DataType::Double => "DOUBLE",
             DataType::Bool => "BOOL",
             DataType::Varchar(_) => "VARCHAR",
             DataType::Array => "ARRAY",
@@ -48,6 +57,7 @@ impl fmt::Display for DataType {
         match self {
             DataType::Int => f.write_str("INT"),
             DataType::BigInt => f.write_str("BIGINT"),
+            DataType::Double => f.write_str("DOUBLE"),
             DataType::Bool => f.write_str("BOOL"),
             DataType::Varchar(max_len) => write!(f, "VARCHAR({max_len})"),
             DataType::Array => f.write_str("ARRAY"),
@@ -56,15 +66,21 @@ impl fmt::Display for DataType {
 }
 
 /// A single SQL value.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub enum Value {
     Null,
     Int(i32),
     BigInt(i64),
+    /// Never infinite or NaN.
+    Double(f64),
     Bool(bool),
     Varchar(String),
     Array(Vec<Value>),
 }
+
+/// 2^63, the smallest double above every `i64`. Every double in
+/// `-2^63..2^63` has an integer part that fits in an `i64`.
+pub(crate) const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
 
 #[derive(Clone, Copy)]
 enum ArithOp {
@@ -98,6 +114,74 @@ impl ArithOp {
         };
         out.ok_or(ValueError::Overflow)
     }
+
+    /// Never called for `%`, which does not take doubles. The operands are
+    /// finite, so an infinite result means it overflowed.
+    fn apply_double(self, l: f64, r: f64) -> Result<f64> {
+        let out = match self {
+            ArithOp::Add => l + r,
+            ArithOp::Sub => l - r,
+            ArithOp::Mul => l * r,
+            ArithOp::Div if r == 0.0 => return Err(ValueError::DivisionByZero),
+            ArithOp::Div => l / r,
+            ArithOp::Rem => unreachable!("% does not take doubles"),
+        };
+        if out.is_finite() {
+            Ok(out)
+        } else {
+            Err(ValueError::DoubleOverflow)
+        }
+    }
+}
+
+/// A number of any numeric type, for the operators that mix them.
+#[derive(Clone, Copy)]
+enum Number {
+    Integer(i64),
+    Double(f64),
+}
+
+impl Number {
+    fn compare(self, other: Number) -> Ordering {
+        match (self, other) {
+            (Number::Integer(l), Number::Integer(r)) => l.cmp(&r),
+            (Number::Double(l), Number::Double(r)) => compare_doubles(l, r),
+            (Number::Integer(l), Number::Double(r)) => compare_integer_with_double(l, r),
+            (Number::Double(l), Number::Integer(r)) => compare_integer_with_double(r, l).reverse(),
+        }
+    }
+
+    /// The nearest double; exact for integers up to 2^53.
+    fn to_f64(self) -> f64 {
+        match self {
+            Number::Integer(v) => v as f64,
+            Number::Double(v) => v,
+        }
+    }
+}
+
+/// Orders doubles as PostgreSQL does: `-0` equals `0`, and NaN equals
+/// itself and is above everything else. No value is NaN, but the order is
+/// total anyway, as an index needs.
+fn compare_doubles(l: f64, r: f64) -> Ordering {
+    l.partial_cmp(&r)
+        .unwrap_or_else(|| l.is_nan().cmp(&r.is_nan()))
+}
+
+/// Orders an integer and a double exactly. Rounding the integer to a double
+/// first would make 2^53 + 1 equal to 2^53 as a double, and equal values
+/// must hash alike (see [`crate::hash`]).
+fn compare_integer_with_double(i: i64, d: f64) -> Ordering {
+    if d.is_nan() || d >= TWO_POW_63 {
+        return Ordering::Less;
+    }
+    if d < -TWO_POW_63 {
+        return Ordering::Greater;
+    }
+    let whole = d.trunc();
+    // `whole` fits in an i64, so the cast is exact; then the fraction decides.
+    i.cmp(&(whole as i64))
+        .then_with(|| compare_doubles(0.0, d - whole))
 }
 
 impl Value {
@@ -111,6 +195,7 @@ impl Value {
             Value::Null => "NULL",
             Value::Int(_) => "INT",
             Value::BigInt(_) => "BIGINT",
+            Value::Double(_) => "DOUBLE",
             Value::Bool(_) => "BOOL",
             Value::Varchar(_) => "VARCHAR",
             Value::Array(_) => "ARRAY",
@@ -119,15 +204,15 @@ impl Value {
 
     /// Orders two values, or returns `None` if either is NULL.
     ///
-    /// Integers compare with each other across widths, strings compare
-    /// bytewise, and `false < true`.
+    /// Numbers compare by value across types, strings compare bytewise,
+    /// and `false < true`.
     pub fn compare(&self, other: &Value) -> Result<Option<Ordering>> {
         match (self, other) {
             (Value::Null, _) | (_, Value::Null) => Ok(None),
             (Value::Bool(l), Value::Bool(r)) => Ok(Some(l.cmp(r))),
             (Value::Varchar(l), Value::Varchar(r)) => Ok(Some(l.cmp(r))),
-            _ => match (self.as_i64(), other.as_i64()) {
-                (Some(l), Some(r)) => Ok(Some(l.cmp(&r))),
+            _ => match (self.as_number(), other.as_number()) {
+                (Some(l), Some(r)) => Ok(Some(l.compare(r))),
                 _ => Err(ValueError::Incomparable {
                     left: self.type_name(),
                     right: other.type_name(),
@@ -178,12 +263,13 @@ impl Value {
         self.arith(ArithOp::Mul, other)
     }
 
-    /// Integer division, truncating toward zero.
+    /// Integer division truncates toward zero.
     pub fn checked_div(&self, other: &Value) -> Result<Value> {
         self.arith(ArithOp::Div, other)
     }
 
-    /// Remainder of truncating division; takes the sign of `self`.
+    /// Remainder of truncating division; takes the sign of `self`. Only
+    /// for integers.
     pub fn checked_rem(&self, other: &Value) -> Result<Value> {
         self.arith(ArithOp::Rem, other)
     }
@@ -196,6 +282,7 @@ impl Value {
                 .checked_neg()
                 .map(Value::BigInt)
                 .ok_or(ValueError::Overflow),
+            Value::Double(v) => Ok(Value::Double(-v)),
             _ => Err(ValueError::InvalidOperand {
                 op: "-",
                 operand: self.type_name(),
@@ -233,10 +320,46 @@ impl Value {
         }
     }
 
-    fn as_i64(&self) -> Option<i64> {
+    /// Converts a number to `to`: INT, BIGINT or DOUBLE. A double becomes
+    /// the nearest integer, ties to even, as in PostgreSQL. Fails with
+    /// [`ValueError::Overflow`] if the result does not fit in `to`. NULL
+    /// stays NULL.
+    pub fn cast_number(&self, to: DataType) -> Result<Value> {
+        let invalid = || ValueError::InvalidOperands {
+            op: "CAST",
+            left: self.type_name(),
+            right: to.type_name(),
+        };
+        if self.is_null() {
+            return Ok(Value::Null);
+        }
+        let number = self.as_number().ok_or_else(invalid)?;
+        let integer = match (number, to) {
+            (_, DataType::Double) => return Ok(Value::Double(number.to_f64())),
+            (_, DataType::Int | DataType::BigInt) => match number {
+                Number::Integer(v) => v,
+                Number::Double(v) => {
+                    let v = v.round_ties_even();
+                    if !(-TWO_POW_63..TWO_POW_63).contains(&v) {
+                        return Err(ValueError::Overflow);
+                    }
+                    v as i64
+                }
+            },
+            _ => return Err(invalid()),
+        };
+        Ok(if to == DataType::Int {
+            Value::Int(i32::try_from(integer).map_err(|_| ValueError::Overflow)?)
+        } else {
+            Value::BigInt(integer)
+        })
+    }
+
+    fn as_number(&self) -> Option<Number> {
         match self {
-            Value::Int(v) => Some(i64::from(*v)),
-            Value::BigInt(v) => Some(*v),
+            Value::Int(v) => Some(Number::Integer(i64::from(*v))),
+            Value::BigInt(v) => Some(Number::Integer(*v)),
+            Value::Double(v) => Some(Number::Double(*v)),
             _ => None,
         }
     }
@@ -266,8 +389,13 @@ impl Value {
                     .map(Value::Int)
                     .map_err(|_| ValueError::Overflow)
             }
-            _ => match (self.as_i64(), other.as_i64()) {
-                (Some(l), Some(r)) => op.apply(l, r).map(Value::BigInt),
+            _ => match (self.as_number(), other.as_number()) {
+                (Some(Number::Integer(l)), Some(Number::Integer(r))) => {
+                    op.apply(l, r).map(Value::BigInt)
+                }
+                (Some(l), Some(r)) if !matches!(op, ArithOp::Rem) => {
+                    op.apply_double(l.to_f64(), r.to_f64()).map(Value::Double)
+                }
                 _ => Err(ValueError::InvalidOperands {
                     op: op.symbol(),
                     left: self.type_name(),
@@ -293,12 +421,70 @@ impl Value {
     }
 }
 
+/// Structural identity; see the module docs.
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            (Value::Int(l), Value::Int(r)) => l == r,
+            (Value::BigInt(l), Value::BigInt(r)) => l == r,
+            (Value::Double(l), Value::Double(r)) => l.to_bits() == r.to_bits(),
+            (Value::Bool(l), Value::Bool(r)) => l == r,
+            (Value::Varchar(l), Value::Varchar(r)) => l == r,
+            (Value::Array(l), Value::Array(r)) => l == r,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
+
+/// Agrees with `==`, not with SQL `=`; [`crate::hash`] hashes for `=`.
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Value::Null => {}
+            Value::Int(v) => v.hash(state),
+            Value::BigInt(v) => v.hash(state),
+            Value::Double(v) => v.to_bits().hash(state),
+            Value::Bool(v) => v.hash(state),
+            Value::Varchar(v) => v.hash(state),
+            Value::Array(values) => values.hash(state),
+        }
+    }
+}
+
+/// Writes `v` as PostgreSQL does: the fewest digits that read back as `v`,
+/// in scientific notation when the exponent is below -4 or at least 15.
+fn format_double(v: f64, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    if v.is_nan() {
+        return f.write_str("NaN");
+    }
+    if v.is_infinite() {
+        return f.write_str(if v > 0.0 { "Infinity" } else { "-Infinity" });
+    }
+    // `{:e}` gives the fewest digits, as `1.5e-7`.
+    let scientific = format!("{v:e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("a finite double formats with an exponent");
+    let exponent: i32 = exponent.parse().expect("the exponent is an integer");
+    if (-4..15).contains(&exponent) {
+        write!(f, "{v}")
+    } else {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        write!(f, "{mantissa}e{sign}{:02}", exponent.abs())
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Null => f.write_str("NULL"),
             Value::Int(v) => write!(f, "{v}"),
             Value::BigInt(v) => write!(f, "{v}"),
+            Value::Double(v) => format_double(*v, f),
             Value::Bool(v) => write!(f, "{v}"),
             Value::Varchar(v) => f.write_str(v),
             Value::Array(values) => {
@@ -324,6 +510,12 @@ impl From<i32> for Value {
 impl From<i64> for Value {
     fn from(v: i64) -> Self {
         Value::BigInt(v)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(v: f64) -> Self {
+        Value::Double(v)
     }
 }
 
@@ -457,6 +649,106 @@ mod tests {
                 operand: "BOOL"
             })
         ));
+    }
+
+    #[test]
+    fn compares_doubles_with_integers_exactly() {
+        assert_eq!(v(1.5).compare(&v(2)), Ok(Some(Ordering::Less)));
+        assert_eq!(v(2.0).compare(&v(2_i64)), Ok(Some(Ordering::Equal)));
+        assert_eq!(v(-1).compare(&v(-1.5)), Ok(Some(Ordering::Greater)));
+        assert_eq!(v(-0.0).compare(&v(0.0)), Ok(Some(Ordering::Equal)));
+        // 2^53 + 1 is not a double: it rounds to 2^53.
+        let big = (1_i64 << 53) + 1;
+        assert_eq!(
+            v(big).compare(&v((1_i64 << 53) as f64)),
+            Ok(Some(Ordering::Greater))
+        );
+        assert_eq!(
+            v(i64::MAX).compare(&v(TWO_POW_63)),
+            Ok(Some(Ordering::Less))
+        );
+        assert_eq!(
+            v(i64::MIN).compare(&v(-TWO_POW_63)),
+            Ok(Some(Ordering::Equal))
+        );
+        assert!(v(1.0).compare(&v("1")).is_err());
+    }
+
+    #[test]
+    fn nan_is_above_everything() {
+        let nan = v(f64::NAN);
+        assert_eq!(nan.compare(&v(f64::NAN)), Ok(Some(Ordering::Equal)));
+        assert_eq!(nan.compare(&v(1e300)), Ok(Some(Ordering::Greater)));
+        assert_eq!(v(i64::MAX).compare(&nan), Ok(Some(Ordering::Less)));
+    }
+
+    #[test]
+    fn arithmetic_with_a_double_is_double() {
+        assert_eq!(v(1.5).checked_add(&v(1)), Ok(v(2.5)));
+        assert_eq!(v(1_i64).checked_sub(&v(0.5)), Ok(v(0.5)));
+        assert_eq!(v(2.0).checked_mul(&v(1.25)), Ok(v(2.5)));
+        assert_eq!(v(7).checked_div(&v(2.0)), Ok(v(3.5)));
+        assert_eq!(v(1.5).checked_neg(), Ok(v(-1.5)));
+        assert_eq!(v(1.5).checked_add(&NULL), Ok(NULL));
+    }
+
+    #[test]
+    fn double_arithmetic_errors() {
+        assert_eq!(
+            v(1e308).checked_mul(&v(10)),
+            Err(ValueError::DoubleOverflow)
+        );
+        assert_eq!(v(1.0).checked_div(&v(0)), Err(ValueError::DivisionByZero));
+        assert_eq!(v(1).checked_div(&v(0.0)), Err(ValueError::DivisionByZero));
+        assert!(matches!(
+            v(1.5).checked_rem(&v(1)),
+            Err(ValueError::InvalidOperands { op: "%", .. })
+        ));
+    }
+
+    #[test]
+    fn casts_between_numbers() {
+        assert_eq!(v(7).cast_number(DataType::Double), Ok(v(7.0)));
+        assert_eq!(v(7_i64).cast_number(DataType::Int), Ok(v(7)));
+        assert_eq!(v(2.5).cast_number(DataType::Int), Ok(v(2)));
+        assert_eq!(v(3.5).cast_number(DataType::BigInt), Ok(v(4_i64)));
+        assert_eq!(v(-2.5).cast_number(DataType::Int), Ok(v(-2)));
+        assert_eq!(NULL.cast_number(DataType::Double), Ok(NULL));
+        assert_eq!(v(3e9).cast_number(DataType::Int), Err(ValueError::Overflow));
+        assert_eq!(
+            v(TWO_POW_63).cast_number(DataType::BigInt),
+            Err(ValueError::Overflow)
+        );
+        assert_eq!(
+            v(-TWO_POW_63).cast_number(DataType::BigInt),
+            Ok(v(i64::MIN))
+        );
+        assert!(v("1").cast_number(DataType::Int).is_err());
+        assert!(v(1).cast_number(DataType::Bool).is_err());
+    }
+
+    #[test]
+    fn doubles_are_identical_by_bits() {
+        assert_eq!(v(1.5), v(1.5));
+        assert_ne!(v(0.0), v(-0.0));
+        assert_ne!(v(1.0), v(1));
+        assert_eq!(v(f64::NAN), v(f64::NAN));
+    }
+
+    #[test]
+    fn displays_doubles_like_postgres() {
+        let shown = |x: f64| v(x).to_string();
+        assert_eq!(shown(1.5), "1.5");
+        assert_eq!(shown(3.0), "3");
+        assert_eq!(shown(-0.0), "-0");
+        assert_eq!(shown(0.1 + 0.2), "0.30000000000000004");
+        assert_eq!(shown(0.0001), "0.0001");
+        assert_eq!(shown(0.00001), "1e-05");
+        assert_eq!(shown(123456789012345.0), "123456789012345");
+        assert_eq!(shown(1e15), "1e+15");
+        assert_eq!(shown(-1.25e100), "-1.25e+100");
+        assert_eq!(shown(f64::NAN), "NaN");
+        assert_eq!(DataType::Double.to_string(), "DOUBLE");
     }
 
     #[test]

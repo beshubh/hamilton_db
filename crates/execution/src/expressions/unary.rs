@@ -1,13 +1,13 @@
 use common::{Column, DataType, Schema, Tuple, Value, ValueError};
 
-use super::{AbstractExpr, Expr, UNNAMED_COLUMN, type_name};
+use super::{AbstractExpr, Expr, UNNAMED_COLUMN, is_number, type_name};
 use crate::Result;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnaryOp {
     /// `NOT` on a BOOL.
     Not,
-    /// `-` on an integer.
+    /// `-` on a number.
     Neg,
 }
 
@@ -39,12 +39,12 @@ pub struct UnaryExpr {
 }
 
 impl UnaryExpr {
-    /// Fails if `arg` is not BOOL for NOT, or not an integer for `-`.
+    /// Fails if `arg` is not BOOL for NOT, or not a number for `-`.
     pub fn new(op: UnaryOp, arg: AbstractExpr) -> Result<Self> {
         let ty = arg.return_type();
         let accepted = match op {
             UnaryOp::Not => ty.data_type == DataType::Bool,
-            UnaryOp::Neg => matches!(ty.data_type, DataType::Int | DataType::BigInt),
+            UnaryOp::Neg => is_number(ty.data_type),
         };
         if !accepted {
             return Err(ValueError::InvalidOperand {

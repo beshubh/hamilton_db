@@ -8,10 +8,15 @@ use crate::error::{ExecutionError, Result};
 /// [`ExecutionContext::join_frames`].
 pub const DEFAULT_JOIN_FRAMES: usize = 64;
 
+/// How many buffer frames an aggregation gets by default; see
+/// [`ExecutionContext::aggregation_frames`].
+pub const DEFAULT_AGGREGATION_FRAMES: usize = 64;
+
 /// What the executors of one statement share.
 pub struct ExecutionContext {
     catalog: Arc<Catalog>,
     join_frames: usize,
+    aggregation_frames: usize,
     // TBD
     // txn manager
     // lock manager maybe
@@ -22,6 +27,7 @@ impl ExecutionContext {
         Self {
             catalog,
             join_frames: DEFAULT_JOIN_FRAMES,
+            aggregation_frames: DEFAULT_AGGREGATION_FRAMES,
         }
     }
 
@@ -30,6 +36,18 @@ impl ExecutionContext {
     pub fn with_join_frames(mut self, frames: usize) -> Self {
         assert!(frames >= 3, "a join needs at least 3 frames, got {frames}");
         self.join_frames = frames;
+        self
+    }
+
+    /// Gives each aggregation `frames` buffers instead of
+    /// [`DEFAULT_AGGREGATION_FRAMES`]. Panics if `frames` is below 3: one for
+    /// input and at least two partitions to split groups into.
+    pub fn with_aggregation_frames(mut self, frames: usize) -> Self {
+        assert!(
+            frames >= 3,
+            "an aggregation needs at least 3 frames, got {frames}"
+        );
+        self.aggregation_frames = frames;
         self
     }
 
@@ -56,5 +74,12 @@ impl ExecutionContext {
     /// of right rows and one of output.
     pub fn join_frames(&self) -> usize {
         self.join_frames
+    }
+
+    /// The `B` page-sized buffers a hash aggregation may hold its groups in,
+    /// on top of the buffer pool: `B - 1` for its hash table, or for the
+    /// partitions it spills to, and one to read input.
+    pub fn aggregation_frames(&self) -> usize {
+        self.aggregation_frames
     }
 }

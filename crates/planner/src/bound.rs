@@ -310,8 +310,10 @@ pub struct BoundAggregate {
 pub enum AggregateFunction {
     /// `count(*)` counts rows; `count(x)` counts non-NULL values.
     Count,
-    /// Of integers.
+    /// Of numbers.
     Sum,
+    /// Of numbers, as a DOUBLE.
+    Avg,
     /// Of integers, BOOLs or VARCHARs.
     Min,
     Max,
@@ -322,6 +324,7 @@ impl AggregateFunction {
         match name {
             "count" => Some(AggregateFunction::Count),
             "sum" => Some(AggregateFunction::Sum),
+            "avg" => Some(AggregateFunction::Avg),
             "min" => Some(AggregateFunction::Min),
             "max" => Some(AggregateFunction::Max),
             _ => None,
@@ -332,6 +335,7 @@ impl AggregateFunction {
         match self {
             AggregateFunction::Count => "count",
             AggregateFunction::Sum => "sum",
+            AggregateFunction::Avg => "avg",
             AggregateFunction::Min => "min",
             AggregateFunction::Max => "max",
         }

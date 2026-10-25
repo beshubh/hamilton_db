@@ -13,10 +13,12 @@ pub enum Aggregate {
     CountStar,
     /// `COUNT(expr)`: the number of non-NULL values.
     Count(AbstractExpr),
-    /// `SUM(expr)` of integers, as BIGINT.
+    /// `SUM(expr)`: BIGINT for integers, DOUBLE for doubles.
     Sum(AbstractExpr),
     Min(AbstractExpr),
     Max(AbstractExpr),
+    /// `AVG(expr)` of numbers, as DOUBLE.
+    Avg(AbstractExpr),
 }
 
 impl Aggregate {
@@ -27,7 +29,8 @@ impl Aggregate {
             Aggregate::Count(expr)
             | Aggregate::Sum(expr)
             | Aggregate::Min(expr)
-            | Aggregate::Max(expr) => Some(expr),
+            | Aggregate::Max(expr)
+            | Aggregate::Avg(expr) => Some(expr),
         }
     }
 
@@ -38,7 +41,14 @@ impl Aggregate {
             Aggregate::CountStar | Aggregate::Count(_) => {
                 Column::new("count", DataType::BigInt, false)
             }
-            Aggregate::Sum(_) => Column::new("sum", DataType::BigInt, true),
+            Aggregate::Sum(expr) => {
+                let data_type = match expr.return_type().data_type {
+                    DataType::Double => DataType::Double,
+                    _ => DataType::BigInt,
+                };
+                Column::new("sum", data_type, true)
+            }
+            Aggregate::Avg(_) => Column::new("avg", DataType::Double, true),
             Aggregate::Min(expr) => Column::new("min", expr.return_type().data_type, true),
             Aggregate::Max(expr) => Column::new("max", expr.return_type().data_type, true),
         }

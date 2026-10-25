@@ -1,6 +1,6 @@
 use common::{Column, DataType, Schema, Tuple, Value, ValueError};
 
-use super::{AbstractExpr, Expr, UNNAMED_COLUMN, type_name};
+use super::{AbstractExpr, Expr, UNNAMED_COLUMN, is_number, type_name};
 use crate::Result;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,8 +38,8 @@ impl ComparisonOp {
     }
 }
 
-/// `left <op> right` between two integers (of either width), two BOOLs or
-/// two VARCHARs. The result is BOOL, and NULL if either side is NULL.
+/// `left <op> right` between two numbers (of any numeric type), two BOOLs
+/// or two VARCHARs. The result is BOOL, and NULL if either side is NULL.
 #[derive(Clone, Debug)]
 pub struct ComparisonExpr {
     op: ComparisonOp,
@@ -53,9 +53,8 @@ impl ComparisonExpr {
     pub fn new(op: ComparisonOp, left: AbstractExpr, right: AbstractExpr) -> Result<Self> {
         let (l, r) = (left.return_type(), right.return_type());
         match (l.data_type, r.data_type) {
-            (DataType::Int | DataType::BigInt, DataType::Int | DataType::BigInt)
-            | (DataType::Bool, DataType::Bool)
-            | (DataType::Varchar(_), DataType::Varchar(_)) => {}
+            (l, r) if is_number(l) && is_number(r) => {}
+            (DataType::Bool, DataType::Bool) | (DataType::Varchar(_), DataType::Varchar(_)) => {}
             _ => {
                 return Err(ValueError::InvalidOperands {
                     op: op.symbol(),

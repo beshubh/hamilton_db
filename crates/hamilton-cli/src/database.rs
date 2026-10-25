@@ -219,7 +219,7 @@ mod tests {
             "SELEC 1",
             "SELECT * FROM missing",
             "INSERT INTO t VALUES (1), (NULL)",
-            "SELECT id FROM t ORDER BY id",
+            "SELECT 1 / 0",
         ] {
             assert!(db.execute(bad).is_err(), "{bad}");
         }

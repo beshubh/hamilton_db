@@ -254,6 +254,7 @@ fn encode_type(data_type: DataType) -> (i32, i32) {
         DataType::Bool => (2, 0),
         DataType::Varchar(max_len) => (3, max_len as i32),
         DataType::Array => (4, 0),
+        DataType::Double => (5, 0),
     }
 }
 
@@ -264,6 +265,7 @@ fn decode_type(type_id: i32, max_len: i32) -> Result<DataType> {
         2 => DataType::Bool,
         3 => DataType::Varchar(max_len as u32),
         4 => DataType::Array,
+        5 => DataType::Double,
         other => return Err(CatalogError::Corrupt(format!("unknown type id {other}"))),
     })
 }
@@ -318,6 +320,7 @@ mod tests {
         for data_type in [
             DataType::Int,
             DataType::BigInt,
+            DataType::Double,
             DataType::Bool,
             DataType::Varchar(255),
         ] {

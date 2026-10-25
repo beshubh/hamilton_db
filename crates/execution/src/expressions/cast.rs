@@ -1,10 +1,11 @@
 use common::{Column, DataType, Schema, Tuple, Value, ValueError};
 
-use super::{AbstractExpr, Expr, UNNAMED_COLUMN, type_name};
+use super::{AbstractExpr, Expr, UNNAMED_COLUMN, is_number, type_name};
 use crate::Result;
 
-/// Converts an integer to INT or BIGINT. Narrowing a BIGINT that does not
-/// fit in an INT fails with [`ValueError::Overflow`]; NULL stays NULL.
+/// Converts a number to INT, BIGINT or DOUBLE, as [`Value::cast_number`]
+/// does: a DOUBLE is rounded to an integer, and a value that does not fit
+/// fails with [`ValueError::Overflow`]. NULL stays NULL.
 #[derive(Clone, Debug)]
 pub struct CastExpr {
     /// Always `[arg]`.
@@ -13,11 +14,10 @@ pub struct CastExpr {
 }
 
 impl CastExpr {
-    /// Fails unless `arg` is an integer and `to` is INT or BIGINT.
+    /// Fails unless `arg` and `to` are numeric types.
     pub fn new(arg: AbstractExpr, to: DataType) -> Result<Self> {
         let ty = arg.return_type();
-        let is_integer = |t| matches!(t, DataType::Int | DataType::BigInt);
-        if !is_integer(ty.data_type) || !is_integer(to) {
+        if !is_number(ty.data_type) || !is_number(to) {
             return Err(ValueError::InvalidOperands {
                 op: "CAST",
                 left: type_name(ty.data_type),
@@ -33,21 +33,7 @@ impl CastExpr {
     }
 
     fn cast(&self, value: Value) -> Result<Value> {
-        let out = match (value, self.return_type.data_type) {
-            (Value::Int(v), DataType::BigInt) => Value::BigInt(i64::from(v)),
-            (Value::BigInt(v), DataType::Int) => {
-                Value::Int(i32::try_from(v).map_err(|_| ValueError::Overflow)?)
-            }
-            (value @ (Value::Null | Value::Int(_) | Value::BigInt(_)), _) => value,
-            (value, _) => {
-                return Err(ValueError::InvalidOperand {
-                    op: "CAST",
-                    operand: value.type_name(),
-                }
-                .into());
-            }
-        };
-        Ok(out)
+        Ok(value.cast_number(self.return_type.data_type)?)
     }
 }
 
@@ -107,7 +93,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_integers() {
+    fn converts_doubles() {
+        let to_double = cast(column(0), DataType::Double);
+        assert_eq!(to_double.return_type().data_type, DataType::Double);
+        assert_eq!(
+            eval(&to_double, &ints(Some(7), 0)).unwrap(),
+            Value::Double(7.0)
+        );
+        let round = cast(cast(column(1), DataType::Double), DataType::Int);
+        assert_eq!(eval(&round, &ints(None, -3)).unwrap(), Value::Int(-3));
+    }
+
+    #[test]
+    fn rejects_non_numbers() {
         let err = CastExpr::new(column(2), DataType::Int).unwrap_err();
         assert!(matches!(
             err,

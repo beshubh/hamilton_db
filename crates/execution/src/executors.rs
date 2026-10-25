@@ -15,8 +15,8 @@
 //!
 //! So far there are executors for CREATE TABLE, CREATE INDEX, INSERT ...
 //! VALUES, UPDATE, DELETE, SELECT ... WHERE through a table or an index
-//! scan, ORDER BY, LIMIT, and nested loop, index nested loop and hash
-//! joins; other plans fail with
+//! scan, ORDER BY, LIMIT, nested loop, index nested loop and hash joins, and
+//! hash aggregation for GROUP BY and aggregates; other plans fail with
 //! [`ExecutionError::NoExecutor`]. There are no transactions yet, so every
 //! write is committed as soon as it is made.
 
@@ -24,6 +24,7 @@ mod create_index;
 mod create_table;
 mod delete;
 mod filter;
+mod hash_aggregation;
 mod hash_join;
 mod index_scan;
 mod insert;
@@ -44,6 +45,7 @@ pub use create_index::CreateIndexExecutor;
 pub use create_table::CreateTableExecutor;
 pub use delete::DeleteExecutor;
 pub use filter::FilterExecutor;
+pub use hash_aggregation::HashAggregationExecutor;
 pub use hash_join::HashJoinExecutor;
 pub use index_scan::IndexScanExecutor;
 pub use insert::InsertExecutor;
@@ -109,6 +111,7 @@ pub enum AbstractExecutor {
     NestedLoopJoinExecutor,
     NestedIndexJoinExecutor,
     HashJoinExecutor,
+    HashAggregationExecutor,
 }
 
 /// The executor for `plan` and, below it, for each of its children.
@@ -165,8 +168,8 @@ pub fn create_executor(
             let (left, right) = (child(plan.left())?, child(plan.right())?);
             HashJoinExecutor::new(Arc::clone(ctx), plan.clone(), left, right).into()
         }
-        AbstractPlanNode::AggregationPlan(_) => {
-            return Err(ExecutionError::NoExecutor("Aggregation"));
+        AbstractPlanNode::AggregationPlan(plan) => {
+            HashAggregationExecutor::new(Arc::clone(ctx), plan.clone(), child(plan.child())?).into()
         }
         AbstractPlanNode::WindowPlan(_) => return Err(ExecutionError::NoExecutor("Window")),
         AbstractPlanNode::TopNPlan(_) => return Err(ExecutionError::NoExecutor("TopN")),

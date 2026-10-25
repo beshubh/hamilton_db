@@ -16,6 +16,9 @@ pub enum ParseError {
     #[error("integer {0} is out of range")]
     IntegerOutOfRange(String),
 
+    #[error("{0} is out of range for type DOUBLE")]
+    DoubleOutOfRange(String),
+
     #[error("multiple primary keys for table {0} are not allowed")]
     MultiplePrimaryKeys(String),
 

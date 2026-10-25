@@ -55,7 +55,17 @@ impl Db {
 
     /// Gives the joins of later plans `frames` buffers.
     pub fn set_join_frames(&mut self, frames: usize) {
-        let ctx = ExecutionContext::new(Arc::clone(&self.catalog)).with_join_frames(frames);
+        let ctx = ExecutionContext::new(Arc::clone(&self.catalog))
+            .with_join_frames(frames)
+            .with_aggregation_frames(self.ctx.aggregation_frames());
+        self.ctx = Arc::new(ctx);
+    }
+
+    /// Gives the aggregations of later plans `frames` buffers.
+    pub fn set_aggregation_frames(&mut self, frames: usize) {
+        let ctx = ExecutionContext::new(Arc::clone(&self.catalog))
+            .with_join_frames(self.ctx.join_frames())
+            .with_aggregation_frames(frames);
         self.ctx = Arc::new(ctx);
     }
 

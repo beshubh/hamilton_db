@@ -29,6 +29,11 @@ impl Db {
         Self::with_ctx(|ctx| ctx.with_join_frames(frames))
     }
 
+    /// A database whose aggregations get `frames` buffers.
+    fn with_aggregation_frames(frames: usize) -> Self {
+        Self::with_ctx(|ctx| ctx.with_aggregation_frames(frames))
+    }
+
     fn with_ctx(configure: impl FnOnce(ExecutionContext) -> ExecutionContext) -> Self {
         let dir = TempDir::new().unwrap();
         let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
@@ -211,12 +216,118 @@ fn composite_primary_key_rejects_duplicates_of_the_whole_key() {
 }
 
 #[test]
+fn doubles_are_stored_compared_and_computed() {
+    let db = Db::new();
+    db.run("CREATE TABLE m (id INT NOT NULL, x DOUBLE PRECISION)");
+    db.run("INSERT INTO m VALUES (1, 1.5), (2, -0.25), (3, NULL), (4, 2)");
+    assert_eq!(
+        db.run("SELECT id, x * 2, x + id FROM m WHERE x > 1 ORDER BY x"),
+        [
+            vec![Value::Int(1), Value::Double(3.0), Value::Double(2.5)],
+            vec![Value::Int(4), Value::Double(4.0), Value::Double(6.0)],
+        ]
+    );
+    assert_eq!(
+        db.run("SELECT id FROM m WHERE x = 2"),
+        [vec![Value::Int(4)]]
+    );
+    assert!(matches!(
+        db.try_run("SELECT x / 0 FROM m WHERE id = 1"),
+        Err(ExecutionError::Value(common::ValueError::DivisionByZero))
+    ));
+}
+
+#[test]
+fn aggregates_with_group_by_and_having() {
+    let db = Db::new();
+    db.run("CREATE TABLE orders (user_id INT, total INT, price DOUBLE)");
+    db.run(
+        "INSERT INTO orders VALUES (1, 10, 1.5), (1, 20, 2.5), (2, 5, NULL), \
+         (NULL, 7, 0.5), (NULL, NULL, 1.0), (3, 1, 9.0), (3, 2, 9.0)",
+    );
+    let null = Value::Null;
+    assert_eq!(
+        db.run(
+            "SELECT user_id, count(*), count(total), sum(total), avg(total), \
+             min(price), max(price), sum(price) FROM orders \
+             GROUP BY user_id HAVING count(*) > 1 ORDER BY user_id"
+        ),
+        [
+            vec![
+                Value::Int(1),
+                Value::BigInt(2),
+                Value::BigInt(2),
+                Value::BigInt(30),
+                Value::Double(15.0),
+                Value::Double(1.5),
+                Value::Double(2.5),
+                Value::Double(4.0),
+            ],
+            vec![
+                Value::Int(3),
+                Value::BigInt(2),
+                Value::BigInt(2),
+                Value::BigInt(3),
+                Value::Double(1.5),
+                Value::Double(9.0),
+                Value::Double(9.0),
+                Value::Double(18.0),
+            ],
+            // NULLs sort last, and all NULL user_ids are one group.
+            vec![
+                null.clone(),
+                Value::BigInt(2),
+                Value::BigInt(1),
+                Value::BigInt(7),
+                Value::Double(7.0),
+                Value::Double(0.5),
+                Value::Double(1.0),
+                Value::Double(1.5),
+            ],
+        ]
+    );
+    assert_eq!(
+        db.run("SELECT count(*), sum(total), avg(price) FROM orders WHERE total > 100"),
+        [vec![Value::BigInt(0), null.clone(), null]]
+    );
+    assert!(
+        db.run("SELECT user_id, count(*) FROM orders WHERE total > 100 GROUP BY user_id")
+            .is_empty()
+    );
+}
+
+#[test]
+fn aggregation_spills_groups_that_do_not_fit() {
+    let groups = 1500;
+    let rows: Vec<String> = (0..groups)
+        .flat_map(|k| [format!("({k}, {k})"), format!("({k}, 1)")])
+        .collect();
+    let expected: Vec<Vec<Value>> = (0..groups)
+        .map(|k| {
+            vec![
+                Value::Int(k),
+                Value::BigInt(2),
+                Value::BigInt(i64::from(k) + 1),
+            ]
+        })
+        .collect();
+    for db in [Db::new(), Db::with_aggregation_frames(3)] {
+        db.run("CREATE TABLE t (k INT, v INT)");
+        db.run(&format!("INSERT INTO t VALUES {}", rows.join(", ")));
+        assert_eq!(
+            db.run("SELECT k, count(*), sum(v) FROM t GROUP BY k ORDER BY k"),
+            expected
+        );
+    }
+}
+
+#[test]
 fn plans_without_executors_are_rejected() {
     let db = Db::new();
     db.run("CREATE TABLE t (a INT)");
     assert!(matches!(
-        db.try_plan("SELECT a FROM t ORDER BY a"),
-        Err(ExecutionError::NoExecutor("Sort"))
+        db.try_plan("SELECT a, row_number() OVER () FROM t"),
+        Err(ExecutionError::NoExecutor("Window"))
     ));
 }
 

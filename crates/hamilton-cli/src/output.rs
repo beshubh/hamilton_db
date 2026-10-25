@@ -243,7 +243,10 @@ fn dim() -> Style {
 }
 
 fn is_numeric(data_type: DataType) -> bool {
-    matches!(data_type, DataType::Int | DataType::BigInt)
+    matches!(
+        data_type,
+        DataType::Int | DataType::BigInt | DataType::Double
+    )
 }
 
 #[cfg(test)]

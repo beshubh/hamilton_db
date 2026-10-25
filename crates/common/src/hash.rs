@@ -1,10 +1,11 @@
 //! Hashes of SQL values with xxHash (XXH3), for operators that match or
 //! group rows by value, such as the hash join.
 //!
-//! Values that are equal under SQL `=` hash the same: an INT is hashed as the
-//! BIGINT with the same value, so INT and BIGINT keys can be matched. Values
-//! that are not equal can still collide, so callers compare the values of
-//! rows whose hashes match.
+//! Values that are equal under SQL `=` hash the same: an INT, and a DOUBLE
+//! with an integer value, are hashed as the BIGINT with the same value, so
+//! keys of different numeric types can be matched. Values that are not equal
+//! can still collide, so callers compare the values of rows whose hashes
+//! match.
 //!
 //! Every hash takes a `seed`. The same values hashed with different seeds
 //! give unrelated hashes, so an operator that splits rows more than once,
@@ -12,7 +13,7 @@
 
 use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
-use crate::value::Value;
+use crate::value::{TWO_POW_63, Value};
 
 pub fn hash_bytes(bytes: &[u8], seed: u64) -> u64 {
     xxh3_64_with_seed(bytes, seed)
@@ -32,6 +33,17 @@ pub fn hash_bigint(v: i64, seed: u64) -> u64 {
     hash_bytes(&v.to_le_bytes(), seed)
 }
 
+/// The same as [`hash_bigint`] for a double with an integer value that
+/// fits in a BIGINT, as `=` compares numbers by value. So `-0` hashes as `0`.
+pub fn hash_double(v: f64, seed: u64) -> u64 {
+    if v.fract() == 0.0 && (-TWO_POW_63..TWO_POW_63).contains(&v) {
+        return hash_bigint(v as i64, seed);
+    }
+    // Every NaN equals every other.
+    let bits = if v.is_nan() { f64::NAN } else { v }.to_bits();
+    hash_bytes(&bits.to_le_bytes(), seed)
+}
+
 pub fn hash_varchar(v: &str, seed: u64) -> u64 {
     hash_bytes(v.as_bytes(), seed)
 }
@@ -43,6 +55,7 @@ pub fn hash_value(value: &Value, seed: u64) -> u64 {
         Value::Null => hash_bytes(&[], seed),
         Value::Int(v) => hash_int(*v, seed),
         Value::BigInt(v) => hash_bigint(*v, seed),
+        Value::Double(v) => hash_double(*v, seed),
         Value::Bool(v) => hash_bool(*v, seed),
         Value::Varchar(v) => hash_varchar(v, seed),
         Value::Array(values) => hash_values(values, seed),
@@ -56,6 +69,12 @@ pub fn hash_values<'a>(values: impl IntoIterator<Item = &'a Value>, seed: u64) -
         .fold(hash_bytes(&[], seed), |hash, value| {
             combine_hashes(hash, hash_value(value, seed))
         })
+}
+
+/// The partition, out of `partitions`, a row whose key hashes to `hash`
+/// goes to.
+pub fn partition_index(hash: u64, partitions: usize) -> usize {
+    (hash % partitions as u64) as usize
 }
 
 /// Mixes two hashes into one. The order matters: `(a, b)` and `(b, a)` give
@@ -88,6 +107,19 @@ mod tests {
         assert_eq!(
             hash_value(&Value::Array(vec![Value::Int(1), Value::Int(2)]), 0),
             hash_value(&Value::Array(vec![Value::BigInt(1), Value::BigInt(2)]), 0)
+        );
+    }
+
+    #[test]
+    fn doubles_hash_like_equal_integers() {
+        assert_eq!(hash_double(3.0, 7), hash_bigint(3, 7));
+        assert_eq!(hash_double(-0.0, 7), hash_double(0.0, 7));
+        assert_eq!(hash_double(-TWO_POW_63, 7), hash_bigint(i64::MIN, 7));
+        assert_ne!(hash_double(1.5, 7), hash_double(2.5, 7));
+        assert_ne!(hash_double(TWO_POW_63, 7), hash_bigint(i64::MIN, 7));
+        assert_eq!(
+            hash_value(&Value::Double(2.0), 7),
+            hash_value(&Value::Int(2), 7)
         );
     }
 

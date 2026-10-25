@@ -3,13 +3,16 @@
 //! The rules match the execution crate's expressions and [`Value`]'s
 //! operators, so a bound expression does not fail on types at run time:
 //!
-//! - `+ - * / %` and unary `-` take integers. INT with INT is INT;
-//!   any BIGINT makes the result BIGINT.
-//! - Comparisons take two integers, two BOOLs or two VARCHARs.
+//! - `+ - * /` and unary `-` take numbers (INT, BIGINT, DOUBLE), and `%`
+//!   integers. INT with INT is INT; any DOUBLE makes the result DOUBLE, and
+//!   otherwise any BIGINT makes it BIGINT.
+//! - Comparisons take two numbers, two BOOLs or two VARCHARs.
 //! - AND, OR and NOT take BOOLs.
 //! - The result can be NULL if any operand can, except for IS [NOT] NULL.
-//! - `count` takes anything, `sum` integers, and `min` and `max` anything
-//!   comparable. `x IN (SELECT y ...)` needs `x = y` to be valid.
+//! - `count` takes anything, `sum` and `avg` numbers, and `min` and `max`
+//!   anything comparable. `sum` is BIGINT for integers and DOUBLE for
+//!   doubles; `avg` is always DOUBLE. `x IN (SELECT y ...)` needs `x = y` to
+//!   be valid.
 //!
 //! A NULL literal has no type of its own. It takes the type its context
 //! asks for (the other operand, BOOL under AND, the column it is stored
@@ -257,9 +260,10 @@ fn single_column(subquery: &BoundSelect) -> Result<Column> {
     }
 }
 
-/// Converts `expr` for storing in `column`: INT and BIGINT convert into
-/// each other, a VARCHAR fits any VARCHAR column (its length is checked
-/// when the row is stored), and a NULL literal fits any nullable column.
+/// Converts `expr` for storing in `column`: numbers convert into each other
+/// (a DOUBLE is rounded into an integer column), a VARCHAR fits any VARCHAR
+/// column (its length is checked when the row is stored), and a NULL literal
+/// fits any nullable column.
 pub(super) fn assign(mut expr: BoundExpr, column: &Column) -> Result<BoundExpr> {
     if is_null_literal(&expr) {
         if !column.nullable {
@@ -273,11 +277,10 @@ pub(super) fn assign(mut expr: BoundExpr, column: &Column) -> Result<BoundExpr> 
     match (from, column.data_type) {
         (DataType::Int, DataType::Int)
         | (DataType::BigInt, DataType::BigInt)
+        | (DataType::Double, DataType::Double)
         | (DataType::Bool, DataType::Bool)
         | (DataType::Varchar(_), DataType::Varchar(_)) => Ok(expr),
-        (DataType::Int | DataType::BigInt, to @ (DataType::Int | DataType::BigInt)) => {
-            cast_integer(expr, to)
-        }
+        (from, to) if is_number(from) && is_number(to) => cast_number(expr, to),
         _ => Err(ValueError::TypeMismatch {
             column: column.name.clone(),
             expected: column.data_type,
@@ -292,19 +295,12 @@ pub(super) fn null_for(column: &Column) -> Result<BoundExpr> {
     assign(constant(Value::Null), column)
 }
 
-/// Casts an integer expression to the other integer type. A literal is
+/// Casts a numeric expression to another numeric type. A literal is
 /// converted now, so one out of range is an error here rather than at run
 /// time.
-fn cast_integer(expr: BoundExpr, to: DataType) -> Result<BoundExpr> {
+fn cast_number(expr: BoundExpr, to: DataType) -> Result<BoundExpr> {
     if let BoundExprKind::Constant(value) = &expr.kind {
-        let value = match (value, to) {
-            (Value::Int(v), DataType::BigInt) => Value::BigInt(i64::from(*v)),
-            (Value::BigInt(v), DataType::Int) => {
-                Value::Int(i32::try_from(*v).map_err(|_| ValueError::Overflow)?)
-            }
-            _ => unreachable!("cast_integer is only called between INT and BIGINT"),
-        };
-        return Ok(constant(value));
+        return Ok(constant(value.cast_number(to)?));
     }
     let nullable = expr.return_type.nullable;
     Ok(BoundExpr {
@@ -339,6 +335,7 @@ fn bind_binary(op: BinaryOp, mut left: BoundExpr, mut right: BoundExpr) -> Resul
                 (DataType::Int | DataType::BigInt, DataType::Int | DataType::BigInt) => {
                     Some(DataType::BigInt)
                 }
+                _ if is_number(l) && is_number(r) && op != BinaryOp::Rem => Some(DataType::Double),
                 _ => None,
             }
         }
@@ -378,7 +375,7 @@ fn bind_unary(op: UnaryOp, mut expr: BoundExpr) -> Result<BoundExpr> {
             type_null(&mut expr, DataType::Bool);
             expr.return_type.data_type == DataType::Bool
         }
-        UnaryOp::Minus => matches!(expr.return_type.data_type, DataType::Int | DataType::BigInt),
+        UnaryOp::Minus => is_number(expr.return_type.data_type),
     };
     if !accepted {
         return Err(ValueError::InvalidOperand {
@@ -399,13 +396,17 @@ fn bind_unary(op: UnaryOp, mut expr: BoundExpr) -> Result<BoundExpr> {
 
 /// Whether `=`, `<` and the like accept these operand types.
 fn comparable(l: DataType, r: DataType) -> bool {
+    (is_number(l) && is_number(r))
+        || matches!(
+            (l, r),
+            (DataType::Bool, DataType::Bool) | (DataType::Varchar(_), DataType::Varchar(_))
+        )
+}
+
+fn is_number(data_type: DataType) -> bool {
     matches!(
-        (l, r),
-        (
-            DataType::Int | DataType::BigInt,
-            DataType::Int | DataType::BigInt
-        ) | (DataType::Bool, DataType::Bool)
-            | (DataType::Varchar(_), DataType::Varchar(_))
+        data_type,
+        DataType::Int | DataType::BigInt | DataType::Double
     )
 }
 
@@ -499,7 +500,7 @@ fn bind_aggregate(
     let ty = arg.return_type.data_type;
     let accepted = match function {
         AggregateFunction::Count => true,
-        AggregateFunction::Sum => matches!(ty, DataType::Int | DataType::BigInt),
+        AggregateFunction::Sum | AggregateFunction::Avg => is_number(ty),
         AggregateFunction::Min | AggregateFunction::Max => comparable(ty, ty),
     };
     if !accepted {
@@ -511,7 +512,9 @@ fn bind_aggregate(
     }
     let return_type = match function {
         AggregateFunction::Count => unnamed(DataType::BigInt, false),
+        AggregateFunction::Sum if ty == DataType::Double => unnamed(DataType::Double, true),
         AggregateFunction::Sum => unnamed(DataType::BigInt, true),
+        AggregateFunction::Avg => unnamed(DataType::Double, true),
         AggregateFunction::Min | AggregateFunction::Max => unnamed(ty, true),
     };
     Ok(BoundAggregate {
@@ -527,6 +530,7 @@ fn constant(value: Value) -> BoundExpr {
         Value::Null => DataType::Int,
         Value::Int(_) => DataType::Int,
         Value::BigInt(_) => DataType::BigInt,
+        Value::Double(_) => DataType::Double,
         Value::Bool(_) => DataType::Bool,
         Value::Varchar(s) => DataType::Varchar(u32::try_from(s.len()).unwrap_or(u32::MAX)),
         Value::Array(_) => DataType::Array,

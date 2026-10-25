@@ -37,6 +37,7 @@ pub(crate) fn fixed_width(data_type: DataType) -> usize {
     match data_type {
         DataType::Int => 4,
         DataType::BigInt => 8,
+        DataType::Double => 8,
         DataType::Bool => 1,
         DataType::Varchar(_) => 4,
         // Never holds a value: encoding a non-NULL ARRAY fails.
@@ -158,6 +159,9 @@ fn encode(schema: &Schema, values: &[Value]) -> Result<Vec<u8>> {
             (DataType::BigInt, Value::BigInt(v)) => {
                 buf[at..at + 8].copy_from_slice(&v.to_le_bytes())
             }
+            (DataType::Double, Value::Double(v)) => {
+                buf[at..at + 8].copy_from_slice(&v.to_le_bytes())
+            }
             (DataType::Bool, Value::Bool(v)) => buf[at] = u8::from(*v),
             (DataType::Varchar(max), Value::Varchar(s)) => {
                 if s.len() > max as usize {
@@ -208,6 +212,7 @@ fn decode_column(schema: &Schema, bytes: &[u8], idx: usize) -> Result<Value> {
     Ok(match column.data_type {
         DataType::Int => Value::Int(i32::from_le_bytes(read_array(bytes, at))),
         DataType::BigInt => Value::BigInt(i64::from_le_bytes(read_array(bytes, at))),
+        DataType::Double => Value::Double(f64::from_le_bytes(read_array(bytes, at))),
         DataType::Bool => match bytes[at] {
             0 => Value::Bool(false),
             1 => Value::Bool(true),
@@ -282,6 +287,25 @@ mod tests {
         let tuple = Tuple::encode(&schema, &row()).unwrap();
         assert_eq!(tuple.decode(&schema).unwrap(), row());
         assert_eq!(tuple.rid(), None);
+    }
+
+    #[test]
+    fn round_trips_doubles() {
+        let schema = Schema::new(vec![
+            Column::new("x", DataType::Double, true),
+            Column::new("y", DataType::Double, false),
+        ]);
+        for values in [
+            vec![Value::Double(-1.5), Value::Double(1e-300)],
+            vec![Value::Null, Value::Double(-0.0)],
+        ] {
+            let tuple = Tuple::encode(&schema, &values).unwrap();
+            assert_eq!(tuple.decode(&schema).unwrap(), values);
+        }
+        assert!(matches!(
+            Tuple::encode(&schema, &[Value::Int(1), Value::Double(1.0)]),
+            Err(ValueError::TypeMismatch { .. })
+        ));
     }
 
     #[test]

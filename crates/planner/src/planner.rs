@@ -324,6 +324,7 @@ fn plan_aggregate(aggregate: &BoundAggregate) -> Result<Aggregate> {
         (AggregateFunction::Count, None) => Aggregate::CountStar,
         (AggregateFunction::Count, Some(arg)) => Aggregate::Count(arg),
         (AggregateFunction::Sum, Some(arg)) => Aggregate::Sum(arg),
+        (AggregateFunction::Avg, Some(arg)) => Aggregate::Avg(arg),
         (AggregateFunction::Min, Some(arg)) => Aggregate::Min(arg),
         (AggregateFunction::Max, Some(arg)) => Aggregate::Max(arg),
         (function, None) => unreachable!("the binder allows * only for count, not {function:?}"),

@@ -14,11 +14,11 @@
 use common::{Column, DataType, Value};
 use sqlparser::ast::{
     self as sql, Assignment, AssignmentTarget, BinaryOperator, CharacterLength, ColumnDef,
-    ColumnOption, Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    Ident, IndexColumn, JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart,
-    OrderByKind, OrderByOptions, OrderBySort, PrimaryKeyConstraint, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, TableConstraint, TableFactor, TableObject,
-    TableWithJoins, UnaryOperator, WindowType,
+    ColumnOption, ExactNumberInfo, Expr, FromTable, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, Ident, IndexColumn, JoinConstraint, JoinOperator, LimitClause,
+    ObjectName, ObjectNamePart, OrderByKind, OrderByOptions, OrderBySort, PrimaryKeyConstraint,
+    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, TableConstraint, TableFactor,
+    TableObject, TableWithJoins, UnaryOperator, WindowType,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -210,6 +210,11 @@ fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
     match data_type {
         T::Int(None) | T::Integer(None) | T::Int4(None) => Ok(DataType::Int),
         T::BigInt(None) | T::Int8(None) => Ok(DataType::BigInt),
+        // FLOAT without a precision is a double in PostgreSQL.
+        T::DoublePrecision
+        | T::Double(ExactNumberInfo::None)
+        | T::Float8
+        | T::Float(ExactNumberInfo::None) => Ok(DataType::Double),
         T::Bool | T::Boolean => Ok(DataType::Bool),
         T::Varchar(Some(CharacterLength::IntegerLength { length, unit: None }))
         | T::CharacterVarying(Some(CharacterLength::IntegerLength { length, unit: None })) => {
@@ -585,7 +590,7 @@ fn convert_expr(expr: &Expr) -> Result<ast::Expr> {
             expr: inner,
         } => match number(inner) {
             // Parse the sign together with the digits so i64::MIN fits.
-            Some(digits) => integer(&format!("-{digits}")).map(ast::Expr::Literal),
+            Some(digits) => number_literal(&format!("-{digits}")).map(ast::Expr::Literal),
             None => Ok(ast::Expr::Unary {
                 op: UnaryOp::Minus,
                 expr: Box::new(convert_expr(inner)?),
@@ -624,11 +629,12 @@ fn convert_expr(expr: &Expr) -> Result<ast::Expr> {
     }
 }
 
-/// A literal, or `None` for a kind of literal we don't support. Integers
-/// become INT when they fit and BIGINT otherwise.
+/// A literal, or `None` for a kind of literal we don't support.
 fn convert_literal(value: &sql::Value) -> Option<Result<ast::Expr>> {
     let value = match value {
-        sql::Value::Number(digits, _) => return Some(integer(digits).map(ast::Expr::Literal)),
+        sql::Value::Number(digits, _) => {
+            return Some(number_literal(digits).map(ast::Expr::Literal));
+        }
         sql::Value::SingleQuotedString(s) => Value::Varchar(s.clone()),
         sql::Value::Boolean(b) => Value::Bool(*b),
         sql::Value::Null => Value::Null,
@@ -732,6 +738,30 @@ fn convert_window(spec: &sql::WindowSpec) -> Result<WindowSpec> {
             .map(convert_order_by)
             .collect::<Result<_>>()?,
     })
+}
+
+/// A numeric literal: DOUBLE if it has a decimal point or an exponent, as
+/// `1.5` or `1e3`, and otherwise INT when it fits and BIGINT when not.
+fn number_literal(text: &str) -> Result<Value> {
+    if text.contains(['.', 'e', 'E']) {
+        double(text)
+    } else {
+        integer(text)
+    }
+}
+
+/// Fails, as PostgreSQL does, on a literal too large to be finite or so
+/// small that it rounds to zero.
+fn double(text: &str) -> Result<Value> {
+    let Ok(v) = text.parse::<f64>() else {
+        return Err(ParseError::Unsupported(format!("numeric literal {text}")));
+    };
+    let mantissa = text.split(['e', 'E']).next().unwrap_or(text);
+    let underflow = v == 0.0 && mantissa.contains(|c: char| ('1'..='9').contains(&c));
+    if !v.is_finite() || underflow {
+        return Err(ParseError::DoubleOutOfRange(text.to_owned()));
+    }
+    Ok(Value::Double(v))
 }
 
 fn integer(text: &str) -> Result<Value> {
@@ -879,6 +909,39 @@ mod tests {
                 primary_key: vec![],
             })
         );
+    }
+
+    #[test]
+    fn double_column_types() {
+        for name in ["DOUBLE PRECISION", "DOUBLE", "FLOAT8", "FLOAT"] {
+            let stmt = parse_one(&format!("CREATE TABLE t (x {name})")).unwrap();
+            let Statement::CreateTable(create) = stmt else {
+                panic!("not a CREATE TABLE: {stmt:?}");
+            };
+            assert_eq!(
+                create.columns,
+                vec![Column::new("x", DataType::Double, true)]
+            );
+        }
+        assert_unsupported("CREATE TABLE t (x REAL)");
+        assert_unsupported("CREATE TABLE t (x FLOAT(10))");
+    }
+
+    #[test]
+    fn double_literals() {
+        assert_eq!(expr("1.5"), lit(1.5));
+        assert_eq!(expr("-1.5"), lit(-1.5));
+        assert_eq!(expr(".5"), lit(0.5));
+        assert_eq!(expr("2."), lit(2.0));
+        assert_eq!(expr("1e3"), lit(1000.0));
+        assert_eq!(expr("2.5E-3"), lit(0.0025));
+        assert_eq!(expr("0.0"), lit(0.0));
+        for sql in ["SELECT 1e309", "SELECT 1e-400"] {
+            assert!(matches!(
+                parse_one(sql),
+                Err(ParseError::DoubleOutOfRange(_))
+            ));
+        }
     }
 
     fn primary_key(sql: &str) -> Vec<String> {
@@ -1036,7 +1099,7 @@ mod tests {
         assert_unsupported("INSERT INTO t SELECT * FROM u");
         assert_unsupported("INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING");
         assert_unsupported("INSERT INTO t VALUES (1) RETURNING *");
-        assert_unsupported("INSERT INTO t VALUES (1.5)");
+        assert_unsupported("INSERT INTO t VALUES ($1)");
         assert_unsupported("INSERT INTO t DEFAULT VALUES");
     }
 
@@ -1270,7 +1333,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_expressions() {
-        assert_unsupported("SELECT 1.5");
+        assert_unsupported("SELECT $1");
         assert_unsupported("SELECT 'a' || 'b'");
         assert_unsupported("SELECT a.b.c FROM t");
         assert_unsupported("SELECT CAST(a AS INT) FROM t");
@@ -1408,7 +1471,7 @@ mod tests {
     fn subqueries_are_checked_for_unsupported_parts() {
         assert_unsupported("SELECT * FROM (SELECT DISTINCT a FROM t) AS x");
         assert_unsupported("SELECT EXISTS (SELECT * FROM t LIMIT 1 OFFSET 1)");
-        assert_unsupported("SELECT a IN (SELECT 1.5) FROM t");
+        assert_unsupported("SELECT a IN (SELECT $1) FROM t");
     }
 
     #[test]

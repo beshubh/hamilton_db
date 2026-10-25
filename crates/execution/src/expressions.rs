@@ -81,8 +81,17 @@ pub(crate) fn type_name(data_type: DataType) -> &'static str {
     match data_type {
         DataType::Int => "INT",
         DataType::BigInt => "BIGINT",
+        DataType::Double => "DOUBLE",
         DataType::Bool => "BOOL",
         DataType::Varchar(_) => "VARCHAR",
         DataType::Array => "ARRAY",
     }
+}
+
+/// Whether `data_type` is INT, BIGINT or DOUBLE.
+pub(crate) fn is_number(data_type: DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int | DataType::BigInt | DataType::Double
+    )
 }
