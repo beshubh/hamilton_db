@@ -4,10 +4,8 @@ use std::sync::Arc;
 
 use common::hash::hash_values;
 use common::{INVALID_PAGE_ID, PageId, Rid, Schema, Tuple, Value};
-use storage::StorageError;
-use storage::buffer::arc_replacer::AccessType;
-use storage::page::intermediate_result_page::IntermediateResultPage;
 
+use super::intermediate_result::{IntermediatePages, IntermediateResult};
 use super::{AbstractExecutor, Executor};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
@@ -78,9 +76,9 @@ pub struct HashJoinExecutor {
     /// The pairs of partitions to join, whose right partitions fit in memory
     /// unless partitioning could not split them.
     partition_pairs: Vec<PartitionPair>,
-    /// Every page the partitions were written to, freed when the join is
+    /// The pages the partitions were written to, freed when the join is
     /// initialized again or dropped.
-    intermediate_page_ids: Vec<PageId>,
+    pages: IntermediatePages,
     /// The pair after the one being joined.
     next_pair: usize,
     /// The current chunk of the pair's right partition, by the hash of each
@@ -104,27 +102,9 @@ pub struct HashJoinExecutor {
     output: VecDeque<Tuple>,
 }
 
-/// Rows on a linked list of intermediate result pages.
-struct Partition {
-    /// `INVALID_PAGE_ID` while the partition is empty.
-    first_page_id: PageId,
-    /// The page new rows go to, or `INVALID_PAGE_ID`.
-    last_page_id: PageId,
-    /// Decides whether a hash table of the rows fits in memory.
-    page_count: usize,
-    tuple_count: usize,
-}
-
-impl Partition {
-    fn new() -> Self {
-        Self {
-            first_page_id: INVALID_PAGE_ID,
-            last_page_id: INVALID_PAGE_ID,
-            page_count: 0,
-            tuple_count: 0,
-        }
-    }
-}
+/// Rows with keys that hash alike. Its page count decides whether a hash
+/// table of the rows fits in memory.
+type Partition = IntermediateResult;
 
 /// A left partition and the right partition whose rows its rows can match.
 struct PartitionPair {
@@ -153,12 +133,12 @@ impl HashJoinExecutor {
         right: Box<AbstractExecutor>,
     ) -> Self {
         Self {
+            pages: IntermediatePages::new(Arc::clone(&ctx)),
             exec_ctx: ctx,
             plan,
             left,
             right,
             partition_pairs: Vec::new(),
-            intermediate_page_ids: Vec::new(),
             next_pair: 0,
             hash_table: HashMap::new(),
             next_right_page: INVALID_PAGE_ID,
@@ -242,62 +222,14 @@ impl HashJoinExecutor {
                 match self.hash_tuple(tuple, side, 0)? {
                     Some(hash) => {
                         let i = partition_index(hash, partitions.len());
-                        self.append_tuple(&mut partitions[i], tuple)?;
+                        self.pages.append(&mut partitions[i], tuple)?;
                     }
-                    None if keep_null_keys => self.append_tuple(&mut null_key_rows, tuple)?,
+                    None if keep_null_keys => self.pages.append(&mut null_key_rows, tuple)?,
                     None => {}
                 }
             }
         }
         Ok((partitions, null_key_rows))
-    }
-
-    /// Appends `tuple` to the last page of `partition`, or to a new page
-    /// linked after it when that one is full or the partition has no pages.
-    fn append_tuple(&mut self, partition: &mut Partition, tuple: &Tuple) -> Result<()> {
-        let bpm = self.exec_ctx.catalog().bpm();
-
-        let mut inserted = false;
-        if partition.last_page_id != INVALID_PAGE_ID {
-            let mut guard = bpm.checked_write_page(partition.last_page_id, AccessType::Unknown)?;
-            match IntermediateResultPage::new(guard.get_data_mut())?.insert_tuple(tuple.data()) {
-                Ok(_) => inserted = true,
-                Err(StorageError::PageFull) => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        if !inserted {
-            let page_id = bpm.new_page();
-            self.intermediate_page_ids.push(page_id);
-            let mut guard = bpm.checked_write_page(page_id, AccessType::Unknown)?;
-            IntermediateResultPage::init(guard.get_data_mut()).insert_tuple(tuple.data())?;
-            drop(guard);
-
-            if partition.last_page_id == INVALID_PAGE_ID {
-                partition.first_page_id = page_id;
-            } else {
-                let mut last =
-                    bpm.checked_write_page(partition.last_page_id, AccessType::Unknown)?;
-                IntermediateResultPage::new(last.get_data_mut())?.set_next_page_id(page_id);
-            }
-            partition.last_page_id = page_id;
-            partition.page_count += 1;
-        }
-
-        partition.tuple_count += 1;
-        Ok(())
-    }
-
-    /// The rows on intermediate page `page_id`, and the page after it.
-    fn read_page(&self, page_id: PageId) -> Result<(Vec<Tuple>, PageId)> {
-        let bpm = self.exec_ctx.catalog().bpm();
-        let guard = bpm.checked_read_page(page_id, AccessType::Scan)?;
-        let page = IntermediateResultPage::new(guard.get_data())?;
-        let tuples = page
-            .tuples()
-            .map(|data| Tuple::from_bytes(data.to_vec()))
-            .collect();
-        Ok((tuples, page.next_page_id()))
     }
 
     /// Splits the rows of `partition`, from `side`, into
@@ -311,13 +243,13 @@ impl HashJoinExecutor {
         let mut partitions: Vec<_> = (0..self.fan_out()).map(|_| Partition::new()).collect();
         let mut page_id = partition.first_page_id;
         while page_id != INVALID_PAGE_ID {
-            let (tuples, next_page_id) = self.read_page(page_id)?;
+            let (tuples, next_page_id) = self.pages.read_page(page_id)?;
             for tuple in &tuples {
                 let hash = self
                     .hash_tuple(tuple, side, seed)?
                     .expect("rows with a NULL key are not partitioned");
                 let i = partition_index(hash, partitions.len());
-                self.append_tuple(&mut partitions[i], tuple)?;
+                self.pages.append(&mut partitions[i], tuple)?;
             }
             page_id = next_page_id;
         }
@@ -358,15 +290,6 @@ impl HashJoinExecutor {
         }
         Ok(())
     }
-
-    /// Frees every page the partitions were written to.
-    fn free_intermediate_pages(&mut self) -> Result<()> {
-        let bpm = self.exec_ctx.catalog().bpm();
-        for page_id in self.intermediate_page_ids.drain(..) {
-            bpm.delete_page(page_id)?;
-        }
-        Ok(())
-    }
 }
 
 /// Building and probing, done by `next`.
@@ -400,7 +323,7 @@ impl HashJoinExecutor {
             if self.next_right_page == INVALID_PAGE_ID {
                 break;
             }
-            let (rows, next_page_id) = self.read_page(self.next_right_page)?;
+            let (rows, next_page_id) = self.pages.read_page(self.next_right_page)?;
             for tuple in rows {
                 let keys = self
                     .key_values(&tuple, Side::Right)?
@@ -422,7 +345,7 @@ impl HashJoinExecutor {
             if self.next_left_page == INVALID_PAGE_ID {
                 return Ok(None);
             }
-            (self.left_rows, self.next_left_page) = self.read_page(self.next_left_page)?;
+            (self.left_rows, self.next_left_page) = self.pages.read_page(self.next_left_page)?;
             self.next_left = 0;
         }
         let row = std::mem::take(&mut self.left_rows[self.next_left]);
@@ -493,7 +416,7 @@ impl Executor for HashJoinExecutor {
         self.left.init()?;
         self.right.init()?;
         self.partition_pairs.clear();
-        self.free_intermediate_pages()?;
+        self.pages.free_all()?;
         self.next_pair = 0;
         self.hash_table.clear();
         self.next_right_page = INVALID_PAGE_ID;
@@ -543,25 +466,17 @@ impl Executor for HashJoinExecutor {
     }
 }
 
-impl Drop for HashJoinExecutor {
-    fn drop(&mut self) {
-        // Nothing can be done about a page that cannot be freed, and it is
-        // never read again.
-        let _ = self.free_intermediate_pages();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
     use std::fmt::Debug;
     use std::sync::Arc;
 
-    use common::{Column, DataType, INVALID_PAGE_ID, PageId, Schema, Value};
-    use storage::buffer::arc_replacer::AccessType;
-    use storage::page::intermediate_result_page::IntermediateResultPage;
+    use common::{Column, DataType, INVALID_PAGE_ID, Schema, Value};
 
-    use super::super::test_util::{Db, column, compare, constant, int, users_schema};
+    use super::super::test_util::{
+        Db, column, compare, constant, int, is_intermediate_page, users_schema,
+    };
     use super::super::{Executor, create_executor};
     use super::{HashJoinExecutor, Partition};
     use crate::expressions::{
@@ -617,7 +532,7 @@ mod tests {
         let (mut ids, mut pages) = (Vec::new(), 0);
         let (mut page_id, mut last) = (partition.first_page_id, INVALID_PAGE_ID);
         while page_id != INVALID_PAGE_ID {
-            let (tuples, next_page_id) = join.read_page(page_id).unwrap();
+            let (tuples, next_page_id) = join.pages.read_page(page_id).unwrap();
             for tuple in tuples {
                 ids.push(tuple.value(schema, 0).unwrap());
             }
@@ -784,13 +699,6 @@ mod tests {
         assert!(ids(&join, &pair.left, &users_schema()).contains(&Value::Int(1)));
     }
 
-    /// Whether `page_id` is still an intermediate result page, rather than
-    /// the zeroes a freed page reads as.
-    fn is_intermediate_page(db: &Db, page_id: PageId) -> bool {
-        let guard = db.bpm.read_page(page_id, AccessType::Unknown);
-        IntermediateResultPage::new(guard.get_data()).is_ok()
-    }
-
     /// The partitions' pages are freed when the join starts over and when it
     /// is dropped.
     #[test]
@@ -806,12 +714,12 @@ mod tests {
             column(0),
             column(0),
         );
-        let first: BTreeSet<_> = join.intermediate_page_ids.iter().copied().collect();
+        let first: BTreeSet<_> = join.pages.page_ids().collect();
         assert!(!first.is_empty());
         assert!(first.iter().all(|&id| is_intermediate_page(&db, id)));
 
         join.init().unwrap();
-        let second = join.intermediate_page_ids.clone();
+        let second: Vec<_> = join.pages.page_ids().collect();
         assert!(first.iter().all(|&id| !is_intermediate_page(&db, id)));
         assert!(second.iter().all(|&id| is_intermediate_page(&db, id)));
 

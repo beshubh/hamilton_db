@@ -3,10 +3,12 @@
 use std::sync::Arc;
 
 use catalog::{Catalog, TableInfo};
-use common::{Column, DataType, Rid, Schema, Tuple, Value};
+use common::{Column, DataType, PageId, Rid, Schema, Tuple, Value};
+use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::disk::disk_manager::DiskManager;
 use storage::index::IndexTrait;
+use storage::page::intermediate_result_page::IntermediateResultPage;
 use tempfile::TempDir;
 
 use super::{Executor, create_executor};
@@ -165,4 +167,11 @@ pub fn compare(op: ComparisonOp, left: AbstractExpr, right: AbstractExpr) -> Abs
 /// The rows of `tuples`, decoded with `schema`.
 pub fn decode(tuples: &[Tuple], schema: &Schema) -> Vec<Vec<Value>> {
     tuples.iter().map(|t| t.decode(schema).unwrap()).collect()
+}
+
+/// Whether `page_id` is still an intermediate result page, rather than the
+/// zeroes a freed page reads as.
+pub fn is_intermediate_page(db: &Db, page_id: PageId) -> bool {
+    let guard = db.bpm.read_page(page_id, AccessType::Unknown);
+    IntermediateResultPage::new(guard.get_data()).is_ok()
 }
