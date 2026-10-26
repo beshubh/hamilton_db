@@ -15,6 +15,10 @@ impl ConstantExpr {
     pub fn new(value: Value, return_type: Column) -> Self {
         Self { value, return_type }
     }
+
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
 }
 
 impl Expr for ConstantExpr {

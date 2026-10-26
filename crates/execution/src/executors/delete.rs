@@ -100,7 +100,8 @@ mod tests {
             Some(filter) => Arc::new(filter.into()),
             None => db.scan(None),
         };
-        db.run(DeletePlan::new(db.users.oid, child).into()).unwrap()
+        db.run(DeletePlan::new(db.users.oid, &db.users.name, child).into())
+            .unwrap()
     }
 
     #[test]
@@ -150,7 +151,7 @@ mod tests {
             compare(ComparisonOp::Gt, quotient.into(), int(0)),
             db.scan(None),
         );
-        let delete = DeletePlan::new(db.users.oid, Arc::new(filter.into()));
+        let delete = DeletePlan::new(db.users.oid, &db.users.name, Arc::new(filter.into()));
         assert!(matches!(
             db.run(delete.into()),
             Err(ExecutionError::Value(ValueError::DivisionByZero))

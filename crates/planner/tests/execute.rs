@@ -666,3 +666,33 @@ fn join_across_many_blocks() {
     let padded = db.run("SELECT a.id FROM a LEFT JOIN b ON a.id = b.id WHERE b.id IS NULL");
     assert_eq!(padded.len(), 500 - 72);
 }
+
+/// EXPLAIN shows the plan, one row per line, and runs none of it: the
+/// DELETE leaves the rows, and the window plan needs no executor.
+#[test]
+fn explain_does_not_run_the_statement() {
+    let db = shop();
+    let lines = |sql| db.run(sql).concat();
+    assert_eq!(
+        lines("EXPLAIN DELETE FROM orders WHERE user_id = 1"),
+        [
+            "Delete on orders",
+            "  ->  Filter",
+            "        Condition: user_id = 1",
+            "        ->  SeqScan on orders",
+        ]
+        .map(text)
+    );
+    assert_eq!(db.run("SELECT id FROM orders").len(), 4);
+    assert_eq!(
+        lines("EXPLAIN SELECT name, rank() OVER (ORDER BY id DESC) FROM users"),
+        [
+            "Projection",
+            "  Output: name, rank",
+            "  ->  Window",
+            "        Output: id, name, rank() OVER (ORDER BY id DESC)",
+            "        ->  SeqScan on users",
+        ]
+        .map(text)
+    );
+}

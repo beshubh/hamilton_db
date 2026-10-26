@@ -47,7 +47,24 @@ fn convert_statement(stmt: &sql::Statement) -> Result<Statement> {
         }
         sql::Statement::Update(update) => convert_update(stmt, update),
         sql::Statement::Delete(delete) => convert_delete(stmt, delete),
+        sql::Statement::Explain { statement, .. } => convert_explain(stmt, statement),
         _ => Err(unsupported(stmt)),
+    }
+}
+
+/// `EXPLAIN stmt`, without options such as ANALYZE or VERBOSE.
+fn convert_explain(stmt: &sql::Statement, explained: &sql::Statement) -> Result<Statement> {
+    ensure_canonical(stmt, &format!("EXPLAIN {explained}"), "EXPLAIN <statement>")?;
+    match explained {
+        sql::Statement::Query(_)
+        | sql::Statement::Insert(_)
+        | sql::Statement::Update(_)
+        | sql::Statement::Delete(_) => {
+            Ok(Statement::Explain(Box::new(convert_statement(explained)?)))
+        }
+        _ => Err(ParseError::Unsupported(format!(
+            "`{stmt}` (only EXPLAIN of SELECT, INSERT, UPDATE or DELETE)"
+        ))),
     }
 }
 
@@ -1533,6 +1550,29 @@ mod tests {
         assert_unsupported("DELETE FROM t USING u WHERE t.a = u.a");
         assert_unsupported("DELETE FROM t RETURNING *");
         assert_unsupported("DELETE FROM t, u");
+    }
+
+    #[test]
+    fn explain() {
+        assert_eq!(
+            parse_one("EXPLAIN DELETE FROM t").unwrap(),
+            Statement::Explain(Box::new(parse_one("DELETE FROM t").unwrap()))
+        );
+        assert_eq!(
+            parse_one("explain select a from t").unwrap(),
+            Statement::Explain(Box::new(parse_one("SELECT a FROM t").unwrap()))
+        );
+    }
+
+    #[test]
+    fn explain_rejects_options_and_other_statements() {
+        assert_unsupported("EXPLAIN ANALYZE SELECT 1");
+        assert_unsupported("EXPLAIN VERBOSE SELECT 1");
+        assert_unsupported("EXPLAIN (COSTS OFF) SELECT 1");
+        assert_unsupported("DESCRIBE SELECT 1");
+        assert_unsupported("EXPLAIN CREATE TABLE t (a INT)");
+        // The explained statement is checked as it would be on its own.
+        assert_unsupported("EXPLAIN DELETE FROM t RETURNING *");
     }
 
     #[test]

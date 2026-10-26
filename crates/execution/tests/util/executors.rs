@@ -101,7 +101,7 @@ impl Db {
             })
             .collect();
         let values = ValuesPlan::new(users_schema(), rows);
-        let insert = InsertPlan::new(self.users.oid, Arc::new(values.into()));
+        let insert = InsertPlan::new(self.users.oid, &self.users.name, Arc::new(values.into()));
         match self.run(insert.into()).unwrap().as_slice() {
             [row] => match row.as_slice() {
                 [Value::BigInt(count)] => *count,

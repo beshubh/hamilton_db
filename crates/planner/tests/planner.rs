@@ -92,6 +92,7 @@ fn shape(plan: &AbstractPlanNode) -> String {
         AbstractPlanNode::LimitPlan(_) => "Limit",
         AbstractPlanNode::TopNPlan(_) => "TopN",
         AbstractPlanNode::TopNPerGroupPlan(_) => "TopNPerGroup",
+        AbstractPlanNode::ExplainPlan(_) => "Explain",
     };
     let children: Vec<_> = plan.get_children().iter().map(|c| shape(c)).collect();
     format!("{name}({})", children.join(", "))
@@ -287,6 +288,55 @@ fn delete_without_where_scans_everything() {
     assert_eq!(
         shape(&db.plan("DELETE FROM users WHERE id > 3")),
         "Delete(Filter(SeqScan users))"
+    );
+}
+
+#[test]
+fn explain_sits_above_the_plan() {
+    let db = Db::new();
+    let plan = db.plan(
+        "EXPLAIN SELECT u.name, sum(o.total) FROM users u JOIN orders o ON u.id = o.user_id \
+         WHERE o.total > 10 GROUP BY u.name ORDER BY 2 DESC LIMIT 3",
+    );
+    assert_eq!(
+        shape(&plan),
+        "Explain(Projection(Limit(Sort(Aggregation(Filter(HashJoin(SeqScan users, SeqScan orders)))))))"
+    );
+    assert_eq!(names(plan.get_output_schema()), ["QUERY PLAN"]);
+    assert_eq!(
+        plan.get_child_at(0).to_string(),
+        "Projection
+  Output: name, sum
+  ->  Limit 3
+        ->  Sort
+              Key: sum DESC
+              ->  Aggregation
+                    Group By: name
+                    Aggregates: sum(total)
+                    ->  Filter
+                          Condition: total > 10
+                          ->  HashJoin (inner)
+                                Keys: left.id = right.user_id
+                                ->  SeqScan on users
+                                ->  SeqScan on orders"
+    );
+}
+
+#[test]
+fn explain_dml() {
+    let db = Db::new();
+    assert_eq!(
+        db.plan("INSERT INTO orders VALUES (1, 2, 3)").to_string(),
+        "Insert on orders\n  ->  Values (1 row)"
+    );
+    assert_eq!(
+        db.plan("UPDATE users SET name = 'x', score = score + 1 WHERE id = 1")
+            .to_string(),
+        "Update on users
+  Set: name = 'x', score = score + 1
+  ->  Filter
+        Condition: id = 1
+        ->  SeqScan on users"
     );
 }
 

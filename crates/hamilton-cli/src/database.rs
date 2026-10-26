@@ -94,7 +94,7 @@ impl Database {
         let command = match bound {
             BoundStatement::CreateTable(_) => return Ok(Output::Done("CREATE TABLE")),
             BoundStatement::CreateIndex(_) => return Ok(Output::Done("CREATE INDEX")),
-            BoundStatement::Select(_) => {
+            BoundStatement::Select(_) | BoundStatement::Explain(_) => {
                 let columns = executor.get_output_schema().columns().to_vec();
                 return Ok(Output::Rows { columns, rows });
             }
@@ -188,6 +188,30 @@ mod tests {
                 count: 2
             }
         );
+    }
+
+    #[test]
+    fn explain_shows_the_plan() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path().join("test.db")).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        let output = one(&db, "EXPLAIN INSERT INTO t VALUES (1), (2)");
+        let Output::Rows {
+            columns,
+            rows: lines,
+        } = output
+        else {
+            panic!("{output:?}");
+        };
+        assert_eq!(columns[0].name, "QUERY PLAN");
+        assert_eq!(
+            lines,
+            [
+                vec![Value::from("Insert on t")],
+                vec![Value::from("  ->  Values (2 rows)")],
+            ]
+        );
+        assert!(rows(&one(&db, "SELECT * FROM t")).is_empty());
     }
 
     #[test]

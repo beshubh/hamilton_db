@@ -15,6 +15,9 @@ pub enum Statement {
     Select(Box<Select>),
     Update(Update),
     Delete(Delete),
+    /// `EXPLAIN stmt`: the plan of a SELECT, INSERT, UPDATE or DELETE,
+    /// without running it.
+    Explain(Box<Statement>),
 }
 
 /// `CREATE TABLE name (col type [NULL | NOT NULL] [PRIMARY KEY], ...

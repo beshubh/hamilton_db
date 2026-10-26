@@ -14,19 +14,29 @@ pub struct DeletePlan {
     /// Always `[child]`.
     children: Vec<Arc<AbstractPlanNode>>,
     table_oid: TableOid,
+    table_name: String,
 }
 
 impl DeletePlan {
-    pub fn new(table_oid: TableOid, child: Arc<AbstractPlanNode>) -> Self {
+    pub fn new(
+        table_oid: TableOid,
+        table_name: impl Into<String>,
+        child: Arc<AbstractPlanNode>,
+    ) -> Self {
         Self {
             output_schema: dml_output_schema(),
             children: vec![child],
             table_oid,
+            table_name: table_name.into(),
         }
     }
 
     pub fn table_oid(&self) -> TableOid {
         self.table_oid
+    }
+
+    pub fn table_name(&self) -> &str {
+        &self.table_name
     }
 
     pub fn child(&self) -> &Arc<AbstractPlanNode> {

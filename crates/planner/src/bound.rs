@@ -32,6 +32,7 @@ pub enum BoundStatement {
     Select(BoundSelect),
     Update(BoundUpdate),
     Delete(BoundDelete),
+    Explain(Box<BoundStatement>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

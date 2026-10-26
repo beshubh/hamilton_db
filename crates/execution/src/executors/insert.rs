@@ -150,7 +150,7 @@ mod tests {
             ],
         ];
         let values = ValuesPlan::new(users_schema(), rows);
-        let insert = InsertPlan::new(db.users.oid, Arc::new(values.into()));
+        let insert = InsertPlan::new(db.users.oid, &db.users.name, Arc::new(values.into()));
         assert!(matches!(
             db.run(insert.into()),
             Err(ExecutionError::Value(ValueError::NullNotAllowed(_)))

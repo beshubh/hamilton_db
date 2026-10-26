@@ -25,8 +25,8 @@ use common::Schema;
 use execution::expressions::{AbstractExpr, ColumnValueExpr};
 use execution::plans::{
     AbstractPlanNode, Aggregate, AggregationPlan, CreateIndexPlan, CreateTablePlan, DeletePlan,
-    FilterPlan, HashJoinPlan, InsertPlan, JoinType, LimitPlan, OrderBy, PlanNode, ProjectionPlan,
-    SeqScanPlan, SortPlan, UpdatePlan, ValuesPlan, WindowColumn, WindowFunction,
+    ExplainPlan, FilterPlan, HashJoinPlan, InsertPlan, JoinType, LimitPlan, OrderBy, PlanNode,
+    ProjectionPlan, SeqScanPlan, SortPlan, UpdatePlan, ValuesPlan, WindowColumn, WindowFunction,
     WindowFunctionKind, WindowPlan,
 };
 use parser::{BinaryOp, JoinKind};
@@ -66,6 +66,7 @@ impl<'a> Planner<'a> {
             BoundStatement::Select(select) => self.plan_select(select)?,
             BoundStatement::Update(update) => self.plan_update(update)?,
             BoundStatement::Delete(delete) => self.plan_delete(delete)?,
+            BoundStatement::Explain(stmt) => ExplainPlan::new(self.plan(stmt)?).into(),
         };
         Ok(Arc::new(plan))
     }
@@ -167,7 +168,12 @@ impl<'a> Planner<'a> {
             })
             .collect::<Result<_>>()?;
         let values = ValuesPlan::new(insert.table.schema.clone(), rows);
-        Ok(InsertPlan::new(insert.table.oid, Arc::new(values.into())).into())
+        Ok(InsertPlan::new(
+            insert.table.oid,
+            &insert.table.name,
+            Arc::new(values.into()),
+        )
+        .into())
     }
 
     /// `Update(Filter(SeqScan))`, with a target expression for every column:
@@ -185,13 +191,13 @@ impl<'a> Planner<'a> {
             target_exprs[*idx] = plan_expr(value, Inputs::One)?;
         }
         let child = filtered_scan(table, update.selection.as_ref())?;
-        Ok(UpdatePlan::new(table.oid, target_exprs, child).into())
+        Ok(UpdatePlan::new(table.oid, &table.name, target_exprs, child).into())
     }
 
     /// `Delete(Filter(SeqScan))`.
     fn plan_delete(&self, delete: &BoundDelete) -> Result<AbstractPlanNode> {
         let child = filtered_scan(&delete.table, delete.selection.as_ref())?;
-        Ok(DeletePlan::new(delete.table.oid, child).into())
+        Ok(DeletePlan::new(delete.table.oid, &delete.table.name, child).into())
     }
 }
 

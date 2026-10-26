@@ -546,7 +546,7 @@ mod tests {
             })
             .collect();
         let values = ValuesPlan::new(schema.clone(), rows);
-        db.run(InsertPlan::new(items.oid, Arc::new(values.into())).into())
+        db.run(InsertPlan::new(items.oid, &items.name, Arc::new(values.into())).into())
             .unwrap();
         Arc::new(SeqScanPlan::new(items.oid, "items", schema, None).into())
     }

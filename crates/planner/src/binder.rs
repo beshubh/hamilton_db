@@ -45,6 +45,7 @@ impl<'a> Binder<'a> {
             Statement::Select(select) => self.bind_select(select, None).map(BoundStatement::Select),
             Statement::Update(update) => self.bind_update(update),
             Statement::Delete(delete) => self.bind_delete(delete),
+            Statement::Explain(stmt) => Ok(BoundStatement::Explain(Box::new(self.bind(stmt)?))),
         }
     }
 

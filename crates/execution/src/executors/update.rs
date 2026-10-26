@@ -200,7 +200,7 @@ mod tests {
         targets: Vec<AbstractExpr>,
         child: Arc<AbstractPlanNode>,
     ) -> Result<i64> {
-        let rows = db.run(UpdatePlan::new(table.oid, targets, child).into())?;
+        let rows = db.run(UpdatePlan::new(table.oid, &table.name, targets, child).into())?;
         match rows.as_slice() {
             [row] => match row.as_slice() {
                 [Value::BigInt(count)] => Ok(*count),
@@ -232,7 +232,7 @@ mod tests {
             .map(|&id| vec![int(id), constant(Value::Null, DataType::Varchar(32))])
             .collect();
         let values = ValuesPlan::new(users_schema(), rows);
-        db.run(InsertPlan::new(table.oid, Arc::new(values.into())).into())
+        db.run(InsertPlan::new(table.oid, &table.name, Arc::new(values.into())).into())
             .unwrap();
         table
     }

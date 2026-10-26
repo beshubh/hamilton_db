@@ -20,6 +20,7 @@ pub const KEYWORDS: &[&str] = &[
     "DELETE",
     "DESC",
     "EXISTS",
+    "EXPLAIN",
     "FALSE",
     "FROM",
     "GROUP",

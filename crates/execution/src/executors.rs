@@ -23,6 +23,7 @@
 mod create_index;
 mod create_table;
 mod delete;
+mod explain;
 mod filter;
 mod hash_aggregation;
 mod hash_join;
@@ -44,6 +45,7 @@ mod values;
 pub use create_index::CreateIndexExecutor;
 pub use create_table::CreateTableExecutor;
 pub use delete::DeleteExecutor;
+pub use explain::ExplainExecutor;
 pub use filter::FilterExecutor;
 pub use hash_aggregation::HashAggregationExecutor;
 pub use hash_join::HashJoinExecutor;
@@ -112,6 +114,7 @@ pub enum AbstractExecutor {
     NestedIndexJoinExecutor,
     HashJoinExecutor,
     HashAggregationExecutor,
+    ExplainExecutor,
 }
 
 /// The executor for `plan` and, below it, for each of its children.
@@ -170,6 +173,9 @@ pub fn create_executor(
         }
         AbstractPlanNode::AggregationPlan(plan) => {
             HashAggregationExecutor::new(Arc::clone(ctx), plan.clone(), child(plan.child())?).into()
+        }
+        AbstractPlanNode::ExplainPlan(plan) => {
+            ExplainExecutor::new(Arc::clone(ctx), plan.clone()).into()
         }
         AbstractPlanNode::WindowPlan(_) => return Err(ExecutionError::NoExecutor("Window")),
         AbstractPlanNode::TopNPlan(_) => return Err(ExecutionError::NoExecutor("TopN")),

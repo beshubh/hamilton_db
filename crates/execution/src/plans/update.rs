@@ -15,6 +15,7 @@ pub struct UpdatePlan {
     /// Always `[child]`.
     children: Vec<Arc<AbstractPlanNode>>,
     table_oid: TableOid,
+    table_name: String,
     /// The new row: one expression per table column, in table order and of
     /// the column's type, evaluated on the old row. A column the UPDATE does
     /// not set reads itself.
@@ -24,6 +25,7 @@ pub struct UpdatePlan {
 impl UpdatePlan {
     pub fn new(
         table_oid: TableOid,
+        table_name: impl Into<String>,
         target_exprs: Vec<AbstractExpr>,
         child: Arc<AbstractPlanNode>,
     ) -> Self {
@@ -31,12 +33,17 @@ impl UpdatePlan {
             output_schema: dml_output_schema(),
             children: vec![child],
             table_oid,
+            table_name: table_name.into(),
             target_exprs,
         }
     }
 
     pub fn table_oid(&self) -> TableOid {
         self.table_oid
+    }
+
+    pub fn table_name(&self) -> &str {
+        &self.table_name
     }
 
     pub fn target_exprs(&self) -> &[AbstractExpr] {

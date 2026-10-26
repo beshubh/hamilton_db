@@ -200,7 +200,7 @@ mod tests {
             })
             .collect();
         let values = ValuesPlan::new(table.schema.clone(), rows);
-        db.run(InsertPlan::new(table.oid, Arc::new(values.into())).into())
+        db.run(InsertPlan::new(table.oid, &table.name, Arc::new(values.into())).into())
             .unwrap();
         Inner { table, index }
     }

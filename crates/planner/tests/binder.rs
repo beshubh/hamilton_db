@@ -773,7 +773,8 @@ fn every_statement_kind_binds() {
     let stmts = parser::parse(
         "CREATE TABLE t (a INT); CREATE INDEX i ON orders (id); \
          INSERT INTO orders VALUES (1, 2, 3); \
-         SELECT * FROM orders; UPDATE orders SET total = 0; DELETE FROM orders",
+         SELECT * FROM orders; UPDATE orders SET total = 0; DELETE FROM orders; \
+         EXPLAIN SELECT * FROM orders",
     )
     .unwrap();
     let binder = Binder::new(&db.catalog);
@@ -787,6 +788,7 @@ fn every_statement_kind_binds() {
                 | (Statement::Select(_), BoundStatement::Select(_))
                 | (Statement::Update(_), BoundStatement::Update(_))
                 | (Statement::Delete(_), BoundStatement::Delete(_))
+                | (Statement::Explain(_), BoundStatement::Explain(_))
         );
         assert!(same_kind, "{stmt:?} bound to {bound:?}");
     }

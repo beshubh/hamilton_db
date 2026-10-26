@@ -14,6 +14,7 @@ mod aggregation;
 mod create_index;
 mod create_table;
 mod delete;
+mod explain;
 mod filter;
 mod hash_join;
 mod index_scan;
@@ -34,6 +35,7 @@ pub use aggregation::{Aggregate, AggregationPlan};
 pub use create_index::CreateIndexPlan;
 pub use create_table::CreateTablePlan;
 pub use delete::DeletePlan;
+pub use explain::ExplainPlan;
 pub use filter::FilterPlan;
 pub use hash_join::HashJoinPlan;
 pub use index_scan::{IndexScanPlan, IndexScanRange, KeyBound};
@@ -93,6 +95,7 @@ pub enum AbstractPlanNode {
     LimitPlan,
     TopNPlan,
     TopNPerGroupPlan,
+    ExplainPlan,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,9 +246,9 @@ mod tests {
 
     #[test]
     fn dml_outputs_a_count() {
-        let delete = DeletePlan::new(1, scan());
+        let delete = DeletePlan::new(1, "users", scan());
         assert_eq!(delete.get_output_schema(), &dml_output_schema());
-        let update = UpdatePlan::new(1, vec![column(0), column(1)], scan());
+        let update = UpdatePlan::new(1, "users", vec![column(0), column(1)], scan());
         assert_eq!(update.get_output_schema(), &dml_output_schema());
     }
 
