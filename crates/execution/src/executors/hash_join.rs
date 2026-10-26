@@ -2,19 +2,20 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use common::hash::{hash_values, partition_index};
+use common::hash::{ValuesHasher, partition_index};
 use common::{INVALID_PAGE_ID, PageId, Rid, Schema, Tuple, Value};
 
-use super::intermediate_result::{IntermediatePages, IntermediateResult};
+use super::intermediate_result::{IntermediatePages, IntermediateResult, PageCount};
 use super::{AbstractExecutor, Executor};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
-use crate::expressions::{AbstractExpr, Expr};
+use crate::expressions::{AbstractExpr, Expr, evaluate_in_place};
 use crate::plans::{HashJoinPlan, JoinType, PlanNode};
 
-/// How many rows `init` asks a child for at a time while partitioning it.
-/// Each batch goes straight to the partitions' pages, so this only bounds
-/// the rows in flight.
+/// How many rows a child is asked for at a time: while partitioning it,
+/// while reading the right child into memory, and while probing with the
+/// left child. Each batch goes straight to the partitions' pages or the hash
+/// table, or is probed with, so this only bounds the rows in flight.
 const CHILD_BATCH_SIZE: usize = 128;
 
 /// The seed the hash table hashes keys with. Partitioning uses seeds from 0
@@ -22,32 +23,47 @@ const CHILD_BATCH_SIZE: usize = 128;
 /// will do.
 const HASH_TABLE_SEED: u64 = 0;
 
-/// A grace hash join: the right child is the build side and the left child
-/// the probe side.
+/// A hash join: the right child is the build side and the left child the
+/// probe side. With `B` join frames ([`ExecutionContext::join_frames`]), a
+/// hash table gets `B - 2` frames, leaving one to read left rows and one for
+/// output.
 ///
-/// With `B` join frames ([`ExecutionContext::join_frames`]), both children
-/// are split into `B - 1` partitions by a hash of their keys, written to
-/// intermediate pages: one frame reads the input and each partition has one
-/// to write to. Rows with equal keys land in partitions with the same number,
-/// so each left partition only has to be joined with the matching right
-/// partition. That is done with a hash table of the right partition, which
-/// gets `B - 2` frames, leaving one to read the left partition and one for
-/// output. A right partition of more than `B - 2` pages is partitioned
-/// again, along with its left partition, with another hash function, until
-/// it fits.
+/// The right child is read first. If its rows fit in the hash table, they
+/// make the only one, and the left child is probed with as it is read, so
+/// neither side is written out. That is the simple in-memory hash join.
+///
+/// If they do not fit, it is a grace hash join: both children are split
+/// into `B - 1` partitions by a hash of their keys, written to intermediate
+/// pages: one frame reads the input and each partition has one to write to.
+/// Rows with equal keys land in partitions with the same number, so each
+/// left partition only has to be joined with the matching right partition,
+/// through a hash table of that right partition. A right partition of more
+/// than `B - 2` pages is partitioned again, along with its left partition,
+/// with another hash function, until it fits. Unlike a hybrid hash join, no
+/// partition is kept in memory while the others are written out: once the
+/// right side does not fit, all of it is.
 ///
 /// ```text
-/// partition the right rows and the left rows by hash(keys, seed 0)
-/// for each pair of partitions:
-///     while the right partition is more than B - 2 pages:
-///         partition both again by hash(keys, seed + 1)
-///     for each chunk of B - 2 pages of the right partition:
-///         build a hash table of the chunk's rows by their right_keys
-///         for each left row:
-///             for each right row in the hash table under its left_keys:
-///                 if the pair passes the predicate, output it
-///             LEFT join, last chunk: if no chunk had a match, output the
-///                 row padded with NULLs
+/// read right rows while they fit in B - 2 pages
+/// if that is all of them:
+///     build a hash table of them by their right_keys
+///     for each left row, as the left child gives it:
+///         join it with the hash table (below)
+/// else:
+///     partition the right rows and the left rows by hash(keys, seed 0)
+///     for each pair of partitions:
+///         while the right partition is more than B - 2 pages:
+///             partition both again by hash(keys, seed + 1)
+///         for each chunk of B - 2 pages of the right partition:
+///             build a hash table of the chunk's rows by their right_keys
+///             for each left row of the left partition:
+///                 join it with the hash table (below)
+///
+/// join a left row with the hash table:
+///     for each right row in the hash table under its left_keys:
+///         if the keys are equal and the pair passes the predicate, output it
+///     LEFT join, last chunk: if no chunk had a match, output the row padded
+///         with NULLs
 /// ```
 ///
 /// A right partition that fits is a single chunk. If partitioning a right
@@ -57,9 +73,14 @@ const HASH_TABLE_SEED: u64 = 0;
 /// chunk, as in a block nested loop join. `matched` remembers which left
 /// rows matched in an earlier chunk, so only the last chunk pads them.
 ///
-/// A NULL key matches nothing, so right rows with one are dropped while
-/// partitioning, and so are left rows, except in a LEFT join, which joins
-/// them with an empty right partition so they come out padded with NULLs.
+/// A NULL key matches nothing, so right rows with one are dropped, and so
+/// are left rows, except in a LEFT join, which pads them with NULLs. When
+/// partitioning, those left rows get their own partition, paired with an
+/// empty right partition.
+///
+/// Keys are read from the rows in place, so a VARCHAR key is hashed and
+/// compared without being copied, and a joined row is made by copying the
+/// bytes of the two rows ([`Tuple::join`]) without decoding them.
 ///
 /// One left row can have more matches than fit in a batch, so its joined
 /// rows wait in `output` until `next` returns them. That holds every joined
@@ -73,30 +94,36 @@ pub struct HashJoinExecutor {
     left: Box<AbstractExecutor>,
     /// The build side.
     right: Box<AbstractExecutor>,
+    /// Where `next_left_row` reads left rows from.
+    left_input: LeftInput,
     /// The pairs of partitions to join, whose right partitions fit in memory
-    /// unless partitioning could not split them.
+    /// unless partitioning could not split them. Empty unless the right side
+    /// did not fit.
     partition_pairs: Vec<PartitionPair>,
     /// The pages the partitions were written to, freed when the join is
     /// initialized again or dropped.
     pages: IntermediatePages,
     /// The pair after the one being joined.
     next_pair: usize,
-    /// The current chunk of the pair's right partition, by the hash of each
-    /// row's keys.
-    hash_table: HashMap<u64, Vec<BuildRow>>,
+    /// The right rows being joined with, by the hash of their keys: all of
+    /// them, or the current chunk of the pair's right partition.
+    hash_table: HashMap<u64, Vec<Tuple>>,
     /// The first page of the right partition's next chunk, or
-    /// `INVALID_PAGE_ID` if `hash_table` holds its last chunk.
+    /// `INVALID_PAGE_ID` if `hash_table` holds its last chunk, or all the
+    /// right rows.
     next_right_page: PageId,
-    /// The rows of the left page being probed with.
+    /// The rows of the left page or batch being probed with.
     left_rows: Vec<Tuple>,
+    left_rids: Vec<Rid>,
     /// The next row of `left_rows` to probe with.
     next_left: usize,
     /// The left page after `left_rows`, or `INVALID_PAGE_ID`.
     next_left_page: PageId,
-    /// Where the next left row is in its partition.
+    /// Where the next left row is in its partition, or in its batch.
     left_position: usize,
     /// Whether each row of the pair's left partition has matched a right row
-    /// in any chunk so far.
+    /// in any chunk so far. When the right side fit in memory, there is one
+    /// chunk, and this only covers the batch of left rows being probed with.
     matched: Vec<bool>,
     /// Joined rows not returned by `next` yet.
     output: VecDeque<Tuple>,
@@ -112,17 +139,20 @@ struct PartitionPair {
     right: Partition,
 }
 
-/// A right row in the hash table, with the values of its keys to compare
-/// with the left row's.
-struct BuildRow {
-    keys: Vec<Value>,
-    tuple: Tuple,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Side {
     Left,
     Right,
+}
+
+/// Where the left rows come from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeftInput {
+    /// The left child, probed with as it is read: the right side fit in
+    /// memory.
+    Child,
+    /// The left partition of each pair in turn.
+    Partitions,
 }
 
 impl HashJoinExecutor {
@@ -138,26 +168,19 @@ impl HashJoinExecutor {
             plan,
             left,
             right,
+            left_input: LeftInput::Partitions,
             partition_pairs: Vec::new(),
             next_pair: 0,
             hash_table: HashMap::new(),
             next_right_page: INVALID_PAGE_ID,
             left_rows: Vec::new(),
+            left_rids: Vec::new(),
             next_left: 0,
             next_left_page: INVALID_PAGE_ID,
             left_position: 0,
             matched: Vec::new(),
             output: VecDeque::new(),
         }
-    }
-}
-
-/// Partitioning, done by `init`.
-impl HashJoinExecutor {
-    /// How many partitions each round of partitioning splits rows into:
-    /// `B - 1`, one output page each and one frame for the input.
-    fn fan_out(&self) -> usize {
-        self.exec_ctx.join_frames() - 1
     }
 
     /// How many pages of right rows a hash table may hold: `B - 2`.
@@ -179,47 +202,96 @@ impl HashJoinExecutor {
         }
     }
 
-    /// The values of `side`'s keys on `tuple`, or `None` if one is NULL, as
+    /// Hashes the values of `side`'s keys on `tuple` with seed `seed`: each
+    /// round of partitioning uses another one. `None` if a key is NULL, as
     /// the row then matches nothing.
-    fn key_values(&self, tuple: &Tuple, side: Side) -> Result<Option<Vec<Value>>> {
-        let mut values = Vec::with_capacity(self.keys(side).len());
+    fn hash_keys(&self, tuple: &Tuple, side: Side, seed: u64) -> Result<Option<u64>> {
+        let mut hasher = ValuesHasher::new(seed);
         for key in self.keys(side) {
-            let value = key.evaluate(tuple, self.schema(side))?;
-            if value.is_null() {
+            let value = evaluate_in_place(key, tuple, self.schema(side))?;
+            if value.as_value_ref().is_null() {
                 return Ok(None);
             }
-            values.push(value);
+            hasher.add(value.as_value_ref());
         }
-        Ok(Some(values))
+        Ok(Some(hasher.finish()))
     }
 
-    /// Hashes the values of `side`'s keys on `tuple` with seed `seed`: each
-    /// round of partitioning uses another one. `None` if a key is NULL.
-    fn hash_tuple(&self, tuple: &Tuple, side: Side, seed: u64) -> Result<Option<u64>> {
-        Ok(self
-            .key_values(tuple, side)?
-            .map(|values| hash_values(&values, seed)))
+    /// Whether the keys of `left` and `right`, neither of them NULL, are
+    /// equal under `=`, which compares an INT and a BIGINT by value.
+    fn keys_equal(&self, left: &Tuple, right: &Tuple) -> Result<bool> {
+        let keys = self.plan.left_keys().iter().zip(self.plan.right_keys());
+        for (left_key, right_key) in keys {
+            let l = evaluate_in_place(left_key, left, self.schema(Side::Left))?;
+            let r = evaluate_in_place(right_key, right, self.schema(Side::Right))?;
+            if l.as_value_ref().compare(r.as_value_ref())? != Some(Ordering::Equal) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Reading the right side and partitioning, done by `init`.
+impl HashJoinExecutor {
+    /// How many partitions each round of partitioning splits rows into:
+    /// `B - 1`, one output page each and one frame for the input.
+    fn fan_out(&self) -> usize {
+        self.exec_ctx.join_frames() - 1
     }
 
-    /// Reads `side`'s child to the end, splitting its rows into
-    /// [`fan_out`](Self::fan_out) partitions with hash function 0. Also
-    /// returns the rows with a NULL key, which are only kept for the left
-    /// side of a LEFT join.
-    fn partition_child(&mut self, side: Side) -> Result<(Vec<Partition>, Partition)> {
+    /// Reads the right child while its rows fit on
+    /// [`build_pages`](Self::build_pages) pages. Returns the rows read, and
+    /// whether they are all of them.
+    fn read_right_while_it_fits(&mut self) -> Result<(Vec<Tuple>, bool)> {
+        let (mut rows, mut pages) = (Vec::new(), PageCount::new());
+        let (mut tuples, mut rids) = (Vec::new(), Vec::new());
+        while pages.pages() <= self.build_pages() {
+            if !self.right.next(&mut tuples, &mut rids, CHILD_BATCH_SIZE)? {
+                return Ok((rows, true));
+            }
+            for tuple in tuples.drain(..) {
+                pages.add(&tuple);
+                rows.push(tuple);
+            }
+        }
+        Ok((rows, false))
+    }
+
+    /// Partitions both children, for a right side too big for memory:
+    /// `right_rows`, the right rows read already, along with the rest of the
+    /// right child, then the left child. Then pairs up the partitions.
+    fn partition_both(&mut self, right_rows: Vec<Tuple>) -> Result<()> {
+        let (rights, _) = self.partition_child(Side::Right, right_rows)?;
+        let (lefts, null_key_rows) = self.partition_child(Side::Left, Vec::new())?;
+        for (left, right) in lefts.into_iter().zip(rights) {
+            self.prepare_partition_pair(left, right, 1)?;
+        }
+        if null_key_rows.tuple_count > 0 {
+            self.partition_pairs.push(PartitionPair {
+                left: null_key_rows,
+                right: Partition::new(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Splits `read`, rows of `side`'s child read already, and then the rest
+    /// of the child, into [`fan_out`](Self::fan_out) partitions with hash
+    /// function 0. Also returns the rows with a NULL key, which are only
+    /// kept for the left side of a LEFT join.
+    fn partition_child(
+        &mut self,
+        side: Side,
+        read: Vec<Tuple>,
+    ) -> Result<(Vec<Partition>, Partition)> {
         let keep_null_keys = side == Side::Left && self.plan.join_type() == JoinType::Left;
         let mut partitions: Vec<_> = (0..self.fan_out()).map(|_| Partition::new()).collect();
         let mut null_key_rows = Partition::new();
-        let (mut tuples, mut rids) = (Vec::new(), Vec::new());
+        let (mut tuples, mut rids) = (read, Vec::new());
         loop {
-            let child = match side {
-                Side::Left => &mut self.left,
-                Side::Right => &mut self.right,
-            };
-            if !child.next(&mut tuples, &mut rids, CHILD_BATCH_SIZE)? {
-                break;
-            }
             for tuple in &tuples {
-                match self.hash_tuple(tuple, side, 0)? {
+                match self.hash_keys(tuple, side, 0)? {
                     Some(hash) => {
                         let i = partition_index(hash, partitions.len());
                         self.pages.append(&mut partitions[i], tuple)?;
@@ -227,6 +299,13 @@ impl HashJoinExecutor {
                     None if keep_null_keys => self.pages.append(&mut null_key_rows, tuple)?,
                     None => {}
                 }
+            }
+            let child = match side {
+                Side::Left => &mut self.left,
+                Side::Right => &mut self.right,
+            };
+            if !child.next(&mut tuples, &mut rids, CHILD_BATCH_SIZE)? {
+                break;
             }
         }
         Ok((partitions, null_key_rows))
@@ -246,7 +325,7 @@ impl HashJoinExecutor {
             let (tuples, next_page_id) = self.pages.read_page(page_id)?;
             for tuple in &tuples {
                 let hash = self
-                    .hash_tuple(tuple, side, seed)?
+                    .hash_keys(tuple, side, seed)?
                     .expect("rows with a NULL key are not partitioned");
                 let i = partition_index(hash, partitions.len());
                 self.pages.append(&mut partitions[i], tuple)?;
@@ -294,9 +373,19 @@ impl HashJoinExecutor {
 
 /// Building and probing, done by `next`.
 impl HashJoinExecutor {
+    /// Adds a right row to the hash table, under the hash of its keys. A row
+    /// with a NULL key matches nothing, so it is left out.
+    fn add_to_hash_table(&mut self, tuple: Tuple) -> Result<()> {
+        if let Some(hash) = self.hash_keys(&tuple, Side::Right, HASH_TABLE_SEED)? {
+            self.hash_table.entry(hash).or_default().push(tuple);
+        }
+        Ok(())
+    }
+
     /// Starts another pass over the current pair's left partition, with the
     /// next chunk of its right partition, or with the next pair's first chunk
-    /// once that one is done. False once every pair is done.
+    /// once that one is done. False once every pair is done, and at once
+    /// when the right side fit in memory, as there are no pairs.
     fn start_next_chunk(&mut self) -> Result<bool> {
         if self.next_right_page == INVALID_PAGE_ID {
             let Some(pair) = self.partition_pairs.get(self.next_pair) else {
@@ -325,28 +414,43 @@ impl HashJoinExecutor {
             }
             let (rows, next_page_id) = self.pages.read_page(self.next_right_page)?;
             for tuple in rows {
-                let keys = self
-                    .key_values(&tuple, Side::Right)?
-                    .expect("rows with a NULL key are not partitioned");
-                let hash = hash_values(&keys, HASH_TABLE_SEED);
-                let bucket = self.hash_table.entry(hash).or_default();
-                bucket.push(BuildRow { keys, tuple });
+                self.add_to_hash_table(tuple)?;
             }
             self.next_right_page = next_page_id;
         }
         Ok(())
     }
 
-    /// The next row of the pair's left partition and where it is in the
-    /// partition, reading the next page when this one is done. None once the
-    /// partition is done.
+    /// The next left row and where it is among the rows `matched` covers,
+    /// reading the next batch of the left child, or page of the pair's left
+    /// partition, when this one is done. None once they are done.
     fn next_left_row(&mut self) -> Result<Option<(usize, Tuple)>> {
         while self.next_left == self.left_rows.len() {
-            if self.next_left_page == INVALID_PAGE_ID {
-                return Ok(None);
+            match self.left_input {
+                LeftInput::Child => {
+                    // The child empties `left_rows` even when it has no more.
+                    self.next_left = 0;
+                    let more = self.left.next(
+                        &mut self.left_rows,
+                        &mut self.left_rids,
+                        CHILD_BATCH_SIZE,
+                    )?;
+                    if !more {
+                        return Ok(None);
+                    }
+                    self.matched.clear();
+                    self.matched.resize(self.left_rows.len(), false);
+                    self.left_position = 0;
+                }
+                LeftInput::Partitions => {
+                    if self.next_left_page == INVALID_PAGE_ID {
+                        return Ok(None);
+                    }
+                    (self.left_rows, self.next_left_page) =
+                        self.pages.read_page(self.next_left_page)?;
+                    self.next_left = 0;
+                }
             }
-            (self.left_rows, self.next_left_page) = self.pages.read_page(self.next_left_page)?;
-            self.next_left = 0;
         }
         let row = std::mem::take(&mut self.left_rows[self.next_left]);
         self.next_left += 1;
@@ -354,61 +458,48 @@ impl HashJoinExecutor {
         Ok(Some((self.left_position - 1, row)))
     }
 
-    /// Joins `left`, the row at `position` in its partition, with the right
-    /// rows in the hash table under its keys, adding the joined rows to
-    /// `output`. In a LEFT join, once the last chunk is built, a row that
-    /// never matched is added padded with NULLs.
+    /// Joins `left`, the row at `position` among the rows `matched` covers,
+    /// with the right rows in the hash table under its keys, adding the
+    /// joined rows to `output`. In a LEFT join, once the last chunk is built,
+    /// a row that never matched is added padded with NULLs.
     fn join_left_row(&mut self, position: usize, left: &Tuple) -> Result<()> {
         let left_schema = self.left.get_output_schema();
         let right_schema = self.right.get_output_schema();
-        if let Some(keys) = self.key_values(left, Side::Left)? {
-            let bucket = self.hash_table.get(&hash_values(&keys, HASH_TABLE_SEED));
-            for right in bucket.into_iter().flatten() {
-                if !keys_equal(&keys, &right.keys)? {
+        let schema = self.plan.get_output_schema();
+        if let Some(hash) = self.hash_keys(left, Side::Left, HASH_TABLE_SEED)? {
+            for right in self.hash_table.get(&hash).into_iter().flatten() {
+                if !self.keys_equal(left, right)? {
                     continue;
                 }
                 if let Some(predicate) = self.plan.predicate()
-                    && predicate.evaluate_join(left, left_schema, &right.tuple, right_schema)?
+                    && predicate.evaluate_join(left, left_schema, right, right_schema)?
                         != Value::Bool(true)
                 {
                     continue;
                 }
-                let mut values = left.decode(left_schema)?;
-                values.extend(right.tuple.decode(right_schema)?);
-                self.output
-                    .push_back(Tuple::encode(self.plan.get_output_schema(), &values)?);
+                let joined = Tuple::join(schema, left, left_schema, Some(right), right_schema)?;
+                self.output.push_back(joined);
                 self.matched[position] = true;
             }
         }
 
         let last_chunk = self.next_right_page == INVALID_PAGE_ID;
         if last_chunk && !self.matched[position] && self.plan.join_type() == JoinType::Left {
-            let mut values = left.decode(left_schema)?;
-            values.extend(std::iter::repeat_n(Value::Null, right_schema.len()));
-            self.output
-                .push_back(Tuple::encode(self.plan.get_output_schema(), &values)?);
+            let padded = Tuple::join(schema, left, left_schema, None, right_schema)?;
+            self.output.push_back(padded);
         }
         Ok(())
     }
 }
 
-/// Whether two keys without NULLs are equal under `=`, which compares an INT
-/// and a BIGINT by value.
-fn keys_equal(left: &[Value], right: &[Value]) -> Result<bool> {
-    for (l, r) in left.iter().zip(right) {
-        if l.compare(r)? != Some(Ordering::Equal) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 impl Executor for HashJoinExecutor {
-    /// Partitions both children, so that `next` can join the pairs of
+    /// Reads the right child into the hash table if it fits, or else
+    /// partitions both children, so that `next` can join the pairs of
     /// partitions one at a time.
     fn init(&mut self) -> Result<()> {
         self.left.init()?;
         self.right.init()?;
+        self.left_input = LeftInput::Partitions;
         self.partition_pairs.clear();
         self.pages.free_all()?;
         self.next_pair = 0;
@@ -421,16 +512,17 @@ impl Executor for HashJoinExecutor {
         self.matched.clear();
         self.output.clear();
 
-        let (rights, _) = self.partition_child(Side::Right)?;
-        let (lefts, null_key_rows) = self.partition_child(Side::Left)?;
-        for (left, right) in lefts.into_iter().zip(rights) {
-            self.prepare_partition_pair(left, right, 1)?;
+        let (right_rows, all_read) = self.read_right_while_it_fits()?;
+        if !all_read {
+            return self.partition_both(right_rows);
         }
-        if null_key_rows.tuple_count > 0 {
-            self.partition_pairs.push(PartitionPair {
-                left: null_key_rows,
-                right: Partition::new(),
-            });
+        for tuple in right_rows {
+            self.add_to_hash_table(tuple)?;
+        }
+        // Without right rows to match, only a LEFT join outputs anything.
+        // An inner join is left with no pairs to join, so it is done at once.
+        if !self.hash_table.is_empty() || self.plan.join_type() == JoinType::Left {
+            self.left_input = LeftInput::Child;
         }
         Ok(())
     }
@@ -469,10 +561,10 @@ mod tests {
     use common::{Column, DataType, INVALID_PAGE_ID, Schema, Value};
 
     use super::super::test_util::{
-        Db, column, compare, constant, int, is_intermediate_page, users_schema,
+        Db, column, compare, constant, decode, int, is_intermediate_page, users_schema,
     };
     use super::super::{Executor, create_executor};
-    use super::{HashJoinExecutor, Partition};
+    use super::{HashJoinExecutor, LeftInput, Partition};
     use crate::expressions::{
         AbstractExpr, ArithmeticExpr, ArithmeticOp, ColumnValueExpr, ComparisonOp,
     };
@@ -490,9 +582,9 @@ mod tests {
         [Db::new(), small]
     }
 
-    /// A hash join of `left` and `right` on `left_key = right_key`, with
-    /// both sides partitioned.
-    fn partitioned(
+    /// A hash join of `left` and `right` on `left_key = right_key`, not
+    /// initialized yet.
+    fn hash_join(
         db: &Db,
         join_type: JoinType,
         left: Arc<AbstractPlanNode>,
@@ -510,13 +602,28 @@ mod tests {
             vec![right_key],
             None,
         );
-        let mut join = HashJoinExecutor::new(
+        HashJoinExecutor::new(
             Arc::clone(&db.ctx),
             plan,
             Box::new(left_executor),
             Box::new(right_executor),
-        );
-        join.init().unwrap();
+        )
+    }
+
+    /// [`hash_join`] with both sides partitioned, as `init` does when the
+    /// right side does not fit in memory.
+    fn partitioned(
+        db: &Db,
+        join_type: JoinType,
+        left: Arc<AbstractPlanNode>,
+        right: Arc<AbstractPlanNode>,
+        left_key: AbstractExpr,
+        right_key: AbstractExpr,
+    ) -> HashJoinExecutor {
+        let mut join = hash_join(db, join_type, left, right, left_key, right_key);
+        join.left.init().unwrap();
+        join.right.init().unwrap();
+        join.partition_both(Vec::new()).unwrap();
         join
     }
 
@@ -691,6 +798,52 @@ mod tests {
         assert_eq!(pair.right.tuple_count, 600);
         assert!(pair.right.page_count > join.build_pages());
         assert!(ids(&join, &pair.left, &users_schema()).contains(&Value::Int(1)));
+    }
+
+    /// A right side that fits in the hash table is joined in memory, and
+    /// nothing is written out. With the fewest frames, the 600 users do not
+    /// fit, and both sides are partitioned. Either way, the rows are the
+    /// same, padded rows with NULL keys included.
+    #[test]
+    fn joins_in_memory_when_the_right_side_fits() {
+        let left_ids: Vec<_> = (0..300)
+            .map(|i| (i % 10 != 0).then_some(i * 3 % 700))
+            .collect();
+        for db in dbs() {
+            db.insert_numbered(600);
+            let mut join = hash_join(
+                &db,
+                JoinType::Left,
+                user_ids(&left_ids),
+                db.scan(None),
+                user_id(),
+                column(0),
+            );
+            join.init().unwrap();
+            let fits = db.ctx.join_frames() != MIN_FRAMES;
+            assert_eq!(join.left_input == LeftInput::Child, fits);
+            assert_eq!(join.pages.page_ids().next().is_none(), fits);
+            assert_eq!(join.partition_pairs.is_empty(), fits);
+
+            let (mut tuples, mut rids, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+            while join.next(&mut tuples, &mut rids, 7).unwrap() {
+                rows.extend(decode(&tuples, join.get_output_schema()));
+            }
+            let expected: Vec<_> = left_ids
+                .iter()
+                .map(|&id| match id {
+                    Some(id @ 1..=600) => {
+                        vec![
+                            Value::Int(id),
+                            Value::Int(id),
+                            Value::from(format!("user {id}")),
+                        ]
+                    }
+                    _ => vec![id.map_or(Value::Null, Value::Int), Value::Null, Value::Null],
+                })
+                .collect();
+            assert_eq!(sorted(rows), sorted(expected));
+        }
     }
 
     /// The partitions' pages are freed when the join starts over and when it

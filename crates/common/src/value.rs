@@ -78,6 +78,20 @@ pub enum Value {
     Array(Vec<Value>),
 }
 
+/// A [`Value`] that borrows its string or array, from a tuple's bytes or
+/// from a `Value`, so reading one allocates nothing. Comparisons and hashes
+/// take these, so a column can be compared or hashed where it is stored.
+#[derive(Clone, Copy, Debug)]
+pub enum ValueRef<'a> {
+    Null,
+    Int(i32),
+    BigInt(i64),
+    Double(f64),
+    Bool(bool),
+    Varchar(&'a str),
+    Array(&'a [Value]),
+}
+
 /// 2^63, the smallest double above every `i64`. Every double in
 /// `-2^63..2^63` has an integer part that fits in an `i64`.
 pub(crate) const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
@@ -184,21 +198,21 @@ fn compare_integer_with_double(i: i64, d: f64) -> Ordering {
         .then_with(|| compare_doubles(0.0, d - whole))
 }
 
-impl Value {
-    pub fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
+impl<'a> ValueRef<'a> {
+    pub fn is_null(self) -> bool {
+        matches!(self, ValueRef::Null)
     }
 
     /// The SQL name of the value's type, for error messages.
-    pub fn type_name(&self) -> &'static str {
+    pub fn type_name(self) -> &'static str {
         match self {
-            Value::Null => "NULL",
-            Value::Int(_) => "INT",
-            Value::BigInt(_) => "BIGINT",
-            Value::Double(_) => "DOUBLE",
-            Value::Bool(_) => "BOOL",
-            Value::Varchar(_) => "VARCHAR",
-            Value::Array(_) => "ARRAY",
+            ValueRef::Null => "NULL",
+            ValueRef::Int(_) => "INT",
+            ValueRef::BigInt(_) => "BIGINT",
+            ValueRef::Double(_) => "DOUBLE",
+            ValueRef::Bool(_) => "BOOL",
+            ValueRef::Varchar(_) => "VARCHAR",
+            ValueRef::Array(_) => "ARRAY",
         }
     }
 
@@ -206,11 +220,11 @@ impl Value {
     ///
     /// Numbers compare by value across types, strings compare bytewise,
     /// and `false < true`.
-    pub fn compare(&self, other: &Value) -> Result<Option<Ordering>> {
+    pub fn compare(self, other: ValueRef<'_>) -> Result<Option<Ordering>> {
         match (self, other) {
-            (Value::Null, _) | (_, Value::Null) => Ok(None),
-            (Value::Bool(l), Value::Bool(r)) => Ok(Some(l.cmp(r))),
-            (Value::Varchar(l), Value::Varchar(r)) => Ok(Some(l.cmp(r))),
+            (ValueRef::Null, _) | (_, ValueRef::Null) => Ok(None),
+            (ValueRef::Bool(l), ValueRef::Bool(r)) => Ok(Some(l.cmp(&r))),
+            (ValueRef::Varchar(l), ValueRef::Varchar(r)) => Ok(Some(l.cmp(r))),
             _ => match (self.as_number(), other.as_number()) {
                 (Some(l), Some(r)) => Ok(Some(l.compare(r))),
                 _ => Err(ValueError::Incomparable {
@@ -219,6 +233,58 @@ impl Value {
                 }),
             },
         }
+    }
+
+    /// A [`Value`] holding a copy of this one.
+    pub fn to_value(self) -> Value {
+        match self {
+            ValueRef::Null => Value::Null,
+            ValueRef::Int(v) => Value::Int(v),
+            ValueRef::BigInt(v) => Value::BigInt(v),
+            ValueRef::Double(v) => Value::Double(v),
+            ValueRef::Bool(v) => Value::Bool(v),
+            ValueRef::Varchar(v) => Value::Varchar(v.to_owned()),
+            ValueRef::Array(values) => Value::Array(values.to_vec()),
+        }
+    }
+
+    fn as_number(self) -> Option<Number> {
+        match self {
+            ValueRef::Int(v) => Some(Number::Integer(i64::from(v))),
+            ValueRef::BigInt(v) => Some(Number::Integer(v)),
+            ValueRef::Double(v) => Some(Number::Double(v)),
+            _ => None,
+        }
+    }
+}
+
+impl Value {
+    pub fn is_null(&self) -> bool {
+        matches!(self, Value::Null)
+    }
+
+    /// The value as a [`ValueRef`], borrowing its string or array.
+    pub fn as_value_ref(&self) -> ValueRef<'_> {
+        match self {
+            Value::Null => ValueRef::Null,
+            Value::Int(v) => ValueRef::Int(*v),
+            Value::BigInt(v) => ValueRef::BigInt(*v),
+            Value::Double(v) => ValueRef::Double(*v),
+            Value::Bool(v) => ValueRef::Bool(*v),
+            Value::Varchar(v) => ValueRef::Varchar(v),
+            Value::Array(values) => ValueRef::Array(values),
+        }
+    }
+
+    /// The SQL name of the value's type, for error messages.
+    pub fn type_name(&self) -> &'static str {
+        self.as_value_ref().type_name()
+    }
+
+    /// Orders two values, or returns `None` if either is NULL; see
+    /// [`ValueRef::compare`].
+    pub fn compare(&self, other: &Value) -> Result<Option<Ordering>> {
+        self.as_value_ref().compare(other.as_value_ref())
     }
 
     /// SQL `=`: a BOOL, or NULL if either side is NULL.
@@ -356,12 +422,7 @@ impl Value {
     }
 
     fn as_number(&self) -> Option<Number> {
-        match self {
-            Value::Int(v) => Some(Number::Integer(i64::from(*v))),
-            Value::BigInt(v) => Some(Number::Integer(*v)),
-            Value::Double(v) => Some(Number::Double(*v)),
-            _ => None,
-        }
+        self.as_value_ref().as_number()
     }
 
     /// `Some(None)` for NULL, `Some(Some(b))` for a BOOL, `None` otherwise.

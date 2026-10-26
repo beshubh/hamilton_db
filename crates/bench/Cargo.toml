@@ -4,5 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-storage = { path = "../storage" }
 anyhow.workspace = true
+catalog = { path = "../catalog" }
+common = { path = "../common" }
+execution = { path = "../execution" }
+parser = { path = "../parser" }
+planner = { path = "../planner" }
+postgres = "0.19"
+storage = { path = "../storage" }
+tempfile = "3.27.0"

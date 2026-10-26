@@ -172,9 +172,7 @@ impl DiskManager {
         let mut state = self.state.lock();
         let offset = state.offset_or_allocate(page_id)?;
 
-        state.db_io.seek(SeekFrom::Start(offset))?;
-        state.db_io.write_all(page_data)?;
-        state.db_io.flush()?;
+        write_all_at(&state.db_io, page_data, offset)?;
         state.num_writes += 1;
         Ok(())
     }
@@ -190,8 +188,7 @@ impl DiskManager {
             return Ok(());
         };
 
-        state.db_io.seek(SeekFrom::Start(offset))?;
-        let n = read_full(&mut state.db_io, page_data)?;
+        let n = read_full_at(&state.db_io, page_data, offset)?;
         page_data[n..].fill(0);
         state.num_reads += 1;
         Ok(())
@@ -467,8 +464,44 @@ fn check_page_id(page_id: PageId) -> Result<()> {
     Ok(())
 }
 
+/// Writes all of `buf` at `offset` in one positioned write (`pwrite`),
+/// without moving the file's cursor.
+#[cfg(unix)]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, buf, offset)
+}
+
+#[cfg(not(unix))]
+fn write_all_at(mut file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(buf)
+}
+
+/// Reads at `offset` until `buf` is full or EOF, with positioned reads
+/// (`pread`), returning the number of bytes read.
+#[cfg(unix)]
+fn read_full_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    let mut n = 0;
+    while n < buf.len() {
+        match file.read_at(&mut buf[n..], offset + n as u64) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
+}
+
+#[cfg(not(unix))]
+fn read_full_at(mut file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    file.seek(SeekFrom::Start(offset))?;
+    read_full(file, buf)
+}
+
 /// Reads until `buf` is full or EOF, returning the number of bytes read.
-fn read_full(file: &mut File, buf: &mut [u8]) -> io::Result<usize> {
+fn read_full(mut file: impl Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
         match file.read(&mut buf[n..]) {

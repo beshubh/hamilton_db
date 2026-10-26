@@ -1,6 +1,9 @@
-use common::{Column, DataType, Schema, Tuple, Value, ValueError};
+use common::{Column, DataType, Schema, Tuple, Value, ValueError, ValueRef};
 
-use super::{AbstractExpr, Expr, UNNAMED_COLUMN, is_number, type_name};
+use super::{
+    AbstractExpr, Expr, UNNAMED_COLUMN, evaluate_in_place, evaluate_join_in_place, is_number,
+    type_name,
+};
 use crate::Result;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,21 +28,24 @@ impl ComparisonOp {
         }
     }
 
-    fn apply(self, left: &Value, right: &Value) -> Result<Value> {
-        let out = match self {
-            ComparisonOp::Eq => left.cmp_eq(right),
-            ComparisonOp::NotEq => left.cmp_ne(right),
-            ComparisonOp::Lt => left.cmp_lt(right),
-            ComparisonOp::LtEq => left.cmp_le(right),
-            ComparisonOp::Gt => left.cmp_gt(right),
-            ComparisonOp::GtEq => left.cmp_ge(right),
+    fn apply(self, left: ValueRef<'_>, right: ValueRef<'_>) -> Result<Value> {
+        let Some(ordering) = left.compare(right)? else {
+            return Ok(Value::Null);
         };
-        Ok(out?)
+        Ok(Value::Bool(match self {
+            ComparisonOp::Eq => ordering.is_eq(),
+            ComparisonOp::NotEq => ordering.is_ne(),
+            ComparisonOp::Lt => ordering.is_lt(),
+            ComparisonOp::LtEq => ordering.is_le(),
+            ComparisonOp::Gt => ordering.is_gt(),
+            ComparisonOp::GtEq => ordering.is_ge(),
+        }))
     }
 }
 
 /// `left <op> right` between two numbers (of any numeric type), two BOOLs
 /// or two VARCHARs. The result is BOOL, and NULL if either side is NULL.
+/// Columns and constants are compared in place, without copying them.
 #[derive(Clone, Debug)]
 pub struct ComparisonExpr {
     op: ComparisonOp,
@@ -79,9 +85,9 @@ impl ComparisonExpr {
 
 impl Expr for ComparisonExpr {
     fn evaluate(&self, tuple: &Tuple, schema: &Schema) -> Result<Value> {
-        let left = self.children[0].evaluate(tuple, schema)?;
-        let right = self.children[1].evaluate(tuple, schema)?;
-        self.op.apply(&left, &right)
+        let left = evaluate_in_place(&self.children[0], tuple, schema)?;
+        let right = evaluate_in_place(&self.children[1], tuple, schema)?;
+        self.op.apply(left.as_value_ref(), right.as_value_ref())
     }
 
     fn evaluate_join(
@@ -91,9 +97,9 @@ impl Expr for ComparisonExpr {
         right: &Tuple,
         right_schema: &Schema,
     ) -> Result<Value> {
-        let l = self.children[0].evaluate_join(left, left_schema, right, right_schema)?;
-        let r = self.children[1].evaluate_join(left, left_schema, right, right_schema)?;
-        self.op.apply(&l, &r)
+        let l = evaluate_join_in_place(&self.children[0], left, left_schema, right, right_schema)?;
+        let r = evaluate_join_in_place(&self.children[1], left, left_schema, right, right_schema)?;
+        self.op.apply(l.as_value_ref(), r.as_value_ref())
     }
 
     fn children(&self) -> &[AbstractExpr] {

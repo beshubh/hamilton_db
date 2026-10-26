@@ -42,3 +42,10 @@ cargo build --workspace
 cargo test --workspace
 cargo run -p hamilton-cli
 ```
+
+To time join queries against a local Postgres on the same data (flags are
+listed at the top of `crates/bench/src/main.rs`):
+
+```sh
+cargo run --release -p bench -- --pg postgres://postgres@127.0.0.1:5432
+```

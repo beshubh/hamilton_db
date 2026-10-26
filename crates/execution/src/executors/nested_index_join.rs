@@ -92,17 +92,15 @@ impl NestedIndexJoinExecutor {
             {
                 continue;
             }
-            let mut values = outer.decode(outer_schema)?;
-            values.extend(inner.decode(inner_schema)?);
-            self.output
-                .push_back(Tuple::encode(self.plan.get_output_schema(), &values)?);
+            let schema = self.plan.get_output_schema();
+            let joined = Tuple::join(schema, outer, outer_schema, Some(&inner), inner_schema)?;
+            self.output.push_back(joined);
             matched = true;
         }
         if !matched && self.plan.join_type() == JoinType::Left {
-            let mut values = outer.decode(outer_schema)?;
-            values.extend(std::iter::repeat_n(Value::Null, inner_schema.len()));
-            self.output
-                .push_back(Tuple::encode(self.plan.get_output_schema(), &values)?);
+            let schema = self.plan.get_output_schema();
+            let padded = Tuple::join(schema, outer, outer_schema, None, inner_schema)?;
+            self.output.push_back(padded);
         }
         Ok(())
     }

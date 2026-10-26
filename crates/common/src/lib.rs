@@ -16,7 +16,7 @@ pub use ids::{FrameId, INVALID_LSN, INVALID_PAGE_ID, INVALID_TXN_ID, Lsn, PageId
 pub use rid::{Rid, SlotId};
 pub use schema::{Column, Schema};
 pub use tuple::Tuple;
-pub use value::{DataType, Value};
+pub use value::{DataType, Value, ValueRef};
 
 #[cfg(test)]
 mod tests {

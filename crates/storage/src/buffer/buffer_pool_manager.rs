@@ -18,6 +18,11 @@ use std::{
     },
 };
 
+/// Frames in a buffer pool whose user doesn't choose: 64 MB of pages. The
+/// pool is allocated up front, so this is what it costs even when the
+/// database is smaller.
+pub const DEFAULT_POOL_SIZE: usize = 16_384;
+
 pub type FrameReadLatch = ArcRwLockReadGuard<RawRwLock, PageBuf>;
 pub type FrameWriteLatch = ArcRwLockWriteGuard<RawRwLock, PageBuf>;
 

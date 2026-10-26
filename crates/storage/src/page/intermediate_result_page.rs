@@ -38,8 +38,16 @@ const HEADER_OFFSET: usize = PageHeader::SIZE;
 const SLOTS_OFFSET: usize = HEADER_OFFSET + size_of::<IntermediateHeader>();
 const SLOT_SIZE: usize = size_of::<TupleSlot>();
 
+/// The room an empty page has for tuples and their slots.
+pub const TUPLE_SPACE: usize = PAGE_SIZE - SLOTS_OFFSET;
+
 /// The largest tuple a page holds: what fits in an empty page.
-pub const MAX_TUPLE_SIZE: usize = PAGE_SIZE - SLOTS_OFFSET - SLOT_SIZE;
+pub const MAX_TUPLE_SIZE: usize = TUPLE_SPACE - SLOT_SIZE;
+
+/// The room a tuple of `len` bytes takes on a page, with its slot.
+pub const fn space_for(len: usize) -> usize {
+    SLOT_SIZE + len
+}
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
@@ -99,7 +107,7 @@ impl<B: Deref<Target = [u8; PAGE_SIZE]>> IntermediateResultPage<B> {
 
     /// Whether a tuple of `len` bytes fits, along with its slot.
     pub fn has_room_for(&self, len: usize) -> bool {
-        SLOT_SIZE + len <= self.free_space()
+        space_for(len) <= self.free_space()
     }
 
     /// The tuple at `index`, in the order they were inserted, or `None` if
