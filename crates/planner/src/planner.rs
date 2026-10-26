@@ -3,7 +3,8 @@
 //! The planner builds the plain plan for each statement: scans, hash joins,
 //! a filter for WHERE, aggregation, a filter for HAVING, windows, then sort,
 //! limit and projection. Choosing better operators (index scans, index
-//! nested loop joins, top-N) is left to rewrites of that tree.
+//! nested loop joins, top-N) is left to the [`Optimizer`]'s rewrites of that
+//! tree, which [`Planner::plan`] runs before returning it.
 //!
 //! Every join is a hash join. The `left = right` equalities ANDed together
 //! in its ON condition are its keys, and the rest of the condition is
@@ -23,6 +24,7 @@ use std::sync::Arc;
 use catalog::Catalog;
 use common::Schema;
 use execution::expressions::{AbstractExpr, ColumnValueExpr};
+use execution::optimizer::Optimizer;
 use execution::plans::{
     AbstractPlanNode, Aggregate, AggregationPlan, CreateIndexPlan, CreateTablePlan, DeletePlan,
     ExplainPlan, FilterPlan, HashJoinPlan, InsertPlan, JoinType, LimitPlan, OrderBy, PlanNode,
@@ -40,8 +42,7 @@ use crate::bound::{
 use crate::error::Result;
 
 pub struct Planner<'a> {
-    // For choosing index scans, once storage has indexes to scan.
-    #[allow(dead_code)]
+    /// For the optimizer to choose indexes from.
     catalog: &'a Catalog,
 }
 
@@ -50,8 +51,15 @@ impl<'a> Planner<'a> {
         Self { catalog }
     }
 
-    /// The root of the plan for `stmt`.
+    /// The root of the optimized plan for `stmt`. For EXPLAIN, the plan
+    /// shown is the optimized one, as that is what would run.
     pub fn plan(&self, stmt: &BoundStatement) -> Result<Arc<AbstractPlanNode>> {
+        let plan = self.plan_statement(stmt)?;
+        Ok(Arc::new(Optimizer::new(self.catalog).optimize(&plan)))
+    }
+
+    /// The plain plan for `stmt`, before optimizing.
+    fn plan_statement(&self, stmt: &BoundStatement) -> Result<AbstractPlanNode> {
         let plan = match stmt {
             BoundStatement::CreateTable(create) => CreateTablePlan::new(
                 &create.name,
@@ -66,9 +74,11 @@ impl<'a> Planner<'a> {
             BoundStatement::Select(select) => self.plan_select(select)?,
             BoundStatement::Update(update) => self.plan_update(update)?,
             BoundStatement::Delete(delete) => self.plan_delete(delete)?,
-            BoundStatement::Explain(stmt) => ExplainPlan::new(self.plan(stmt)?).into(),
+            BoundStatement::Explain(stmt) => {
+                ExplainPlan::new(Arc::new(self.plan_statement(stmt)?)).into()
+            }
         };
-        Ok(Arc::new(plan))
+        Ok(plan)
     }
 
     /// `Projection(Limit(Sort(Window(Filter(Aggregation(Filter(from)))))))`,

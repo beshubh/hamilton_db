@@ -140,7 +140,9 @@ fn select_without_from_projects_one_empty_row() {
     assert!(values.rows()[0].is_empty());
 }
 
-/// The hash join `plan` is, or the one under `plan`'s filter.
+/// The hash join `plan` is, or the one under `plan`'s filter. `SELECT *`
+/// has no projection above it: the optimizer removes the one the planner
+/// puts there, as it copies every column.
 fn hash_join(plan: Arc<AbstractPlanNode>) -> HashJoinPlan {
     match &*plan {
         AbstractPlanNode::HashJoinPlan(join) => join.clone(),
@@ -183,7 +185,7 @@ fn nested_join_splits_on_its_own_left_side() {
         "SELECT * FROM users u JOIN orders o ON u.id = o.user_id \
          JOIN users v ON o.id = v.id",
     );
-    let outer = hash_join(plan.get_child_at(0));
+    let outer = hash_join(Arc::clone(&plan));
     assert_eq!(column_ref(&outer.left_keys()[0]), (0, 4));
     assert_eq!(column_ref(&outer.right_keys()[0]), (0, 0));
     assert_eq!(plan.get_output_schema().len(), 11);
@@ -198,7 +200,7 @@ fn join_keys_and_the_rest_of_the_condition() {
         "SELECT * FROM users u JOIN orders o \
          ON o.user_id = u.id AND o.total > 10 AND u.score = o.total + 1",
     );
-    let join = hash_join(plan.get_child_at(0));
+    let join = hash_join(Arc::clone(&plan));
     let left_keys: Vec<_> = join.left_keys().iter().map(column_ref).collect();
     assert_eq!(left_keys, [(0, 0), (0, 2)]);
     assert_eq!(column_ref(&join.right_keys()[0]), (0, 1));
@@ -222,7 +224,7 @@ fn join_without_keys() {
         "u.id = 1 AND o.id = o.user_id",
     ] {
         let plan = db.plan(&format!("SELECT * FROM users u JOIN orders o ON {on}"));
-        let join = hash_join(plan.get_child_at(0));
+        let join = hash_join(plan);
         assert!(join.left_keys().is_empty(), "{on}");
         assert!(join.predicate().is_some(), "{on}");
     }
@@ -234,9 +236,9 @@ fn cross_join_is_an_inner_join_without_a_condition() {
     let plan = db.plan("SELECT * FROM users, orders WHERE users.id = orders.user_id");
     assert_eq!(
         shape(&plan),
-        "Projection(Filter(HashJoin(SeqScan users, SeqScan orders)))"
+        "Filter(HashJoin(SeqScan users, SeqScan orders))"
     );
-    let join = hash_join(plan.get_child_at(0));
+    let join = hash_join(plan);
     assert_eq!(join.join_type(), JoinType::Inner);
     assert!(join.left_keys().is_empty());
     assert!(join.predicate().is_none());
@@ -300,25 +302,41 @@ fn explain_sits_above_the_plan() {
     );
     assert_eq!(
         shape(&plan),
-        "Explain(Projection(Limit(Sort(Aggregation(Filter(HashJoin(SeqScan users, SeqScan orders)))))))"
+        "Explain(Limit(Sort(Aggregation(Filter(HashJoin(SeqScan users, SeqScan orders))))))"
     );
     assert_eq!(names(plan.get_output_schema()), ["QUERY PLAN"]);
     assert_eq!(
         plan.get_child_at(0).to_string(),
+        "Limit 3
+  ->  Sort
+        Key: sum DESC
+        ->  Aggregation
+              Group By: name
+              Aggregates: sum(total)
+              ->  Filter
+                    Condition: total > 10
+                    ->  HashJoin (inner)
+                          Keys: left.id = right.user_id
+                          ->  SeqScan on users
+                          ->  SeqScan on orders"
+    );
+}
+
+/// EXPLAIN shows the plan that would run: the optimized one.
+#[test]
+fn explain_shows_the_optimized_plan() {
+    let db = Db::new();
+    db.catalog
+        .create_index("users_id", "users", &["id"])
+        .unwrap();
+    let plan = db.plan("EXPLAIN SELECT name FROM users WHERE id = 1");
+    assert_eq!(shape(&plan), "Explain(Projection(IndexScan))");
+    assert_eq!(
+        plan.get_child_at(0).to_string(),
         "Projection
-  Output: name, sum
-  ->  Limit 3
-        ->  Sort
-              Key: sum DESC
-              ->  Aggregation
-                    Group By: name
-                    Aggregates: sum(total)
-                    ->  Filter
-                          Condition: total > 10
-                          ->  HashJoin (inner)
-                                Keys: left.id = right.user_id
-                                ->  SeqScan on users
-                                ->  SeqScan on orders"
+  Output: name
+  ->  IndexScan using users_id
+        Keys: 1"
     );
 }
 
@@ -432,7 +450,7 @@ fn aggregate_without_group_by_still_aggregates() {
     let db = Db::new();
     assert_eq!(
         shape(&db.plan("SELECT count(*) FROM users")),
-        "Projection(Aggregation(SeqScan users))"
+        "Aggregation(SeqScan users)"
     );
 }
 

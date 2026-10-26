@@ -38,7 +38,7 @@ mod seq_scan;
 mod sort;
 #[cfg(test)]
 #[path = "../tests/util/executors.rs"]
-mod test_util;
+pub(crate) mod test_util;
 mod update;
 mod values;
 

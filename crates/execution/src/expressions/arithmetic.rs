@@ -102,6 +102,15 @@ impl Expr for ArithmeticExpr {
         &self.children
     }
 
+    fn clone_with_children(&self, children: Vec<AbstractExpr>) -> AbstractExpr {
+        debug_assert_eq!(children.len(), self.children.len());
+        Self {
+            children,
+            ..self.clone()
+        }
+        .into()
+    }
+
     fn return_type(&self) -> &Column {
         &self.return_type
     }

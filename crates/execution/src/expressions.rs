@@ -58,6 +58,10 @@ pub trait Expr {
 
     fn children(&self) -> &[AbstractExpr];
 
+    /// A copy of this expression with its children replaced. The return type
+    /// is kept, so each new child must have the type of the one it replaces.
+    fn clone_with_children(&self, children: Vec<AbstractExpr>) -> AbstractExpr;
+
     /// The column this expression produces: its type and whether it can be
     /// NULL.
     fn return_type(&self) -> &Column;

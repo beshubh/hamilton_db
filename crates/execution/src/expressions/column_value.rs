@@ -64,6 +64,11 @@ impl Expr for ColumnValueExpr {
         &[]
     }
 
+    fn clone_with_children(&self, children: Vec<AbstractExpr>) -> AbstractExpr {
+        debug_assert!(children.is_empty());
+        self.clone().into()
+    }
+
     fn return_type(&self) -> &Column {
         &self.return_type
     }
