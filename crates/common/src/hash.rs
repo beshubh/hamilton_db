@@ -13,7 +13,7 @@
 
 use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
-use crate::value::{TWO_POW_63, Value};
+use crate::value::{TWO_POW_63, Value, ValueRef};
 
 pub fn hash_bytes(bytes: &[u8], seed: u64) -> u64 {
     xxh3_64_with_seed(bytes, seed)
@@ -51,24 +51,53 @@ pub fn hash_varchar(v: &str, seed: u64) -> u64 {
 /// Hashes `value` by its type. NULL equals nothing, but still has a hash,
 /// for operators that put NULLs together, such as GROUP BY.
 pub fn hash_value(value: &Value, seed: u64) -> u64 {
+    hash_value_ref(value.as_value_ref(), seed)
+}
+
+/// [`hash_value`] of a value read in place.
+pub fn hash_value_ref(value: ValueRef<'_>, seed: u64) -> u64 {
     match value {
-        Value::Null => hash_bytes(&[], seed),
-        Value::Int(v) => hash_int(*v, seed),
-        Value::BigInt(v) => hash_bigint(*v, seed),
-        Value::Double(v) => hash_double(*v, seed),
-        Value::Bool(v) => hash_bool(*v, seed),
-        Value::Varchar(v) => hash_varchar(v, seed),
-        Value::Array(values) => hash_values(values, seed),
+        ValueRef::Null => hash_bytes(&[], seed),
+        ValueRef::Int(v) => hash_int(v, seed),
+        ValueRef::BigInt(v) => hash_bigint(v, seed),
+        ValueRef::Double(v) => hash_double(v, seed),
+        ValueRef::Bool(v) => hash_bool(v, seed),
+        ValueRef::Varchar(v) => hash_varchar(v, seed),
+        ValueRef::Array(values) => hash_values(values, seed),
     }
 }
 
 /// Hashes `values` in order, such as the columns of a multi-column key.
 pub fn hash_values<'a>(values: impl IntoIterator<Item = &'a Value>, seed: u64) -> u64 {
-    values
-        .into_iter()
-        .fold(hash_bytes(&[], seed), |hash, value| {
-            combine_hashes(hash, hash_value(value, seed))
-        })
+    let mut hasher = ValuesHasher::new(seed);
+    for value in values {
+        hasher.add(value.as_value_ref());
+    }
+    hasher.finish()
+}
+
+/// Hashes values one at a time, giving what [`hash_values`] gives for all
+/// of them, for callers that read each value in place.
+pub struct ValuesHasher {
+    seed: u64,
+    hash: u64,
+}
+
+impl ValuesHasher {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            seed,
+            hash: hash_bytes(&[], seed),
+        }
+    }
+
+    pub fn add(&mut self, value: ValueRef<'_>) {
+        self.hash = combine_hashes(self.hash, hash_value_ref(value, self.seed));
+    }
+
+    pub fn finish(self) -> u64 {
+        self.hash
+    }
 }
 
 /// The partition, out of `partitions`, a row whose key hashes to `hash`
@@ -151,5 +180,20 @@ mod tests {
         assert_eq!(hash_values([&one, &two], 0), hash_values([&one, &two], 0));
         assert_ne!(hash_values([&one, &two], 0), hash_values([&two, &one], 0));
         assert_ne!(hash_values([&one], 0), hash_values([&one, &one], 0));
+    }
+
+    #[test]
+    fn hashing_in_place_matches_hashing_values() {
+        let values = [Value::Int(1), Value::from("pen"), Value::Null];
+        let mut hasher = ValuesHasher::new(5);
+        for value in &values {
+            assert_eq!(
+                hash_value_ref(value.as_value_ref(), 5),
+                hash_value(value, 5)
+            );
+            hasher.add(value.as_value_ref());
+        }
+        assert_eq!(hasher.finish(), hash_values(&values, 5));
+        assert_eq!(ValuesHasher::new(5).finish(), hash_values([], 5));
     }
 }

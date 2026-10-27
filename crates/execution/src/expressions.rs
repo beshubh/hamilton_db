@@ -32,7 +32,7 @@ pub use logic::{LogicExpr, LogicOp};
 pub use string::{StringExpr, StringOp};
 pub use unary::{UnaryExpr, UnaryOp};
 
-use common::{Column, DataType, Schema, Tuple, Value};
+use common::{Column, DataType, Schema, Tuple, Value, ValueRef};
 use enum_dispatch::enum_dispatch;
 
 use crate::Result;
@@ -80,6 +80,57 @@ pub enum AbstractExpr {
     StringExpr,
     ArrayExpr,
     CastExpr,
+}
+
+/// What [`evaluate_in_place`] gives.
+pub enum Evaluated<'a> {
+    /// A column or a constant, read where it is.
+    InPlace(ValueRef<'a>),
+    /// A value the expression computed.
+    Computed(Value),
+}
+
+impl Evaluated<'_> {
+    pub fn as_value_ref(&self) -> ValueRef<'_> {
+        match self {
+            Evaluated::InPlace(value) => *value,
+            Evaluated::Computed(value) => value.as_value_ref(),
+        }
+    }
+}
+
+/// Evaluates `expr` on `tuple` like [`Expr::evaluate`], except that a column
+/// or a constant is read in place instead of copied into a [`Value`], which
+/// for a VARCHAR saves allocating a string. For callers that only look at
+/// the value, such as comparisons and hash keys.
+pub fn evaluate_in_place<'a>(
+    expr: &'a AbstractExpr,
+    tuple: &'a Tuple,
+    schema: &Schema,
+) -> Result<Evaluated<'a>> {
+    Ok(match expr {
+        AbstractExpr::ColumnValueExpr(column) => Evaluated::InPlace(column.read(tuple, schema)?),
+        AbstractExpr::ConstantExpr(constant) => Evaluated::InPlace(constant.value().as_value_ref()),
+        expr => Evaluated::Computed(expr.evaluate(tuple, schema)?),
+    })
+}
+
+/// [`evaluate_in_place`] on a pair of tuples from the two inputs of a join,
+/// like [`Expr::evaluate_join`].
+pub fn evaluate_join_in_place<'a>(
+    expr: &'a AbstractExpr,
+    left: &'a Tuple,
+    left_schema: &Schema,
+    right: &'a Tuple,
+    right_schema: &Schema,
+) -> Result<Evaluated<'a>> {
+    Ok(match expr {
+        AbstractExpr::ColumnValueExpr(column) => {
+            Evaluated::InPlace(column.read_join(left, left_schema, right, right_schema)?)
+        }
+        AbstractExpr::ConstantExpr(constant) => Evaluated::InPlace(constant.value().as_value_ref()),
+        expr => Evaluated::Computed(expr.evaluate_join(left, left_schema, right, right_schema)?),
+    })
 }
 
 /// The SQL name of a type, for error messages; matches [`Value::type_name`].

@@ -11,11 +11,8 @@ use execution::execution_context::ExecutionContext;
 use execution::executors::{Executor, create_executor};
 use parser::Statement;
 use planner::{Binder, BoundStatement, Planner};
-use storage::buffer::buffer_pool_manager::BufferPoolManager;
+use storage::buffer::buffer_pool_manager::{BufferPoolManager, DEFAULT_POOL_SIZE};
 use storage::disk::disk_manager::DiskManager;
-
-/// Pages kept in memory.
-const NUM_FRAMES: usize = 256;
 
 /// Rows pulled from the root executor at a time.
 const BATCH_SIZE: usize = 128;
@@ -46,7 +43,7 @@ impl Database {
     /// Its `.meta` and `.log` files sit next to it.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let disk = Arc::new(DiskManager::new(path)?);
-        let bpm = Arc::new(BufferPoolManager::new(NUM_FRAMES, Arc::clone(&disk)));
+        let bpm = Arc::new(BufferPoolManager::new(DEFAULT_POOL_SIZE, Arc::clone(&disk)));
         let catalog = Arc::new(Catalog::open(Arc::clone(&bpm))?);
         Ok(Self {
             disk,

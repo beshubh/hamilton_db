@@ -1,7 +1,9 @@
 use common::INVALID_PAGE_ID;
 use storage::StorageError;
 use storage::page::PageBuf;
-use storage::page::intermediate_result_page::{IntermediateResultPage, MAX_TUPLE_SIZE};
+use storage::page::intermediate_result_page::{
+    IntermediateResultPage, MAX_TUPLE_SIZE, TUPLE_SPACE, space_for,
+};
 use storage::page::page_header::{PageHeader, PageType};
 use zerocopy::FromBytes;
 
@@ -42,12 +44,14 @@ fn inserts_until_full() {
     let mut buf = PageBuf::zeroed();
     let mut page = IntermediateResultPage::init(&mut *buf);
     let free = page.free_space();
+    assert_eq!(free, TUPLE_SPACE);
     let tuple = [7u8; 96];
-    let fits = free / (tuple.len() + 4);
+    assert_eq!(space_for(tuple.len()), tuple.len() + 4);
+    let fits = free / space_for(tuple.len());
     for i in 0..fits {
         assert_eq!(page.insert_tuple(&tuple).unwrap(), i);
     }
-    assert_eq!(page.free_space(), free - fits * (tuple.len() + 4));
+    assert_eq!(page.free_space(), free - fits * space_for(tuple.len()));
     assert!(matches!(
         page.insert_tuple(&tuple),
         Err(StorageError::PageFull)

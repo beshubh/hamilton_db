@@ -24,10 +24,12 @@
 //! The slot of a NULL column is zero. Strings are stored in the data area in
 //! column order. All multi-byte fields are little-endian and unaligned.
 
+use std::ops::Range;
+
 use crate::error::{Result, ValueError};
 use crate::rid::Rid;
 use crate::schema::Schema;
-use crate::value::{DataType, Value};
+use crate::value::{DataType, Value, ValueRef};
 
 /// Offsets in a tuple are u16, so no tuple can be longer than this.
 pub const MAX_TUPLE_SIZE: usize = u16::MAX as usize;
@@ -116,6 +118,31 @@ impl Tuple {
         decode_column(schema, &self.data, idx)
     }
 
+    /// Reads column `idx` like [`value`](Self::value), but in place: a
+    /// VARCHAR borrows the tuple's bytes instead of copying them.
+    pub fn value_ref(&self, schema: &Schema, idx: usize) -> Result<ValueRef<'_>> {
+        read_column(schema, &self.data, idx)
+    }
+
+    /// Joins `left` and `right` into one tuple of `schema`, whose columns
+    /// are `left_schema`'s followed by `right_schema`'s, as a join outputs.
+    /// The columns' bytes are copied over without decoding them. A `right`
+    /// of `None` gives NULLs for its columns, as a LEFT join pads a row
+    /// that matched nothing.
+    pub fn join(
+        schema: &Schema,
+        left: &Tuple,
+        left_schema: &Schema,
+        right: Option<&Tuple>,
+        right_schema: &Schema,
+    ) -> Result<Self> {
+        let sides = [
+            (Some(left.data.as_slice()), left_schema),
+            (right.map(|right| right.data.as_slice()), right_schema),
+        ];
+        Ok(Self::from_bytes(join(schema, sides)?))
+    }
+
     /// Whether column `idx` is NULL, from the null bitmap alone.
     pub fn is_null(&self, schema: &Schema, idx: usize) -> Result<bool> {
         is_null(schema, &self.data, idx)
@@ -145,7 +172,15 @@ fn encode(schema: &Schema, values: &[Value]) -> Result<Vec<u8>> {
         });
     }
 
-    let mut buf = vec![0; schema.fixed_len()];
+    let strings_len: usize = values
+        .iter()
+        .map(|value| match value {
+            Value::Varchar(s) => s.len(),
+            _ => 0,
+        })
+        .sum();
+    let mut buf = Vec::with_capacity(schema.fixed_len() + strings_len);
+    buf.resize(schema.fixed_len(), 0);
     for (idx, (column, value)) in schema.columns().iter().zip(values).enumerate() {
         let at = schema.fixed_offset(idx);
         match (column.data_type, value) {
@@ -202,34 +237,108 @@ fn encode(schema: &Schema, values: &[Value]) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Lays out the columns of each side one after another, copying each
+/// column's slot and, for a VARCHAR, its bytes, which get a new offset.
+/// A side without bytes is all NULLs.
+fn join(schema: &Schema, sides: [(Option<&[u8]>, &Schema); 2]) -> Result<Vec<u8>> {
+    let found: usize = sides.iter().map(|(_, side)| side.len()).sum();
+    if found != schema.len() {
+        return Err(ValueError::ColumnCountMismatch {
+            expected: schema.len(),
+            found,
+        });
+    }
+
+    let strings_len: usize = sides
+        .iter()
+        .map(|&(bytes, side)| bytes.map_or(0, |b| b.len().saturating_sub(side.fixed_len())))
+        .sum();
+    let mut buf = Vec::with_capacity(schema.fixed_len() + strings_len);
+    buf.resize(schema.fixed_len(), 0);
+    let mut idx = 0;
+    for (bytes, side) in sides {
+        for side_idx in 0..side.len() {
+            let column = &schema.columns()[idx];
+            let side_type = side.columns()[side_idx].data_type;
+            if side_type != column.data_type {
+                return Err(ValueError::TypeMismatch {
+                    column: column.name.clone(),
+                    expected: column.data_type,
+                    found: side_type.type_name(),
+                });
+            }
+            let bytes = match bytes {
+                Some(bytes) if !is_null(side, bytes, side_idx)? => bytes,
+                _ => {
+                    if !column.nullable {
+                        return Err(ValueError::NullNotAllowed(column.name.clone()));
+                    }
+                    buf[idx / 8] |= 1 << (idx % 8);
+                    idx += 1;
+                    continue;
+                }
+            };
+            let (from, at) = (side.fixed_offset(side_idx), schema.fixed_offset(idx));
+            match column.data_type {
+                DataType::Varchar(_) => {
+                    let string = varchar_range(side, bytes, from)?;
+                    let offset = buf.len();
+                    buf.extend_from_slice(&bytes[string.clone()]);
+                    if buf.len() > MAX_TUPLE_SIZE {
+                        return Err(ValueError::TupleTooLarge);
+                    }
+                    buf[at..at + 2].copy_from_slice(&(offset as u16).to_le_bytes());
+                    buf[at + 2..at + 4].copy_from_slice(&(string.len() as u16).to_le_bytes());
+                }
+                DataType::Array => return Err(ValueError::CorruptTuple("ARRAY is not NULL")),
+                data_type => {
+                    let width = fixed_width(data_type);
+                    buf[at..at + width].copy_from_slice(&bytes[from..from + width]);
+                }
+            }
+            idx += 1;
+        }
+    }
+    Ok(buf)
+}
+
 fn decode_column(schema: &Schema, bytes: &[u8], idx: usize) -> Result<Value> {
+    read_column(schema, bytes, idx).map(ValueRef::to_value)
+}
+
+fn read_column<'a>(schema: &Schema, bytes: &'a [u8], idx: usize) -> Result<ValueRef<'a>> {
     if is_null(schema, bytes, idx)? {
-        return Ok(Value::Null);
+        return Ok(ValueRef::Null);
     }
     let column = &schema.columns()[idx];
 
     let at = schema.fixed_offset(idx);
     Ok(match column.data_type {
-        DataType::Int => Value::Int(i32::from_le_bytes(read_array(bytes, at))),
-        DataType::BigInt => Value::BigInt(i64::from_le_bytes(read_array(bytes, at))),
-        DataType::Double => Value::Double(f64::from_le_bytes(read_array(bytes, at))),
+        DataType::Int => ValueRef::Int(i32::from_le_bytes(read_array(bytes, at))),
+        DataType::BigInt => ValueRef::BigInt(i64::from_le_bytes(read_array(bytes, at))),
+        DataType::Double => ValueRef::Double(f64::from_le_bytes(read_array(bytes, at))),
         DataType::Bool => match bytes[at] {
-            0 => Value::Bool(false),
-            1 => Value::Bool(true),
+            0 => ValueRef::Bool(false),
+            1 => ValueRef::Bool(true),
             _ => return Err(ValueError::CorruptTuple("BOOL is not 0 or 1")),
         },
         DataType::Varchar(_) => {
-            let offset = usize::from(u16::from_le_bytes(read_array(bytes, at)));
-            let len = usize::from(u16::from_le_bytes(read_array(bytes, at + 2)));
-            if offset < schema.fixed_len() || offset + len > bytes.len() {
-                return Err(ValueError::CorruptTuple("VARCHAR is out of bounds"));
-            }
-            let s = std::str::from_utf8(&bytes[offset..offset + len])
+            let s = std::str::from_utf8(&bytes[varchar_range(schema, bytes, at)?])
                 .map_err(|_| ValueError::CorruptTuple("VARCHAR is not UTF-8"))?;
-            Value::Varchar(s.to_owned())
+            ValueRef::Varchar(s)
         }
         DataType::Array => return Err(ValueError::CorruptTuple("ARRAY is not NULL")),
     })
+}
+
+/// Where the bytes of the VARCHAR whose slot is at `at` are in the tuple.
+fn varchar_range(schema: &Schema, bytes: &[u8], at: usize) -> Result<Range<usize>> {
+    let offset = usize::from(u16::from_le_bytes(read_array(bytes, at)));
+    let len = usize::from(u16::from_le_bytes(read_array(bytes, at + 2)));
+    if offset < schema.fixed_len() || offset + len > bytes.len() {
+        return Err(ValueError::CorruptTuple("VARCHAR is out of bounds"));
+    }
+    Ok(offset..offset + len)
 }
 
 /// Reads column `idx`'s null bit, checking that the tuple is long enough to
@@ -512,5 +621,89 @@ mod tests {
         ));
         let null = Tuple::encode(&schema, &[Value::Null]).unwrap();
         assert_eq!(null.value(&schema, 0).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn reads_columns_in_place() {
+        let schema = users();
+        let tuple = Tuple::encode(&schema, &row()).unwrap();
+        for (idx, value) in row().iter().enumerate() {
+            assert_eq!(tuple.value_ref(&schema, idx).unwrap().to_value(), *value);
+        }
+        assert!(matches!(
+            tuple.value_ref(&schema, 1).unwrap(),
+            ValueRef::Varchar("ada")
+        ));
+    }
+
+    fn orders() -> Schema {
+        Schema::new(vec![
+            Column::new("item", DataType::Varchar(16), true),
+            Column::new("qty", DataType::Int, true),
+        ])
+    }
+
+    /// The schema of `users` joined with `orders`.
+    fn joined() -> Schema {
+        let columns = [users().columns(), orders().columns()].concat();
+        Schema::new(columns)
+    }
+
+    /// Joining copies bytes, and gives what encoding the values would.
+    #[test]
+    fn joins_two_rows() {
+        let (users, orders) = (users(), orders());
+        let left = Tuple::encode(&users, &row()).unwrap();
+        for right_values in [
+            vec![Value::from("pen"), Value::Int(3)],
+            vec![Value::Null, Value::Int(0)],
+            vec![Value::from(""), Value::Null],
+        ] {
+            let right = Tuple::encode(&orders, &right_values).unwrap();
+            let schema = joined();
+            let tuple = Tuple::join(&schema, &left, &users, Some(&right), &orders).unwrap();
+            let values: Vec<_> = row().into_iter().chain(right_values).collect();
+            assert_eq!(tuple, Tuple::encode(&schema, &values).unwrap());
+            assert_eq!(tuple.decode(&schema).unwrap(), values);
+        }
+    }
+
+    #[test]
+    fn joins_with_nulls_for_a_missing_right_row() {
+        let (users, orders) = (users(), orders());
+        let left = Tuple::encode(&users, &row()).unwrap();
+        let schema = joined();
+        let tuple = Tuple::join(&schema, &left, &users, None, &orders).unwrap();
+        let values: Vec<_> = row()
+            .into_iter()
+            .chain([Value::Null, Value::Null])
+            .collect();
+        assert_eq!(tuple.decode(&schema).unwrap(), values);
+
+        let mut columns = schema.columns().to_vec();
+        columns[6].nullable = false;
+        let not_null = Schema::new(columns);
+        assert!(matches!(
+            Tuple::join(&not_null, &left, &users, None, &orders),
+            Err(ValueError::NullNotAllowed(column)) if column == "qty"
+        ));
+    }
+
+    #[test]
+    fn join_checks_the_schema() {
+        let (users, orders) = (users(), orders());
+        let left = Tuple::encode(&users, &row()).unwrap();
+        assert!(matches!(
+            Tuple::join(&users, &left, &users, None, &orders),
+            Err(ValueError::ColumnCountMismatch {
+                expected: 5,
+                found: 7
+            })
+        ));
+        let swapped = Schema::new(orders.columns().iter().rev().cloned().collect());
+        assert!(matches!(
+            Tuple::join(&joined(), &left, &users, None, &swapped),
+            Err(ValueError::TypeMismatch { column, .. }) if column == "item"
+        ));
     }
 }

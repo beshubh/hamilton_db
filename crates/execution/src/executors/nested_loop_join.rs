@@ -141,11 +141,9 @@ impl Output<'_> {
         self.tuples.len() >= self.batch_size || self.bytes >= PAGE_SIZE
     }
 
-    fn push(&mut self, schema: &Schema, values: &[Value]) -> Result<()> {
-        let tuple = Tuple::encode(schema, values)?;
+    fn push(&mut self, tuple: Tuple) {
         self.bytes += tuple.len();
         self.tuples.push(tuple);
-        Ok(())
     }
 }
 
@@ -186,9 +184,14 @@ impl NestedLoopJoinExecutor {
                     continue;
                 }
                 self.matched[o] = true;
-                let mut values = outer.decode(outer_schema)?;
-                values.extend(inner.decode(inner_schema)?);
-                output.push(self.plan.get_output_schema(), &values)?;
+                let schema = self.plan.get_output_schema();
+                output.push(Tuple::join(
+                    schema,
+                    outer,
+                    outer_schema,
+                    Some(inner),
+                    inner_schema,
+                )?);
             }
         }
         Ok(State::InnerBlock)
@@ -198,15 +201,21 @@ impl NestedLoopJoinExecutor {
     /// nothing, padded with NULLs, until `output` is full or they are done.
     /// Returns the state to go on from.
     fn pad_unmatched(&mut self, start: usize, output: &mut Output) -> Result<State> {
-        let (outer_schema, nulls) = (self.outer.schema(), self.inner.schema().len());
+        let (outer_schema, inner_schema) = (self.outer.schema(), self.inner.schema());
         for o in start..self.outer_block.len() {
             if output.is_full() {
                 return Ok(State::Unmatched { outer: o });
             }
             if !self.matched[o] {
-                let mut values = self.outer_block[o].decode(outer_schema)?;
-                values.extend(std::iter::repeat_n(Value::Null, nulls));
-                output.push(self.plan.get_output_schema(), &values)?;
+                let schema = self.plan.get_output_schema();
+                let outer = &self.outer_block[o];
+                output.push(Tuple::join(
+                    schema,
+                    outer,
+                    outer_schema,
+                    None,
+                    inner_schema,
+                )?);
             }
         }
         Ok(State::OuterBlock)

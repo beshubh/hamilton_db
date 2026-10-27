@@ -9,7 +9,7 @@ use common::{INVALID_PAGE_ID, PageId, Tuple};
 use storage::StorageError;
 use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
-use storage::page::intermediate_result_page::IntermediateResultPage;
+use storage::page::intermediate_result_page::{IntermediateResultPage, TUPLE_SPACE, space_for};
 
 use crate::Result;
 use crate::execution_context::ExecutionContext;
@@ -32,6 +32,36 @@ impl IntermediateResult {
             page_count: 0,
             tuple_count: 0,
         }
+    }
+}
+
+/// Counts the pages rows would fill as an intermediate result, without
+/// writing them, for an executor that keeps rows in memory while they would
+/// fit in its frames.
+pub(super) struct PageCount {
+    pages: usize,
+    /// The room left on the last page.
+    free: usize,
+}
+
+impl PageCount {
+    pub fn new() -> Self {
+        Self { pages: 0, free: 0 }
+    }
+
+    /// Counts `tuple` on the last page if it fits there, and on a new page
+    /// if not, as [`IntermediatePages::append`] would put it.
+    pub fn add(&mut self, tuple: &Tuple) {
+        let space = space_for(tuple.len());
+        if space > self.free {
+            self.pages += 1;
+            self.free = TUPLE_SPACE;
+        }
+        self.free = self.free.saturating_sub(space);
+    }
+
+    pub fn pages(&self) -> usize {
+        self.pages
     }
 }
 
@@ -154,5 +184,31 @@ impl Drop for IntermediatePages {
         // Nothing can be done about a page that cannot be freed, and it is
         // never read again.
         let _ = self.free_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use common::Tuple;
+
+    use super::super::test_util::Db;
+    use super::{IntermediatePages, IntermediateResult, PageCount};
+
+    /// Counting rows gives the pages appending them fills.
+    #[test]
+    fn counts_the_pages_appending_fills() {
+        let db = Db::new();
+        let mut pages = IntermediatePages::new(Arc::clone(&db.ctx));
+        let (mut result, mut count) = (IntermediateResult::new(), PageCount::new());
+        assert_eq!(count.pages(), 0);
+        for len in (0..500).map(|i| i * 7 % 300) {
+            let tuple = Tuple::from_bytes(vec![1; len]);
+            pages.append(&mut result, &tuple).unwrap();
+            count.add(&tuple);
+            assert_eq!(count.pages(), result.page_count);
+        }
+        assert!(result.page_count > 1);
     }
 }

@@ -1,4 +1,4 @@
-use common::{Column, Schema, Tuple, Value};
+use common::{Column, Schema, Tuple, Value, ValueRef};
 
 use super::{AbstractExpr, Expr};
 use crate::{ExecutionError, Result};
@@ -35,14 +35,35 @@ impl ColumnValueExpr {
             inputs,
         }
     }
+
+    /// Reads the column in place from `tuple`, the only input.
+    pub fn read<'a>(&self, tuple: &'a Tuple, schema: &Schema) -> Result<ValueRef<'a>> {
+        if self.tuple_idx != 0 {
+            return Err(self.out_of_range(1));
+        }
+        Ok(tuple.value_ref(schema, self.col_idx)?)
+    }
+
+    /// Reads the column in place from its side of a join.
+    pub fn read_join<'a>(
+        &self,
+        left: &'a Tuple,
+        left_schema: &Schema,
+        right: &'a Tuple,
+        right_schema: &Schema,
+    ) -> Result<ValueRef<'a>> {
+        let (tuple, schema) = match self.tuple_idx {
+            0 => (left, left_schema),
+            1 => (right, right_schema),
+            _ => return Err(self.out_of_range(2)),
+        };
+        Ok(tuple.value_ref(schema, self.col_idx)?)
+    }
 }
 
 impl Expr for ColumnValueExpr {
     fn evaluate(&self, tuple: &Tuple, schema: &Schema) -> Result<Value> {
-        if self.tuple_idx != 0 {
-            return Err(self.out_of_range(1));
-        }
-        Ok(tuple.value(schema, self.col_idx)?)
+        Ok(self.read(tuple, schema)?.to_value())
     }
 
     fn evaluate_join(
@@ -52,12 +73,9 @@ impl Expr for ColumnValueExpr {
         right: &Tuple,
         right_schema: &Schema,
     ) -> Result<Value> {
-        let (tuple, schema) = match self.tuple_idx {
-            0 => (left, left_schema),
-            1 => (right, right_schema),
-            _ => return Err(self.out_of_range(2)),
-        };
-        Ok(tuple.value(schema, self.col_idx)?)
+        Ok(self
+            .read_join(left, left_schema, right, right_schema)?
+            .to_value())
     }
 
     fn children(&self) -> &[AbstractExpr] {
