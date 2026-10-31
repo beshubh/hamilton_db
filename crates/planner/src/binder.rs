@@ -24,7 +24,7 @@ use self::scope::Scope;
 use crate::bound::{
     BoundCreateIndex, BoundCreateTable, BoundDelete, BoundExpr, BoundExprKind, BoundFrom,
     BoundInsert, BoundOrderBy, BoundSelect, BoundSelectItem, BoundStatement, BoundTable,
-    BoundUpdate,
+    BoundUpdate, TransactionCommand,
 };
 use crate::error::{PlannerError, Result};
 
@@ -46,6 +46,9 @@ impl<'a> Binder<'a> {
             Statement::Update(update) => self.bind_update(update),
             Statement::Delete(delete) => self.bind_delete(delete),
             Statement::Explain(stmt) => Ok(BoundStatement::Explain(Box::new(self.bind(stmt)?))),
+            Statement::Begin => Ok(BoundStatement::Transaction(TransactionCommand::Begin)),
+            Statement::Commit => Ok(BoundStatement::Transaction(TransactionCommand::Commit)),
+            Statement::Rollback => Ok(BoundStatement::Transaction(TransactionCommand::Rollback)),
         }
     }
 

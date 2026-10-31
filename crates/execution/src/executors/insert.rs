@@ -1,27 +1,16 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
-use catalog::IndexInfo;
 use common::{Rid, Schema, Tuple};
-use storage::index::IndexTrait;
-use storage::table::table_page::TupleMeta;
 
-use super::{
-    AbstractExecutor, COMMIT_TS, Executor, count_row, duplicate_key, index_keys, locators,
-};
+use super::{AbstractExecutor, Executor, count_row, duplicate_key, index_keys, locators};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::plans::{InsertPlan, PlanNode};
 
 /// Inserts all of the child's rows, and their entries in each of the table's
 /// indexes, on the first call to `next`, and produces one row holding how
-/// many there were.
-///
-/// There are no transactions to roll back yet, so it reads every row and
-/// checks that none duplicates a primary key before inserting any: a row
-/// that fails to evaluate or has a duplicate key inserts nothing. An error
-/// from storage part way through, such as a key too long for its index,
-/// still leaves the rows before it inserted.
+/// many there were. A row whose primary key is taken, by a row already in
+/// the table or one inserted before it, fails the statement.
 pub struct InsertExecutor {
     ctx: Arc<ExecutionContext>,
     plan: InsertPlan,
@@ -71,17 +60,14 @@ impl Executor for InsertExecutor {
         {
             rows.append(&mut self.child_tuples);
         }
+        let txn = self.ctx.txn();
         // The child's rows are already in the table's layout.
-        let keys = rows
-            .iter()
-            .map(|tuple| index_keys(&table, &indexes, tuple))
-            .collect::<Result<Vec<_>>>()?;
-        check_primary_keys(&indexes, &keys)?;
-        for (tuple, keys) in rows.iter().zip(&keys) {
-            let rid = table.heap.insert(&TupleMeta::new(COMMIT_TS), tuple)?;
-            let locators = locators(&indexes, keys, rid);
-            for ((index, key), locator) in indexes.iter().zip(keys).zip(&locators) {
-                if !index.index.insert_entry(key, locator)? {
+        for tuple in &rows {
+            let keys = index_keys(&table, &indexes, tuple)?;
+            let rid = txn.insert(&table.heap, &table.schema, tuple)?;
+            let locators = locators(&indexes, &keys, rid);
+            for ((index, key), locator) in indexes.iter().zip(&keys).zip(&locators) {
+                if !txn.insert_entry(&index.index, key, locator)? {
                     return Err(duplicate_key(index, key));
                 }
             }
@@ -93,27 +79,6 @@ impl Executor for InsertExecutor {
     fn get_output_schema(&self) -> &Schema {
         self.plan.get_output_schema()
     }
-}
-
-/// Fails if a row's key in a primary key index is already in the index, or
-/// is also an earlier row's. `keys` holds each row's key in each of
-/// `indexes`.
-fn check_primary_keys(indexes: &[Arc<IndexInfo>], keys: &[Vec<Tuple>]) -> Result<()> {
-    let mut found = Vec::new();
-    for (i, index) in indexes.iter().enumerate() {
-        if !index.is_primary_key {
-            continue;
-        }
-        let mut seen = HashSet::new();
-        for row_keys in keys {
-            let key = &row_keys[i];
-            index.index.scan_key(key, &mut found)?;
-            if !found.is_empty() || !seen.insert(key.data()) {
-                return Err(duplicate_key(index, key));
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

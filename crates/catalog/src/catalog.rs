@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use common::{Column, DataType, PageId, Schema, ValueError};
+use common::{Column, DataType, PageId, Schema, TxnId, ValueError};
 use parking_lot::RwLock;
 use storage::StorageError;
 use storage::buffer::arc_replacer::AccessType;
@@ -12,7 +12,7 @@ use storage::index::{Index, IndexMetadata, LocatorKind};
 use storage::table::table_heap::TableHeap;
 
 use crate::error::{CatalogError, Result};
-use crate::header_page::{CATALOG_PAGE_ID, SystemTableRoots};
+use crate::header_page::{CATALOG_PAGE_ID, SystemTableRoots, read_next_tid, write_next_tid};
 use crate::system_tables::{ColumnRow, IndexColumnRow, IndexRow, SystemTables, TableRow};
 
 /// Identifies a table. Never reused.
@@ -177,6 +177,25 @@ impl Catalog {
 
     pub fn bpm(&self) -> &BufferPoolManager {
         &self.bpm
+    }
+
+    /// The Tid to start the transaction manager at, as last recorded with
+    /// `set_next_tid`.
+    pub fn next_tid(&self) -> Result<TxnId> {
+        let guard = self
+            .bpm
+            .checked_read_page(CATALOG_PAGE_ID, AccessType::Lookup)?;
+        Ok(read_next_tid(guard.get_data()))
+    }
+
+    /// Records `tid` as the next Tid in the header page. It reaches disk when
+    /// the page is flushed, like any other.
+    pub fn set_next_tid(&self, tid: TxnId) -> Result<()> {
+        let mut guard = self
+            .bpm
+            .checked_write_page(CATALOG_PAGE_ID, AccessType::Lookup)?;
+        write_next_tid(guard.get_data_mut(), tid);
+        Ok(())
     }
 
     /// Reads the system tables into memory. Rows left by a create that did
@@ -869,6 +888,15 @@ mod tests {
         };
         check(&db);
         check(&db.restart());
+    }
+
+    #[test]
+    fn next_tid_survives_restart() {
+        let db = Db::new(8);
+        assert_eq!(db.catalog.next_tid().unwrap(), 1);
+        db.catalog.set_next_tid(17).unwrap();
+        let db = db.restart();
+        assert_eq!(db.catalog.next_tid().unwrap(), 17);
     }
 
     #[test]

@@ -601,9 +601,9 @@ mod tests {
 
     /// The executor for `plan`, initialized.
     fn aggregation(db: &Db, plan: AggregationPlan) -> HashAggregationExecutor {
-        let child = create_executor(&db.ctx, plan.child()).unwrap();
-        let mut aggregation =
-            HashAggregationExecutor::new(Arc::clone(&db.ctx), plan, Box::new(child));
+        let ctx = db.ctx();
+        let child = create_executor(&ctx, plan.child()).unwrap();
+        let mut aggregation = HashAggregationExecutor::new(ctx, plan, Box::new(child));
         aggregation.init().unwrap();
         aggregation
     }

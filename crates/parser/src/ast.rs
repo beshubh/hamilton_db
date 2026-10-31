@@ -18,6 +18,12 @@ pub enum Statement {
     /// `EXPLAIN stmt`: the plan of a SELECT, INSERT, UPDATE or DELETE,
     /// without running it.
     Explain(Box<Statement>),
+    /// `BEGIN [TRANSACTION | WORK]` or `START TRANSACTION`.
+    Begin,
+    /// `COMMIT [TRANSACTION | WORK]` or `END [TRANSACTION | WORK]`.
+    Commit,
+    /// `ROLLBACK [TRANSACTION | WORK]` or `ABORT [TRANSACTION | WORK]`.
+    Rollback,
 }
 
 /// `CREATE TABLE name (col type [NULL | NOT NULL] [PRIMARY KEY], ...

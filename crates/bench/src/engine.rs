@@ -6,9 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use catalog::Catalog;
 use common::Value;
-use execution::execution_context::ExecutionContext;
-use execution::executors::{Executor, create_executor};
-use planner::{Binder, Planner};
+use planner::{ExecutionEngine, Output};
 use postgres::{Client, NoTls, SimpleQueryMessage};
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::disk::disk_manager::DiskManager;
@@ -26,15 +24,13 @@ pub trait Engine {
     fn finish_load(&mut self) -> Result<()>;
 }
 
-/// Rows pulled from the root executor at a time, as in the CLI.
-const BATCH_SIZE: usize = 128;
-
 /// A fresh hamilton database in a temporary directory, run through the
-/// same pipeline as the CLI: parse, bind, plan (which optimizes), execute.
+/// same session as the CLI: parse, bind, plan (which optimizes), execute,
+/// each statement in a transaction of its own.
 pub struct Hamilton {
     disk: Arc<DiskManager>,
     bpm: Arc<BufferPoolManager>,
-    ctx: Arc<ExecutionContext>,
+    engine: ExecutionEngine,
     _dir: TempDir,
 }
 
@@ -47,7 +43,7 @@ impl Hamilton {
         Ok(Self {
             disk,
             bpm,
-            ctx: Arc::new(ExecutionContext::new(catalog)),
+            engine: ExecutionEngine::new(catalog)?,
             _dir: dir,
         })
     }
@@ -59,24 +55,18 @@ impl Engine for Hamilton {
     }
 
     fn execute(&mut self, sql: &str) -> Result<Vec<Row>> {
-        let statements = parser::parse(sql)?;
+        let statements = self.engine.parse(sql)?;
         let [stmt] = statements.as_slice() else {
             anyhow::bail!("expected one statement, got {}", statements.len());
         };
-        let catalog = self.ctx.catalog();
-        let bound = Binder::new(catalog).bind(stmt)?;
-        let plan = Planner::new(catalog).plan(&bound)?;
-        let mut executor = create_executor(&self.ctx, &plan)?;
-        executor.init()?;
-        let (mut tuples, mut rids) = (Vec::new(), Vec::new());
-        let mut rows = Vec::new();
-        while executor.next(&mut tuples, &mut rids, BATCH_SIZE)? {
-            for tuple in &tuples {
-                let values = tuple.decode(executor.get_output_schema())?;
-                rows.push(values.iter().map(text).collect());
-            }
-        }
-        Ok(rows)
+        Ok(match self.engine.execute(stmt)? {
+            Output::Rows { rows, .. } => rows
+                .iter()
+                .map(|values| values.iter().map(text).collect())
+                .collect(),
+            Output::Count { count, .. } => vec![vec![Some(count.to_string())]],
+            Output::Done(_) => Vec::new(),
+        })
     }
 
     fn finish_load(&mut self) -> Result<()> {

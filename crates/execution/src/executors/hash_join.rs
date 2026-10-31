@@ -592,8 +592,9 @@ mod tests {
         left_key: AbstractExpr,
         right_key: AbstractExpr,
     ) -> HashJoinExecutor {
-        let left_executor = create_executor(&db.ctx, &left).unwrap();
-        let right_executor = create_executor(&db.ctx, &right).unwrap();
+        let ctx = db.ctx();
+        let left_executor = create_executor(&ctx, &left).unwrap();
+        let right_executor = create_executor(&ctx, &right).unwrap();
         let plan = HashJoinPlan::new(
             join_type,
             left,
@@ -602,12 +603,7 @@ mod tests {
             vec![right_key],
             None,
         );
-        HashJoinExecutor::new(
-            Arc::clone(&db.ctx),
-            plan,
-            Box::new(left_executor),
-            Box::new(right_executor),
-        )
+        HashJoinExecutor::new(ctx, plan, Box::new(left_executor), Box::new(right_executor))
     }
 
     /// [`hash_join`] with both sides partitioned, as `init` does when the
@@ -703,7 +699,7 @@ mod tests {
                 all.extend(left);
             }
             assert_eq!(sorted(all), sorted(ints(1..=600)));
-            if db.ctx.join_frames() == MIN_FRAMES {
+            if db.join_frames() == MIN_FRAMES {
                 assert!(
                     join.partition_pairs.len() > MIN_FRAMES - 1,
                     "the partitions were split again"
@@ -820,7 +816,7 @@ mod tests {
                 column(0),
             );
             join.init().unwrap();
-            let fits = db.ctx.join_frames() != MIN_FRAMES;
+            let fits = db.join_frames() != MIN_FRAMES;
             assert_eq!(join.left_input == LeftInput::Child, fits);
             assert_eq!(join.pages.page_ids().next().is_none(), fits);
             assert_eq!(join.partition_pairs.is_empty(), fits);
@@ -1205,7 +1201,7 @@ mod tests {
             vec![column(0)],
             None,
         );
-        let mut join = create_executor(&db.ctx, &plan.into()).unwrap();
+        let mut join = create_executor(&db.ctx(), &plan.into()).unwrap();
         let (mut tuples, mut rids) = (Vec::new(), Vec::new());
         for _ in 0..2 {
             join.init().unwrap();

@@ -39,7 +39,7 @@ use crate::bound::{
     BoundInsert, BoundOrderBy, BoundSelect, BoundStatement, BoundTable, BoundUpdate, BoundWindow,
     BoundWindowFunction,
 };
-use crate::error::Result;
+use crate::error::{PlannerError, Result};
 
 pub struct Planner<'a> {
     /// For the optimizer to choose indexes from.
@@ -76,6 +76,9 @@ impl<'a> Planner<'a> {
             BoundStatement::Delete(delete) => self.plan_delete(delete)?,
             BoundStatement::Explain(stmt) => {
                 ExplainPlan::new(Arc::new(self.plan_statement(stmt)?)).into()
+            }
+            BoundStatement::Transaction(command) => {
+                return Err(PlannerError::Unsupported(format!("planning {command:?}")));
             }
         };
         Ok(plan)

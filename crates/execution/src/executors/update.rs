@@ -1,14 +1,10 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
-use catalog::IndexInfo;
+use catalog::{IndexInfo, TableInfo};
 use common::{Rid, Schema, Tuple};
-use storage::index::{IndexTrait, LocatorKind};
-use storage::table::table_page::{INVALID_UNDO_PTR, TupleMeta};
+use storage::index::RowLocator;
 
-use super::{
-    AbstractExecutor, COMMIT_TS, Executor, count_row, duplicate_key, index_keys, locators,
-};
+use super::{AbstractExecutor, Executor, count_row, duplicate_key, index_keys, locators};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::expressions::Expr;
@@ -18,21 +14,14 @@ use crate::plans::{PlanNode, UpdatePlan};
 /// one row holding how many there were. The child reads the table, so every
 /// row it produces has a rid.
 ///
-/// It reads every row before updating any, so a row it moves is not read
-/// again by a scan still running below it. There are no transactions to roll
-/// back yet, so it also computes every new row and checks the primary keys
-/// before writing: a row that fails to evaluate or a duplicate key updates
-/// nothing. An error from storage part way through still leaves the rows
-/// before it updated.
+/// It reads every row before updating any, so a row it changes is not read
+/// again by a scan still running below it.
 ///
-/// An update deletes the old tuple and inserts the new one, so the row gets a
-/// new rid. Index entries that store the rid are always rewritten. Entries
-/// that store the primary key are rewritten only if the index key or the
-/// primary key changed.
-///
-/// All old entries are removed before new ones are added, so
-/// `SET id = id + 1` doesn't collide with itself.
-// TODO: update in place, keeping the rid, once there is an undo log.
+/// Rows are updated in place, keeping their rids unless a new version
+/// doesn't fit its page (`Transaction::update`). A row's entry in an index
+/// is rewritten only if its key or its locator changed. All old entries are
+/// removed before new ones are added, so `SET id = id + 1` doesn't collide
+/// with itself.
 pub struct UpdateExecutor {
     ctx: Arc<ExecutionContext>,
     plan: UpdatePlan,
@@ -41,6 +30,9 @@ pub struct UpdateExecutor {
     child_rids: Vec<Rid>,
     done: bool,
 }
+
+/// A row's entry in an index: its key and the locator stored with it.
+type Entry = (Tuple, RowLocator);
 
 impl UpdateExecutor {
     pub fn new(ctx: Arc<ExecutionContext>, plan: UpdatePlan, child: Box<AbstractExecutor>) -> Self {
@@ -52,6 +44,18 @@ impl UpdateExecutor {
             child_rids: Vec::new(),
             done: false,
         }
+    }
+
+    /// The new version of `old`, a row of `table`.
+    fn new_row(&self, table: &TableInfo, old: &Tuple) -> Result<Tuple> {
+        let child_schema = self.child.get_output_schema();
+        let values = self
+            .plan
+            .target_exprs()
+            .iter()
+            .map(|expr| expr.evaluate(old, child_schema))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Tuple::encode(&table.schema, &values)?)
     }
 }
 
@@ -83,48 +87,28 @@ impl Executor for UpdateExecutor {
             debug_assert_eq!(self.child_rids.len(), self.child_tuples.len());
             found.extend(self.child_rids.drain(..).zip(self.child_tuples.drain(..)));
         }
-        let child_schema = self.child.get_output_schema();
-        let new_rows = found
-            .iter()
-            .map(|(_, old)| {
-                let values = self
-                    .plan
-                    .target_exprs()
-                    .iter()
-                    .map(|expr| expr.evaluate(old, child_schema))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(Tuple::encode(&table.schema, &values)?)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let old_keys = found
-            .iter()
-            .map(|(_, old)| index_keys(&table, &indexes, old))
-            .collect::<Result<Vec<_>>>()?;
-        let new_keys = new_rows
-            .iter()
-            .map(|new| index_keys(&table, &indexes, new))
-            .collect::<Result<Vec<_>>>()?;
-        check_primary_keys(&indexes, &found, &new_keys)?;
 
-        for (((rid, _), old), new) in found.iter().zip(&old_keys).zip(&new_keys) {
-            let old_locators = locators(&indexes, old, *rid);
-            for (i, index) in indexes.iter().enumerate() {
-                if entry_moves(&indexes, i, old, new) {
-                    index.index.delete_entry(&old[i], &old_locators[i])?;
+        let txn = self.ctx.txn();
+        // Each row's entries in `indexes`, before and after the update.
+        let mut moved: Vec<(Vec<Entry>, Vec<Entry>)> = Vec::with_capacity(found.len());
+        for (rid, old) in &found {
+            let new = self.new_row(&table, old)?;
+            let new_rid = txn.update(&table.heap, &table.schema, *rid, &new)?;
+            let old_entries = entries(&table, &indexes, old, *rid)?;
+            let new_entries = entries(&table, &indexes, &new, new_rid)?;
+            moved.push((old_entries, new_entries));
+        }
+        for (old_entries, new_entries) in &moved {
+            for ((index, old), new) in indexes.iter().zip(old_entries).zip(new_entries) {
+                if old != new {
+                    txn.delete_entry(&index.index, &old.0, &old.1)?;
                 }
             }
         }
-        for ((((rid, _), new_row), old), new) in
-            found.iter().zip(&new_rows).zip(&old_keys).zip(&new_keys)
-        {
-            table.heap.mark_delete(*rid, COMMIT_TS, INVALID_UNDO_PTR)?;
-            let new_rid = table.heap.insert(&TupleMeta::new(COMMIT_TS), new_row)?;
-            let new_locators = locators(&indexes, new, new_rid);
-            for (i, index) in indexes.iter().enumerate() {
-                if entry_moves(&indexes, i, old, new)
-                    && !index.index.insert_entry(&new[i], &new_locators[i])?
-                {
-                    return Err(duplicate_key(index, &new[i]));
+        for (old_entries, new_entries) in &moved {
+            for ((index, old), new) in indexes.iter().zip(old_entries).zip(new_entries) {
+                if old != new && !txn.insert_entry(&index.index, &new.0, &new.1)? {
+                    return Err(duplicate_key(index, &new.0));
                 }
             }
         }
@@ -137,59 +121,17 @@ impl Executor for UpdateExecutor {
     }
 }
 
-/// Whether the row's entry in `indexes[i]` must be rewritten. `old_keys` and
-/// `new_keys` hold the row's key in each index before and after the update.
-fn entry_moves(
+/// The entry in each of `indexes` (all of `table`'s) for `tuple`, stored at
+/// `rid`.
+fn entries(
+    table: &TableInfo,
     indexes: &[Arc<IndexInfo>],
-    i: usize,
-    old_keys: &[Tuple],
-    new_keys: &[Tuple],
-) -> bool {
-    match indexes[i].locator {
-        LocatorKind::Rid => true,
-        LocatorKind::PrimaryKey => {
-            let pk = indexes
-                .iter()
-                .position(|index| index.is_primary_key)
-                .expect("only a table with a primary key has indexes that store it");
-            old_keys[i] != new_keys[i] || old_keys[pk] != new_keys[pk]
-        }
-    }
-}
-
-/// Fails if, once every row in `found` is updated, two rows would share a
-/// key in a primary key index: a new key that is also another updated row's
-/// new key, or a row's key that is not being updated. `new_keys` holds each
-/// updated row's new key in each of `indexes`.
-fn check_primary_keys(
-    indexes: &[Arc<IndexInfo>],
-    found: &[(Rid, Tuple)],
-    new_keys: &[Vec<Tuple>],
-) -> Result<()> {
-    let updated: HashSet<Rid> = found.iter().map(|(rid, _)| *rid).collect();
-    let mut holders = Vec::new();
-    for (i, index) in indexes.iter().enumerate() {
-        if !index.is_primary_key {
-            continue;
-        }
-        let mut seen = HashSet::new();
-        for row_keys in new_keys {
-            let key = &row_keys[i];
-            if !seen.insert(key.data()) {
-                return Err(duplicate_key(index, key));
-            }
-            holders.clear();
-            index.index.scan_key(key, &mut holders)?;
-            // The rows being updated give up their old keys.
-            if holders.iter().any(|holder| {
-                let rid = holder.as_rid().expect("the primary key index stores rids");
-                !updated.contains(&rid)
-            }) {
-                return Err(duplicate_key(index, key));
-            }
-        }
-    }
-    Ok(())
+    tuple: &Tuple,
+    rid: Rid,
+) -> Result<Vec<Entry>> {
+    let keys = index_keys(table, indexes, tuple)?;
+    let locators = locators(indexes, &keys, rid);
+    Ok(keys.into_iter().zip(locators).collect())
 }
 
 #[cfg(test)]
@@ -197,13 +139,16 @@ mod tests {
     use std::sync::Arc;
 
     use catalog::TableInfo;
-    use common::{DataType, Rid, Value, ValueError};
+    use common::{Column, DataType, Rid, Schema, Value, ValueError};
+    use storage::StorageError;
     use storage::buffer::traced_buffer_pool_manager::{PageAccess, TracedBufferPoolManager};
 
     use super::super::test_util::{
         Db, account, account_column, column, compare, constant, int, user, users_schema,
     };
-    use crate::expressions::{AbstractExpr, ArithmeticExpr, ArithmeticOp, ComparisonOp};
+    use crate::expressions::{
+        AbstractExpr, ArithmeticExpr, ArithmeticOp, ColumnValueExpr, ComparisonOp,
+    };
     use crate::plans::{
         AbstractPlanNode, FilterPlan, IndexScanPlan, IndexScanRange, InsertPlan, KeyBound,
         SeqScanPlan, UpdatePlan, ValuesPlan,
@@ -451,10 +396,9 @@ mod tests {
             .any(|access| matches!(access, PageAccess::Write(_)))
     }
 
-    /// The rows move, but `accounts_name`, which stores primary keys, isn't
-    /// written at all.
+    /// Rows updated in place keep their rids, so neither index is written.
     #[test]
-    fn an_update_of_other_columns_leaves_secondary_entries_alone() {
+    fn an_update_in_place_writes_no_index() {
         let db = Db::new();
         let table = three_accounts(&db);
         let entries = db.index_entries("accounts_name");
@@ -477,14 +421,9 @@ mod tests {
         name_pages.stop_tracing();
         pkey_pages.stop_tracing();
         assert!(!wrote(&name_pages));
-        assert!(wrote(&pkey_pages));
+        assert!(!wrote(&pkey_pages));
         assert_eq!(db.index_entries("accounts_name"), entries);
-        // The primary key index points at the rows' new versions.
-        let new_rids = pkey_rids(&db, &[1, 2, 3]);
-        for (old, new) in rids.iter().zip(&new_rids) {
-            assert_ne!(old, new);
-            assert!(table.heap.get(*old).unwrap().0.is_deleted);
-        }
+        assert_eq!(pkey_rids(&db, &[1, 2, 3]), rids);
         assert_eq!(
             db.index_rows("accounts_name", &["a".into()]),
             [account(1, Some("a"), 11), account(3, Some("a"), 31)]
@@ -493,6 +432,71 @@ mod tests {
             db.index_rows("accounts_name", &["b".into()]),
             [account(2, Some("b"), 21)]
         );
+    }
+
+    /// A row that no longer fits its page moves to a new rid. The primary
+    /// key index follows it, but `notes_tag`, which stores primary keys,
+    /// isn't written.
+    #[test]
+    fn a_moved_row_rewrites_only_entries_that_store_its_rid() {
+        let db = Db::new();
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::Int, false),
+            Column::new("tag", DataType::Int, true),
+            Column::new("note", DataType::Varchar(2000), true),
+        ]);
+        let table = db
+            .catalog()
+            .create_table("notes", schema.clone(), &["id"])
+            .unwrap();
+        db.catalog()
+            .create_index("notes_tag", "notes", &["tag"])
+            .unwrap();
+        // Row 1 is short; the rest fill most of its page.
+        let note = |len: usize| {
+            constant(
+                Value::from("n".repeat(len).as_str()),
+                DataType::Varchar(2000),
+            )
+        };
+        let rows = (1..=4)
+            .map(|id| vec![int(id), int(7), note(if id == 1 { 10 } else { 1000 })])
+            .collect();
+        let values = ValuesPlan::new(schema.clone(), rows);
+        db.run(InsertPlan::new(table.oid, &table.name, Arc::new(values.into())).into())
+            .unwrap();
+        let rids = db.index_lookup("notes_pkey", &[Value::Int(1)]);
+        let (tag_pages, pkey_pages) = (db.index_pages("notes_tag"), db.index_pages("notes_pkey"));
+        tag_pages.start_tracing();
+        pkey_pages.start_tracing();
+
+        let column = |idx| ColumnValueExpr::new(0, idx, schema.column(idx).unwrap().clone());
+        let id_1 = compare(ComparisonOp::Eq, column(0).into(), int(1));
+        let scan = SeqScanPlan::new(table.oid, &table.name, schema.clone(), Some(id_1));
+        let targets = vec![column(0).into(), column(1).into(), note(1500)];
+        assert_eq!(
+            update(&db, &table, targets, Arc::new(scan.into())).unwrap(),
+            1
+        );
+
+        tag_pages.stop_tracing();
+        pkey_pages.stop_tracing();
+        assert!(!wrote(&tag_pages));
+        assert!(wrote(&pkey_pages));
+        let new_rids = db.index_lookup("notes_pkey", &[Value::Int(1)]);
+        assert_ne!(new_rids, rids);
+        // The old version is gone for new transactions (and may already be
+        // reclaimed).
+        let txn = db.tm.begin();
+        assert!(txn.get(&table.heap, &schema, rids[0]).unwrap().is_none());
+        db.tm.commit(&txn).unwrap();
+        let by_tag = db.index_rows("notes_tag", &[Value::Int(7)]);
+        assert_eq!(by_tag.len(), 4);
+        assert!(by_tag.contains(&vec![
+            Value::Int(1),
+            Value::Int(7),
+            Value::from("n".repeat(1500).as_str())
+        ]));
     }
 
     #[test]
@@ -559,6 +563,30 @@ mod tests {
         assert_eq!(
             db.index_rows("accounts_name", &["b".into()]),
             [account(3, Some("b"), 20)]
+        );
+    }
+
+    /// Two transactions writing the same row: the later write fails, and
+    /// aborting it leaves the first one's write.
+    #[test]
+    fn a_row_another_transaction_wrote_is_a_conflict() {
+        let db = Db::new();
+        db.insert_numbered(2);
+        let (first, second) = (db.tm.begin(), db.tm.begin());
+        let id_1 = || matching(&db.users, compare(ComparisonOp::Eq, column(0), int(1)));
+        let set_name =
+            |name| UpdatePlan::new(db.users.oid, "users", vec![column(0), text(name)], id_1());
+        db.run_in(&first, set_name("first").into()).unwrap();
+        let err = db.run_in(&second, set_name("second").into()).unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::Storage(StorageError::Conflict { .. })),
+            "{err:?}"
+        );
+        db.tm.abort(&second).unwrap();
+        db.tm.commit(&first).unwrap();
+        assert_eq!(
+            rows(&db, &db.users),
+            [user(1, Some("first")), user(2, Some("user 2"))]
         );
     }
 

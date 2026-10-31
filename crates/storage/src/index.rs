@@ -157,12 +157,14 @@ pub trait IndexTrait {
     /// Adds `key` for the row at `locator`. Returns `false`, changing
     /// nothing, if that entry exists, or if this is a primary key index and
     /// `key` is taken.
-    // TODO: take the transaction once there are transactions.
+    ///
+    /// Entries are not versioned. Writers inside a transaction go through
+    /// `Transaction::insert_entry`, which undoes the write on abort.
     fn insert_entry(&self, key: &Tuple, locator: &RowLocator) -> Result<bool>;
 
-    /// Removes `key` for the row at `locator`, if present. Other rows with
-    /// `key` keep their entries.
-    fn delete_entry(&self, key: &Tuple, locator: &RowLocator) -> Result<()>;
+    /// Removes `key` for the row at `locator`, if present, and returns
+    /// whether it was. Other rows with `key` keep their entries.
+    fn delete_entry(&self, key: &Tuple, locator: &RowLocator) -> Result<bool>;
 
     /// Appends the locators of the rows with `key` to `result`.
     fn scan_key(&self, key: &Tuple, result: &mut Vec<RowLocator>) -> Result<()>;

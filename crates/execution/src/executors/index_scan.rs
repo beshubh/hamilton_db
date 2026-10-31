@@ -1,9 +1,11 @@
+use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::ops::Bound;
 use std::sync::Arc;
 
+use catalog::{IndexInfo, TableInfo};
 use common::{Rid, Schema, Tuple, Value};
-use storage::index::btree_index::KeySchemaComparator;
+use storage::index::btree_index::{KeySchemaComparator, compare_key_prefix};
 use storage::index::{Index, IndexTrait, RowLocator};
 use storage::page::btree_page::KeyComparator;
 
@@ -24,11 +26,50 @@ use crate::plans::{IndexScanPlan, IndexScanRange, KeyBound, PlanNode};
 ///
 /// If the index stores primary keys, `next` looks each one up in the primary
 /// key index to find the rid, skipping rows that are gone.
+///
+/// Rows are read as the statement's transaction sees them, skipping those it
+/// doesn't see. Index entries are not versioned, so the version it sees may
+/// have a key other than its entry's: a row whose key is no longer in the
+/// plan's range is skipped too.
 pub struct IndexScanExecutor {
     ctx: Arc<ExecutionContext>,
     plan: IndexScanPlan,
     /// Locators of the rows not produced yet, in key order. Set by `init`.
     locators: VecDeque<RowLocator>,
+    /// The keys the rows must have. Set by `init`.
+    keys: KeyRange,
+}
+
+/// The keys an index scan reads, as values.
+enum KeyRange {
+    Full,
+    Points(Vec<Vec<Value>>),
+    Range(Bound<Vec<Value>>, Bound<Vec<Value>>),
+}
+
+impl KeyRange {
+    /// Whether `key` (a row's key, as values) is in this range.
+    fn contains(&self, key: &[Value]) -> bool {
+        match self {
+            KeyRange::Full => true,
+            KeyRange::Points(points) => points
+                .iter()
+                .any(|point| compare_key_prefix(key, point).is_eq()),
+            KeyRange::Range(lower, upper) => {
+                let above_lower = match lower {
+                    Bound::Included(p) => compare_key_prefix(key, p) != Ordering::Less,
+                    Bound::Excluded(p) => compare_key_prefix(key, p) == Ordering::Greater,
+                    Bound::Unbounded => true,
+                };
+                let below_upper = match upper {
+                    Bound::Included(p) => compare_key_prefix(key, p) != Ordering::Greater,
+                    Bound::Excluded(p) => compare_key_prefix(key, p) == Ordering::Less,
+                    Bound::Unbounded => true,
+                };
+                above_lower && below_upper
+            }
+        }
+    }
 }
 
 impl IndexScanExecutor {
@@ -37,19 +78,22 @@ impl IndexScanExecutor {
             ctx,
             plan,
             locators: VecDeque::new(),
+            keys: KeyRange::Full,
         }
     }
 
-    /// The locators of the entries in the plan's range, in key order.
-    fn scan_index(&self) -> Result<Vec<RowLocator>> {
+    /// The plan's range as values, and the locators of the entries in it, in
+    /// key order.
+    fn scan_index(&self) -> Result<(KeyRange, Vec<RowLocator>)> {
         let index = self.ctx.index(self.plan.index_oid())?;
         let Index::BtreeIndex(btree) = &*index.index;
         let mut locators = Vec::new();
-        match self.plan.range() {
+        let keys = match self.plan.range() {
             IndexScanRange::Full => {
                 for locator in btree.scan_range(Bound::Unbounded, Bound::Unbounded)? {
                     locators.push(locator?);
                 }
+                KeyRange::Full
             }
             IndexScanRange::Points(points) => {
                 let key_schema = &index.key_schema;
@@ -63,21 +107,29 @@ impl IndexScanExecutor {
                 for key in &keys {
                     btree.scan_key(key, &mut locators)?;
                 }
+                let values = keys
+                    .iter()
+                    .map(|key| key.decode(key_schema))
+                    .collect::<Result<_, _>>()?;
+                KeyRange::Points(values)
             }
             IndexScanRange::Range { lower, upper } => {
                 let (lower, upper) = (bound_values(lower)?, bound_values(upper)?);
                 for locator in btree.scan_range(as_bound(&lower), as_bound(&upper))? {
                     locators.push(locator?);
                 }
+                KeyRange::Range(lower, upper)
             }
-        }
-        Ok(locators)
+        };
+        Ok((keys, locators))
     }
 }
 
 impl Executor for IndexScanExecutor {
     fn init(&mut self) -> Result<()> {
-        self.locators = self.scan_index()?.into();
+        let (keys, locators) = self.scan_index()?;
+        self.keys = keys;
+        self.locators = locators.into();
         Ok(())
     }
 
@@ -90,6 +142,7 @@ impl Executor for IndexScanExecutor {
         tuples.clear();
         rids.clear();
         let table = self.ctx.table(self.plan.table_oid())?;
+        let index = self.ctx.index(self.plan.index_oid())?;
         while tuples.len() < batch_size {
             let Some(locator) = self.locators.pop_front() else {
                 break;
@@ -97,8 +150,10 @@ impl Executor for IndexScanExecutor {
             let Some(rid) = self.ctx.locate(&table, &locator)? else {
                 continue;
             };
-            let (meta, tuple) = table.heap.get(rid)?;
-            if meta.is_deleted {
+            let Some((_, tuple)) = self.ctx.txn().get(&table.heap, &table.schema, rid)? else {
+                continue;
+            };
+            if !self.keys.contains(&key_values(&table, &index, &tuple)?) {
                 continue;
             }
             if let Some(filter) = self.plan.filter()
@@ -107,7 +162,7 @@ impl Executor for IndexScanExecutor {
                 continue;
             }
             rids.push(rid);
-            tuples.push(tuple);
+            tuples.push(tuple.with_rid(rid));
         }
         Ok(!tuples.is_empty())
     }
@@ -115,6 +170,19 @@ impl Executor for IndexScanExecutor {
     fn get_output_schema(&self) -> &Schema {
         self.plan.get_output_schema()
     }
+}
+
+/// The values of `tuple`'s key in `index`, an index on `table`.
+pub(super) fn key_values(
+    table: &TableInfo,
+    index: &IndexInfo,
+    tuple: &Tuple,
+) -> Result<Vec<Value>> {
+    index
+        .key_columns
+        .iter()
+        .map(|&column| Ok(tuple.value(&table.schema, column)?))
+        .collect()
 }
 
 /// The values of key expressions, which read no input.
@@ -330,6 +398,41 @@ mod tests {
         );
     }
 
+    /// A newer transaction moves user 1 to id 10 in place, which moves its
+    /// index entry at once. An older one still sees id 1, so the entry for
+    /// 10 leads it to a row whose key isn't 10: it is skipped.
+    #[test]
+    fn rows_whose_visible_key_left_the_range_are_skipped() {
+        let db = with_ids(&[1, 2, 3]);
+        let older = db.tm.begin();
+        let id_1 = compare(ComparisonOp::Eq, column(0), int(1));
+        let update = UpdatePlan::new(
+            db.users.oid,
+            &db.users.name,
+            vec![int(10), column(1)],
+            db.scan(Some(id_1)),
+        );
+        db.run(update.into()).unwrap();
+
+        let point = |id| IndexScanRange::Points(vec![vec![int(id)]]);
+        let at_10 = db.run_in(&older, scan(&db, "users_id", point(10), None));
+        assert!(at_10.unwrap().is_empty());
+        let range = IndexScanRange::Range {
+            lower: bound(vec![int(5)], true),
+            upper: None,
+        };
+        assert!(
+            db.run_in(&older, scan(&db, "users_id", range, None))
+                .unwrap()
+                .is_empty()
+        );
+        db.tm.commit(&older).unwrap();
+        assert_eq!(
+            db.run(scan(&db, "users_id", point(10), None)).unwrap(),
+            [user(10, Some("user 1"))]
+        );
+    }
+
     #[test]
     fn ranges_respect_their_bounds() {
         let db = with_ids(&[5, 4, 3, 2, 1]);
@@ -404,7 +507,7 @@ mod tests {
     fn produces_the_rids_of_its_rows() {
         let db = with_ids(&[3, 1, 2]);
         let plan = scan(&db, "users_id", IndexScanRange::Full, None);
-        let mut executor = create_executor(&db.ctx, &plan).unwrap();
+        let mut executor = create_executor(&db.ctx(), &plan).unwrap();
         executor.init().unwrap();
         let (mut tuples, mut rids) = (Vec::new(), Vec::new());
         let mut seen = 0;
@@ -428,7 +531,7 @@ mod tests {
     fn skips_deleted_rows() {
         let db = with_ids(&[1, 2, 3]);
         let plan = scan(&db, "users_id", IndexScanRange::Full, None);
-        let mut executor = create_executor(&db.ctx, &plan).unwrap();
+        let mut executor = create_executor(&db.ctx(), &plan).unwrap();
         executor.init().unwrap();
         // Deleted after the index was read, so its entry was still there.
         let rid = db.index_lookup("users_id", &[Value::Int(2)])[0];
