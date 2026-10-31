@@ -1,3 +1,4 @@
+pub mod index_versions;
 pub mod read_ts;
 pub mod transaction;
 pub mod transaction_manager;

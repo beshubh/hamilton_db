@@ -19,3 +19,6 @@ Use this file to write down any surprises we face in development or testing. Any
 - `planner` depends on `execution`, so nothing in `execution` can bind or plan. The session that runs SQL in transactions (`ExecutionEngine`) lives in `planner::engine`, not in `execution`.
 - Under MVTO a reader newer than a lock holder fails with `Conflict`, so a test that has two transactions write the same row must begin the one that takes the lock first. The newer one fails on its scan, before its write.
 - The shell is zsh: `for f in $FILES` doesn't split the list, so `rustfmt` gets one long "file" name. Pipe the names into `while read -r f` instead.
+- Show plans in the chat reply in full. If a delegate needs the plan as a file, paste it in chat as well: the index indirection plan was only linked as a scratchpad file, and the user could not see it.
+- The transaction manager's collector thread runs after every commit, so a test that counts raw index entries (`index_entries`) right after a statement passes or fails by timing. Call `tm.wait_for_gc()` first, and hold an older transaction open to check that entries are kept for it.
+- In a `thread::scope` stress test, stop helper loops from a drop guard in the worker threads, not after joining them: a failed assertion in a worker otherwise leaves the helper looping, and the test hangs instead of failing.

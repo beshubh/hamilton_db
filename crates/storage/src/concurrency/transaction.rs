@@ -16,19 +16,16 @@
 //! background collector reclaims them once the watermark passes the Tid,
 //! with the undo records below it.
 //!
-//! Index entries are not versioned: `insert_entry` and `delete_entry` change
-//! the index at once, as every transaction sees it, and record the change.
-//! Abort applies the inverse of each, newest first; commit drops the record.
+//! Index entries are added at once and never removed by a write: the
+//! entries a transaction's writes leave behind are retired, and garbage
+//! collection removes them. See `index_versions`.
 //!
 //! **Known gaps.** Phantoms: read timestamps guard the tuples a transaction
 //! read, not rows inserted later that it should have seen, so schedules
-//! with inserts are not serializable. Because index entries change at once,
-//! an older transaction reading through an index misses rows whose entries
-//! a newer one removed or moved, and a primary key is checked against
-//! entries other transactions have not committed. Nothing is logged, so a
-//! commit or abort that fails partway leaves some tuples done and the rest
-//! locked, and the transaction stays running; a crash does the same to
-//! every running transaction. Reclaimed tuples keep their slots (see
+//! with inserts are not serializable. Nothing is logged, so a commit or
+//! abort that fails partway leaves some tuples done and the rest locked,
+//! and the transaction stays running; a crash does the same to every
+//! running transaction. Reclaimed tuples keep their slots (see
 //! `table_page`).
 
 use std::collections::{HashMap, HashSet};
@@ -39,6 +36,7 @@ use std::thread;
 use common::{PageId, Rid, Schema, TXN_UNCOMMITTED_BIT, Tuple, TxnId};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 
+use crate::concurrency::index_versions::{self, IndexedTable, TableEntry};
 use crate::concurrency::read_ts::ReadTimestamps;
 use crate::concurrency::watermark::Watermark;
 use crate::error::{Result, StorageError};
@@ -48,8 +46,19 @@ use crate::table::table_iterator::{TableIterator, TableRow};
 use crate::table::table_page::TupleMeta;
 use crate::table::undo_log::UndoLog;
 
-/// Tuples an ended transaction left deleted, for garbage collection.
-pub(crate) type DeadTuples = Vec<(Arc<TableHeap>, Rid)>;
+/// What an ended transaction leaves for garbage collection: the tuples it
+/// left deleted and the index entries it retired.
+#[derive(Default)]
+pub(crate) struct Garbage {
+    pub tuples: Vec<(Arc<TableHeap>, Rid)>,
+    pub entries: Vec<TableEntry>,
+}
+
+impl Garbage {
+    pub fn is_empty(&self) -> bool {
+        self.tuples.is_empty() && self.entries.is_empty()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionState {
@@ -79,8 +88,13 @@ pub struct Transaction {
     /// Set once this is the oldest running transaction, which it then stays.
     oldest: AtomicBool,
     write_set: Mutex<HashMap<PageId, TableWrites>>,
-    /// The index entries this transaction added and removed, oldest first.
+    /// The manager's entry lock; see `index_versions`.
+    entry_lock: Arc<RwLock<()>>,
+    /// The index entries this transaction added or found already there,
+    /// oldest first.
     index_writes: Mutex<Vec<IndexWrite>>,
+    /// The index entries this transaction's writes left behind.
+    retired: Mutex<Vec<TableEntry>>,
 }
 
 /// The tuples a transaction wrote in one table, keyed by the table's first
@@ -91,12 +105,11 @@ struct TableWrites {
     rids: HashSet<Rid>,
 }
 
-/// An index entry a transaction added (`inserted`) or removed.
+/// An index entry a transaction needs: one it `added`, or found already in
+/// the index.
 struct IndexWrite {
-    index: Arc<Index>,
-    key: Tuple,
-    locator: RowLocator,
-    inserted: bool,
+    entry: TableEntry,
+    added: bool,
 }
 
 impl Transaction {
@@ -105,6 +118,7 @@ impl Transaction {
         undo: Arc<UndoLog>,
         read_ts: Arc<ReadTimestamps>,
         watermark: Arc<Watermark>,
+        entry_lock: Arc<RwLock<()>>,
     ) -> Self {
         Self {
             tid,
@@ -114,7 +128,9 @@ impl Transaction {
             watermark,
             oldest: AtomicBool::new(false),
             write_set: Mutex::new(HashMap::new()),
+            entry_lock,
             index_writes: Mutex::new(Vec::new()),
+            retired: Mutex::new(Vec::new()),
         }
     }
 
@@ -168,36 +184,71 @@ impl Transaction {
         Ok(())
     }
 
-    /// Adds `key` for the row at `locator` to `index`, as
-    /// `IndexTrait::insert_entry` does, and records it to undo on abort.
+    /// Makes sure `index`, one of `table`'s, holds `key` for the row at
+    /// `locator`, which this transaction has just written. Abort removes the
+    /// entry if this added it.
+    ///
+    /// In a primary key index the key must also be free, as
+    /// `index_versions` describes: returns `false`, adding nothing, if the
+    /// row this transaction sees at another rid has it, and fails with
+    /// `Conflict` if another transaction's newer or uncommitted version
+    /// does. Add a row's primary key entry before its other entries.
     pub fn insert_entry(
         &self,
+        table: &Arc<IndexedTable>,
         index: &Arc<Index>,
         key: &Tuple,
         locator: &RowLocator,
     ) -> Result<bool> {
         let _running = self.running()?;
-        let inserted = index.insert_entry(key, locator)?;
-        if inserted {
-            self.record_index_write(index, key, locator, true);
+        let added = {
+            let _entries = self.entry_lock.read();
+            index.insert_entry(key, locator)?
+        };
+        let free = if index.metadata().is_primary_key() {
+            let rid = locator.as_rid().expect("the primary key index stores rids");
+            self.key_is_free(table, index, key, rid)
+        } else {
+            Ok(true)
+        };
+        if matches!(free, Ok(false)) {
+            if added {
+                index.delete_entry(key, locator)?;
+            }
+            return Ok(false);
         }
-        Ok(inserted)
+        // Recorded on `Conflict` too, for abort to remove.
+        self.index_writes.lock().push(IndexWrite {
+            entry: TableEntry {
+                table: Arc::clone(table),
+                index: Arc::clone(index),
+                key: key.clone(),
+                locator: locator.clone(),
+            },
+            added,
+        });
+        free
     }
 
-    /// Removes `key` for the row at `locator` from `index`, as
-    /// `IndexTrait::delete_entry` does, and records it to undo on abort.
-    pub fn delete_entry(
+    /// Retires the entry `key` for the row at `locator` in `index`, one of
+    /// `table`'s, which this transaction's write to the row left behind. It
+    /// stays in the index; once this transaction has committed and no
+    /// reader needs it, garbage collection removes it.
+    pub fn retire_entry(
         &self,
+        table: &Arc<IndexedTable>,
         index: &Arc<Index>,
         key: &Tuple,
         locator: &RowLocator,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let _running = self.running()?;
-        let deleted = index.delete_entry(key, locator)?;
-        if deleted {
-            self.record_index_write(index, key, locator, false);
-        }
-        Ok(deleted)
+        self.retired.lock().push(TableEntry {
+            table: Arc::clone(table),
+            index: Arc::clone(index),
+            key: key.clone(),
+            locator: locator.clone(),
+        });
+        Ok(())
     }
 
     /// The version of the tuple at `rid` this transaction sees, or `None` if
@@ -206,6 +257,39 @@ impl Transaction {
     pub fn get(&self, heap: &TableHeap, schema: &Schema, rid: Rid) -> Result<Option<TableRow>> {
         let _running = self.running()?;
         heap.get_at(rid, self.tid, schema, &self.undo, self.reads())
+    }
+
+    /// The row this transaction sees that `locator`, from an entry of one of
+    /// `table`'s indexes, leads to, with its rid: the row at the rid, or the
+    /// one with the primary key. `None` if there is none. The row's key in
+    /// the index is not checked; it may have changed since the entry was
+    /// added. Fails as `get` does.
+    pub fn row_at(
+        &self,
+        table: &IndexedTable,
+        locator: &RowLocator,
+    ) -> Result<Option<(Rid, Tuple)>> {
+        let _running = self.running()?;
+        let schema = &table.schema;
+        let mut found = None;
+        for rid in table.rids(locator)? {
+            let row = table
+                .heap
+                .get_at(rid, self.tid, schema, &self.undo, self.reads())?;
+            let Some((_, tuple)) = row else {
+                continue;
+            };
+            // The primary key index holds old versions' rids too.
+            if let RowLocator::PrimaryKey(pk) = locator {
+                let primary_key = table.primary_key.as_ref().expect("checked by `rids`");
+                if !index_versions::has_key(primary_key, schema, &tuple, pk)? {
+                    continue;
+                }
+            }
+            debug_assert!(found.is_none(), "two rows {locator:?} are visible");
+            found = Some((rid, tuple));
+        }
+        Ok(found)
     }
 
     /// Scans `heap` as this transaction sees it. See `TableIterator`.
@@ -219,29 +303,33 @@ impl Transaction {
     }
 
     /// Clears the lock on every tuple written, or rolls each back along
-    /// with the index entries, and sets the state to `outcome`. Returns the
-    /// tuples left deleted: those deleted by a commit, and those inserted by
-    /// an abort. The manager calls this before ending the Tid.
-    pub(crate) fn finish(&self, outcome: TransactionState) -> Result<DeadTuples> {
+    /// with the index entries added, and sets the state to `outcome`.
+    /// Returns the garbage: the tuples left deleted (those deleted by a
+    /// commit, and those inserted by an abort), and the entries retired by a
+    /// commit or found already there by an abort. The manager calls this
+    /// before ending the Tid.
+    pub(crate) fn finish(&self, outcome: TransactionState) -> Result<Garbage> {
         let mut state = self.state.write();
         if *state != TransactionState::Running {
             return Err(StorageError::TransactionNotRunning(self.tid));
         }
+        let mut garbage = Garbage::default();
         let mut index_writes = self.index_writes.lock();
+        let mut retired = self.retired.lock();
         if outcome == TransactionState::Aborted {
-            while let Some(write) = index_writes.pop() {
-                // A primary key another transaction has taken since is not
-                // put back; see the module's known gaps.
-                if write.inserted {
-                    write.index.delete_entry(&write.key, &write.locator)?;
+            while let Some(IndexWrite { entry, added }) = index_writes.pop() {
+                if added {
+                    entry.index.delete_entry(&entry.key, &entry.locator)?;
                 } else {
-                    write.index.insert_entry(&write.key, &write.locator)?;
+                    garbage.entries.push(entry);
                 }
             }
+            retired.clear();
+        } else {
+            index_writes.clear();
+            garbage.entries.append(&mut retired);
         }
-        index_writes.clear();
         let mut write_set = self.write_set.lock();
-        let mut deleted = Vec::new();
         for table in write_set.values() {
             for &rid in &table.rids {
                 let is_deleted = match outcome {
@@ -256,13 +344,13 @@ impl Transaction {
                     TransactionState::Running => unreachable!("a transaction ends running"),
                 };
                 if is_deleted {
-                    deleted.push((Arc::clone(&table.heap), rid));
+                    garbage.tuples.push((Arc::clone(&table.heap), rid));
                 }
             }
         }
         write_set.clear();
         *state = outcome;
-        Ok(deleted)
+        Ok(garbage)
     }
 
     pub(crate) fn undo_log(&self) -> &Arc<UndoLog> {
@@ -311,19 +399,50 @@ impl Transaction {
         Ok(rid)
     }
 
-    fn record_index_write(
+    /// Whether `key`, which this transaction has just added to the primary
+    /// key `index` for its row at `rid`, is free: no other row the key leads
+    /// to has it. See `index_versions` for the rule. The caller holds
+    /// `running`.
+    fn key_is_free(
         &self,
-        index: &Arc<Index>,
+        table: &IndexedTable,
+        index: &Index,
         key: &Tuple,
-        locator: &RowLocator,
-        inserted: bool,
-    ) {
-        self.index_writes.lock().push(IndexWrite {
-            index: Arc::clone(index),
-            key: key.clone(),
-            locator: locator.clone(),
-            inserted,
-        });
+        rid: Rid,
+    ) -> Result<bool> {
+        let schema = &table.schema;
+        let mut holders = Vec::new();
+        index.scan_key(key, &mut holders)?;
+        let others = holders
+            .iter()
+            .map(|locator| locator.as_rid().expect("the primary key index stores rids"))
+            .filter(|&other| other != rid);
+        for other in others {
+            let versions = table
+                .heap
+                .versions_since(other, self.tid, schema, &self.undo)?;
+            for (meta, version) in versions {
+                let by_another = meta.ts > self.tid && meta.ts != self.write_ts();
+                if by_another
+                    && !meta.is_deleted
+                    && index_versions::has_key(index, schema, &version, key)?
+                {
+                    return Err(StorageError::Conflict {
+                        rid: other,
+                        other: meta.ts & !TXN_UNCOMMITTED_BIT,
+                    });
+                }
+            }
+            let visible = table
+                .heap
+                .get_at(other, self.tid, schema, &self.undo, self.reads())?;
+            if let Some((_, version)) = visible
+                && index_versions::has_key(index, schema, &version, key)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn record_write(&self, heap: &Arc<TableHeap>, schema: &Schema, rid: Rid) {

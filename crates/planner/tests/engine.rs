@@ -398,3 +398,133 @@ fn a_storage_error_in_a_block_fails_it() {
         [account(1, "ann", 100), account(2, "bo", 50)]
     );
 }
+
+/// Runs one statement in `session`.
+fn run_in(session: &mut ExecutionEngine, sql: &str) -> Result<Output, EngineError> {
+    let mut stmts = session.parse(sql)?;
+    assert_eq!(stmts.len(), 1, "{sql}");
+    session.execute(&stmts.remove(0))
+}
+
+fn rows_in(session: &mut ExecutionEngine, sql: &str) -> Vec<Vec<Value>> {
+    match run_in(session, sql) {
+        Ok(Output::Rows { rows, .. }) => rows,
+        result => panic!("{sql}: {result:?}"),
+    }
+}
+
+/// Whether `sql`, a SELECT, reads through an index.
+fn uses_an_index(db: &mut Db, sql: &str) -> bool {
+    let plan = db.rows(&format!("EXPLAIN {sql}"));
+    plan.iter()
+        .any(|line| matches!(&line[0], Value::Varchar(s) if s.contains("IndexScan")))
+}
+
+/// A block that began before another session deleted and changed rows still
+/// finds them through every kind of index, by their old keys.
+#[test]
+fn an_older_block_reads_old_versions_through_indexes() {
+    let mut db = Db::with_tables();
+    let mut other = db.engine.session();
+    let by_id = "SELECT * FROM accounts WHERE id = 1";
+    let by_name = "SELECT * FROM accounts WHERE name = 'bo'";
+    let log = "SELECT note FROM log WHERE id = 1";
+    for sql in [by_id, by_name, log] {
+        assert!(uses_an_index(&mut db, sql), "{sql}");
+    }
+
+    db.ok("BEGIN");
+    assert_eq!(db.rows(by_id), [account(1, "ann", 100)]);
+    run_in(&mut other, "DELETE FROM accounts WHERE id = 1").unwrap();
+    run_in(
+        &mut other,
+        "UPDATE accounts SET id = 20, name = 'zed' WHERE id = 2",
+    )
+    .unwrap();
+    run_in(&mut other, "DELETE FROM log WHERE id = 1").unwrap();
+
+    assert_eq!(db.rows(by_id), [account(1, "ann", 100)]);
+    assert_eq!(db.rows(by_name), [account(2, "bo", 50)]);
+    assert_eq!(db.rows(log), [[text("opened")]]);
+    assert!(
+        db.rows("SELECT * FROM accounts WHERE name = 'zed'")
+            .is_empty()
+    );
+    db.ok("COMMIT");
+
+    assert!(db.rows(by_id).is_empty());
+    assert!(db.rows(by_name).is_empty());
+    assert!(db.rows(log).is_empty());
+    assert_eq!(
+        db.rows("SELECT * FROM accounts WHERE name = 'zed'"),
+        [account(20, "zed", 50)]
+    );
+}
+
+#[test]
+fn a_deleted_primary_key_can_be_inserted_again() {
+    let mut db = Db::with_tables();
+    db.ok("DELETE FROM accounts WHERE id = 1");
+    db.ok("INSERT INTO accounts VALUES (1, 'new', 5)");
+    assert_eq!(
+        db.rows("SELECT * FROM accounts WHERE id = 1"),
+        [account(1, "new", 5)]
+    );
+    db.ok("BEGIN");
+    db.ok("DELETE FROM accounts WHERE id = 2");
+    db.ok("INSERT INTO accounts VALUES (2, 'again', 6)");
+    db.ok("COMMIT");
+    assert_eq!(
+        db.rows("SELECT * FROM accounts WHERE id = 2"),
+        [account(2, "again", 6)]
+    );
+}
+
+/// While a block holds a deleted key, another session can't insert it, so
+/// rolling the delete back leaves one row with the key. Deleting used to
+/// remove the index entry, letting the insert in, and the rollback had no
+/// entry to put back.
+#[test]
+fn a_key_a_block_deleted_is_not_free_until_it_commits() {
+    let mut db = Db::with_tables();
+    let mut other = db.engine.session();
+    db.ok("BEGIN");
+    db.ok("DELETE FROM accounts WHERE id = 1");
+    let err = run_in(&mut other, "INSERT INTO accounts VALUES (1, 'cy', 0)");
+    assert!(
+        matches!(
+            err,
+            Err(EngineError::Execution(ExecutionError::Storage(
+                StorageError::Conflict { .. }
+            )))
+        ),
+        "{err:?}"
+    );
+    db.ok("ROLLBACK");
+
+    assert_eq!(
+        db.rows("SELECT * FROM accounts WHERE id = 1"),
+        [account(1, "ann", 100)]
+    );
+    assert_eq!(db.rows("SELECT * FROM accounts").len(), 2);
+    assert_eq!(
+        rows_in(&mut other, "SELECT * FROM accounts WHERE name = 'ann'"),
+        [account(1, "ann", 100)]
+    );
+}
+
+/// An insert that another session's block rolls back doesn't keep the key
+/// taken.
+#[test]
+fn a_key_a_rolled_back_block_inserted_is_free() {
+    let mut db = Db::with_tables();
+    let mut other = db.engine.session();
+    db.ok("BEGIN");
+    db.ok("INSERT INTO accounts VALUES (3, 'cy', 0)");
+    db.ok("ROLLBACK");
+    run_in(&mut other, "INSERT INTO accounts VALUES (3, 'di', 1)").unwrap();
+    assert_eq!(
+        db.rows("SELECT * FROM accounts WHERE id = 3"),
+        [account(3, "di", 1)]
+    );
+}

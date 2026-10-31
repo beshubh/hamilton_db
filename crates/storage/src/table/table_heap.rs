@@ -284,6 +284,31 @@ impl TableHeap {
         undo_log::version_at(rid, head, ts, schema, undo)
     }
 
+    /// Every version of the tuple at `rid` that a reader at or above `ts`
+    /// might see, newest first, as `undo_log::versions_since` describes.
+    /// None for a reclaimed tuple. Nothing is checked or recorded: this is
+    /// for deciding which index entries are still needed, not for reading
+    /// rows.
+    pub fn versions_since(
+        &self,
+        rid: Rid,
+        ts: u64,
+        schema: &Schema,
+        undo: &UndoLog,
+    ) -> Result<Vec<TableRow>> {
+        let guard = self
+            .bpm
+            .checked_read_page(rid.page_id, AccessType::Lookup)?;
+        let page = TablePage::new(guard.get_data())?;
+        if page.is_dead(rid.slot) {
+            return Ok(Vec::new());
+        }
+        let (meta, payload) = page.get(rid.slot)?;
+        let head = (meta, Tuple::from_bytes(payload.to_vec()).with_rid(rid));
+        drop(guard);
+        undo_log::versions_since(rid, head, ts, schema, undo)
+    }
+
     /// Commits the head of the tuple at `rid`, which the running transaction
     /// `tid` wrote: clears `TXN_UNCOMMITTED_BIT` from its `ts`, and releases
     /// any padding a shrinking update kept, which needs `schema` to find the

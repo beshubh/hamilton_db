@@ -47,7 +47,9 @@ pub fn run(db: &Database, path: &str) -> anyhow::Result<()> {
                 // Saved as it is entered, like the database, so a session
                 // that is killed loses none of it.
                 editor.sync_history()?;
-                match session.run(&input, &mut stdout)? {
+                let outcome = session.run(&input, &mut stdout)?;
+                prompt.session = db.session();
+                match outcome {
                     Outcome::Done { failed } => prompt.failed = failed,
                     Outcome::Clear => editor.clear_screen()?,
                     Outcome::Quit => break,

@@ -130,6 +130,13 @@ impl<'a> Session<'a> {
                 let state = if self.printer.timing { "on" } else { "off" };
                 self.printer.note(&format!("Timing is {state}."))
             }
+            Command::Session(name) => {
+                if let Some(name) = name {
+                    self.db.switch_session(&name);
+                }
+                self.printer
+                    .note(&format!("Session \"{}\".", self.db.session()))
+            }
             Command::Unknown(command) => {
                 let error = self
                     .printer
@@ -223,6 +230,7 @@ impl<'a> Session<'a> {
             .map(|(command, about)| {
                 let usage = match *command {
                     "\\d" => "\\d [NAME]",
+                    "\\session" => "\\session [NAME]",
                     command => command,
                 };
                 format!("  {}{about}", self.key(usage))

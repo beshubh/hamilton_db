@@ -23,6 +23,10 @@
 //!   statements do.
 //! - Dropping the engine with a block open rolls it back.
 //!
+//! [`ExecutionEngine::session`] opens another session on the same database.
+//! Sessions share one `TransactionManager`, so their transactions are
+//! ordered against each other by Tid as MVTO requires.
+//!
 //! Every commit first records the next Tid in the catalog header, so that a
 //! restarted session never starts below a committed `ts` on disk (see
 //! `storage::concurrency::watermark`). There is no write-ahead log: what
@@ -106,7 +110,7 @@ pub type Result<T, E = EngineError> = std::result::Result<T, E>;
 /// One session on a database. See the module docs.
 pub struct ExecutionEngine {
     catalog: Arc<Catalog>,
-    txn_manager: TransactionManager,
+    txn_manager: Arc<TransactionManager>,
     settings: ExecutionSettings,
     batch_size: usize,
     state: State,
@@ -126,11 +130,24 @@ impl ExecutionEngine {
         let next_tid = catalog.next_tid().map_err(ExecutionError::from)?;
         Ok(Self {
             catalog,
-            txn_manager: TransactionManager::new(next_tid),
+            txn_manager: Arc::new(TransactionManager::new(next_tid)),
             settings: ExecutionSettings::default(),
             batch_size: DEFAULT_BATCH_SIZE,
             state: State::Idle,
         })
+    }
+
+    /// Another session on the same database, sharing this one's
+    /// transaction manager and settings. It starts outside a transaction
+    /// block.
+    pub fn session(&self) -> Self {
+        Self {
+            catalog: Arc::clone(&self.catalog),
+            txn_manager: Arc::clone(&self.txn_manager),
+            settings: self.settings,
+            batch_size: self.batch_size,
+            state: State::Idle,
+        }
     }
 
     /// Gives the executors of later statements `settings`.

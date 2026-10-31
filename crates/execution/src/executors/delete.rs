@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use common::{Rid, Schema, Tuple};
 
-use super::{AbstractExecutor, Executor, count_row, index_keys, locators};
+use super::{AbstractExecutor, Executor, count_row, index_keys, locators, write_indexes};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::plans::{DeletePlan, PlanNode};
@@ -12,7 +12,8 @@ use crate::plans::{DeletePlan, PlanNode};
 /// row it produces has a rid.
 ///
 /// A delete marks the tuple deleted in the statement's transaction and
-/// removes its entries from the table's indexes.
+/// retires its entries in the table's indexes, which stay there for older
+/// readers until garbage collection removes them.
 pub struct DeleteExecutor {
     ctx: Arc<ExecutionContext>,
     plan: DeletePlan,
@@ -54,7 +55,8 @@ impl Executor for DeleteExecutor {
         }
         self.done = true;
         let table = self.ctx.table(self.plan.table_oid())?;
-        let indexes = self.ctx.catalog().table_indexes(&table.name);
+        let indexes = write_indexes(&self.ctx, &table);
+        let indexed = self.ctx.indexed_table(&table);
         let mut found = Vec::new();
         while self
             .child
@@ -69,7 +71,7 @@ impl Executor for DeleteExecutor {
             let keys = index_keys(&table, &indexes, tuple)?;
             let locators = locators(&indexes, &keys, *rid);
             for ((index, key), locator) in indexes.iter().zip(&keys).zip(&locators) {
-                txn.delete_entry(&index.index, key, locator)?;
+                txn.retire_entry(&indexed, &index.index, key, locator)?;
             }
         }
         tuples.push(count_row(self.plan.get_output_schema(), found.len())?);
@@ -122,10 +124,19 @@ mod tests {
             .create_index("users_name", "users", &["name"])
             .unwrap();
         db.insert_numbered(5);
+        let older = db.tm.begin();
         let id_above_2 = compare(ComparisonOp::Gt, column(0), int(2));
         delete(&db, Some(FilterPlan::new(id_above_2, db.scan(None))));
         assert_eq!(db.index_lookup("users_name", &["user 2".into()]).len(), 1);
         assert!(db.index_lookup("users_name", &["user 3".into()]).is_empty());
+
+        // The entries stay for the older transaction, which still sees the
+        // rows, until garbage collection removes them.
+        db.tm.wait_for_gc();
+        assert_eq!(db.index_entries("users_name").len(), 5);
+        db.tm.commit(&older).unwrap();
+        db.tm.wait_for_gc();
+        assert_eq!(db.index_entries("users_name").len(), 2);
     }
 
     #[test]
@@ -141,6 +152,8 @@ mod tests {
             db.index_lookup("accounts_pkey", &[Value::Int(1)])
                 .is_empty()
         );
+        db.tm.wait_for_gc();
+        assert_eq!(db.index_entries("accounts_pkey").len(), 2);
         assert_eq!(db.index_entries("accounts_name").len(), 2);
         assert_eq!(
             db.index_rows("accounts_name", &["a".into()]),

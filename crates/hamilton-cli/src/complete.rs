@@ -384,7 +384,10 @@ mod tests {
 
     #[test]
     fn backslash_commands() {
-        assert_eq!(complete("\\"), ["\\?", "\\clear", "\\d", "\\q", "\\timing"]);
+        assert_eq!(
+            complete("\\"),
+            ["\\?", "\\clear", "\\d", "\\q", "\\session", "\\timing"]
+        );
         assert_eq!(complete("\\t"), ["\\timing"]);
     }
 }
