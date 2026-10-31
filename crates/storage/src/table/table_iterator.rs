@@ -6,6 +6,7 @@ use common::{INVALID_PAGE_ID, PageId, Rid, Schema, SlotId, Tuple};
 
 use crate::buffer::arc_replacer::AccessType;
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
+use crate::concurrency::read_ts::ReadTimestamps;
 use crate::error::Result;
 use crate::table::table_heap::TableHeap;
 use crate::table::table_page::{TablePage, TupleMeta};
@@ -61,7 +62,7 @@ impl TableIterator {
     /// The live rows of the next page that has any, or `None` once the scan
     /// is done. Does not return rows already buffered for `next`.
     pub fn next_batch(&mut self) -> Result<Option<Vec<TableRow>>> {
-        while let Some(rows) = self.next_page(|meta| !meta.is_deleted)? {
+        while let Some(rows) = self.next_page(|meta| !meta.is_deleted, |_| Ok(()))? {
             if !rows.is_empty() {
                 return Ok(Some(rows));
             }
@@ -71,19 +72,32 @@ impl TableIterator {
 
     /// The rows of the next page that has any rows visible at `ts`, each the
     /// version visible at `ts` with its meta, or `None` once the scan is
-    /// done. Pass the same `ts`, and `schema` and `undo` of the table, on
-    /// every call. Fails with `MissingUndoRecord` as `TableHeap::get_at`
-    /// does.
+    /// done. Pass the same arguments on every call. Fails as
+    /// `TableHeap::get_at` does.
+    ///
+    /// Every row of each page read is recorded in `read_ts`, as
+    /// `TableHeap::get_at` records one, under the page's guard: deleted
+    /// rows too, and rows with no version at `ts`.
     pub fn next_batch_at(
         &mut self,
         ts: u64,
         schema: &Schema,
         undo: &UndoLog,
+        read_ts: Option<&ReadTimestamps>,
     ) -> Result<Option<Vec<TableRow>>> {
-        while let Some(heads) = self.next_page(|_| true)? {
+        let record_reads = |heads: &[TableRow]| {
+            for (meta, tuple) in heads {
+                undo_log::check_read(row_rid(tuple), meta, ts)?;
+            }
+            if let Some(read_ts) = read_ts {
+                read_ts.record_page(heads.iter().map(|(_, tuple)| row_rid(tuple)), ts);
+            }
+            Ok(())
+        };
+        while let Some(heads) = self.next_page(|_| true, record_reads)? {
             let mut rows = Vec::with_capacity(heads.len());
             for head in heads {
-                let rid = head.1.rid().expect("rows read from a page carry their rid");
+                let rid = row_rid(&head.1);
                 if let Some(row) = undo_log::version_at(rid, head, ts, schema, undo)? {
                     rows.push(row);
                 }
@@ -95,9 +109,14 @@ impl TableIterator {
         Ok(None)
     }
 
-    /// Copies the rows of the next page that `keep` accepts, under one read
-    /// guard, or returns `None` once the scan is done.
-    fn next_page(&mut self, keep: impl Fn(&TupleMeta) -> bool) -> Result<Option<Vec<TableRow>>> {
+    /// Copies the rows of the next page that `keep` accepts, and passes them
+    /// to `under_latch`, under one read guard. Returns them, or `None` once
+    /// the scan is done.
+    fn next_page(
+        &mut self,
+        keep: impl Fn(&TupleMeta) -> bool,
+        under_latch: impl FnOnce(&[TableRow]) -> Result<()>,
+    ) -> Result<Option<Vec<TableRow>>> {
         if self.next_page_id == INVALID_PAGE_ID {
             return Ok(None);
         }
@@ -119,6 +138,7 @@ impl TableIterator {
                 (meta, tuple.with_rid(Rid::new(page_id, slot)))
             })
             .collect();
+        under_latch(&rows)?;
         self.next_page_id = if is_last {
             INVALID_PAGE_ID
         } else {
@@ -126,6 +146,10 @@ impl TableIterator {
         };
         Ok(Some(rows))
     }
+}
+
+fn row_rid(tuple: &Tuple) -> Rid {
+    tuple.rid().expect("rows read from a page carry their rid")
 }
 
 impl Iterator for TableIterator {

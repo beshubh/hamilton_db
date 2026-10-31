@@ -32,6 +32,8 @@
 //!
 //! **Known gaps.** No durability; `undo_ptr`s on disk dangle after a restart,
 //! so they are only followed through a checked lookup (`older_record`).
+//! Read timestamps (`concurrency::read_ts`) guard existing tuples, not
+//! phantoms, and index entries are not rolled back.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -190,12 +192,8 @@ pub(crate) fn version_at(
         data.truncate(len);
         return Ok(Some((meta, Tuple::from_bytes(data).with_rid(rid))));
     }
-    if meta.ts & TXN_UNCOMMITTED_BIT != 0 {
-        let writer = meta.ts & !TXN_UNCOMMITTED_BIT;
-        if writer < ts {
-            return Err(StorageError::Conflict { rid, other: writer });
-        }
-    } else if meta.ts <= ts {
+    check_read(rid, &meta, ts)?;
+    if meta.ts & TXN_UNCOMMITTED_BIT == 0 && meta.ts <= ts {
         return Ok((!meta.is_deleted).then_some((meta, tuple)));
     }
 
@@ -226,6 +224,18 @@ pub(crate) fn version_at(
         None => tuple,
     };
     Ok(Some((meta, tuple)))
+}
+
+/// Checks that a reader at `ts` may read the tuple at `rid` given `head`,
+/// its newest version: fails with `Conflict` if an older transaction holds
+/// the tuple's lock. `version_at` checks this too; the heap also checks it
+/// under the page latch, before recording the read.
+pub(crate) fn check_read(rid: Rid, head: &TupleMeta, ts: u64) -> Result<()> {
+    let writer = head.ts & !TXN_UNCOMMITTED_BIT;
+    if head.ts & TXN_UNCOMMITTED_BIT != 0 && writer < ts {
+        return Err(StorageError::Conflict { rid, other: writer });
+    }
+    Ok(())
 }
 
 /// The record that `meta`, a version of the tuple at `rid`, points at. The

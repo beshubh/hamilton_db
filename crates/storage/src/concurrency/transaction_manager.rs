@@ -2,17 +2,19 @@ use std::sync::Arc;
 
 use common::TxnId;
 
+use crate::concurrency::read_ts::ReadTimestamps;
 use crate::concurrency::transaction::{Transaction, TransactionState};
 use crate::concurrency::watermark::Watermark;
 use crate::error::Result;
 use crate::table::undo_log::UndoLog;
 
-/// Begins and ends transactions. It owns the watermark and the one undo log
-/// every table's versions go into, and collects that log's garbage each time
-/// a transaction ends.
+/// Begins and ends transactions. It owns the watermark, the one undo log
+/// every table's versions go into, and the read timestamps of every table's
+/// tuples, and collects garbage from both each time a transaction ends.
 pub struct TransactionManager {
-    watermark: Watermark,
+    watermark: Arc<Watermark>,
     undo: Arc<UndoLog>,
+    read_ts: Arc<ReadTimestamps>,
 }
 
 impl TransactionManager {
@@ -20,14 +22,20 @@ impl TransactionManager {
     /// `Watermark::new`.
     pub fn new(next_tid: TxnId) -> Self {
         Self {
-            watermark: Watermark::new(next_tid),
+            watermark: Arc::new(Watermark::new(next_tid)),
             undo: Arc::new(UndoLog::new()),
+            read_ts: Arc::new(ReadTimestamps::new()),
         }
     }
 
     pub fn begin(&self) -> Arc<Transaction> {
         let tid = self.watermark.begin();
-        Arc::new(Transaction::new(tid, Arc::clone(&self.undo)))
+        Arc::new(Transaction::new(
+            tid,
+            Arc::clone(&self.undo),
+            Arc::clone(&self.read_ts),
+            Arc::clone(&self.watermark),
+        ))
     }
 
     /// Commits `txn`: unlocks the versions it wrote, which makes them
@@ -49,6 +57,10 @@ impl TransactionManager {
         &self.undo
     }
 
+    pub fn read_timestamps(&self) -> &Arc<ReadTimestamps> {
+        &self.read_ts
+    }
+
     /// The oldest Tid any running transaction reads at. See `Watermark`.
     pub fn watermark(&self) -> TxnId {
         self.watermark.get()
@@ -62,7 +74,9 @@ impl TransactionManager {
         );
         txn.finish(outcome)?;
         self.watermark.end(txn.tid());
-        self.undo.collect(self.watermark.get());
+        let watermark = self.watermark.get();
+        self.undo.collect(watermark);
+        self.read_ts.collect(watermark);
         Ok(())
     }
 }

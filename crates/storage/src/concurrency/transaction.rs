@@ -2,10 +2,11 @@
 //!
 //! A transaction's Tid is its timestamp: the result must equal running the
 //! transactions one after another in Tid order. A transaction reads each
-//! tuple as of its Tid, by the rule in `undo_log`, and writes versions
-//! stamped `tid | TXN_UNCOMMITTED_BIT`, which write-lock their tuples until
-//! it ends. Storage reports a read or write that would break Tid order as
-//! `Conflict`; the caller then aborts the transaction.
+//! tuple as of its Tid, by the rule in `undo_log`, recording the read in
+//! `read_ts`, and writes versions stamped `tid | TXN_UNCOMMITTED_BIT`, which
+//! write-lock their tuples until it ends. Storage reports a read or write
+//! that would break Tid order as `Conflict`; the caller then aborts the
+//! transaction.
 //!
 //! Every write goes into the write set, by table, so that commit can clear
 //! the bit on each written tuple (`TableHeap::stamp_commit`) and abort can
@@ -13,19 +14,22 @@
 //! (`TableHeap::rollback`). The `TransactionManager` then ends the Tid in the
 //! watermark and frees the undo records below it.
 //!
-//! **Known gaps.** No read timestamps: a write does not check whether a
-//! newer transaction already read the version it replaces, so schedules are
-//! not serializable yet. Index entries are not rolled back. Nothing is
-//! logged, so a commit or abort that fails partway leaves some tuples done
-//! and the rest locked, and the transaction stays running.
+//! **Known gaps.** Phantoms: read timestamps guard the tuples a transaction
+//! read, not rows inserted later that it should have seen, so schedules
+//! with inserts are not serializable. Index entries are not rolled back.
+//! Nothing is logged, so a commit or abort that fails partway leaves some
+//! tuples done and the rest locked, and the transaction stays running.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use common::{PageId, Rid, Schema, TXN_UNCOMMITTED_BIT, Tuple, TxnId};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 
+use crate::concurrency::read_ts::ReadTimestamps;
+use crate::concurrency::watermark::Watermark;
 use crate::error::{Result, StorageError};
 use crate::table::table_heap::TableHeap;
 use crate::table::table_iterator::{TableIterator, TableRow};
@@ -55,6 +59,10 @@ pub struct Transaction {
     /// write and misses it.
     state: RwLock<TransactionState>,
     undo: Arc<UndoLog>,
+    read_ts: Arc<ReadTimestamps>,
+    watermark: Arc<Watermark>,
+    /// Set once this is the oldest running transaction, which it then stays.
+    oldest: AtomicBool,
     write_set: Mutex<HashMap<PageId, TableWrites>>,
 }
 
@@ -67,11 +75,19 @@ struct TableWrites {
 }
 
 impl Transaction {
-    pub(crate) fn new(tid: TxnId, undo: Arc<UndoLog>) -> Self {
+    pub(crate) fn new(
+        tid: TxnId,
+        undo: Arc<UndoLog>,
+        read_ts: Arc<ReadTimestamps>,
+        watermark: Arc<Watermark>,
+    ) -> Self {
         Self {
             tid,
             state: RwLock::new(TransactionState::Running),
             undo,
+            read_ts,
+            watermark,
+            oldest: AtomicBool::new(false),
             write_set: Mutex::new(HashMap::new()),
         }
     }
@@ -94,8 +110,8 @@ impl Transaction {
     /// Replaces the tuple at `rid` with `new` and returns where `new` is. If
     /// `new` does not fit on the tuple's page, the tuple is deleted and `new`
     /// inserted at a new `Rid`. Fails with `Conflict` if another transaction
-    /// holds the tuple's lock or committed it after this one's Tid, and with
-    /// `TupleDeleted` if it is deleted.
+    /// holds the tuple's lock, or committed or read it after this one's Tid,
+    /// and with `TupleDeleted` if it is deleted.
     pub fn update(
         &self,
         heap: &Arc<TableHeap>,
@@ -104,13 +120,13 @@ impl Transaction {
         new: &Tuple,
     ) -> Result<Rid> {
         let _running = self.running()?;
-        match heap.update_versioned(rid, new, self.write_ts(), schema, &self.undo) {
+        match heap.update_versioned(rid, new, self.write_ts(), schema, &self.undo, &self.read_ts) {
             Ok(()) => {
                 self.record_write(heap, schema, rid);
                 Ok(rid)
             }
             Err(StorageError::PageFull) => {
-                heap.delete_versioned(rid, self.write_ts(), &self.undo)?;
+                heap.delete_versioned(rid, self.write_ts(), &self.undo, &self.read_ts)?;
                 self.record_write(heap, schema, rid);
                 self.insert_locked(heap, schema, new)
             }
@@ -121,7 +137,7 @@ impl Transaction {
     /// Deletes the tuple at `rid`. Fails as `update` does.
     pub fn delete(&self, heap: &Arc<TableHeap>, schema: &Schema, rid: Rid) -> Result<()> {
         let _running = self.running()?;
-        heap.delete_versioned(rid, self.write_ts(), &self.undo)?;
+        heap.delete_versioned(rid, self.write_ts(), &self.undo, &self.read_ts)?;
         self.record_write(heap, schema, rid);
         Ok(())
     }
@@ -131,7 +147,7 @@ impl Transaction {
     /// transaction holds the tuple's lock.
     pub fn get(&self, heap: &TableHeap, schema: &Schema, rid: Rid) -> Result<Option<TableRow>> {
         let _running = self.running()?;
-        heap.get_at(rid, self.tid, schema, &self.undo)
+        heap.get_at(rid, self.tid, schema, &self.undo, self.reads())
     }
 
     /// Scans `heap` as this transaction sees it. See `TableIterator`.
@@ -183,6 +199,19 @@ impl Transaction {
             return Err(StorageError::TransactionNotRunning(self.tid));
         }
         Ok(state)
+    }
+
+    /// Where this transaction's reads are recorded: nowhere once it is the
+    /// oldest running transaction. Only an older writer could conflict with
+    /// its reads, and Tids only grow, so none is running or will begin.
+    fn reads(&self) -> Option<&ReadTimestamps> {
+        if !self.oldest.load(Ordering::Relaxed) {
+            if self.watermark.get() != self.tid {
+                return Some(&self.read_ts);
+            }
+            self.oldest.store(true, Ordering::Relaxed);
+        }
+        None
     }
 
     /// The `ts` this transaction writes versions at: its Tid, locked.
@@ -247,6 +276,6 @@ impl TransactionScan {
     pub fn next_batch(&mut self) -> Result<Option<Vec<TableRow>>> {
         let _running = self.txn.running()?;
         self.iter
-            .next_batch_at(self.txn.tid, &self.schema, &self.txn.undo)
+            .next_batch_at(self.txn.tid, &self.schema, &self.txn.undo, self.txn.reads())
     }
 }

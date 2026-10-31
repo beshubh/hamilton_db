@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 
 use crate::buffer::arc_replacer::AccessType;
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
+use crate::concurrency::read_ts::ReadTimestamps;
 use crate::error::{Result, StorageError};
 use crate::page::page_guard::WritePageGuard;
 use crate::table::table_iterator::{TableIterator, TableRow};
@@ -150,8 +151,9 @@ impl TableHeap {
     /// leaving the heap and `undo` unchanged. The caller then deletes the
     /// tuple with `delete_versioned` and inserts `new` at a new `Rid`:
     /// version chains never cross `Rid`s. Fails with `Conflict` if the tuple
-    /// is locked by another transaction or was committed after `ts` (see
-    /// `check_write`), and with `TupleDeleted` if it is deleted.
+    /// is locked by another transaction, was committed after `ts`, or was
+    /// read by a transaction newer than `ts` (see `check_write`), and with
+    /// `TupleDeleted` if it is deleted.
     pub fn update_versioned(
         &self,
         rid: Rid,
@@ -159,11 +161,12 @@ impl TableHeap {
         ts: u64,
         schema: &Schema,
         undo: &UndoLog,
+        read_ts: &ReadTimestamps,
     ) -> Result<()> {
         let mut guard = self.write_page(rid)?;
         let mut page = TablePage::new(guard.get_data_mut())?;
         let (head, payload) = page.get(rid.slot)?;
-        check_write(rid, &head, ts)?;
+        check_write(rid, &head, ts, read_ts)?;
         if head.is_deleted {
             return Err(StorageError::TupleDeleted(rid));
         }
@@ -204,11 +207,17 @@ impl TableHeap {
     /// changed columns: the tuple's bytes stay on the page. Fails with
     /// `Conflict` as `update_versioned` does, and with `TupleDeleted` if the
     /// tuple is already deleted.
-    pub fn delete_versioned(&self, rid: Rid, ts: u64, undo: &UndoLog) -> Result<()> {
+    pub fn delete_versioned(
+        &self,
+        rid: Rid,
+        ts: u64,
+        undo: &UndoLog,
+        read_ts: &ReadTimestamps,
+    ) -> Result<()> {
         let mut guard = self.write_page(rid)?;
         let mut page = TablePage::new(guard.get_data_mut())?;
         let (head, _) = page.get(rid.slot)?;
-        check_write(rid, &head, ts)?;
+        check_write(rid, &head, ts, read_ts)?;
         if head.is_deleted {
             return Err(StorageError::TupleDeleted(rid));
         }
@@ -234,16 +243,33 @@ impl TableHeap {
     /// The head is copied out under the page's read guard, and older
     /// versions are rebuilt after the guard is released. A head visible at
     /// `ts` is returned without decoding it or reading `undo`. Fails with
+    /// `Conflict` if an older transaction holds the tuple's lock, and with
     /// `MissingUndoRecord` if a record on the way was freed, which happens
     /// only if garbage collection ran past a reader still at `ts`.
+    ///
+    /// Unless the read fails with `Conflict`, it is recorded in `read_ts`
+    /// under the guard, as transaction `ts`'s read. Pass `None` for a read
+    /// that no write needs to know about: one outside a transaction, or by
+    /// the oldest running transaction.
     pub fn get_at(
         &self,
         rid: Rid,
         ts: u64,
         schema: &Schema,
         undo: &UndoLog,
+        read_ts: Option<&ReadTimestamps>,
     ) -> Result<Option<TableRow>> {
-        let head = self.get(rid)?;
+        let guard = self
+            .bpm
+            .checked_read_page(rid.page_id, AccessType::Lookup)?;
+        let page = TablePage::new(guard.get_data())?;
+        let (meta, payload) = page.get(rid.slot)?;
+        undo_log::check_read(rid, &meta, ts)?;
+        if let Some(read_ts) = read_ts {
+            read_ts.record(rid, ts);
+        }
+        let head = (meta, Tuple::from_bytes(payload.to_vec()).with_rid(rid));
+        drop(guard);
         undo_log::version_at(rid, head, ts, schema, undo)
     }
 
@@ -356,8 +382,9 @@ impl TableHeap {
 /// Checks that a versioned write at `ts` may replace `head`, the newest
 /// version of the tuple at `rid`, made under the page's write guard. A head
 /// locked by another transaction, or committed after the writer's Tid, fails
-/// with `Conflict`. A transaction may write its own locked head again.
-fn check_write(rid: Rid, head: &TupleMeta, ts: u64) -> Result<()> {
+/// with `Conflict`, as does a tuple a newer transaction has read. A
+/// transaction may write its own locked head again.
+fn check_write(rid: Rid, head: &TupleMeta, ts: u64, read_ts: &ReadTimestamps) -> Result<()> {
     if head.ts & TXN_UNCOMMITTED_BIT != 0 {
         if head.ts != ts {
             return Err(StorageError::Conflict {
@@ -371,7 +398,7 @@ fn check_write(rid: Rid, head: &TupleMeta, ts: u64) -> Result<()> {
             other: head.ts,
         });
     }
-    Ok(())
+    read_ts.check(rid, ts & !TXN_UNCOMMITTED_BIT)
 }
 
 #[cfg(test)]

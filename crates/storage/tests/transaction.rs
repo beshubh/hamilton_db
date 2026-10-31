@@ -491,10 +491,15 @@ fn undo_records_live_as_long_as_a_reader_needs_them() {
 /// Threads run short transactions over shared rows: each scans the table,
 /// then updates, deletes or inserts a row, and commits, or aborts on
 /// purpose. A `Conflict` aborts the transaction and retries it.
+///
+/// Every transaction reads every row, so a write conflicts with any newer
+/// transaction that scanned in between (see `read_ts`), and most attempts
+/// abort. Aborted inserts leave slots that every later scan reads, since
+/// nothing vacuums them, so the load is kept small.
 #[test]
 fn concurrent_transactions_see_only_committed_writes() {
-    const THREADS: u64 = 8;
-    const TXNS: u64 = 150;
+    const THREADS: u64 = 4;
+    const TXNS: u64 = 50;
     let db = setup(64);
     let initial: Vec<Vec<Value>> = (0..40).map(|id| row(id, 1, 100)).collect();
     db.load(&initial);
