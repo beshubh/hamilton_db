@@ -1,17 +1,22 @@
 use std::sync::Arc;
 
-use common::{INVALID_PAGE_ID, PageId, Rid, SlotId, Tuple};
+use common::{INVALID_PAGE_ID, PageId, Rid, Schema, SlotId, Tuple, Value};
 use parking_lot::Mutex;
 
 use crate::buffer::arc_replacer::AccessType;
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::error::{Result, StorageError};
 use crate::page::page_guard::WritePageGuard;
-use crate::table::table_iterator::TableIterator;
+use crate::table::table_iterator::{TableIterator, TableRow};
 use crate::table::table_page::{TablePage, TupleMeta};
+use crate::table::undo_log::{self, UndoLog, UndoRecord};
 
 /// A table stored as a linked list of table pages, reached through the
 /// buffer pool.
+///
+/// The heap holds the newest version of each tuple. The `_versioned` writes
+/// and `get_at` keep older versions in an `UndoLog`, as `undo_log`
+/// describes; the other methods read and write the newest version alone.
 ///
 /// Each operation latches only the pages it touches, through the buffer
 /// pool's page guards. Inserts also take `last_page_id`'s mutex, so that two
@@ -125,6 +130,100 @@ impl TableHeap {
     pub fn update_in_place(&self, rid: Rid, meta: &TupleMeta, tuple: &Tuple) -> Result<()> {
         let mut guard = self.write_page(rid)?;
         TablePage::new(guard.get_data_mut())?.update(rid.slot, meta, tuple.data())
+    }
+
+    /// Replaces the tuple at `rid` with `new`, written at `ts`, keeping its
+    /// `Rid`. The version it replaces stays readable through a record pushed
+    /// to `undo`, which holds the old values of the columns that changed.
+    ///
+    /// Fails with `PageFull` if `new` does not fit on the tuple's page,
+    /// leaving the heap and `undo` unchanged. The caller then deletes the
+    /// tuple with `delete_versioned` and inserts `new` at a new `Rid`:
+    /// version chains never cross `Rid`s. Fails with `TupleDeleted` if the
+    /// tuple is deleted.
+    pub fn update_versioned(
+        &self,
+        rid: Rid,
+        new: &Tuple,
+        ts: u64,
+        schema: &Schema,
+        undo: &UndoLog,
+    ) -> Result<()> {
+        let mut guard = self.write_page(rid)?;
+        let mut page = TablePage::new(guard.get_data_mut())?;
+        let (head, payload) = page.get(rid.slot)?;
+        if head.is_deleted {
+            return Err(StorageError::TupleDeleted(rid));
+        }
+        debug_assert!(ts >= head.ts, "writes arrive in ts order");
+        page.check_update(rid.slot, new.len())?;
+
+        let old_values = Tuple::from_bytes(payload.to_vec()).decode(schema)?;
+        let new_values = new.decode(schema)?;
+        let record = UndoRecord {
+            rid,
+            writer_ts: ts,
+            meta: head,
+            delta: undo_log::diff(old_values, &new_values),
+        };
+        // The record is in the log before the heap points at it. `update`
+        // cannot fail after `check_update`; if it did, the record would be
+        // orphaned until garbage collection passes `ts`.
+        let undo_ptr = undo.push(record);
+        let meta = TupleMeta {
+            ts,
+            undo_ptr,
+            is_deleted: false,
+            has_nulls: new_values.iter().any(|value| matches!(value, Value::Null)),
+        };
+        page.update(rid.slot, &meta, new.data())
+    }
+
+    /// Marks the tuple at `rid` deleted as of `ts`. The version before the
+    /// delete stays readable through a record pushed to `undo`, with no
+    /// changed columns: the tuple's bytes stay on the page. Fails with
+    /// `TupleDeleted` if the tuple is already deleted.
+    pub fn delete_versioned(&self, rid: Rid, ts: u64, undo: &UndoLog) -> Result<()> {
+        let mut guard = self.write_page(rid)?;
+        let mut page = TablePage::new(guard.get_data_mut())?;
+        let (head, _) = page.get(rid.slot)?;
+        if head.is_deleted {
+            return Err(StorageError::TupleDeleted(rid));
+        }
+        debug_assert!(ts >= head.ts, "writes arrive in ts order");
+        let undo_ptr = undo.push(UndoRecord {
+            rid,
+            writer_ts: ts,
+            meta: head,
+            delta: Vec::new(),
+        });
+        let meta = TupleMeta {
+            ts,
+            undo_ptr,
+            is_deleted: true,
+            ..head
+        };
+        page.update_meta(rid.slot, &meta)
+    }
+
+    /// The version of the tuple at `rid` visible at `ts`, with its meta, or
+    /// `None` if the tuple does not exist at `ts`. See `undo_log` for the
+    /// rule.
+    ///
+    /// The head is copied out under the page's read guard, and older
+    /// versions are rebuilt after the guard is released. A head visible at
+    /// `ts` is returned without decoding it or reading `undo`. Fails with
+    /// `MissingUndoRecord` if a record on the way was freed, which happens
+    /// only if garbage collection ran past a reader still at `ts`.
+    pub fn get_at(
+        &self,
+        rid: Rid,
+        ts: u64,
+        schema: &Schema,
+        undo: &UndoLog,
+    ) -> Result<Option<TableRow>> {
+        let head = self.get(rid)?;
+        undo_log::version_at(rid, head, ts, schema, undo)
     }
 
     /// Iterates over the live rows of the table. See `TableIterator`.
