@@ -13,6 +13,9 @@
 //! **Visibility.** At time `ts` a tuple is its newest version with a `ts` at
 //! or below `ts` (`version_at`); none if that version is deleted or the
 //! chain ends first. A version ends where the next newer one starts.
+//! While its writer runs, a version's `ts` is the writer's Tid with
+//! `TXN_UNCOMMITTED_BIT` set: the writer reads it, older readers walk past
+//! it, and newer readers fail with `Conflict` instead of reading past it.
 //!
 //! **Deltas** are `(column, old value)` pairs rather than encoded bytes:
 //! records never reach disk, and a version is rebuilt by decoding the head
@@ -22,19 +25,18 @@
 //! new Tids exceed every `ts` on disk, so no reader walks a chain. Undoing
 //! crashed writes is the WAL's job.
 //!
-//! **GC.** A record pushed at `ts` X is read only by readers below X, so
-//! [`UndoLog::collect`] frees every writer's records below the watermark.
+//! **GC.** A record's `writer_ts` is its writer's plain Tid, so commit
+//! restamps the heap alone. A record pushed at X is read only by readers
+//! below X, so [`UndoLog::collect`] frees every writer's records below the
+//! watermark; a running writer is never below it.
 //!
 //! **Known gaps.** No durability; `undo_ptr`s on disk dangle after a restart,
-//! so they are only followed through a checked lookup (`older_record`). No
-//! MVTO checks yet: writes are assumed to be committed, in `ts` order, and
-//! never to conflict; restamping `ts` at commit must keep it equal to the
-//! record's `writer_ts`.
+//! so they are only followed through a checked lookup (`older_record`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use common::{Rid, Schema, Tuple, Value, ValueError};
+use common::{Rid, Schema, TXN_UNCOMMITTED_BIT, Tuple, Value, ValueError};
 use parking_lot::RwLock;
 
 use crate::error::{Result, StorageError};
@@ -47,9 +49,10 @@ use crate::table::table_page::{INVALID_UNDO_PTR, TupleMeta};
 pub struct UndoRecord {
     /// The tuple whose chain this record is on.
     pub rid: Rid,
-    /// The `ts` of the write that pushed this record. It is also the `ts` of
-    /// the version that points at the record. Garbage collection frees
-    /// records by this `ts`.
+    /// The `ts` of the write that pushed this record, without
+    /// `TXN_UNCOMMITTED_BIT`. It is also the `ts` of the version that points
+    /// at the record, once that version is committed. Garbage collection
+    /// frees records by this `ts`.
     pub writer_ts: u64,
     /// The meta of the version this record rebuilds: its `ts`, its flags,
     /// and in `undo_ptr` the next older record.
@@ -156,8 +159,13 @@ impl UndoLog {
 /// version: the newest version whose `ts` is at or below `ts`. Returns
 /// `None` if that version is deleted or the tuple was inserted after `ts`.
 ///
-/// A visible head is returned as it is, without decoding it or reading
-/// `undo`. Otherwise the head's values are decoded when the first record
+/// A head written by the transaction `ts` itself, still uncommitted, is
+/// visible, with any padding of a shrinking update cut off. A head locked by
+/// an older transaction fails with `Conflict`: in `ts` order it comes before
+/// the reader, but it may still change or be rolled back.
+///
+/// A visible committed head is returned as it is, without decoding it or
+/// reading `undo`. Otherwise the head's values are decoded when the first record
 /// that changes a column is applied, and encoded again once at the end.
 /// Fails with `MissingUndoRecord` if the chain leads to a record that is not
 /// in `undo`, which means a reader older than the watermark is still
@@ -170,10 +178,28 @@ pub(crate) fn version_at(
     undo: &UndoLog,
 ) -> Result<Option<TableRow>> {
     let (mut meta, tuple) = head;
-    if meta.ts <= ts {
+    if meta.ts == ts | TXN_UNCOMMITTED_BIT {
+        if meta.is_deleted {
+            return Ok(None);
+        }
+        let len = tuple.encoded_len(schema)?;
+        if len == tuple.len() {
+            return Ok(Some((meta, tuple)));
+        }
+        let mut data = tuple.into_data();
+        data.truncate(len);
+        return Ok(Some((meta, Tuple::from_bytes(data).with_rid(rid))));
+    }
+    if meta.ts & TXN_UNCOMMITTED_BIT != 0 {
+        let writer = meta.ts & !TXN_UNCOMMITTED_BIT;
+        if writer < ts {
+            return Err(StorageError::Conflict { rid, other: writer });
+        }
+    } else if meta.ts <= ts {
         return Ok((!meta.is_deleted).then_some((meta, tuple)));
     }
 
+    // Uncommitted versions have the top bit set, so the walk passes them.
     let mut values: Option<Vec<Value>> = None;
     while meta.ts > ts {
         if meta.undo_ptr == INVALID_UNDO_PTR {
@@ -205,11 +231,12 @@ pub(crate) fn version_at(
 /// The record that `meta`, a version of the tuple at `rid`, points at. The
 /// log issues handles from 1 again after a restart, so an old `undo_ptr` can
 /// name another tuple's record. A record must match both `rid` and the `ts`
-/// of the version pointing at it; pre-restart `ts`s are older than every
-/// write since, so a stale pointer never matches and is reported missing.
-fn older_record(rid: Rid, meta: &TupleMeta, undo: &UndoLog) -> Result<Arc<UndoRecord>> {
+/// of the version pointing at it, without the uncommitted bit; pre-restart
+/// `ts`s are older than every write since, so a stale pointer never matches
+/// and is reported missing.
+pub(crate) fn older_record(rid: Rid, meta: &TupleMeta, undo: &UndoLog) -> Result<Arc<UndoRecord>> {
     undo.get(meta.undo_ptr)
-        .filter(|record| record.rid == rid && record.writer_ts == meta.ts)
+        .filter(|record| record.rid == rid && record.writer_ts == meta.ts & !TXN_UNCOMMITTED_BIT)
         .ok_or(StorageError::MissingUndoRecord {
             rid,
             undo_ptr: meta.undo_ptr,

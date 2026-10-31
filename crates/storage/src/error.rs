@@ -1,7 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use common::{PageId, Rid, SlotId, ValueError};
+use common::{PageId, Rid, SlotId, TxnId, ValueError};
 use thiserror::Error;
 
 use crate::page::page_header::PageType;
@@ -85,6 +85,17 @@ pub enum StorageError {
     /// `undo_ptr` is from before a restart.
     #[error("undo record {undo_ptr} of tuple {rid} is missing")]
     MissingUndoRecord { rid: Rid, undo_ptr: u64 },
+
+    /// A transaction's read or write of the tuple at `rid` would break
+    /// timestamp order because of transaction `other`: `other` holds the
+    /// tuple's write lock, or committed a newer version than the writer's
+    /// Tid. Storage changes nothing; the caller aborts the transaction.
+    #[error("tuple {rid} conflicts with transaction {other}")]
+    Conflict { rid: Rid, other: TxnId },
+
+    /// The transaction has already committed or aborted.
+    #[error("transaction {0} is not running")]
+    TransactionNotRunning(TxnId),
 
     /// The disk scheduler's worker thread exited before finishing a request.
     #[error("disk scheduler worker exited")]

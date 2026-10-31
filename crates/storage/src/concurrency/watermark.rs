@@ -21,8 +21,9 @@
 //!
 //! Tids start at 1, because 0 is `INVALID_TXN_ID` and every tuple written
 //! before transactions existed carries `ts = 0`, which must read as committed
-//! before every transaction. They stay below `1 << 63`, because a tuple marks
-//! an uncommitted version by storing its writer's Tid with the top bit set.
+//! before every transaction. They stay below `TXN_UNCOMMITTED_BIT`, because
+//! a tuple marks an uncommitted version by storing its writer's Tid with
+//! that bit set.
 //!
 //! The counter is not persisted yet. Once real timestamps reach disk, a
 //! restarted counter must not start below any committed `ts` there;
@@ -30,12 +31,8 @@
 
 use std::collections::BTreeSet;
 
-use common::{INVALID_TXN_ID, TxnId};
+use common::{INVALID_TXN_ID, TXN_UNCOMMITTED_BIT, TxnId};
 use parking_lot::Mutex;
-
-/// Tids, and the counter, stay below this bit, which marks uncommitted
-/// versions in the tuple header.
-const TXN_ID_LIMIT: TxnId = 1 << 63;
 
 /// Allocates Tids and tracks which are active, to give the watermark.
 pub struct Watermark {
@@ -54,7 +51,7 @@ impl Watermark {
     pub fn new(next: TxnId) -> Self {
         assert!(next != INVALID_TXN_ID, "the first Tid must be at least 1");
         assert!(
-            next < TXN_ID_LIMIT,
+            next < TXN_UNCOMMITTED_BIT,
             "the first Tid {next} has the top bit set"
         );
         Self {
@@ -71,7 +68,10 @@ impl Watermark {
     pub fn begin(&self) -> TxnId {
         let mut inner = self.inner.lock();
         let tid = inner.next;
-        assert!(tid + 1 < TXN_ID_LIMIT, "transaction ids are exhausted");
+        assert!(
+            tid + 1 < TXN_UNCOMMITTED_BIT,
+            "transaction ids are exhausted"
+        );
         inner.next = tid + 1;
         inner.active.insert(tid);
         tid

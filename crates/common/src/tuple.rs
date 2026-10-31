@@ -105,6 +105,29 @@ impl Tuple {
         self.data.is_empty()
     }
 
+    /// How many of the tuple's bytes its columns use with `schema`: the
+    /// fixed-width part and the strings, which `encode` and `join` lay out
+    /// with nothing after the last one. Bytes past this are not part of any
+    /// column, such as the zeros the table heap pads an uncommitted shrinking
+    /// update with.
+    pub fn encoded_len(&self, schema: &Schema) -> Result<usize> {
+        let mut end = schema.fixed_len();
+        if self.data.len() < end {
+            return Err(ValueError::CorruptTuple(
+                "shorter than its fixed-width part",
+            ));
+        }
+        for (idx, column) in schema.columns().iter().enumerate() {
+            if matches!(column.data_type, DataType::Varchar(_))
+                && !is_null(schema, &self.data, idx)?
+            {
+                let at = schema.fixed_offset(idx);
+                end = end.max(varchar_range(schema, &self.data, at)?.end);
+            }
+        }
+        Ok(end)
+    }
+
     /// Decodes every column.
     pub fn decode(&self, schema: &Schema) -> Result<Vec<Value>> {
         (0..schema.len())
@@ -514,6 +537,37 @@ mod tests {
         let tuple = Tuple::encode(&schema, &[]).unwrap();
         assert!(tuple.is_empty());
         assert!(tuple.decode(&schema).unwrap().is_empty());
+        assert_eq!(tuple.encoded_len(&schema).unwrap(), 0);
+    }
+
+    #[test]
+    fn encoded_len_ignores_trailing_bytes() {
+        let schema = users();
+        let mut nulls = row();
+        nulls[3] = Value::Null;
+        for values in [
+            row(),
+            nulls,
+            vec![
+                Value::Int(1),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Bool(false),
+            ],
+        ] {
+            let tuple = Tuple::encode(&schema, &values).unwrap();
+            let len = tuple.len();
+            assert_eq!(tuple.encoded_len(&schema).unwrap(), len);
+
+            let mut padded = tuple.into_data();
+            padded.resize(len + 9, 0);
+            let padded = Tuple::from_bytes(padded);
+            assert_eq!(padded.encoded_len(&schema).unwrap(), len);
+            assert_eq!(padded.decode(&schema).unwrap(), values);
+        }
+        let short = Tuple::from_bytes(vec![0; schema.fixed_len() - 1]);
+        assert!(short.encoded_len(&schema).is_err());
     }
 
     #[test]
