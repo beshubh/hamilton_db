@@ -255,6 +255,7 @@ fn uncommitted_writes_are_hidden_until_commit() {
     for txn in [older, newer, later] {
         db.tm.commit(&txn).unwrap();
     }
+    db.tm.wait_for_gc();
     assert!(db.tm.undo_log().is_empty());
 }
 
@@ -280,6 +281,7 @@ fn several_writes_to_one_tuple_commit_as_the_last() {
     assert_eq!(db.head(rid).1.data(), encode(&row(1, w, 20)).data());
     db.tm.commit(&older).unwrap();
     db.tm.commit(&newer).unwrap();
+    db.tm.wait_for_gc();
     assert!(db.tm.undo_log().is_empty());
 }
 
@@ -331,6 +333,7 @@ fn abort_restores_every_tuple_it_wrote() {
     }
     db.tm.commit(&older).unwrap();
     db.tm.commit(&newer).unwrap();
+    db.tm.wait_for_gc();
     assert!(db.tm.undo_log().is_empty());
 
     // The restored tuples can be written again.
@@ -482,6 +485,7 @@ fn undo_records_live_as_long_as_a_reader_needs_them() {
     assert_eq!(db.tm.undo_log().len(), 11);
 
     db.tm.commit(&old).unwrap();
+    db.tm.wait_for_gc();
     assert!(db.tm.undo_log().is_empty());
     let new = db.tm.begin();
     assert_eq!(db.read(&new, rids[0]), Some(row(1, last, 20)));
@@ -494,8 +498,7 @@ fn undo_records_live_as_long_as_a_reader_needs_them() {
 ///
 /// Every transaction reads every row, so a write conflicts with any newer
 /// transaction that scanned in between (see `read_ts`), and most attempts
-/// abort. Aborted inserts leave slots that every later scan reads, since
-/// nothing vacuums them, so the load is kept small.
+/// abort, so the load is kept small.
 #[test]
 fn concurrent_transactions_see_only_committed_writes() {
     const THREADS: u64 = 4;
@@ -564,6 +567,7 @@ fn concurrent_transactions_see_only_committed_writes() {
         assert!(committed.contains(&writer) && !aborted.contains(&writer));
     }
     db.tm.commit(&last).unwrap();
+    db.tm.wait_for_gc();
     assert!(db.tm.undo_log().is_empty());
     assert!(!aborted.is_empty());
 }

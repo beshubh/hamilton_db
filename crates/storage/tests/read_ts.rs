@@ -87,6 +87,7 @@ impl Db {
         for txn in txns {
             self.tm.commit(txn).unwrap();
         }
+        self.tm.wait_for_gc();
         assert!(self.tm.read_timestamps().is_empty());
         assert!(self.tm.undo_log().is_empty());
     }
@@ -297,13 +298,15 @@ fn a_scan_records_each_page_it_reads() {
 }
 
 /// A get that finds no version is recorded too: an older writer that would
-/// otherwise get `TupleDeleted` conflicts.
+/// otherwise get `TupleDeleted` conflicts. The watermark is held so that the
+/// deleted tuple is not reclaimed.
 #[test]
 fn a_get_that_finds_nothing_is_recorded() {
     let db = setup(4);
     let [x] = db.load(&[row(1, 100)])[..] else {
         unreachable!()
     };
+    let _hold = hold_watermark(&db);
     let deleter = db.tm.begin();
     let writer = db.tm.begin();
     let reader = db.tm.begin();
@@ -318,7 +321,7 @@ fn a_get_that_finds_nothing_is_recorded() {
         reader.tid()
     ));
     db.tm.abort(&writer).unwrap();
-    db.end_all(&[&reader]);
+    db.end_all(&[&reader, &_hold]);
 }
 
 #[test]
@@ -340,6 +343,7 @@ fn entries_below_the_watermark_are_freed() {
     assert!(is_conflict(db.write(&old, x, &row(1, 50)), x, a.tid()));
     assert!(is_conflict(db.write(&old, y, &row(2, 50)), y, b.tid()));
     db.tm.abort(&old).unwrap();
+    db.tm.wait_for_gc();
     assert!(db.tm.read_timestamps().is_empty());
 
     // With a newer transaction open, an older reader's entry is freed

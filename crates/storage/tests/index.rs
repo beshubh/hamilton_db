@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use common::{Column, DataType, Schema};
-use storage::index::IndexMetadata;
+use storage::index::{IndexMetadata, LocatorKind};
 
 fn metadata(is_primary_key: bool) -> IndexMetadata {
     let key_schema = Schema::new(vec![
@@ -14,6 +14,7 @@ fn metadata(is_primary_key: bool) -> IndexMetadata {
         vec![0, 2],
         Arc::new(key_schema),
         is_primary_key,
+        LocatorKind::Rid,
     )
 }
 
@@ -25,6 +26,7 @@ fn accessors() {
     assert_eq!(meta.key_attrs(), [0, 2]);
     assert_eq!(meta.key_schema().len(), 2);
     assert!(meta.is_primary_key());
+    assert_eq!(meta.locator(), LocatorKind::Rid);
 }
 
 #[test]

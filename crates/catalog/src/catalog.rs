@@ -8,7 +8,7 @@ use storage::StorageError;
 use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::index::btree_index::BtreeIndex;
-use storage::index::{Index, IndexMetadata};
+use storage::index::{Index, IndexMetadata, LocatorKind};
 use storage::table::table_heap::TableHeap;
 
 use crate::error::{CatalogError, Result};
@@ -66,6 +66,9 @@ pub struct IndexInfo {
     pub header_page_id: PageId,
     /// Whether this is its table's primary key, which is unique.
     pub is_primary_key: bool,
+    /// Which `RowLocator` the index stores. Not saved to disk: it follows
+    /// from whether the table has a primary key.
+    pub locator: LocatorKind,
     /// The one open handle on the index's B+ tree.
     pub index: Arc<Index>,
 }
@@ -81,6 +84,7 @@ impl fmt::Debug for IndexInfo {
             .field("key_schema", &self.key_schema)
             .field("header_page_id", &self.header_page_id)
             .field("is_primary_key", &self.is_primary_key)
+            .field("locator", &self.locator)
             .finish()
     }
 }
@@ -205,7 +209,15 @@ impl Catalog {
             state.next_index_oid = state.next_index_oid.max(row.index_oid + 1);
             key_columns.entry(row.index_oid).or_default().push(row);
         }
-        for row in system.scan_indexes()? {
+        let index_rows = system.scan_indexes()?;
+        // Find the tables with a primary key first: their other indexes
+        // store it.
+        let with_primary_key: HashSet<TableOid> = index_rows
+            .iter()
+            .filter(|row| row.is_primary_key)
+            .map(|row| row.table_oid)
+            .collect();
+        for row in index_rows {
             state.next_index_oid = state.next_index_oid.max(row.oid + 1);
             let table = state.tables.get(&row.table_oid).ok_or_else(|| {
                 CatalogError::Corrupt(format!(
@@ -219,7 +231,8 @@ impl Catalog {
             let key_schema = key_schema(&table.schema, &key).ok_or_else(|| {
                 CatalogError::Corrupt(format!("index {} has a bad key column", row.name))
             })?;
-            let index = open_index(&bpm, table, &row, &key, &key_schema)?;
+            let locator = locator_kind(row.is_primary_key, with_primary_key.contains(&table.oid));
+            let index = open_index(&bpm, table, &row, &key, &key_schema, locator)?;
             let info = IndexInfo {
                 oid: row.oid,
                 name: row.name,
@@ -229,6 +242,7 @@ impl Catalog {
                 key_schema,
                 header_page_id: row.header_page_id,
                 is_primary_key: row.is_primary_key,
+                locator,
                 index,
             };
             state.add_index(Arc::new(info)).map_err(corrupt)?;
@@ -374,6 +388,8 @@ impl Catalog {
         is_primary_key: bool,
     ) -> Result<Arc<IndexInfo>> {
         let key_schema = key_schema(&table.schema, &key).expect("key columns were resolved");
+        let table_has_primary_key = is_primary_key || primary_key_index(state, table.oid).is_some();
+        let locator = locator_kind(is_primary_key, table_has_primary_key);
 
         let oid = state.next_index_oid;
         state.next_index_oid += 1;
@@ -387,7 +403,7 @@ impl Catalog {
         };
         // Opening the tree formats its header page, which dirties it, so it
         // is written out and keeps its id across a restart.
-        let index = open_index(&self.bpm, table, &row, &key, &key_schema)?;
+        let index = open_index(&self.bpm, table, &row, &key, &key_schema, locator)?;
 
         for (position, &column) in key.iter().enumerate() {
             self.system.insert_index_column(&IndexColumnRow {
@@ -407,6 +423,7 @@ impl Catalog {
             key_schema,
             header_page_id: row.header_page_id,
             is_primary_key,
+            locator,
             index,
         });
         state.add_index(Arc::clone(&info))?;
@@ -420,6 +437,11 @@ impl Catalog {
 
     pub fn get_index_by_oid(&self, oid: IndexOid) -> Option<Arc<IndexInfo>> {
         self.state.read().indexes.get(&oid).cloned()
+    }
+
+    /// The primary key index of the table `table_oid`, if it has one.
+    pub fn primary_key_index(&self, table_oid: TableOid) -> Option<Arc<IndexInfo>> {
+        primary_key_index(&self.state.read(), table_oid).cloned()
     }
 
     /// The indexes on `table_name`, in the order they were created. Empty if
@@ -446,14 +468,34 @@ fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn primary_key_index(state: &CatalogState, table_oid: TableOid) -> Option<&Arc<IndexInfo>> {
+    state
+        .table_indexes
+        .get(&table_oid)?
+        .iter()
+        .map(|oid| &state.indexes[oid])
+        .find(|index| index.is_primary_key)
+}
+
+/// The primary key index stores rids. A secondary index stores the primary
+/// key if the table has one, and rids otherwise.
+fn locator_kind(is_primary_key: bool, table_has_primary_key: bool) -> LocatorKind {
+    if !is_primary_key && table_has_primary_key {
+        LocatorKind::PrimaryKey
+    } else {
+        LocatorKind::Rid
+    }
+}
+
 /// Opens the B+ tree of the index `row` describes, on the `key` columns of
-/// `table`.
+/// `table`, storing `locator`s.
 fn open_index(
     bpm: &Arc<BufferPoolManager>,
     table: &TableInfo,
     row: &IndexRow,
     key: &[usize],
     key_schema: &Schema,
+    locator: LocatorKind,
 ) -> Result<Arc<Index>> {
     let metadata = IndexMetadata::new(
         row.name.clone(),
@@ -461,6 +503,7 @@ fn open_index(
         key.to_vec(),
         Arc::new(key_schema.clone()),
         row.is_primary_key,
+        locator,
     );
     let index = BtreeIndex::new(metadata, row.header_page_id, Arc::clone(bpm))?;
     Ok(Arc::new(index.into()))
@@ -520,6 +563,7 @@ mod tests {
     use super::*;
     use common::{Tuple, Value};
     use storage::disk::disk_manager::DiskManager;
+    use storage::index::IndexTrait;
     use storage::page::page_header::PageType;
     use storage::table::table_page::{TablePage, TupleMeta};
     use tempfile::TempDir;
@@ -794,6 +838,37 @@ mod tests {
         db.catalog.create_table("empty", users(), &[]).unwrap();
         assert!(db.catalog.table_indexes("empty").is_empty());
         assert!(db.catalog.table_indexes("missing").is_empty());
+    }
+
+    /// Only secondary indexes on a table with a primary key store the
+    /// primary key, before and after a restart.
+    #[test]
+    fn indexes_point_by_primary_key_on_tables_with_one() {
+        let db = Db::new(16);
+        let users_info = db.catalog.create_table("users", users(), &["id"]).unwrap();
+        let logs = db.catalog.create_table("logs", users(), &[]).unwrap();
+        db.catalog
+            .create_index("users_name", "users", &["name"])
+            .unwrap();
+        db.catalog
+            .create_index("logs_name", "logs", &["name"])
+            .unwrap();
+
+        let check = |db: &Db| {
+            let locator = |name| {
+                let index = db.catalog.get_index(name).unwrap();
+                assert_eq!(index.index.metadata().locator(), index.locator);
+                index.locator
+            };
+            assert_eq!(locator("users_pkey"), LocatorKind::Rid);
+            assert_eq!(locator("users_name"), LocatorKind::PrimaryKey);
+            assert_eq!(locator("logs_name"), LocatorKind::Rid);
+            let pkey = db.catalog.primary_key_index(users_info.oid).unwrap();
+            assert_eq!(pkey.name, "users_pkey");
+            assert!(db.catalog.primary_key_index(logs.oid).is_none());
+        };
+        check(&db);
+        check(&db.restart());
     }
 
     #[test]

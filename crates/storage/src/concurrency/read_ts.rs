@@ -48,7 +48,7 @@ struct Inner {
     read_ts: HashMap<Rid, TxnId>,
     /// The tuples whose read-ts each reader raised, so that `collect` visits
     /// only the entries it frees. A `Rid` stays under an older reader after a
-    /// newer one raises it again; `collect` skips those.
+    /// newer one raises it again, or after `remove`; `collect` skips those.
     by_reader: BTreeMap<TxnId, Vec<Rid>>,
 }
 
@@ -87,6 +87,12 @@ impl ReadTimestamps {
             Some(&other) if other > writer => Err(StorageError::Conflict { rid, other }),
             _ => Ok(()),
         }
+    }
+
+    /// Drops the read-ts of the tuple at `rid`, once garbage collection has
+    /// reclaimed it.
+    pub fn remove(&self, rid: Rid) {
+        self.inner.lock().read_ts.remove(&rid);
     }
 
     /// The read-ts of the tuple at `rid`, if it has one.

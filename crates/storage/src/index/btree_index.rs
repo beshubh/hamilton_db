@@ -2,19 +2,30 @@ use std::cmp::Ordering;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use common::{PageId, Rid, Schema, SlotId, Tuple, Value, ValueError};
+use common::{INVALID_PAGE_ID, PageId, Rid, Schema, SlotId, Tuple, Value, ValueError};
 
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::buffer::traced_buffer_pool_manager::TracedBufferPoolManager;
 use crate::error::Result;
 use crate::index::btree::Btree;
-use crate::index::{IndexMetadata, IndexTrait};
+use crate::index::{IndexMetadata, IndexTrait, LocatorKind, RowLocator};
 use crate::page::btree_page::{KeyComparator, check_key_size};
 
 type Tree = Btree<EntryComparator>;
 
 /// Bytes a record id takes at the end of an entry.
 const RID_SIZE: usize = size_of::<PageId>() + size_of::<SlotId>();
+
+/// Bytes the length of a primary key takes at the end of an entry.
+const PK_LEN_SIZE: usize = size_of::<u16>();
+
+/// The tree's value for an entry that stores a primary key. Unused: the
+/// primary key in the entry is what finds the row.
+// TODO: store a guess at the rid here, to skip the primary key lookup while
+// the row hasn't moved.
+fn no_rid() -> Rid {
+    Rid::new(INVALID_PAGE_ID, 0)
+}
 
 /// Orders index keys, which are key tuples as `Tuple::to_key` encodes them,
 /// by decoding them with the index's key schema and comparing column by
@@ -80,46 +91,85 @@ fn compare_values(a: &Value, b: &Value) -> Ordering {
     }
 }
 
-/// Orders a `BtreeIndex`'s entries: by key with `KeySchemaComparator`, and
-/// then by record id for an index whose entries end in one.
+/// What a `BtreeIndex`'s entries hold besides the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryLayout {
+    /// Just the key, for a primary key index.
+    Key,
+    /// `key || rid`, with the rid as a little-endian page id and slot.
+    KeyRid,
+    /// `key || pk || pk_len`, with `pk_len` a little-endian `u16`.
+    KeyPk,
+}
+
+/// Orders a `BtreeIndex`'s entries by key, then by what follows the key (a
+/// rid, or a primary key's bytes) to separate rows with equal keys.
+///
+/// Primary keys are compared as bytes, not values, so they don't always sort
+/// in value order: a little-endian 256 sorts before 1.
 ///
 /// # Panics
-/// If an entry is shorter than a record id, or its key does not decode.
+/// If an entry is too short for its layout, or its key does not decode.
 pub struct EntryComparator {
     keys: KeySchemaComparator,
-    /// Whether entries are `key || rid` rather than just the key.
-    with_rid: bool,
+    layout: EntryLayout,
 }
 
 impl EntryComparator {
-    /// The entry for `key` in the row at `rid`.
-    fn entry(&self, key: &[u8], rid: Rid) -> Vec<u8> {
+    /// The entry for `key` in the row at `locator`.
+    fn entry(&self, key: &[u8], locator: &RowLocator) -> Vec<u8> {
         let mut entry = Vec::with_capacity(key.len() + RID_SIZE);
         entry.extend_from_slice(key);
-        if self.with_rid {
-            entry.extend_from_slice(&rid.page_id.to_le_bytes());
-            entry.extend_from_slice(&rid.slot.to_le_bytes());
+        match (self.layout, locator) {
+            (EntryLayout::Key, RowLocator::Rid(_)) => {}
+            (EntryLayout::KeyRid, RowLocator::Rid(rid)) => {
+                entry.extend_from_slice(&rid.page_id.to_le_bytes());
+                entry.extend_from_slice(&rid.slot.to_le_bytes());
+            }
+            (EntryLayout::KeyPk, RowLocator::PrimaryKey(pk)) => {
+                let len = u16::try_from(pk.data().len())
+                    .expect("a primary key is shorter than any index entry");
+                entry.extend_from_slice(pk.data());
+                entry.extend_from_slice(&len.to_le_bytes());
+            }
+            (layout, locator) => panic!("{locator:?} in an index of {layout:?} entries"),
         }
         entry
     }
 
-    /// The key of `entry`, without its record id if it has one.
+    /// The key part of `entry`.
     pub fn key_of<'a>(&self, entry: &'a [u8]) -> &'a [u8] {
-        if self.with_rid {
-            split_rid(entry).0
-        } else {
-            entry
+        match self.layout {
+            EntryLayout::Key => entry,
+            EntryLayout::KeyRid => split_rid(entry).0,
+            EntryLayout::KeyPk => split_pk(entry).0,
+        }
+    }
+
+    /// The `RowLocator` stored in `entry`, whose tree value is `rid`.
+    fn locator(&self, entry: &[u8], rid: Rid) -> RowLocator {
+        match self.layout {
+            EntryLayout::Key | EntryLayout::KeyRid => RowLocator::Rid(rid),
+            EntryLayout::KeyPk => {
+                RowLocator::PrimaryKey(Tuple::from_bytes(split_pk(entry).1.to_vec()))
+            }
         }
     }
 }
 
 impl KeyComparator for EntryComparator {
     fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-        if !self.with_rid {
-            return self.keys.compare(a, b);
+        match self.layout {
+            EntryLayout::Key => self.keys.compare(a, b),
+            EntryLayout::KeyRid => {
+                let ((a_key, a_rid), (b_key, b_rid)) = (split_rid(a), split_rid(b));
+                self.keys.compare(a_key, b_key).then(a_rid.cmp(&b_rid))
+            }
+            EntryLayout::KeyPk => {
+                let ((a_key, a_pk), (b_key, b_pk)) = (split_pk(a), split_pk(b));
+                self.keys.compare(a_key, b_key).then(a_pk.cmp(b_pk))
+            }
         }
-        let ((a_key, a_rid), (b_key, b_rid)) = (split_rid(a), split_rid(b));
-        self.keys.compare(a_key, b_key).then(a_rid.cmp(&b_rid))
     }
 }
 
@@ -139,6 +189,24 @@ fn split_rid(entry: &[u8]) -> (&[u8], Rid) {
         SlotId::from_le_bytes(slot.try_into().unwrap()),
     );
     (key, rid)
+}
+
+/// Splits `key || pk || pk_len` into the key's bytes and the primary key's.
+///
+/// # Panics
+/// If `entry` is shorter than its primary key and length say.
+fn split_pk(entry: &[u8]) -> (&[u8], &[u8]) {
+    assert!(
+        entry.len() >= PK_LEN_SIZE,
+        "index entry shorter than a primary key length"
+    );
+    let (rest, len) = entry.split_at(entry.len() - PK_LEN_SIZE);
+    let len = usize::from(u16::from_le_bytes(len.try_into().unwrap()));
+    assert!(
+        rest.len() >= len,
+        "index entry shorter than its primary key"
+    );
+    rest.split_at(rest.len() - len)
 }
 
 /// Values for the first columns of an index's key, any number of them, as a
@@ -177,17 +245,18 @@ impl KeyComparator for PrefixProbe<'_> {
 /// record id, and an insert of a key it already holds fails. Rows whose keys
 /// hold a NULL collide too, as NULLs are equal to each other.
 ///
-/// Any other index holds one entry per row, its key followed by its record
-/// id, mapped to the same record id. Rows with the same key are distinct
-/// entries, kept in record id order.
+/// Any other index holds one entry per row: the key followed by the row's
+/// rid or primary key (see `EntryLayout`), so rows with equal keys are
+/// separate entries.
 pub struct BtreeIndex {
     metadata: IndexMetadata,
     tree: Tree,
 }
 
 impl BtreeIndex {
-    /// The longest encoded key tuple the index accepts: what is left of the
-    /// tree's limit after a record id, whether or not entries have one.
+    /// The longest encoded key the index accepts, leaving room for a rid. An
+    /// index that stores primary keys may accept less: the key and the
+    /// primary key must fit in an entry together.
     pub const MAX_KEY_SIZE: usize = Tree::MAX_KEY_SIZE - RID_SIZE;
 
     /// Opens the index whose B+tree header page is `header_page_id`,
@@ -197,9 +266,14 @@ impl BtreeIndex {
         header_page_id: PageId,
         bpm: Arc<BufferPoolManager>,
     ) -> Result<Self> {
+        let layout = match (metadata.is_primary_key(), metadata.locator()) {
+            (true, _) => EntryLayout::Key,
+            (false, LocatorKind::Rid) => EntryLayout::KeyRid,
+            (false, LocatorKind::PrimaryKey) => EntryLayout::KeyPk,
+        };
         let comparator = EntryComparator {
             keys: KeySchemaComparator::new(Arc::clone(metadata.key_schema())),
-            with_rid: !metadata.is_primary_key(),
+            layout,
         };
         let tree = Tree::new(
             metadata.name(),
@@ -216,8 +290,8 @@ impl BtreeIndex {
         &self.tree
     }
 
-    /// The record ids of the rows whose keys are between `lower` and
-    /// `upper`, in key order and then record id order.
+    /// The locators of the rows whose keys are between `lower` and `upper`,
+    /// in `EntryComparator` order.
     ///
     /// A bound holds values for the first columns of the key, any number of
     /// them, and keys are compared with it on those columns only. On an
@@ -236,8 +310,17 @@ impl BtreeIndex {
         &self,
         lower: Bound<&[Value]>,
         upper: Bound<&[Value]>,
-    ) -> Result<impl Iterator<Item = Result<Rid>>> {
+    ) -> Result<impl Iterator<Item = Result<RowLocator>>> {
         self.scan(self.prefix_bound(lower)?, self.prefix_bound(upper)?)
+    }
+
+    fn check_locator(&self, locator: &RowLocator) {
+        debug_assert_eq!(
+            locator.kind(),
+            self.metadata.locator(),
+            "locator of the wrong kind for index {}",
+            self.metadata.name()
+        );
     }
 
     fn prefix_bound(&self, bound: Bound<&[Value]>) -> Result<Bound<KeyPrefix>> {
@@ -268,7 +351,7 @@ impl BtreeIndex {
         &self,
         lower: Bound<KeyPrefix>,
         upper: Bound<KeyPrefix>,
-    ) -> Result<impl Iterator<Item = Result<Rid>>> {
+    ) -> Result<impl Iterator<Item = Result<RowLocator>>> {
         let cmp = self.tree.comparator();
         let seek = |prefix: &KeyPrefix, tie| {
             let probe = PrefixProbe {
@@ -303,7 +386,7 @@ impl BtreeIndex {
                 Ok((entry, _)) => below_upper(entry),
                 Err(_) => true,
             })
-            .map(|e| e.map(|(_, rid)| rid)))
+            .map(move |e| e.map(|(entry, rid)| cmp.locator(&entry, rid))))
     }
 }
 
@@ -313,26 +396,35 @@ impl IndexTrait for BtreeIndex {
     }
 
     /// Fails with `KeyTooLarge` if the encoded key is longer than
-    /// `MAX_KEY_SIZE`.
-    fn insert_entry(&self, key: &Tuple, rid: Rid) -> Result<bool> {
-        check_key_size(key.data(), Self::MAX_KEY_SIZE)?;
-        let entry = self.tree.comparator().entry(key.data(), rid);
+    /// `MAX_KEY_SIZE`, or too long to fit in an entry with the primary key.
+    fn insert_entry(&self, key: &Tuple, locator: &RowLocator) -> Result<bool> {
+        self.check_locator(locator);
+        let (max, rid) = match locator {
+            RowLocator::Rid(rid) => (Self::MAX_KEY_SIZE, *rid),
+            RowLocator::PrimaryKey(pk) => {
+                let room = Tree::MAX_KEY_SIZE.saturating_sub(pk.data().len() + PK_LEN_SIZE);
+                (Self::MAX_KEY_SIZE.min(room), no_rid())
+            }
+        };
+        check_key_size(key.data(), max)?;
+        let entry = self.tree.comparator().entry(key.data(), locator);
         self.tree.insert(&entry, rid)
     }
 
     /// In a primary key index, `key` is removed whatever record id it has.
-    fn delete_entry(&self, key: &Tuple, rid: Rid) -> Result<()> {
+    fn delete_entry(&self, key: &Tuple, locator: &RowLocator) -> Result<()> {
+        self.check_locator(locator);
         self.tree
-            .remove(&self.tree.comparator().entry(key.data(), rid))
+            .remove(&self.tree.comparator().entry(key.data(), locator))
     }
 
-    fn scan_key(&self, key: &Tuple, result: &mut Vec<Rid>) -> Result<()> {
+    fn scan_key(&self, key: &Tuple, result: &mut Vec<RowLocator>) -> Result<()> {
         let key = KeyPrefix {
             key: key.clone(),
             schema: Arc::clone(self.metadata.key_schema()),
         };
-        for rid in self.scan(Bound::Included(key.clone()), Bound::Included(key))? {
-            result.push(rid?);
+        for locator in self.scan(Bound::Included(key.clone()), Bound::Included(key))? {
+            result.push(locator?);
         }
         Ok(())
     }

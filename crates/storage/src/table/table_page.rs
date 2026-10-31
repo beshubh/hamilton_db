@@ -19,9 +19,10 @@
 //! shrinking updates, moved tuples and freed slots) are counted in
 //! `hole_bytes` and recovered by compacting the page.
 //!
-//! Slot flags record the physical state of a slot (live or free). Whether a
-//! tuple is deleted is a logical, MVCC-level fact and lives in the tuple
-//! header: a deleted tuple keeps its slot until vacuum frees it.
+//! Slot flags record the physical state of a slot: live, dead or free.
+//! Whether a tuple is deleted is a logical, MVCC-level fact and lives in the
+//! tuple header: a deleted tuple stays live until garbage collection, once no
+//! reader can see it, frees its bytes and marks its slot dead.
 //!
 //! All multi-byte fields are little-endian and unaligned, so a page can be
 //! viewed from any byte buffer.
@@ -82,10 +83,23 @@ struct Slot {
 const _: () = assert!(size_of::<Slot>() == 5);
 
 const SLOT_LIVE: u8 = 1;
+/// A slot whose tuple garbage collection reclaimed. Inserts never reuse it,
+/// because an index entry may still name its `Rid` and must not come to point
+/// at an unrelated tuple. Known gap: nothing frees dead slots yet, so each
+/// keeps its slot entry; that needs a GC that also removes index entries.
+const SLOT_DEAD: u8 = 2;
 
 impl Slot {
     fn is_live(&self) -> bool {
         self.flags & SLOT_LIVE != 0
+    }
+
+    fn is_dead(&self) -> bool {
+        self.flags & SLOT_DEAD != 0
+    }
+
+    fn is_free(&self) -> bool {
+        self.flags & (SLOT_LIVE | SLOT_DEAD) == 0
     }
 }
 
@@ -179,7 +193,7 @@ impl<B: Deref<Target = [u8; PAGE_SIZE]>> TablePage<B> {
         self.header().next_page_id.get()
     }
 
-    /// Number of slots in the slot array, free ones included.
+    /// Number of slots in the slot array, free and dead ones included.
     pub fn slot_count(&self) -> SlotId {
         self.header().slot_count.get()
     }
@@ -191,7 +205,7 @@ impl<B: Deref<Target = [u8; PAGE_SIZE]>> TablePage<B> {
     }
 
     /// The tuple in `slot`. Deleted tuples are still returned; their meta says
-    /// so.
+    /// so. Fails with `InvalidSlot` if the slot is free or dead.
     pub fn get(&self, slot: SlotId) -> Result<(TupleMeta, &[u8])> {
         let s = self.live_slot(slot)?;
         let tuple = &self.data[s.offset.get() as usize..][..s.len.get() as usize];
@@ -212,13 +226,18 @@ impl<B: Deref<Target = [u8; PAGE_SIZE]>> TablePage<B> {
         Ok(())
     }
 
-    /// Every tuple in slot order, deleted ones included. Free slots are
-    /// skipped.
+    /// Every tuple in slot order, deleted ones included. Free and dead slots
+    /// are skipped.
     pub fn iter(&self) -> impl Iterator<Item = (SlotId, TupleMeta, &[u8])> {
         (0..self.slot_count()).filter_map(|slot| {
             let (meta, payload) = self.get(slot).ok()?;
             Some((slot, meta, payload))
         })
+    }
+
+    /// Whether `slot` is dead: its tuple was reclaimed by `mark_dead`.
+    pub fn is_dead(&self, slot: SlotId) -> bool {
+        slot < self.slot_count() && self.slot(slot).is_dead()
     }
 
     fn header(&self) -> &TableHeader {
@@ -281,7 +300,7 @@ impl<B: DerefMut<Target = [u8; PAGE_SIZE]>> TablePage<B> {
     pub fn insert(&mut self, meta: &TupleMeta, payload: &[u8]) -> Result<SlotId> {
         check_payload_size(payload.len())?;
         let tuple_len = TUPLE_HEADER_SIZE + payload.len();
-        let reuse = (0..self.slot_count()).find(|&i| !self.slot(i).is_live());
+        let reuse = (0..self.slot_count()).find(|&i| self.slot(i).is_free());
         let slot_bytes = if reuse.is_some() { 0 } else { SLOT_SIZE };
         if self.used_bytes() + slot_bytes + tuple_len > INSERT_LIMIT {
             return Err(StorageError::PageFull);
@@ -353,14 +372,28 @@ impl<B: DerefMut<Target = [u8; PAGE_SIZE]>> TablePage<B> {
     }
 
     /// Physically removes the tuple in `slot` and makes the slot available to
-    /// later inserts. Only for vacuum, once no index entry or reader can still
-    /// reach the tuple: a reused slot gives a new tuple the same `Rid`.
+    /// later inserts. Only for garbage collection, once no index entry or
+    /// reader can still reach the tuple: a reused slot gives a new tuple the
+    /// same `Rid`. Nothing calls it yet; see `SLOT_DEAD`.
     pub fn free_slot(&mut self, slot: SlotId) -> Result<()> {
+        self.clear_slot(slot, 0)
+    }
+
+    /// Physically removes the tuple in `slot` but keeps the slot, dead, so
+    /// that no insert reuses its `Rid`. Only for garbage collection, once no
+    /// reader can see the tuple.
+    pub fn mark_dead(&mut self, slot: SlotId) -> Result<()> {
+        self.clear_slot(slot, SLOT_DEAD)
+    }
+
+    /// Gives the bytes of the live tuple in `slot` to `hole_bytes`, leaving
+    /// the slot with `flags`.
+    fn clear_slot(&mut self, slot: SlotId, flags: u8) -> Result<()> {
         let len = self.live_slot(slot)?.len.get();
         *self.slot_mut(slot) = Slot {
             offset: 0.into(),
             len: 0.into(),
-            flags: 0,
+            flags,
         };
         self.header_mut().hole_bytes += len;
         Ok(())
@@ -667,6 +700,52 @@ mod tests {
         assert_eq!(page.slot_count(), 2);
         assert_eq!(page.get(a).unwrap().1, b"third");
         assert_eq!(page.get(b).unwrap().1, b"second");
+    }
+
+    #[test]
+    fn dead_slot_frees_bytes_but_is_not_reused() {
+        let mut buf = empty();
+        let mut page = TablePage::new(&mut *buf).unwrap();
+        let a = page.insert(&TupleMeta::new(1), b"first").unwrap();
+        let b = page.insert(&TupleMeta::new(1), b"second").unwrap();
+        let free = page.free_space();
+
+        page.mark_dead(a).unwrap();
+        assert!(page.is_dead(a) && !page.is_dead(b) && !page.is_dead(9));
+        assert!(matches!(page.get(a), Err(StorageError::InvalidSlot(0))));
+        assert!(matches!(
+            page.mark_dead(a),
+            Err(StorageError::InvalidSlot(0))
+        ));
+        assert_eq!(page.free_space(), free + TUPLE_HEADER_SIZE + 5);
+        assert_eq!(
+            page.iter().map(|(slot, _, _)| slot).collect::<Vec<_>>(),
+            [b]
+        );
+
+        let c = page.insert(&TupleMeta::new(2), b"third").unwrap();
+        assert_eq!((c, page.slot_count()), (2, 3));
+        assert!(page.is_dead(a));
+    }
+
+    #[test]
+    fn compaction_recovers_dead_bytes_and_keeps_slots_dead() {
+        let mut buf = empty();
+        let mut page = TablePage::new(&mut *buf).unwrap();
+        let payload = [1u8; 1000];
+        let a = page.insert(&TupleMeta::new(1), &payload).unwrap();
+        let b = page.insert(&TupleMeta::new(1), &payload).unwrap();
+        let c = page.insert(&TupleMeta::new(1), &payload).unwrap();
+
+        page.mark_dead(a).unwrap();
+        page.mark_dead(b).unwrap();
+        let big = [2u8; 1500];
+        assert!(page.contiguous_free() < SLOT_SIZE + TUPLE_HEADER_SIZE + big.len());
+        let d = page.insert(&TupleMeta::new(2), &big).unwrap();
+        assert_eq!(d, 3);
+        assert!(page.is_dead(a) && page.is_dead(b));
+        assert_eq!(page.get(c).unwrap().1, &payload[..]);
+        assert_eq!(page.get(d).unwrap().1, &big[..]);
     }
 
     #[test]

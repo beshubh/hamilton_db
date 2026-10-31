@@ -65,6 +65,7 @@ use std::sync::Arc;
 use catalog::{IndexInfo, TableInfo};
 use common::{Rid, Schema, Tuple, Value};
 use enum_dispatch::enum_dispatch;
+use storage::index::{LocatorKind, RowLocator};
 
 use crate::error::{ExecutionError, Result};
 use crate::execution_context::ExecutionContext;
@@ -191,6 +192,23 @@ fn index_keys(table: &TableInfo, indexes: &[Arc<IndexInfo>], tuple: &Tuple) -> R
     indexes
         .iter()
         .map(|index| Ok(tuple.to_key(&table.schema, &index.key_schema, &index.key_columns)?))
+        .collect()
+}
+
+/// The `RowLocator` each of `indexes` (all of a table's indexes) stores for a
+/// row, given the row's key in each index and its rid.
+fn locators(indexes: &[Arc<IndexInfo>], keys: &[Tuple], rid: Rid) -> Vec<RowLocator> {
+    let primary_key = indexes.iter().position(|index| index.is_primary_key);
+    indexes
+        .iter()
+        .map(|index| match index.locator {
+            LocatorKind::Rid => RowLocator::Rid(rid),
+            LocatorKind::PrimaryKey => {
+                let pk =
+                    primary_key.expect("only a table with a primary key has indexes that store it");
+                RowLocator::PrimaryKey(keys[pk].clone())
+            }
+        })
         .collect()
 }
 

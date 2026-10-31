@@ -28,7 +28,8 @@
 //! **GC.** A record's `writer_ts` is its writer's plain Tid, so commit
 //! restamps the heap alone. A record pushed at X is read only by readers
 //! below X, so [`UndoLog::collect`] frees every writer's records below the
-//! watermark; a running writer is never below it.
+//! watermark; a running writer is never below it. The tuples those writers
+//! left deleted are reclaimed at the same time (`TransactionManager`).
 //!
 //! **Known gaps.** No durability; `undo_ptr`s on disk dangle after a restart,
 //! so they are only followed through a checked lookup (`older_record`).

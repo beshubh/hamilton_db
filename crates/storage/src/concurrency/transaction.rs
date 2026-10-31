@@ -11,14 +11,17 @@
 //! Every write goes into the write set, by table, so that commit can clear
 //! the bit on each written tuple (`TableHeap::stamp_commit`) and abort can
 //! put back each tuple's version from before the transaction
-//! (`TableHeap::rollback`). The `TransactionManager` then ends the Tid in the
-//! watermark and frees the undo records below it.
+//! (`TableHeap::rollback`). Either way, the tuples it leaves deleted go to
+//! the `TransactionManager`, which ends the Tid in the watermark. Its
+//! background collector reclaims them once the watermark passes the Tid,
+//! with the undo records below it.
 //!
 //! **Known gaps.** Phantoms: read timestamps guard the tuples a transaction
 //! read, not rows inserted later that it should have seen, so schedules
 //! with inserts are not serializable. Index entries are not rolled back.
 //! Nothing is logged, so a commit or abort that fails partway leaves some
 //! tuples done and the rest locked, and the transaction stays running.
+//! Reclaimed tuples keep their slots (see `table_page`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -35,6 +38,9 @@ use crate::table::table_heap::TableHeap;
 use crate::table::table_iterator::{TableIterator, TableRow};
 use crate::table::table_page::TupleMeta;
 use crate::table::undo_log::UndoLog;
+
+/// Tuples an ended transaction left deleted, for garbage collection.
+pub(crate) type DeadTuples = Vec<(Arc<TableHeap>, Rid)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionState {
@@ -161,16 +167,19 @@ impl Transaction {
     }
 
     /// Clears the lock on every tuple written, or rolls each back, and sets
-    /// the state to `outcome`. The manager calls this before ending the Tid.
-    pub(crate) fn finish(&self, outcome: TransactionState) -> Result<()> {
+    /// the state to `outcome`. Returns the tuples left deleted: those deleted
+    /// by a commit, and those inserted by an abort. The manager calls this
+    /// before ending the Tid.
+    pub(crate) fn finish(&self, outcome: TransactionState) -> Result<DeadTuples> {
         let mut state = self.state.write();
         if *state != TransactionState::Running {
             return Err(StorageError::TransactionNotRunning(self.tid));
         }
         let mut write_set = self.write_set.lock();
+        let mut deleted = Vec::new();
         for table in write_set.values() {
             for &rid in &table.rids {
-                match outcome {
+                let is_deleted = match outcome {
                     TransactionState::Committed => {
                         table.heap.stamp_commit(rid, self.tid, &table.schema)?
                     }
@@ -180,12 +189,15 @@ impl Transaction {
                             .rollback(rid, self.tid, &table.schema, &self.undo)?
                     }
                     TransactionState::Running => unreachable!("a transaction ends running"),
+                };
+                if is_deleted {
+                    deleted.push((Arc::clone(&table.heap), rid));
                 }
             }
         }
         write_set.clear();
         *state = outcome;
-        Ok(())
+        Ok(deleted)
     }
 
     pub(crate) fn undo_log(&self) -> &Arc<UndoLog> {
