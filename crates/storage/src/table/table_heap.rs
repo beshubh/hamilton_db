@@ -1,14 +1,18 @@
 use std::sync::Arc;
 
-use common::{INVALID_PAGE_ID, PageId, Rid, Schema, SlotId, Tuple, Value};
+use common::{
+    INVALID_PAGE_ID, INVALID_TXN_ID, PageId, Rid, Schema, SlotId, TXN_UNCOMMITTED_BIT, Tuple,
+    TxnId, Value,
+};
 use parking_lot::Mutex;
 
 use crate::buffer::arc_replacer::AccessType;
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
+use crate::concurrency::read_ts::ReadTimestamps;
 use crate::error::{Result, StorageError};
 use crate::page::page_guard::WritePageGuard;
 use crate::table::table_iterator::{TableIterator, TableRow};
-use crate::table::table_page::{TablePage, TupleMeta};
+use crate::table::table_page::{INVALID_UNDO_PTR, TablePage, TupleMeta};
 use crate::table::undo_log::{self, UndoLog, UndoRecord};
 
 /// A table stored as a linked list of table pages, reached through the
@@ -17,6 +21,13 @@ use crate::table::undo_log::{self, UndoLog, UndoRecord};
 /// The heap holds the newest version of each tuple. The `_versioned` writes
 /// and `get_at` keep older versions in an `UndoLog`, as `undo_log`
 /// describes; the other methods read and write the newest version alone.
+///
+/// A versioned write whose `ts` has `TXN_UNCOMMITTED_BIT` set write-locks
+/// the tuple for its transaction until `stamp_commit` or `rollback`. A
+/// shrinking locked update keeps the tuple's old length, padding the new
+/// payload with zeros, so that its rollback always fits back in place;
+/// `stamp_commit` releases the padding. Reads at a timestamp cut it off;
+/// `get` and `iter` return it.
 ///
 /// Each operation latches only the pages it touches, through the buffer
 /// pool's page guards. Inserts also take `last_page_id`'s mutex, so that two
@@ -139,8 +150,10 @@ impl TableHeap {
     /// Fails with `PageFull` if `new` does not fit on the tuple's page,
     /// leaving the heap and `undo` unchanged. The caller then deletes the
     /// tuple with `delete_versioned` and inserts `new` at a new `Rid`:
-    /// version chains never cross `Rid`s. Fails with `TupleDeleted` if the
-    /// tuple is deleted.
+    /// version chains never cross `Rid`s. Fails with `Conflict` if the tuple
+    /// is locked by another transaction, was committed after `ts`, or was
+    /// read by a transaction newer than `ts` (see `check_write`), and with
+    /// `TupleDeleted` if it is deleted.
     pub fn update_versioned(
         &self,
         rid: Rid,
@@ -148,21 +161,31 @@ impl TableHeap {
         ts: u64,
         schema: &Schema,
         undo: &UndoLog,
+        read_ts: &ReadTimestamps,
     ) -> Result<()> {
         let mut guard = self.write_page(rid)?;
         let mut page = TablePage::new(guard.get_data_mut())?;
         let (head, payload) = page.get(rid.slot)?;
+        check_write(rid, &head, ts, read_ts)?;
         if head.is_deleted {
             return Err(StorageError::TupleDeleted(rid));
         }
-        debug_assert!(ts >= head.ts, "writes arrive in ts order");
-        page.check_update(rid.slot, new.len())?;
+        let old = Tuple::from_bytes(payload.to_vec());
+        let mut padded = Vec::new();
+        let data = if ts & TXN_UNCOMMITTED_BIT != 0 && new.len() < old.len() {
+            padded.extend_from_slice(new.data());
+            padded.resize(old.len(), 0);
+            &padded
+        } else {
+            new.data()
+        };
+        page.check_update(rid.slot, data.len())?;
 
-        let old_values = Tuple::from_bytes(payload.to_vec()).decode(schema)?;
+        let old_values = old.decode(schema)?;
         let new_values = new.decode(schema)?;
         let record = UndoRecord {
             rid,
-            writer_ts: ts,
+            writer_ts: ts & !TXN_UNCOMMITTED_BIT,
             meta: head,
             delta: undo_log::diff(old_values, &new_values),
         };
@@ -176,24 +199,31 @@ impl TableHeap {
             is_deleted: false,
             has_nulls: new_values.iter().any(|value| matches!(value, Value::Null)),
         };
-        page.update(rid.slot, &meta, new.data())
+        page.update(rid.slot, &meta, data)
     }
 
     /// Marks the tuple at `rid` deleted as of `ts`. The version before the
     /// delete stays readable through a record pushed to `undo`, with no
     /// changed columns: the tuple's bytes stay on the page. Fails with
-    /// `TupleDeleted` if the tuple is already deleted.
-    pub fn delete_versioned(&self, rid: Rid, ts: u64, undo: &UndoLog) -> Result<()> {
+    /// `Conflict` as `update_versioned` does, and with `TupleDeleted` if the
+    /// tuple is already deleted.
+    pub fn delete_versioned(
+        &self,
+        rid: Rid,
+        ts: u64,
+        undo: &UndoLog,
+        read_ts: &ReadTimestamps,
+    ) -> Result<()> {
         let mut guard = self.write_page(rid)?;
         let mut page = TablePage::new(guard.get_data_mut())?;
         let (head, _) = page.get(rid.slot)?;
+        check_write(rid, &head, ts, read_ts)?;
         if head.is_deleted {
             return Err(StorageError::TupleDeleted(rid));
         }
-        debug_assert!(ts >= head.ts, "writes arrive in ts order");
         let undo_ptr = undo.push(UndoRecord {
             rid,
-            writer_ts: ts,
+            writer_ts: ts & !TXN_UNCOMMITTED_BIT,
             meta: head,
             delta: Vec::new(),
         });
@@ -213,17 +243,115 @@ impl TableHeap {
     /// The head is copied out under the page's read guard, and older
     /// versions are rebuilt after the guard is released. A head visible at
     /// `ts` is returned without decoding it or reading `undo`. Fails with
+    /// `Conflict` if an older transaction holds the tuple's lock, and with
     /// `MissingUndoRecord` if a record on the way was freed, which happens
     /// only if garbage collection ran past a reader still at `ts`.
+    ///
+    /// Unless the read fails with `Conflict`, it is recorded in `read_ts`
+    /// under the guard, as transaction `ts`'s read. Pass `None` for a read
+    /// that no write needs to know about: one outside a transaction, or by
+    /// the oldest running transaction.
     pub fn get_at(
         &self,
         rid: Rid,
         ts: u64,
         schema: &Schema,
         undo: &UndoLog,
+        read_ts: Option<&ReadTimestamps>,
     ) -> Result<Option<TableRow>> {
-        let head = self.get(rid)?;
+        let guard = self
+            .bpm
+            .checked_read_page(rid.page_id, AccessType::Lookup)?;
+        let page = TablePage::new(guard.get_data())?;
+        let (meta, payload) = page.get(rid.slot)?;
+        undo_log::check_read(rid, &meta, ts)?;
+        if let Some(read_ts) = read_ts {
+            read_ts.record(rid, ts);
+        }
+        let head = (meta, Tuple::from_bytes(payload.to_vec()).with_rid(rid));
+        drop(guard);
         undo_log::version_at(rid, head, ts, schema, undo)
+    }
+
+    /// Commits the head of the tuple at `rid`, which the running transaction
+    /// `tid` wrote: clears `TXN_UNCOMMITTED_BIT` from its `ts`, and releases
+    /// any padding a shrinking update kept, which needs `schema` to find the
+    /// payload's real length. The undo records are left alone: their
+    /// `writer_ts` is already `tid`.
+    pub fn stamp_commit(&self, rid: Rid, tid: TxnId, schema: &Schema) -> Result<()> {
+        let mut guard = self.write_page(rid)?;
+        let mut page = TablePage::new(guard.get_data_mut())?;
+        let (head, payload) = page.get(rid.slot)?;
+        debug_assert_eq!(
+            head.ts,
+            tid | TXN_UNCOMMITTED_BIT,
+            "tuple {rid} is not locked by transaction {tid}"
+        );
+        let meta = TupleMeta { ts: tid, ..head };
+        let tuple = Tuple::from_bytes(payload.to_vec());
+        let len = tuple.encoded_len(schema)?;
+        if len < tuple.len() {
+            page.update(rid.slot, &meta, &tuple.data()[..len])
+        } else {
+            page.update_meta(rid.slot, &meta)
+        }
+    }
+
+    /// Undoes every write the running transaction `tid` made to the tuple at
+    /// `rid`, newest first, and puts back the version from before the first
+    /// of them. A tuple that `tid` inserted is left deleted at `ts` 0, which
+    /// no reader sees, until vacuum frees it.
+    ///
+    /// The restored version always fits in place, because a shrinking locked
+    /// update keeps the tuple's old length. Fails with `MissingUndoRecord` if
+    /// one of `tid`'s records is gone, which garbage collection does not do
+    /// while `tid` is running.
+    pub fn rollback(&self, rid: Rid, tid: TxnId, schema: &Schema, undo: &UndoLog) -> Result<()> {
+        let locked = tid | TXN_UNCOMMITTED_BIT;
+        let mut guard = self.write_page(rid)?;
+        let mut page = TablePage::new(guard.get_data_mut())?;
+        let (head, payload) = page.get(rid.slot)?;
+        debug_assert_eq!(
+            head.ts, locked,
+            "tuple {rid} is not locked by transaction {tid}"
+        );
+        let tuple = Tuple::from_bytes(payload.to_vec());
+
+        let mut meta = head;
+        let mut values: Option<Vec<Value>> = None;
+        while meta.ts == locked {
+            if meta.undo_ptr == INVALID_UNDO_PTR {
+                // `tid` inserted the tuple.
+                let meta = TupleMeta {
+                    ts: INVALID_TXN_ID,
+                    is_deleted: true,
+                    ..meta
+                };
+                return page.update_meta(rid.slot, &meta);
+            }
+            let record = undo_log::older_record(rid, &meta, undo)?;
+            if !record.delta.is_empty() {
+                let values = match &mut values {
+                    Some(values) => values,
+                    None => values.insert(tuple.decode(schema)?),
+                };
+                record.apply(values)?;
+            }
+            meta = record.meta;
+        }
+
+        let data = match values {
+            Some(values) => Tuple::encode(schema, &values)?.into_data(),
+            // Only deletes, or writes that changed nothing, were undone: the
+            // bytes are the old version's, perhaps padded.
+            None => {
+                let len = tuple.encoded_len(schema)?;
+                let mut data = tuple.into_data();
+                data.truncate(len);
+                data
+            }
+        };
+        page.update(rid.slot, &meta, &data)
     }
 
     /// Iterates over the live rows of the table. See `TableIterator`.
@@ -249,6 +377,28 @@ impl TableHeap {
     fn write_page(&self, rid: Rid) -> Result<WritePageGuard> {
         self.bpm.checked_write_page(rid.page_id, AccessType::Lookup)
     }
+}
+
+/// Checks that a versioned write at `ts` may replace `head`, the newest
+/// version of the tuple at `rid`, made under the page's write guard. A head
+/// locked by another transaction, or committed after the writer's Tid, fails
+/// with `Conflict`, as does a tuple a newer transaction has read. A
+/// transaction may write its own locked head again.
+fn check_write(rid: Rid, head: &TupleMeta, ts: u64, read_ts: &ReadTimestamps) -> Result<()> {
+    if head.ts & TXN_UNCOMMITTED_BIT != 0 {
+        if head.ts != ts {
+            return Err(StorageError::Conflict {
+                rid,
+                other: head.ts & !TXN_UNCOMMITTED_BIT,
+            });
+        }
+    } else if head.ts > ts & !TXN_UNCOMMITTED_BIT {
+        return Err(StorageError::Conflict {
+            rid,
+            other: head.ts,
+        });
+    }
+    read_ts.check(rid, ts & !TXN_UNCOMMITTED_BIT)
 }
 
 #[cfg(test)]

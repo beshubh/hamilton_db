@@ -15,3 +15,8 @@ pub const INVALID_LSN: Lsn = 0;
 pub type TxnId = u64;
 
 pub const INVALID_TXN_ID: TxnId = 0;
+
+/// Set in a tuple's `ts` while the transaction that wrote it is running: the
+/// version is uncommitted and write-locked by the Tid in the lower bits.
+/// Tids stay below it.
+pub const TXN_UNCOMMITTED_BIT: TxnId = 1 << 63;

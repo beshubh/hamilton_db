@@ -9,6 +9,7 @@ use std::thread;
 use common::{Column, DataType, PageId, Rid, Schema, Tuple, Value};
 use storage::StorageError;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
+use storage::concurrency::read_ts::ReadTimestamps;
 use storage::disk::disk_manager::DiskManager;
 use storage::table::table_heap::TableHeap;
 use storage::table::table_page::{INVALID_UNDO_PTR, TupleMeta};
@@ -55,14 +56,21 @@ fn insert(heap: &TableHeap, values: &[Value], ts: u64) -> Rid {
 }
 
 fn update(heap: &TableHeap, undo: &UndoLog, rid: Rid, values: &[Value], ts: u64) {
-    heap.update_versioned(rid, &encode(values), ts, &schema(), undo)
-        .unwrap();
+    heap.update_versioned(
+        rid,
+        &encode(values),
+        ts,
+        &schema(),
+        undo,
+        &ReadTimestamps::new(),
+    )
+    .unwrap();
 }
 
 /// The values of the version of `rid` visible at `ts`, checking that the
 /// tuple carries its rid and that its meta says it is live.
 fn read(heap: &TableHeap, undo: &UndoLog, rid: Rid, ts: u64) -> Option<Vec<Value>> {
-    let (meta, tuple) = heap.get_at(rid, ts, &schema(), undo).unwrap()?;
+    let (meta, tuple) = heap.get_at(rid, ts, &schema(), undo, None).unwrap()?;
     assert!(!meta.is_deleted);
     assert!(meta.ts <= ts);
     assert_eq!(tuple.rid(), Some(rid));
@@ -97,7 +105,10 @@ fn each_ts_reads_the_version_written_at_or_before_it() {
             Some(version(1, written)),
             "at {ts}"
         );
-        let (meta, _) = heap.get_at(rid, ts, &schema(), &undo).unwrap().unwrap();
+        let (meta, _) = heap
+            .get_at(rid, ts, &schema(), &undo, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(meta.ts, written);
     }
     // The head is still the newest version, in place.
@@ -148,7 +159,10 @@ fn records_hold_only_the_changed_columns() {
             Some(values),
             "at {ts}"
         );
-        let (meta, tuple) = heap.get_at(rid, ts, &schema(), &undo).unwrap().unwrap();
+        let (meta, tuple) = heap
+            .get_at(rid, ts, &schema(), &undo, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(meta.has_nulls, has_nulls, "at {ts}");
         // A rebuilt version encodes to the bytes it had when it was the head.
         assert_eq!(tuple.data(), encode(values).data());
@@ -166,7 +180,7 @@ fn an_update_that_changes_nothing_keeps_the_old_version() {
     assert_eq!(record.meta.ts, 10);
     assert_eq!(read(&heap, &undo, rid, 15), Some(version(1, 10)));
     assert_eq!(
-        heap.get_at(rid, 15, &schema(), &undo)
+        heap.get_at(rid, 15, &schema(), &undo, None)
             .unwrap()
             .unwrap()
             .0
@@ -180,7 +194,8 @@ fn a_delete_hides_the_row_from_its_ts_on() {
     let (_dir, heap) = setup(4);
     let undo = UndoLog::new();
     let rid = three_versions(&heap, &undo);
-    heap.delete_versioned(rid, 40, &undo).unwrap();
+    heap.delete_versioned(rid, 40, &undo, &ReadTimestamps::new())
+        .unwrap();
 
     let record = head_record(&heap, &undo, rid);
     assert!(record.delta.is_empty());
@@ -197,11 +212,11 @@ fn a_delete_hides_the_row_from_its_ts_on() {
 
     // A deleted tuple cannot be written again.
     assert!(matches!(
-        heap.delete_versioned(rid, 50, &undo),
+        heap.delete_versioned(rid, 50, &undo, &ReadTimestamps::new()),
         Err(StorageError::TupleDeleted(r)) if r == rid
     ));
     assert!(matches!(
-        heap.update_versioned(rid, &encode(&version(1, 50)), 50, &schema(), &undo),
+        heap.update_versioned(rid, &encode(&version(1, 50)), 50, &schema(), &undo, &ReadTimestamps::new()),
         Err(StorageError::TupleDeleted(r)) if r == rid
     ));
     assert_eq!(undo.len(), 3);
@@ -229,12 +244,15 @@ fn reading_a_visible_head_decodes_nothing_and_skips_the_undo_log() {
         ..TupleMeta::new(10)
     };
     let rid = heap.insert(&dangling, &garbage).unwrap();
-    let (meta, tuple) = heap.get_at(rid, 10, &schema(), &undo).unwrap().unwrap();
+    let (meta, tuple) = heap
+        .get_at(rid, 10, &schema(), &undo, None)
+        .unwrap()
+        .unwrap();
     assert_eq!((meta, tuple.data()), (dangling, garbage.data()));
 
     // Reading before the head follows the dangling pointer, which fails.
     assert!(matches!(
-        heap.get_at(rid, 9, &schema(), &undo),
+        heap.get_at(rid, 9, &schema(), &undo, None),
         Err(StorageError::MissingUndoRecord {
             undo_ptr: 12345,
             ..
@@ -243,8 +261,16 @@ fn reading_a_visible_head_decodes_nothing_and_skips_the_undo_log() {
 
     // A tuple with no history, read before its insert, is just absent.
     let fresh = heap.insert(&TupleMeta::new(10), &garbage).unwrap();
-    assert!(heap.get_at(fresh, 5, &schema(), &undo).unwrap().is_none());
-    assert!(heap.get_at(fresh, 20, &schema(), &undo).unwrap().is_some());
+    assert!(
+        heap.get_at(fresh, 5, &schema(), &undo, None)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        heap.get_at(fresh, 20, &schema(), &undo, None)
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// After a restart the undo log issues handles from 1 again, while tuples
@@ -268,7 +294,7 @@ fn an_undo_ptr_from_before_a_restart_is_not_followed() {
 
     assert_eq!(read(&heap, &undo, old, 30), Some(version(1, 30)));
     assert!(matches!(
-        heap.get_at(old, 25, &schema(), &undo),
+        heap.get_at(old, 25, &schema(), &undo, None),
         Err(StorageError::MissingUndoRecord { undo_ptr: 1, .. })
     ));
 
@@ -276,7 +302,7 @@ fn an_undo_ptr_from_before_a_restart_is_not_followed() {
     // a read before that write stops at the stale head.
     update(&heap, &undo, old, &version(1, 60), 60);
     assert_eq!(read(&heap, &undo, old, 55), Some(version(1, 30)));
-    assert!(heap.get_at(old, 25, &schema(), &undo).is_err());
+    assert!(heap.get_at(old, 25, &schema(), &undo, None).is_err());
 }
 
 #[test]
@@ -321,7 +347,7 @@ fn garbage_collection_frees_each_writers_records() {
     // A reader below the watermark finds its version gone: an error, not
     // the wrong version.
     assert!(matches!(
-        heap.get_at(a, 15, &schema(), &undo),
+        heap.get_at(a, 15, &schema(), &undo, None),
         Err(StorageError::MissingUndoRecord { .. })
     ));
 
@@ -341,7 +367,14 @@ fn a_growing_update_that_does_not_fit_leaves_the_heap_alone() {
     let before = heap.get(rid).unwrap();
 
     assert!(matches!(
-        heap.update_versioned(rid, &encode(&big(20, 3000)), 20, &schema(), &undo),
+        heap.update_versioned(
+            rid,
+            &encode(&big(20, 3000)),
+            20,
+            &schema(),
+            &undo,
+            &ReadTimestamps::new()
+        ),
         Err(StorageError::PageFull)
     ));
     assert_eq!(heap.get(rid).unwrap(), before);
@@ -349,7 +382,8 @@ fn a_growing_update_that_does_not_fit_leaves_the_heap_alone() {
 
     // What the caller does instead: delete the tuple and insert the new
     // version at a new Rid, which starts its own chain.
-    heap.delete_versioned(rid, 20, &undo).unwrap();
+    heap.delete_versioned(rid, 20, &undo, &ReadTimestamps::new())
+        .unwrap();
     let moved = insert(&heap, &big(20, 3000), 20);
     assert_ne!(moved.page_id, rid.page_id);
     assert_eq!(read(&heap, &undo, rid, 15), Some(big(10, 1500)));
@@ -399,7 +433,8 @@ fn a_scan_at_ts_sees_each_row_as_it_was() {
             versions.push((20, Some(value(id, 20))));
         }
         if matches!(fate, Fate::Deleted | Fate::UpdatedThenDeleted) {
-            heap.delete_versioned(*rid, 30, &undo).unwrap();
+            heap.delete_versioned(*rid, 30, &undo, &ReadTimestamps::new())
+                .unwrap();
             versions.push((30, None));
         }
     }
@@ -419,7 +454,7 @@ fn a_scan_at_ts_sees_each_row_as_it_was() {
 
         let mut iter = heap.iter().unwrap();
         let mut scanned = Vec::new();
-        while let Some(batch) = iter.next_batch_at(ts, &schema(), &undo).unwrap() {
+        while let Some(batch) = iter.next_batch_at(ts, &schema(), &undo, None).unwrap() {
             assert!(!batch.is_empty());
             for (meta, tuple) in batch {
                 assert!(!meta.is_deleted && meta.ts <= ts);
