@@ -66,7 +66,7 @@ pub use values::ValuesExecutor;
 
 use std::sync::Arc;
 
-use catalog::{IndexInfo, TableInfo};
+use catalog::{IndexInfo, TableInfo, TableWriteGuard};
 use common::{Rid, Schema, Tuple, Value};
 use enum_dispatch::enum_dispatch;
 use storage::index::{LocatorKind, RowLocator};
@@ -189,11 +189,17 @@ pub fn create_executor(
 
 /// The indexes of `table` that INSERT, UPDATE and DELETE write, primary key
 /// first: a row's primary key entry must go in before its other entries
-/// (see `storage::concurrency::index_versions`).
-fn write_indexes(ctx: &ExecutionContext, table: &TableInfo) -> Vec<Arc<IndexInfo>> {
+/// (see `storage::concurrency::index_versions`). Returned with the table's
+/// write lock (`TableInfo::lock_writes`), which the statement holds until
+/// its last write so that no index is created in between.
+fn write_indexes<'a>(
+    ctx: &ExecutionContext,
+    table: &'a TableInfo,
+) -> (TableWriteGuard<'a>, Vec<Arc<IndexInfo>>) {
+    let guard = table.lock_writes();
     let mut indexes = ctx.catalog().table_indexes(&table.name);
     indexes.sort_by_key(|index| !index.is_primary_key);
-    indexes
+    (guard, indexes)
 }
 
 /// The key of `tuple`, a row of `table`, in each of `indexes`.

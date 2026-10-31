@@ -47,16 +47,26 @@ use crate::table::table_page::TupleMeta;
 use crate::table::undo_log::UndoLog;
 
 /// What an ended transaction leaves for garbage collection: the tuples it
-/// left deleted and the index entries it retired.
+/// left deleted and the index entries it retired. `built` holds the entries
+/// it added building an index, which wait for every transaction running
+/// when it ended rather than for its Tid (see `index_versions`).
 #[derive(Default)]
 pub(crate) struct Garbage {
     pub tuples: Vec<(Arc<TableHeap>, Rid)>,
     pub entries: Vec<TableEntry>,
+    pub built: Vec<TableEntry>,
 }
 
 impl Garbage {
     pub fn is_empty(&self) -> bool {
-        self.tuples.is_empty() && self.entries.is_empty()
+        self.tuples.is_empty() && self.entries.is_empty() && self.built.is_empty()
+    }
+
+    /// Moves everything in `other` into this.
+    pub fn append(&mut self, mut other: Garbage) {
+        self.tuples.append(&mut other.tuples);
+        self.entries.append(&mut other.entries);
+        self.built.append(&mut other.built);
     }
 }
 
@@ -95,6 +105,8 @@ pub struct Transaction {
     index_writes: Mutex<Vec<IndexWrite>>,
     /// The index entries this transaction's writes left behind.
     retired: Mutex<Vec<TableEntry>>,
+    /// The index entries `build_index` added.
+    built: Mutex<Vec<TableEntry>>,
 }
 
 /// The tuples a transaction wrote in one table, keyed by the table's first
@@ -131,6 +143,7 @@ impl Transaction {
             entry_lock,
             index_writes: Mutex::new(Vec::new()),
             retired: Mutex::new(Vec::new()),
+            built: Mutex::new(Vec::new()),
         }
     }
 
@@ -251,6 +264,38 @@ impl Transaction {
         Ok(())
     }
 
+    /// Fills `index`, a new index of `table` that no write has seen yet, with
+    /// the entries of every row: one for each version a reader at or above
+    /// the watermark might see. Writes to the table must wait until the index
+    /// is in the catalog. Each entry is retired as it is added; see
+    /// `index_versions` for why. Rows are not read as this transaction sees
+    /// them, so nothing is recorded and no read fails with `Conflict`.
+    pub fn build_index(&self, table: &Arc<IndexedTable>, index: &Arc<Index>) -> Result<()> {
+        let _running = self.running()?;
+        let watermark = self.watermark.get();
+        let mut rows = table.heap.iter()?;
+        while let Some(heads) = rows.next_batch_with_deleted()? {
+            for (_, head) in heads {
+                let rid = head.rid().expect("rows read from a page carry their rid");
+                for (key, locator) in
+                    index_versions::row_entries(table, index, rid, watermark, &self.undo)?
+                {
+                    {
+                        let _entries = self.entry_lock.read();
+                        index.insert_entry(&key, &locator)?;
+                    }
+                    self.built.lock().push(TableEntry {
+                        table: Arc::clone(table),
+                        index: Arc::clone(index),
+                        key,
+                        locator,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The version of the tuple at `rid` this transaction sees, or `None` if
     /// there is none at its Tid. Fails with `Conflict` if an older
     /// transaction holds the tuple's lock.
@@ -305,9 +350,10 @@ impl Transaction {
     /// Clears the lock on every tuple written, or rolls each back along
     /// with the index entries added, and sets the state to `outcome`.
     /// Returns the garbage: the tuples left deleted (those deleted by a
-    /// commit, and those inserted by an abort), and the entries retired by a
-    /// commit or found already there by an abort. The manager calls this
-    /// before ending the Tid.
+    /// commit, and those inserted by an abort), the entries retired by a
+    /// commit or found already there by an abort, and either way the
+    /// entries an index build added. The manager calls this before ending
+    /// the Tid.
     pub(crate) fn finish(&self, outcome: TransactionState) -> Result<Garbage> {
         let mut state = self.state.write();
         if *state != TransactionState::Running {
@@ -316,6 +362,7 @@ impl Transaction {
         let mut garbage = Garbage::default();
         let mut index_writes = self.index_writes.lock();
         let mut retired = self.retired.lock();
+        garbage.built.append(&mut self.built.lock());
         if outcome == TransactionState::Aborted {
             while let Some(IndexWrite { entry, added }) = index_writes.pop() {
                 if added {

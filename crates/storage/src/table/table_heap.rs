@@ -309,6 +309,19 @@ impl TableHeap {
         undo_log::versions_since(rid, head, ts, schema, undo)
     }
 
+    /// The meta of the newest version of the tuple at `rid`, or `None` for a
+    /// reclaimed tuple.
+    pub fn head_meta(&self, rid: Rid) -> Result<Option<TupleMeta>> {
+        let guard = self
+            .bpm
+            .checked_read_page(rid.page_id, AccessType::Lookup)?;
+        let page = TablePage::new(guard.get_data())?;
+        if page.is_dead(rid.slot) {
+            return Ok(None);
+        }
+        Ok(Some(page.get(rid.slot)?.0))
+    }
+
     /// Commits the head of the tuple at `rid`, which the running transaction
     /// `tid` wrote: clears `TXN_UNCOMMITTED_BIT` from its `ts`, and releases
     /// any padding a shrinking update kept, which needs `schema` to find the

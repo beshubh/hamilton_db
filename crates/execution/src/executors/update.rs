@@ -81,8 +81,6 @@ impl Executor for UpdateExecutor {
         }
         self.done = true;
         let table = self.ctx.table(self.plan.table_oid())?;
-        let indexes = write_indexes(&self.ctx, &table);
-        let indexed = self.ctx.indexed_table(&table);
         let mut found = Vec::new();
         while self
             .child
@@ -91,6 +89,8 @@ impl Executor for UpdateExecutor {
             debug_assert_eq!(self.child_rids.len(), self.child_tuples.len());
             found.extend(self.child_rids.drain(..).zip(self.child_tuples.drain(..)));
         }
+        let (_writes, indexes) = write_indexes(&self.ctx, &table);
+        let indexed = self.ctx.indexed_table(&table);
 
         let txn = self.ctx.txn();
         // Each row's entries in `indexes`, before and after the update.
