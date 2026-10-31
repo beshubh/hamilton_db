@@ -2,13 +2,14 @@ use std::collections::VecDeque;
 
 use std::sync::Arc;
 
-use common::{INVALID_PAGE_ID, PageId, Rid, SlotId, Tuple};
+use common::{INVALID_PAGE_ID, PageId, Rid, Schema, SlotId, Tuple};
 
 use crate::buffer::arc_replacer::AccessType;
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::error::Result;
 use crate::table::table_heap::TableHeap;
 use crate::table::table_page::{TablePage, TupleMeta};
+use crate::table::undo_log::{self, UndoLog};
 
 /// A row copied out of a table page. The tuple carries its `Rid`.
 pub type TableRow = (TupleMeta, Tuple);
@@ -20,6 +21,12 @@ pub type TableRow = (TupleMeta, Tuple);
 /// released before the rows are handed out, so a scan takes one latch per
 /// page rather than per row. `next_batch` returns those page-sized batches
 /// directly.
+///
+/// `next_batch_at` reads the rows as they were at a timestamp instead, by
+/// walking each tuple's version chain in the undo log. It keeps deleted rows
+/// while copying a page, because a timestamp before the delete still sees
+/// the version from before it, and resolves versions after releasing the
+/// page's guard.
 ///
 /// The scan ends at the last row that existed when the iterator was created.
 /// Rows inserted later are not seen, so a statement that inserts into the
@@ -54,37 +61,70 @@ impl TableIterator {
     /// The live rows of the next page that has any, or `None` once the scan
     /// is done. Does not return rows already buffered for `next`.
     pub fn next_batch(&mut self) -> Result<Option<Vec<TableRow>>> {
-        while self.next_page_id != INVALID_PAGE_ID {
-            let page_id = self.next_page_id;
-            let guard = self.bpm.checked_read_page(page_id, AccessType::Scan)?;
-            let page = TablePage::new(guard.get_data())?;
-            let is_last = page_id == self.last_page_id;
-            let end = if is_last {
-                self.last_slot_count
-            } else {
-                SlotId::MAX
-            };
-            let rows: Vec<TableRow> = page
-                .iter()
-                .take_while(|&(slot, _, _)| slot < end)
-                .filter(|(_, meta, _)| !meta.is_deleted)
-                .map(|(slot, meta, payload)| {
-                    let tuple = Tuple::from_bytes(payload.to_vec());
-                    (meta, tuple.with_rid(Rid::new(page_id, slot)))
-                })
-                .collect();
-            self.next_page_id = if is_last {
-                INVALID_PAGE_ID
-            } else {
-                page.next_page_id()
-            };
-            drop(guard);
-
+        while let Some(rows) = self.next_page(|meta| !meta.is_deleted)? {
             if !rows.is_empty() {
                 return Ok(Some(rows));
             }
         }
         Ok(None)
+    }
+
+    /// The rows of the next page that has any rows visible at `ts`, each the
+    /// version visible at `ts` with its meta, or `None` once the scan is
+    /// done. Pass the same `ts`, and `schema` and `undo` of the table, on
+    /// every call. Fails with `MissingUndoRecord` as `TableHeap::get_at`
+    /// does.
+    pub fn next_batch_at(
+        &mut self,
+        ts: u64,
+        schema: &Schema,
+        undo: &UndoLog,
+    ) -> Result<Option<Vec<TableRow>>> {
+        while let Some(heads) = self.next_page(|_| true)? {
+            let mut rows = Vec::with_capacity(heads.len());
+            for head in heads {
+                let rid = head.1.rid().expect("rows read from a page carry their rid");
+                if let Some(row) = undo_log::version_at(rid, head, ts, schema, undo)? {
+                    rows.push(row);
+                }
+            }
+            if !rows.is_empty() {
+                return Ok(Some(rows));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Copies the rows of the next page that `keep` accepts, under one read
+    /// guard, or returns `None` once the scan is done.
+    fn next_page(&mut self, keep: impl Fn(&TupleMeta) -> bool) -> Result<Option<Vec<TableRow>>> {
+        if self.next_page_id == INVALID_PAGE_ID {
+            return Ok(None);
+        }
+        let page_id = self.next_page_id;
+        let guard = self.bpm.checked_read_page(page_id, AccessType::Scan)?;
+        let page = TablePage::new(guard.get_data())?;
+        let is_last = page_id == self.last_page_id;
+        let end = if is_last {
+            self.last_slot_count
+        } else {
+            SlotId::MAX
+        };
+        let rows: Vec<TableRow> = page
+            .iter()
+            .take_while(|&(slot, _, _)| slot < end)
+            .filter(|(_, meta, _)| keep(meta))
+            .map(|(slot, meta, payload)| {
+                let tuple = Tuple::from_bytes(payload.to_vec());
+                (meta, tuple.with_rid(Rid::new(page_id, slot)))
+            })
+            .collect();
+        self.next_page_id = if is_last {
+            INVALID_PAGE_ID
+        } else {
+            page.next_page_id()
+        };
+        Ok(Some(rows))
     }
 }
 

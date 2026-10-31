@@ -199,6 +199,19 @@ impl<B: Deref<Target = [u8; PAGE_SIZE]>> TablePage<B> {
         Ok((TupleMeta::from(header), payload))
     }
 
+    /// Checks that `update` can replace the tuple in `slot` with a payload of
+    /// `len` bytes, failing as `update` would: with `TupleTooLarge`, or with
+    /// `PageFull` if the page cannot hold the new version at all.
+    pub fn check_update(&self, slot: SlotId, len: usize) -> Result<()> {
+        check_payload_size(len)?;
+        let old_len = self.live_slot(slot)?.len.get() as usize;
+        let new_len = TUPLE_HEADER_SIZE + len;
+        if new_len > old_len && self.free_space() + old_len < new_len {
+            return Err(StorageError::PageFull);
+        }
+        Ok(())
+    }
+
     /// Every tuple in slot order, deleted ones included. Free slots are
     /// skipped.
     pub fn iter(&self) -> impl Iterator<Item = (SlotId, TupleMeta, &[u8])> {
@@ -266,7 +279,7 @@ impl<B: DerefMut<Target = [u8; PAGE_SIZE]>> TablePage<B> {
     /// one. Fails with `PageFull` if the page would end up past the insert
     /// limit, or `TupleTooLarge` if no page could hold the tuple.
     pub fn insert(&mut self, meta: &TupleMeta, payload: &[u8]) -> Result<SlotId> {
-        check_payload_size(payload)?;
+        check_payload_size(payload.len())?;
         let tuple_len = TUPLE_HEADER_SIZE + payload.len();
         let reuse = (0..self.slot_count()).find(|&i| !self.slot(i).is_live());
         let slot_bytes = if reuse.is_some() { 0 } else { SLOT_SIZE };
@@ -312,8 +325,8 @@ impl<B: DerefMut<Target = [u8; PAGE_SIZE]>> TablePage<B> {
     /// leaves free. Fails with `PageFull` if the page cannot hold the new
     /// version at all.
     pub fn update(&mut self, slot: SlotId, meta: &TupleMeta, payload: &[u8]) -> Result<()> {
-        check_payload_size(payload)?;
-        let s = self.live_slot(slot)?;
+        self.check_update(slot, payload.len())?;
+        let s = self.slot(slot);
         let (offset, old_len) = (s.offset.get(), s.len.get() as usize);
         let new_len = TUPLE_HEADER_SIZE + payload.len();
 
@@ -326,9 +339,6 @@ impl<B: DerefMut<Target = [u8; PAGE_SIZE]>> TablePage<B> {
             return Ok(());
         }
 
-        if self.free_space() + old_len < new_len {
-            return Err(StorageError::PageFull);
-        }
         // Give up the old bytes first, so compaction can reclaim them.
         self.slot_mut(slot).len = 0.into();
         self.header_mut().hole_bytes += old_len as u16;
@@ -404,10 +414,10 @@ impl<B: DerefMut<Target = [u8; PAGE_SIZE]>> TablePage<B> {
     }
 }
 
-fn check_payload_size(payload: &[u8]) -> Result<()> {
-    if payload.len() > MAX_PAYLOAD_SIZE {
+fn check_payload_size(len: usize) -> Result<()> {
+    if len > MAX_PAYLOAD_SIZE {
         return Err(StorageError::TupleTooLarge {
-            size: payload.len(),
+            size: len,
             max: MAX_PAYLOAD_SIZE,
         });
     }

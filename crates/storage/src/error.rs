@@ -1,7 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use common::{PageId, SlotId, ValueError};
+use common::{PageId, Rid, SlotId, ValueError};
 use thiserror::Error;
 
 use crate::page::page_header::PageType;
@@ -75,6 +75,16 @@ pub enum StorageError {
     /// The slot is past the end of the slot array, or holds no tuple.
     #[error("invalid slot {0}")]
     InvalidSlot(SlotId),
+
+    /// The tuple is deleted, so it cannot be written again.
+    #[error("tuple {0} is deleted")]
+    TupleDeleted(Rid),
+
+    /// A version chain leads to an undo record that is not in the undo log:
+    /// garbage collection freed it while a reader still needed it, or the
+    /// `undo_ptr` is from before a restart.
+    #[error("undo record {undo_ptr} of tuple {rid} is missing")]
+    MissingUndoRecord { rid: Rid, undo_ptr: u64 },
 
     /// The disk scheduler's worker thread exited before finishing a request.
     #[error("disk scheduler worker exited")]
