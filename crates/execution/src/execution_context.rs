@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
 use catalog::{Catalog, IndexInfo, IndexOid, TableInfo, TableOid};
-use common::Rid;
+use storage::concurrency::index_versions::IndexedTable;
 use storage::concurrency::transaction::Transaction;
-use storage::index::{IndexTrait, RowLocator};
 
 use crate::error::{ExecutionError, Result};
 
@@ -106,14 +105,9 @@ impl ExecutionContext {
             .ok_or(ExecutionError::IndexNotFound(oid))
     }
 
-    /// The rid of the row of `table` that `locator` points to. A primary key
-    /// is looked up in the table's primary key index; `None` if it isn't
-    /// there, meaning the row is gone.
-    ///
-    /// # Panics
-    /// If `locator` is a primary key and `table` has no primary key index.
-    pub fn locate(&self, table: &TableInfo, locator: &RowLocator) -> Result<Option<Rid>> {
-        locate(&self.catalog, table, locator)
+    /// `table` as the transaction's index reads and writes need it.
+    pub fn indexed_table(&self, table: &TableInfo) -> Arc<IndexedTable> {
+        indexed_table(&self.catalog, table)
     }
 
     /// The `B` page-sized buffers a join may hold its rows in, on top of the
@@ -131,19 +125,14 @@ impl ExecutionContext {
     }
 }
 
-/// See [`ExecutionContext::locate`].
-pub fn locate(catalog: &Catalog, table: &TableInfo, locator: &RowLocator) -> Result<Option<Rid>> {
-    let pk = match locator {
-        RowLocator::Rid(rid) => return Ok(Some(*rid)),
-        RowLocator::PrimaryKey(pk) => pk,
-    };
-    let index = catalog
+/// See [`ExecutionContext::indexed_table`].
+pub fn indexed_table(catalog: &Catalog, table: &TableInfo) -> Arc<IndexedTable> {
+    let primary_key = catalog
         .primary_key_index(table.oid)
-        .unwrap_or_else(|| panic!("table {} has no primary key index", table.name));
-    let mut found = Vec::with_capacity(1);
-    index.index.scan_key(pk, &mut found)?;
-    debug_assert!(found.len() <= 1, "a primary key index is unique");
-    Ok(found
-        .pop()
-        .map(|locator| locator.as_rid().expect("the primary key index stores rids")))
+        .map(|index| Arc::clone(&index.index));
+    Arc::new(IndexedTable::new(
+        Arc::clone(&table.heap),
+        table.schema.clone(),
+        primary_key,
+    ))
 }

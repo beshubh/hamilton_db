@@ -34,7 +34,8 @@
 //! **Known gaps.** No durability; `undo_ptr`s on disk dangle after a restart,
 //! so they are only followed through a checked lookup (`older_record`).
 //! Read timestamps (`concurrency::read_ts`) guard existing tuples, not
-//! phantoms, and index entries are not rolled back.
+//! phantoms. Index entries keep no versions here; see
+//! `concurrency::index_versions`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -225,6 +226,49 @@ pub(crate) fn version_at(
         None => tuple,
     };
     Ok(Some((meta, tuple)))
+}
+
+/// Every version of the tuple at `rid` that a reader at or above `ts` might
+/// see, given its head: the head, then each older version down to the one
+/// visible at `ts`, newest first. Locked versions count, whoever holds
+/// them, and deleted versions are included with their meta.
+///
+/// A record missing from `undo` ends the walk. Garbage collection frees a
+/// record only once no running reader is old enough to see the versions
+/// behind it, so those are not needed.
+pub(crate) fn versions_since(
+    rid: Rid,
+    head: TableRow,
+    ts: u64,
+    schema: &Schema,
+    undo: &UndoLog,
+) -> Result<Vec<TableRow>> {
+    let (mut meta, tuple) = head;
+    let mut versions = vec![(meta, tuple.clone())];
+    let mut values: Option<Vec<Value>> = None;
+    // Locked versions have the top bit set, so the walk passes them.
+    while meta.ts > ts && meta.undo_ptr != INVALID_UNDO_PTR {
+        let record = match older_record(rid, &meta, undo) {
+            Ok(record) => record,
+            Err(StorageError::MissingUndoRecord { .. }) => break,
+            Err(e) => return Err(e),
+        };
+        if !record.delta.is_empty() {
+            let values = match &mut values {
+                Some(values) => values,
+                None => values.insert(tuple.decode(schema)?),
+            };
+            record.apply(values)?;
+        }
+        meta = record.meta;
+        let version = match &values {
+            Some(values) => Tuple::encode(schema, values)?.with_rid(rid),
+            // Only deletes were undone, and they leave the tuple's bytes alone.
+            None => tuple.clone(),
+        };
+        versions.push((meta, version));
+    }
+    Ok(versions)
 }
 
 /// Checks that a reader at `ts` may read the tuple at `rid` given `head`,

@@ -187,6 +187,15 @@ pub fn create_executor(
     Ok(executor)
 }
 
+/// The indexes of `table` that INSERT, UPDATE and DELETE write, primary key
+/// first: a row's primary key entry must go in before its other entries
+/// (see `storage::concurrency::index_versions`).
+fn write_indexes(ctx: &ExecutionContext, table: &TableInfo) -> Vec<Arc<IndexInfo>> {
+    let mut indexes = ctx.catalog().table_indexes(&table.name);
+    indexes.sort_by_key(|index| !index.is_primary_key);
+    indexes
+}
+
 /// The key of `tuple`, a row of `table`, in each of `indexes`.
 fn index_keys(table: &TableInfo, indexes: &[Arc<IndexInfo>], tuple: &Tuple) -> Result<Vec<Tuple>> {
     indexes

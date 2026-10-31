@@ -4,7 +4,9 @@ use catalog::{IndexInfo, TableInfo};
 use common::{Rid, Schema, Tuple};
 use storage::index::RowLocator;
 
-use super::{AbstractExecutor, Executor, count_row, duplicate_key, index_keys, locators};
+use super::{
+    AbstractExecutor, Executor, count_row, duplicate_key, index_keys, locators, write_indexes,
+};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::expressions::Expr;
@@ -18,10 +20,11 @@ use crate::plans::{PlanNode, UpdatePlan};
 /// again by a scan still running below it.
 ///
 /// Rows are updated in place, keeping their rids unless a new version
-/// doesn't fit its page (`Transaction::update`). A row's entry in an index
-/// is rewritten only if its key or its locator changed. All old entries are
-/// removed before new ones are added, so `SET id = id + 1` doesn't collide
-/// with itself.
+/// doesn't fit its page (`Transaction::update`). Where a row's key or
+/// locator in an index changed, its old entry is retired and the new one
+/// added. Every row is written before any entry is added, so that
+/// `SET id = id + 1` checks each new key against the rows' new versions and
+/// doesn't collide with itself.
 pub struct UpdateExecutor {
     ctx: Arc<ExecutionContext>,
     plan: UpdatePlan,
@@ -78,7 +81,8 @@ impl Executor for UpdateExecutor {
         }
         self.done = true;
         let table = self.ctx.table(self.plan.table_oid())?;
-        let indexes = self.ctx.catalog().table_indexes(&table.name);
+        let indexes = write_indexes(&self.ctx, &table);
+        let indexed = self.ctx.indexed_table(&table);
         let mut found = Vec::new();
         while self
             .child
@@ -100,14 +104,11 @@ impl Executor for UpdateExecutor {
         }
         for (old_entries, new_entries) in &moved {
             for ((index, old), new) in indexes.iter().zip(old_entries).zip(new_entries) {
-                if old != new {
-                    txn.delete_entry(&index.index, &old.0, &old.1)?;
+                if old == new {
+                    continue;
                 }
-            }
-        }
-        for (old_entries, new_entries) in &moved {
-            for ((index, old), new) in indexes.iter().zip(old_entries).zip(new_entries) {
-                if old != new && !txn.insert_entry(&index.index, &new.0, &new.1)? {
+                txn.retire_entry(&indexed, &index.index, &old.0, &old.1)?;
+                if !txn.insert_entry(&indexed, &index.index, &new.0, &new.1)? {
                     return Err(duplicate_key(index, &new.0));
                 }
             }
@@ -508,6 +509,9 @@ mod tests {
         let targets = vec![account_column(0), text("c"), account_column(2)];
         update(&db, &table, targets, account_with_id(&db, &table, 2)).unwrap();
 
+        // The old entry stays until garbage collection removes it.
+        assert_eq!(db.index_entries("accounts_name").len(), 4);
+        db.tm.wait_for_gc();
         let after = db.index_entries("accounts_name");
         assert_eq!(after.len(), 3);
         let kept: Vec<_> = entries.iter().filter(|e| after.contains(e)).collect();
@@ -533,6 +537,7 @@ mod tests {
         ];
         update(&db, &table, targets, account_with_id(&db, &table, 1)).unwrap();
 
+        db.tm.wait_for_gc();
         let after = db.index_entries("accounts_name");
         assert_eq!(after.len(), 3);
         // Account 1's entry is replaced; those of accounts 2 and 3 are not.

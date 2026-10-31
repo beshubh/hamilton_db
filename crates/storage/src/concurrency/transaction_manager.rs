@@ -4,12 +4,13 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use common::TxnId;
-use parking_lot::{Condvar, Mutex, MutexGuard};
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 
 use crate::concurrency::read_ts::ReadTimestamps;
-use crate::concurrency::transaction::{DeadTuples, Transaction, TransactionState};
+use crate::concurrency::transaction::{Garbage, Transaction, TransactionState};
 use crate::concurrency::watermark::Watermark;
 use crate::error::Result;
+use crate::index::IndexTrait;
 use crate::table::undo_log::UndoLog;
 
 /// Begins and ends transactions. It owns the watermark, the one undo log
@@ -17,10 +18,12 @@ use crate::table::undo_log::UndoLog;
 /// tuples, and a background thread that collects garbage from them.
 ///
 /// Garbage is collected per transaction. A transaction that ends leaves
-/// some tuples deleted (see `Transaction::finish`). Once the watermark
-/// passes its Tid, no running or future reader can see them, and a pass of
-/// `garbage_collect` reclaims them all at once, with the undo records and
-/// read timestamps below the watermark.
+/// some tuples deleted and some index entries retired (see
+/// `Transaction::finish`). Once the watermark passes its Tid, no running or
+/// future reader can see the tuples, and a pass of `garbage_collect`
+/// reclaims them all at once, with the undo records and read timestamps
+/// below the watermark. It removes each entry no reader needs any more, as
+/// `index_versions` describes.
 ///
 /// Commit and abort only wake the collector thread and return, so the work
 /// stays off their latency. Wakes that arrive during a pass are served by one
@@ -40,9 +43,11 @@ struct Shared {
     watermark: Arc<Watermark>,
     undo: Arc<UndoLog>,
     read_ts: Arc<ReadTimestamps>,
-    /// The tuples each ended transaction left deleted, by Tid, until the
-    /// watermark passes it.
-    garbage: Mutex<BTreeMap<TxnId, DeadTuples>>,
+    /// See `index_versions`.
+    entry_lock: Arc<RwLock<()>>,
+    /// What each ended transaction left, by Tid, until the watermark passes
+    /// it.
+    garbage: Mutex<BTreeMap<TxnId, Garbage>>,
     passes: Mutex<Passes>,
     /// Wakes the collector when a pass is requested or it should stop.
     wake: Condvar,
@@ -68,6 +73,7 @@ impl TransactionManager {
             watermark: Arc::new(Watermark::new(next_tid)),
             undo: Arc::new(UndoLog::new()),
             read_ts: Arc::new(ReadTimestamps::new()),
+            entry_lock: Arc::new(RwLock::new(())),
             garbage: Mutex::new(BTreeMap::new()),
             passes: Mutex::new(Passes::default()),
             wake: Condvar::new(),
@@ -93,6 +99,7 @@ impl TransactionManager {
             Arc::clone(&self.shared.undo),
             Arc::clone(&self.shared.read_ts),
             Arc::clone(&self.shared.watermark),
+            Arc::clone(&self.shared.entry_lock),
         ))
     }
 
@@ -114,12 +121,13 @@ impl TransactionManager {
     /// Runs a pass of garbage collection on the calling thread, alongside
     /// the collector's. A pass frees everything no running or future reader
     /// can reach: the undo records and read timestamps below the watermark,
-    /// and the tuples left deleted by transactions below it.
+    /// and the tuples left deleted and index entries retired by transactions
+    /// below it.
     ///
     /// Passes may run at once; two never reclaim the same tuple. If
-    /// reclaiming a tuple fails, the others are still reclaimed and the first
-    /// error is returned; that tuple stays on its page, wasting its space,
-    /// and is not retried.
+    /// reclaiming a tuple or removing an entry fails, the others are still
+    /// done and the first error is returned; that tuple stays on its page,
+    /// wasting its space, or that entry in its index, and is not retried.
     pub fn garbage_collect(&self) -> Result<()> {
         self.shared.garbage_collect()
     }
@@ -155,7 +163,8 @@ impl TransactionManager {
     /// Number of deleted tuples waiting for the watermark to pass the
     /// transaction that left them.
     pub fn garbage_len(&self) -> usize {
-        self.shared.garbage.lock().values().map(Vec::len).sum()
+        let garbage = self.shared.garbage.lock();
+        garbage.values().map(|garbage| garbage.tuples.len()).sum()
     }
 
     /// The Tid the next transaction will get. Saved across restarts so that
@@ -175,10 +184,10 @@ impl TransactionManager {
             "transaction {} was begun by another manager",
             txn.tid()
         );
-        let deleted = txn.finish(outcome)?;
+        let garbage = txn.finish(outcome)?;
         // Queued before the Tid ends, so the watermark cannot pass it first.
-        if !deleted.is_empty() {
-            self.shared.garbage.lock().insert(txn.tid(), deleted);
+        if !garbage.is_empty() {
+            self.shared.garbage.lock().insert(txn.tid(), garbage);
         }
         self.shared.watermark.end(txn.tid());
         drop(self.shared.request_pass());
@@ -239,11 +248,24 @@ impl Shared {
             std::mem::replace(&mut *garbage, kept)
         };
         let mut first_error = None;
-        for (heap, rid) in dead.into_values().flatten() {
-            match heap.reclaim(rid, watermark) {
-                Ok(true) => self.read_ts.remove(rid),
-                Ok(false) => {}
-                Err(e) => {
+        for garbage in dead.into_values() {
+            for (heap, rid) in garbage.tuples {
+                match heap.reclaim(rid, watermark) {
+                    Ok(true) => self.read_ts.remove(rid),
+                    Ok(false) => {}
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                    }
+                }
+            }
+            for entry in garbage.entries {
+                let _entries = self.entry_lock.write();
+                let removed = match entry.is_needed(watermark, &self.undo) {
+                    Ok(true) => Ok(false),
+                    Ok(false) => entry.index.delete_entry(&entry.key, &entry.locator),
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = removed {
                     first_error.get_or_insert(e);
                 }
             }

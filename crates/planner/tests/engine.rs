@@ -398,3 +398,22 @@ fn a_storage_error_in_a_block_fails_it() {
         [account(1, "ann", 100), account(2, "bo", 50)]
     );
 }
+
+#[test]
+fn a_deleted_primary_key_can_be_inserted_again() {
+    let mut db = Db::with_tables();
+    db.ok("DELETE FROM accounts WHERE id = 1");
+    db.ok("INSERT INTO accounts VALUES (1, 'new', 5)");
+    assert_eq!(
+        db.rows("SELECT * FROM accounts WHERE id = 1"),
+        [account(1, "new", 5)]
+    );
+    db.ok("BEGIN");
+    db.ok("DELETE FROM accounts WHERE id = 2");
+    db.ok("INSERT INTO accounts VALUES (2, 'again', 6)");
+    db.ok("COMMIT");
+    assert_eq!(
+        db.rows("SELECT * FROM accounts WHERE id = 2"),
+        [account(2, "again", 6)]
+    );
+}
