@@ -1,3 +1,4 @@
+use std::ops::Deref;
 use std::sync::Arc;
 
 use common::{
@@ -10,6 +11,7 @@ use crate::buffer::arc_replacer::AccessType;
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::concurrency::read_ts::ReadTimestamps;
 use crate::error::{Result, StorageError};
+use crate::page::PAGE_SIZE;
 use crate::page::page_guard::WritePageGuard;
 use crate::table::table_iterator::{TableIterator, TableRow};
 use crate::table::table_page::{INVALID_UNDO_PTR, TablePage, TupleMeta};
@@ -28,6 +30,11 @@ use crate::table::undo_log::{self, UndoLog, UndoRecord};
 /// payload with zeros, so that its rollback always fits back in place;
 /// `stamp_commit` releases the padding. Reads at a timestamp cut it off;
 /// `get` and `iter` return it.
+///
+/// Once no reader can see a deleted tuple, `reclaim` frees its bytes and
+/// leaves its slot dead (see `table_page`). Transactional reads see a dead
+/// slot as no tuple and writes as a deleted one; `get` fails on it with
+/// `InvalidSlot`.
 ///
 /// Each operation latches only the pages it touches, through the buffer
 /// pool's page guards. Inserts also take `last_page_id`'s mutex, so that two
@@ -120,8 +127,8 @@ impl TableHeap {
     }
 
     /// Marks the tuple at `rid` deleted as of `ts`, with `undo_ptr` pointing
-    /// at the undo entry that restores it. The tuple stays on the page until
-    /// vacuum frees its slot.
+    /// at the undo entry that restores it. The tuple stays on the page:
+    /// garbage collection reclaims only tuples that transactions deleted.
     pub fn mark_delete(&self, rid: Rid, ts: u64, undo_ptr: u64) -> Result<()> {
         let mut guard = self.write_page(rid)?;
         let mut page = TablePage::new(guard.get_data_mut())?;
@@ -153,7 +160,7 @@ impl TableHeap {
     /// version chains never cross `Rid`s. Fails with `Conflict` if the tuple
     /// is locked by another transaction, was committed after `ts`, or was
     /// read by a transaction newer than `ts` (see `check_write`), and with
-    /// `TupleDeleted` if it is deleted.
+    /// `TupleDeleted` if it is deleted or reclaimed.
     pub fn update_versioned(
         &self,
         rid: Rid,
@@ -165,7 +172,7 @@ impl TableHeap {
     ) -> Result<()> {
         let mut guard = self.write_page(rid)?;
         let mut page = TablePage::new(guard.get_data_mut())?;
-        let (head, payload) = page.get(rid.slot)?;
+        let (head, payload) = head_to_write(&page, rid)?;
         check_write(rid, &head, ts, read_ts)?;
         if head.is_deleted {
             return Err(StorageError::TupleDeleted(rid));
@@ -206,7 +213,7 @@ impl TableHeap {
     /// delete stays readable through a record pushed to `undo`, with no
     /// changed columns: the tuple's bytes stay on the page. Fails with
     /// `Conflict` as `update_versioned` does, and with `TupleDeleted` if the
-    /// tuple is already deleted.
+    /// tuple is already deleted or reclaimed.
     pub fn delete_versioned(
         &self,
         rid: Rid,
@@ -216,7 +223,7 @@ impl TableHeap {
     ) -> Result<()> {
         let mut guard = self.write_page(rid)?;
         let mut page = TablePage::new(guard.get_data_mut())?;
-        let (head, _) = page.get(rid.slot)?;
+        let (head, _) = head_to_write(&page, rid)?;
         check_write(rid, &head, ts, read_ts)?;
         if head.is_deleted {
             return Err(StorageError::TupleDeleted(rid));
@@ -238,7 +245,7 @@ impl TableHeap {
 
     /// The version of the tuple at `rid` visible at `ts`, with its meta, or
     /// `None` if the tuple does not exist at `ts`. See `undo_log` for the
-    /// rule.
+    /// rule. A reclaimed tuple exists at no `ts` that is still read.
     ///
     /// The head is copied out under the page's read guard, and older
     /// versions are rebuilt after the guard is released. A head visible at
@@ -250,7 +257,8 @@ impl TableHeap {
     /// Unless the read fails with `Conflict`, it is recorded in `read_ts`
     /// under the guard, as transaction `ts`'s read. Pass `None` for a read
     /// that no write needs to know about: one outside a transaction, or by
-    /// the oldest running transaction.
+    /// the oldest running transaction. Reads of a reclaimed tuple are not
+    /// recorded, since no write can succeed on it.
     pub fn get_at(
         &self,
         rid: Rid,
@@ -263,6 +271,9 @@ impl TableHeap {
             .bpm
             .checked_read_page(rid.page_id, AccessType::Lookup)?;
         let page = TablePage::new(guard.get_data())?;
+        if page.is_dead(rid.slot) {
+            return Ok(None);
+        }
         let (meta, payload) = page.get(rid.slot)?;
         undo_log::check_read(rid, &meta, ts)?;
         if let Some(read_ts) = read_ts {
@@ -278,7 +289,10 @@ impl TableHeap {
     /// any padding a shrinking update kept, which needs `schema` to find the
     /// payload's real length. The undo records are left alone: their
     /// `writer_ts` is already `tid`.
-    pub fn stamp_commit(&self, rid: Rid, tid: TxnId, schema: &Schema) -> Result<()> {
+    ///
+    /// Returns whether the committed head is a delete, which garbage
+    /// collection reclaims once `tid` is below the watermark.
+    pub fn stamp_commit(&self, rid: Rid, tid: TxnId, schema: &Schema) -> Result<bool> {
         let mut guard = self.write_page(rid)?;
         let mut page = TablePage::new(guard.get_data_mut())?;
         let (head, payload) = page.get(rid.slot)?;
@@ -291,22 +305,24 @@ impl TableHeap {
         let tuple = Tuple::from_bytes(payload.to_vec());
         let len = tuple.encoded_len(schema)?;
         if len < tuple.len() {
-            page.update(rid.slot, &meta, &tuple.data()[..len])
+            page.update(rid.slot, &meta, &tuple.data()[..len])?;
         } else {
-            page.update_meta(rid.slot, &meta)
+            page.update_meta(rid.slot, &meta)?;
         }
+        Ok(meta.is_deleted)
     }
 
     /// Undoes every write the running transaction `tid` made to the tuple at
     /// `rid`, newest first, and puts back the version from before the first
     /// of them. A tuple that `tid` inserted is left deleted at `ts` 0, which
-    /// no reader sees, until vacuum frees it.
+    /// no reader sees; rollback then returns `true`, and garbage collection
+    /// reclaims the tuple once `tid` is below the watermark.
     ///
     /// The restored version always fits in place, because a shrinking locked
     /// update keeps the tuple's old length. Fails with `MissingUndoRecord` if
     /// one of `tid`'s records is gone, which garbage collection does not do
     /// while `tid` is running.
-    pub fn rollback(&self, rid: Rid, tid: TxnId, schema: &Schema, undo: &UndoLog) -> Result<()> {
+    pub fn rollback(&self, rid: Rid, tid: TxnId, schema: &Schema, undo: &UndoLog) -> Result<bool> {
         let locked = tid | TXN_UNCOMMITTED_BIT;
         let mut guard = self.write_page(rid)?;
         let mut page = TablePage::new(guard.get_data_mut())?;
@@ -327,7 +343,8 @@ impl TableHeap {
                     is_deleted: true,
                     ..meta
                 };
-                return page.update_meta(rid.slot, &meta);
+                page.update_meta(rid.slot, &meta)?;
+                return Ok(true);
             }
             let record = undo_log::older_record(rid, &meta, undo)?;
             if !record.delta.is_empty() {
@@ -351,7 +368,28 @@ impl TableHeap {
                 data
             }
         };
-        page.update(rid.slot, &meta, &data)
+        page.update(rid.slot, &meta, &data)?;
+        Ok(false)
+    }
+
+    /// Frees the bytes of the tuple at `rid` if no reader at or above
+    /// `watermark` can see it: its head is a delete committed below
+    /// `watermark`, or an aborted insert. Its slot is left dead, never
+    /// reused. Returns whether it reclaimed the tuple; a tuple that is
+    /// already reclaimed, or not dead, is left alone.
+    pub fn reclaim(&self, rid: Rid, watermark: TxnId) -> Result<bool> {
+        let mut guard = self.write_page(rid)?;
+        let mut page = TablePage::new(guard.get_data_mut())?;
+        if page.is_dead(rid.slot) {
+            return Ok(false);
+        }
+        let (head, _) = page.get(rid.slot)?;
+        let committed = head.ts & TXN_UNCOMMITTED_BIT == 0;
+        if !(head.is_deleted && committed && head.ts < watermark) {
+            return Ok(false);
+        }
+        page.mark_dead(rid.slot)?;
+        Ok(true)
     }
 
     /// Iterates over the live rows of the table. See `TableIterator`.
@@ -377,6 +415,18 @@ impl TableHeap {
     fn write_page(&self, rid: Rid) -> Result<WritePageGuard> {
         self.bpm.checked_write_page(rid.page_id, AccessType::Lookup)
     }
+}
+
+/// The head of the tuple at `rid`, for a versioned write. A reclaimed tuple
+/// was deleted, so it fails with `TupleDeleted`.
+fn head_to_write<B: Deref<Target = [u8; PAGE_SIZE]>>(
+    page: &TablePage<B>,
+    rid: Rid,
+) -> Result<(TupleMeta, &[u8])> {
+    if page.is_dead(rid.slot) {
+        return Err(StorageError::TupleDeleted(rid));
+    }
+    page.get(rid.slot)
 }
 
 /// Checks that a versioned write at `ts` may replace `head`, the newest
