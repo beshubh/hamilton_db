@@ -8,6 +8,7 @@ catalog = { path = "../catalog" }
 common = { path = "../common" }
 parser = { path = "../parser" }
 execution = { path = "../execution"}
+storage = { path = "../storage" }
 thiserror.workspace = true
 
 [dev-dependencies]

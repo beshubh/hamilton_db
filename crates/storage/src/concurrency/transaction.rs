@@ -16,12 +16,20 @@
 //! background collector reclaims them once the watermark passes the Tid,
 //! with the undo records below it.
 //!
+//! Index entries are not versioned: `insert_entry` and `delete_entry` change
+//! the index at once, as every transaction sees it, and record the change.
+//! Abort applies the inverse of each, newest first; commit drops the record.
+//!
 //! **Known gaps.** Phantoms: read timestamps guard the tuples a transaction
 //! read, not rows inserted later that it should have seen, so schedules
-//! with inserts are not serializable. Index entries are not rolled back.
-//! Nothing is logged, so a commit or abort that fails partway leaves some
-//! tuples done and the rest locked, and the transaction stays running.
-//! Reclaimed tuples keep their slots (see `table_page`).
+//! with inserts are not serializable. Because index entries change at once,
+//! an older transaction reading through an index misses rows whose entries
+//! a newer one removed or moved, and a primary key is checked against
+//! entries other transactions have not committed. Nothing is logged, so a
+//! commit or abort that fails partway leaves some tuples done and the rest
+//! locked, and the transaction stays running; a crash does the same to
+//! every running transaction. Reclaimed tuples keep their slots (see
+//! `table_page`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -34,6 +42,7 @@ use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use crate::concurrency::read_ts::ReadTimestamps;
 use crate::concurrency::watermark::Watermark;
 use crate::error::{Result, StorageError};
+use crate::index::{Index, IndexTrait, RowLocator};
 use crate::table::table_heap::TableHeap;
 use crate::table::table_iterator::{TableIterator, TableRow};
 use crate::table::table_page::TupleMeta;
@@ -70,6 +79,8 @@ pub struct Transaction {
     /// Set once this is the oldest running transaction, which it then stays.
     oldest: AtomicBool,
     write_set: Mutex<HashMap<PageId, TableWrites>>,
+    /// The index entries this transaction added and removed, oldest first.
+    index_writes: Mutex<Vec<IndexWrite>>,
 }
 
 /// The tuples a transaction wrote in one table, keyed by the table's first
@@ -78,6 +89,14 @@ struct TableWrites {
     heap: Arc<TableHeap>,
     schema: Schema,
     rids: HashSet<Rid>,
+}
+
+/// An index entry a transaction added (`inserted`) or removed.
+struct IndexWrite {
+    index: Arc<Index>,
+    key: Tuple,
+    locator: RowLocator,
+    inserted: bool,
 }
 
 impl Transaction {
@@ -95,6 +114,7 @@ impl Transaction {
             watermark,
             oldest: AtomicBool::new(false),
             write_set: Mutex::new(HashMap::new()),
+            index_writes: Mutex::new(Vec::new()),
         }
     }
 
@@ -148,6 +168,38 @@ impl Transaction {
         Ok(())
     }
 
+    /// Adds `key` for the row at `locator` to `index`, as
+    /// `IndexTrait::insert_entry` does, and records it to undo on abort.
+    pub fn insert_entry(
+        &self,
+        index: &Arc<Index>,
+        key: &Tuple,
+        locator: &RowLocator,
+    ) -> Result<bool> {
+        let _running = self.running()?;
+        let inserted = index.insert_entry(key, locator)?;
+        if inserted {
+            self.record_index_write(index, key, locator, true);
+        }
+        Ok(inserted)
+    }
+
+    /// Removes `key` for the row at `locator` from `index`, as
+    /// `IndexTrait::delete_entry` does, and records it to undo on abort.
+    pub fn delete_entry(
+        &self,
+        index: &Arc<Index>,
+        key: &Tuple,
+        locator: &RowLocator,
+    ) -> Result<bool> {
+        let _running = self.running()?;
+        let deleted = index.delete_entry(key, locator)?;
+        if deleted {
+            self.record_index_write(index, key, locator, false);
+        }
+        Ok(deleted)
+    }
+
     /// The version of the tuple at `rid` this transaction sees, or `None` if
     /// there is none at its Tid. Fails with `Conflict` if an older
     /// transaction holds the tuple's lock.
@@ -166,15 +218,28 @@ impl Transaction {
         })
     }
 
-    /// Clears the lock on every tuple written, or rolls each back, and sets
-    /// the state to `outcome`. Returns the tuples left deleted: those deleted
-    /// by a commit, and those inserted by an abort. The manager calls this
-    /// before ending the Tid.
+    /// Clears the lock on every tuple written, or rolls each back along
+    /// with the index entries, and sets the state to `outcome`. Returns the
+    /// tuples left deleted: those deleted by a commit, and those inserted by
+    /// an abort. The manager calls this before ending the Tid.
     pub(crate) fn finish(&self, outcome: TransactionState) -> Result<DeadTuples> {
         let mut state = self.state.write();
         if *state != TransactionState::Running {
             return Err(StorageError::TransactionNotRunning(self.tid));
         }
+        let mut index_writes = self.index_writes.lock();
+        if outcome == TransactionState::Aborted {
+            while let Some(write) = index_writes.pop() {
+                // A primary key another transaction has taken since is not
+                // put back; see the module's known gaps.
+                if write.inserted {
+                    write.index.delete_entry(&write.key, &write.locator)?;
+                } else {
+                    write.index.insert_entry(&write.key, &write.locator)?;
+                }
+            }
+        }
+        index_writes.clear();
         let mut write_set = self.write_set.lock();
         let mut deleted = Vec::new();
         for table in write_set.values() {
@@ -244,6 +309,21 @@ impl Transaction {
         let rid = heap.insert(&meta, tuple)?;
         self.record_write(heap, schema, rid);
         Ok(rid)
+    }
+
+    fn record_index_write(
+        &self,
+        index: &Arc<Index>,
+        key: &Tuple,
+        locator: &RowLocator,
+        inserted: bool,
+    ) {
+        self.index_writes.lock().push(IndexWrite {
+            index: Arc::clone(index),
+            key: key.clone(),
+            locator: locator.clone(),
+            inserted,
+        });
     }
 
     fn record_write(&self, heap: &Arc<TableHeap>, schema: &Schema, rid: Rid) {

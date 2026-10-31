@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
 use common::{Rid, Schema, Tuple};
-use storage::index::IndexTrait;
-use storage::table::table_page::INVALID_UNDO_PTR;
 
-use super::{AbstractExecutor, COMMIT_TS, Executor, count_row, index_keys, locators};
+use super::{AbstractExecutor, Executor, count_row, index_keys, locators};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::plans::{DeletePlan, PlanNode};
@@ -13,11 +11,8 @@ use crate::plans::{DeletePlan, PlanNode};
 /// one row holding how many there were. The child reads the table, so every
 /// row it produces has a rid.
 ///
-/// There are no transactions to roll back yet, so it finds every row before
-/// deleting any: a WHERE that fails to evaluate deletes nothing.
-///
-/// A delete marks the tuple deleted and removes its entries from the table's
-/// indexes. There is no undo log yet, so the tuple gets no undo entry.
+/// A delete marks the tuple deleted in the statement's transaction and
+/// removes its entries from the table's indexes.
 pub struct DeleteExecutor {
     ctx: Arc<ExecutionContext>,
     plan: DeletePlan,
@@ -68,12 +63,13 @@ impl Executor for DeleteExecutor {
             debug_assert_eq!(self.child_rids.len(), self.child_tuples.len());
             found.extend(self.child_rids.drain(..).zip(self.child_tuples.drain(..)));
         }
+        let txn = self.ctx.txn();
         for (rid, tuple) in &found {
-            table.heap.mark_delete(*rid, COMMIT_TS, INVALID_UNDO_PTR)?;
+            txn.delete(&table.heap, &table.schema, *rid)?;
             let keys = index_keys(&table, &indexes, tuple)?;
             let locators = locators(&indexes, &keys, *rid);
             for ((index, key), locator) in indexes.iter().zip(&keys).zip(&locators) {
-                index.index.delete_entry(key, locator)?;
+                txn.delete_entry(&index.index, key, locator)?;
             }
         }
         tuples.push(count_row(self.plan.get_output_schema(), found.len())?);
@@ -90,6 +86,7 @@ mod tests {
     use std::sync::Arc;
 
     use common::{Value, ValueError};
+    use storage::StorageError;
 
     use super::super::test_util::{Db, account, account_column, column, compare, int, user};
     use crate::ExecutionError;
@@ -180,16 +177,34 @@ mod tests {
         assert_eq!(db.users_rows().len(), 5);
     }
 
+    /// A delete marks the tuple deleted. It stays on its page while an
+    /// older transaction can still see it, and is reclaimed after.
     #[test]
-    fn deleted_rows_stay_on_their_pages() {
+    fn deleted_rows_are_reclaimed_once_no_transaction_sees_them() {
         let db = Db::new();
         db.insert_numbered(3);
         let first = db.users.heap.iter().unwrap().next().unwrap().unwrap().1;
         let rid = first.rid().unwrap();
+        let older = db.tm.begin();
         let filter = FilterPlan::new(compare(ComparisonOp::Eq, column(0), int(1)), db.scan(None));
         delete(&db, Some(filter));
+        db.tm.wait_for_gc();
         let (meta, tuple) = db.users.heap.get(rid).unwrap();
         assert!(meta.is_deleted);
         assert_eq!(tuple.data(), first.data());
+        assert_eq!(
+            db.run_in(&older, Arc::unwrap_or_clone(db.scan(None)))
+                .unwrap()
+                .len(),
+            3
+        );
+
+        db.tm.commit(&older).unwrap();
+        db.tm.wait_for_gc();
+        assert!(matches!(
+            db.users.heap.get(rid),
+            Err(StorageError::InvalidSlot(_))
+        ));
+        assert_eq!(db.users_rows().len(), 2);
     }
 }

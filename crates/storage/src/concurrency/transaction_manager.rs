@@ -158,6 +158,12 @@ impl TransactionManager {
         self.shared.garbage.lock().values().map(Vec::len).sum()
     }
 
+    /// The Tid the next transaction will get. Saved across restarts so that
+    /// it never goes below a committed `ts` on disk; see `watermark`.
+    pub fn next_tid(&self) -> TxnId {
+        self.shared.watermark.next()
+    }
+
     /// The oldest Tid any running transaction reads at. See `Watermark`.
     pub fn watermark(&self) -> TxnId {
         self.shared.watermark.get()

@@ -2,8 +2,10 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use common::{Rid, Schema, Tuple, Value};
-use storage::index::{IndexTrait, RowLocator};
+use storage::index::IndexTrait;
+use storage::index::btree_index::compare_key_prefix;
 
+use super::index_scan::key_values;
 use super::{AbstractExecutor, Executor};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
@@ -23,6 +25,10 @@ use crate::plans::{JoinType, NestedIndexJoinPlan, PlanNode};
 ///
 /// If the index stores primary keys, each match costs a second lookup, in
 /// the primary key index, to find the inner row.
+///
+/// Inner rows are read as the statement's transaction sees them. As in
+/// `IndexScanExecutor`, one whose key is no longer the outer row's is
+/// skipped.
 ///
 /// The inner table is never scanned, so the size of an outer block doesn't
 /// change how much of it is read: the outer rows are taken in the batches
@@ -83,13 +89,23 @@ impl NestedIndexJoinExecutor {
         let outer_schema = self.outer.get_output_schema();
         let inner_schema = self.plan.inner_schema();
         let table = self.ctx.table(self.plan.inner_table_oid())?;
+        let index = self.ctx.index(self.plan.index_oid())?;
+        let Some(key) = self.lookup_key(outer)? else {
+            return self.pad_unmatched(outer, false);
+        };
         let mut matched = false;
-        for locator in self.index_lookup(outer)? {
+        let mut locators = Vec::new();
+        index
+            .index
+            .scan_key(&Tuple::encode(&index.key_schema, &key)?, &mut locators)?;
+        for locator in locators {
             let Some(rid) = self.ctx.locate(&table, &locator)? else {
                 continue;
             };
-            let (meta, inner) = table.heap.get(rid)?;
-            if meta.is_deleted {
+            let Some((_, inner)) = self.ctx.txn().get(&table.heap, &table.schema, rid)? else {
+                continue;
+            };
+            if !compare_key_prefix(&key_values(&table, &index, &inner)?, &key).is_eq() {
                 continue;
             }
             if let Some(predicate) = self.plan.predicate()
@@ -103,31 +119,33 @@ impl NestedIndexJoinExecutor {
             self.output.push_back(joined);
             matched = true;
         }
+        self.pad_unmatched(outer, matched)
+    }
+
+    /// For a LEFT join, outputs `outer` padded with NULLs if it `matched`
+    /// nothing.
+    fn pad_unmatched(&mut self, outer: &Tuple, matched: bool) -> Result<()> {
         if !matched && self.plan.join_type() == JoinType::Left {
             let schema = self.plan.get_output_schema();
+            let (outer_schema, inner_schema) =
+                (self.outer.get_output_schema(), self.plan.inner_schema());
             let padded = Tuple::join(schema, outer, outer_schema, None, inner_schema)?;
             self.output.push_back(padded);
         }
         Ok(())
     }
 
-    /// The locators of the inner rows whose key is the plan's key for
-    /// `outer`. None if the key has a NULL: NULL = NULL is not TRUE, though
-    /// the index holds NULL keys.
-    fn index_lookup(&self, outer: &Tuple) -> Result<Vec<RowLocator>> {
+    /// The plan's key for `outer`, which the inner rows must have. None if
+    /// it has a NULL: NULL = NULL is not TRUE, though the index holds NULL
+    /// keys.
+    fn lookup_key(&self, outer: &Tuple) -> Result<Option<Vec<Value>>> {
         let values = self
             .plan
             .key_exprs()
             .iter()
             .map(|expr| expr.evaluate(outer, self.outer.get_output_schema()))
             .collect::<Result<Vec<_>>>()?;
-        let index = self.ctx.index(self.plan.index_oid())?;
-        let mut locators = Vec::new();
-        if !values.iter().any(Value::is_null) {
-            let key = Tuple::encode(&index.key_schema, &values)?;
-            index.index.scan_key(&key, &mut locators)?;
-        }
-        Ok(locators)
+        Ok((!values.iter().any(Value::is_null)).then_some(values))
     }
 }
 
@@ -465,7 +483,7 @@ mod tests {
     fn init_starts_over() {
         let (db, orders) = some_orders();
         let join = orders.join(JoinType::Inner, db.scan(None), vec![column(0)], None);
-        let mut executor = create_executor(&db.ctx, &join).unwrap();
+        let mut executor = create_executor(&db.ctx(), &join).unwrap();
         let (mut tuples, mut rids) = (Vec::new(), Vec::new());
         for _ in 0..2 {
             executor.init().unwrap();

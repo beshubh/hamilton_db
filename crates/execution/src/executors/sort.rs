@@ -335,10 +335,10 @@ mod tests {
 
     /// A sort of the users table, not initialized yet.
     fn sort_users(db: &Db, order_bys: Vec<OrderBy>) -> SortExecutor {
-        let scan = db.scan(None);
-        let child = create_executor(&db.ctx, &scan).unwrap();
+        let (ctx, scan) = (db.ctx(), db.scan(None));
+        let child = create_executor(&ctx, &scan).unwrap();
         let plan = SortPlan::new(order_bys, scan);
-        SortExecutor::new(Arc::clone(&db.ctx), plan, Box::new(child))
+        SortExecutor::new(ctx, plan, Box::new(child))
     }
 
     /// The ids on the pages of `run`, which must be sorted by id, checking

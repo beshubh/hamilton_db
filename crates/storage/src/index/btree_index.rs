@@ -78,6 +78,20 @@ impl KeyComparator for KeySchemaComparator {
     }
 }
 
+/// Orders the values of a key against those of a prefix of the key, as the
+/// index orders them: column by column over the prefix's columns, with NULL
+/// first.
+///
+/// # Panics
+/// If two values of a column have types that don't compare.
+pub fn compare_key_prefix(key: &[Value], prefix: &[Value]) -> Ordering {
+    key.iter()
+        .zip(prefix)
+        .map(|(a, b)| compare_values(a, b))
+        .find(|order| order.is_ne())
+        .unwrap_or(Ordering::Equal)
+}
+
 /// Orders two values of a key column, with NULL first.
 fn compare_values(a: &Value, b: &Value) -> Ordering {
     match (a.is_null(), b.is_null()) {
@@ -412,7 +426,7 @@ impl IndexTrait for BtreeIndex {
     }
 
     /// In a primary key index, `key` is removed whatever record id it has.
-    fn delete_entry(&self, key: &Tuple, locator: &RowLocator) -> Result<()> {
+    fn delete_entry(&self, key: &Tuple, locator: &RowLocator) -> Result<bool> {
         self.check_locator(locator);
         self.tree
             .remove(&self.tree.comparator().entry(key.data(), locator))

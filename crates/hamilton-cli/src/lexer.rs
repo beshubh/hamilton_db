@@ -7,18 +7,22 @@
 
 /// Keywords the parser understands, uppercase and sorted.
 pub const KEYWORDS: &[&str] = &[
+    "ABORT",
     "AND",
     "ARRAY",
     "AS",
     "ASC",
+    "BEGIN",
     "BIGINT",
     "BOOL",
     "BOOLEAN",
     "BY",
+    "COMMIT",
     "CREATE",
     "CROSS",
     "DELETE",
     "DESC",
+    "END",
     "EXISTS",
     "EXPLAIN",
     "FALSE",
@@ -46,14 +50,18 @@ pub const KEYWORDS: &[&str] = &[
     "OVER",
     "PARTITION",
     "PRIMARY",
+    "ROLLBACK",
     "SELECT",
     "SET",
+    "START",
     "TABLE",
+    "TRANSACTION",
     "TRUE",
     "UPDATE",
     "VALUES",
     "VARCHAR",
     "WHERE",
+    "WORK",
 ];
 
 /// Keywords that stand for a value rather than shape the statement.

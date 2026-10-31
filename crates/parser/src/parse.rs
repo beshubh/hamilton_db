@@ -13,12 +13,12 @@
 
 use common::{Column, DataType, Value};
 use sqlparser::ast::{
-    self as sql, Assignment, AssignmentTarget, BinaryOperator, CharacterLength, ColumnDef,
-    ColumnOption, ExactNumberInfo, Expr, FromTable, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, Ident, IndexColumn, JoinConstraint, JoinOperator, LimitClause,
-    ObjectName, ObjectNamePart, OrderByKind, OrderByOptions, OrderBySort, PrimaryKeyConstraint,
-    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, TableConstraint, TableFactor,
-    TableObject, TableWithJoins, UnaryOperator, WindowType,
+    self as sql, Assignment, AssignmentTarget, BeginTransactionKind, BinaryOperator,
+    CharacterLength, ColumnDef, ColumnOption, ExactNumberInfo, Expr, FromTable, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, IndexColumn, JoinConstraint,
+    JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByKind, OrderByOptions,
+    OrderBySort, PrimaryKeyConstraint, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
+    TableConstraint, TableFactor, TableObject, TableWithJoins, UnaryOperator, WindowType,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -48,7 +48,40 @@ fn convert_statement(stmt: &sql::Statement) -> Result<Statement> {
         sql::Statement::Update(update) => convert_update(stmt, update),
         sql::Statement::Delete(delete) => convert_delete(stmt, delete),
         sql::Statement::Explain { statement, .. } => convert_explain(stmt, statement),
+        sql::Statement::StartTransaction { .. } => convert_begin(stmt),
+        // Matched by field, not by rendering: the AST drops `TRANSACTION`
+        // or `WORK` after the keyword, and `AND NO CHAIN`, which is what
+        // these do anyway. That also lets through `TRAN` after them, which
+        // Postgres rejects.
+        sql::Statement::Commit {
+            chain: false,
+            modifier: None,
+            end: _,
+        } => Ok(Statement::Commit),
+        sql::Statement::Rollback {
+            chain: false,
+            savepoint: None,
+        } => Ok(Statement::Rollback),
         _ => Err(unsupported(stmt)),
+    }
+}
+
+/// `BEGIN [TRANSACTION | WORK]` or `START TRANSACTION`, without modes such
+/// as an isolation level or `READ ONLY`.
+fn convert_begin(stmt: &sql::Statement) -> Result<Statement> {
+    match stmt {
+        sql::Statement::StartTransaction {
+            modes,
+            begin: _,
+            transaction: None | Some(BeginTransactionKind::Transaction | BeginTransactionKind::Work),
+            modifier: None,
+            statements,
+            exception: None,
+            has_end_keyword: false,
+        } if modes.is_empty() && statements.is_empty() => Ok(Statement::Begin),
+        _ => Err(ParseError::Unsupported(format!(
+            "`{stmt}` (only `BEGIN`, without transaction modes)"
+        ))),
     }
 }
 

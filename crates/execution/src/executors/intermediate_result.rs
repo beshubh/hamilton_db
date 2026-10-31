@@ -189,8 +189,6 @@ impl Drop for IntermediatePages {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use common::Tuple;
 
     use super::super::test_util::Db;
@@ -200,7 +198,7 @@ mod tests {
     #[test]
     fn counts_the_pages_appending_fills() {
         let db = Db::new();
-        let mut pages = IntermediatePages::new(Arc::clone(&db.ctx));
+        let mut pages = IntermediatePages::new(db.ctx());
         let (mut result, mut count) = (IntermediateResult::new(), PageCount::new());
         assert_eq!(count.pages(), 0);
         for len in (0..500).map(|i| i * 7 % 300) {

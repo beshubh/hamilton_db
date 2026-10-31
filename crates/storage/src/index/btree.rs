@@ -358,27 +358,27 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
         Ok(())
     }
 
-    /// Removes `key`, if the tree holds it.
-    pub fn remove(&self, key: &[u8]) -> Result<()> {
-        if self.remove_optimistic(key)? {
-            return Ok(());
+    /// Removes `key`, if the tree holds it. Returns whether it did.
+    pub fn remove(&self, key: &[u8]) -> Result<bool> {
+        match self.remove_optimistic(key)? {
+            Some(removed) => Ok(removed),
+            None => self.remove_pessimistic(key),
         }
-        self.remove_pessimistic(key)
     }
 
-    /// Removes `key` from its leaf, holding only read latches above it.
-    /// Returns `false`, changing nothing, if that would leave the leaf
-    /// underfull, or a root leaf empty: either needs the pessimistic remove.
-    fn remove_optimistic(&self, key: &[u8]) -> Result<bool> {
+    /// Removes `key` from its leaf, holding only read latches above it, and
+    /// returns whether it was there. Returns `None`, changing nothing, if
+    /// that would leave the leaf underfull, or a root leaf empty: either
+    /// needs the pessimistic remove.
+    fn remove_optimistic(&self, key: &[u8]) -> Result<Option<bool>> {
         let Some((mut guard, is_root)) = self.find_leaf_mut(key)? else {
-            return Ok(true);
+            return Ok(Some(false));
         };
         let mut leaf = LeafPageMut::<NUM_TOMBS>::new(guard.get_data_mut())?;
         if !self.is_leaf_remove_safe(&leaf, key, is_root) {
-            return Ok(false);
+            return Ok(None);
         }
-        leaf.remove(key, &self.comparator);
-        Ok(true)
+        Ok(Some(leaf.remove(key, &self.comparator).is_some()))
     }
 
     /// Removes `key` holding write latches from the header page down, so it
@@ -387,14 +387,14 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     /// On the way down, reaching a safe page releases every page above it,
     /// the header page included: rebalancing stops there, so they do not
     /// change.
-    fn remove_pessimistic(&self, key: &[u8]) -> Result<()> {
+    fn remove_pessimistic(&self, key: &[u8]) -> Result<bool> {
         let mut ctx = Context::new();
         let header = self
             .bpm
             .checked_write_page(self.header_page_id, AccessType::Index)?;
         ctx.root_page_id = BtreeHeaderPage::new(header.get_data())?.root_page_id();
         if ctx.root_page_id == INVALID_PAGE_ID {
-            return Ok(());
+            return Ok(false);
         }
         ctx.header_page = Some(header);
 
@@ -424,9 +424,10 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
         let removed =
             LeafPageMut::<NUM_TOMBS>::new(guard.get_data_mut())?.remove(key, &self.comparator);
         if removed.is_none() {
-            return Ok(());
+            return Ok(false);
         }
-        self.rebalance(&mut ctx, guard)
+        self.rebalance(&mut ctx, guard)?;
+        Ok(true)
     }
 
     /// Fixes up the tree after a remove, from the leaf in `guard` up through

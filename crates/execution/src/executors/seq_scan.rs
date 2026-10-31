@@ -2,20 +2,21 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use common::{Rid, Schema, Tuple};
-use storage::table::table_iterator::TableIterator;
+use storage::concurrency::transaction::TransactionScan;
 
 use super::{Executor, passes};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::plans::{PlanNode, SeqScanPlan};
 
-/// Reads the live rows of a table in storage order, a page at a time,
-/// keeping those that pass the plan's filter.
+/// Reads the rows of a table that the statement's transaction sees, in
+/// storage order, a page at a time, keeping those that pass the plan's
+/// filter.
 pub struct SeqScanExecutor {
     ctx: Arc<ExecutionContext>,
     plan: SeqScanPlan,
     /// Set by `init`.
-    iter: Option<TableIterator>,
+    iter: Option<TransactionScan>,
     /// Rows of the page read last that have not been produced yet.
     rows: VecDeque<Tuple>,
 }
@@ -34,7 +35,7 @@ impl SeqScanExecutor {
 impl Executor for SeqScanExecutor {
     fn init(&mut self) -> Result<()> {
         let table = self.ctx.table(self.plan.table_oid())?;
-        self.iter = Some(table.heap.iter()?);
+        self.iter = Some(self.ctx.txn().scan(&table.heap, &table.schema)?);
         self.rows.clear();
         Ok(())
     }
@@ -112,7 +113,7 @@ mod tests {
     fn produces_the_rids_of_its_rows() {
         let db = Db::new();
         db.insert_numbered(5);
-        let mut scan = create_executor(&db.ctx, &db.scan(None)).unwrap();
+        let mut scan = create_executor(&db.ctx(), &db.scan(None)).unwrap();
         scan.init().unwrap();
         let (mut tuples, mut rids) = (Vec::new(), Vec::new());
         let mut seen = 0;

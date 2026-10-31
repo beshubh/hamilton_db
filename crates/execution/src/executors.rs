@@ -17,8 +17,12 @@
 //! VALUES, UPDATE, DELETE, SELECT ... WHERE through a table or an index
 //! scan, ORDER BY, LIMIT, nested loop, index nested loop and hash joins, and
 //! hash aggregation for GROUP BY and aggregates; other plans fail with
-//! [`ExecutionError::NoExecutor`]. There are no transactions yet, so every
-//! write is committed as soon as it is made.
+//! [`ExecutionError::NoExecutor`].
+//!
+//! Executors read and write tables and indexes through the statement's
+//! transaction ([`ExecutionContext::txn`]). They never commit or abort it:
+//! whoever runs the statement does, so a statement that fails is undone by
+//! the abort that follows.
 
 mod create_index;
 mod create_table;
@@ -71,10 +75,6 @@ use crate::error::{ExecutionError, Result};
 use crate::execution_context::ExecutionContext;
 use crate::expressions::{AbstractExpr, Expr};
 use crate::plans::AbstractPlanNode;
-
-/// The timestamp every write is stamped with until there are transactions,
-/// the same one the catalog's own rows carry.
-const COMMIT_TS: u64 = 0;
 
 #[enum_dispatch]
 pub trait Executor {
@@ -255,7 +255,7 @@ mod tests {
         let values = Arc::new(ValuesPlan::new(users_schema(), vec![]).into());
         let topn = TopNPlan::new(vec![], 1, values).into();
         assert!(matches!(
-            create_executor(&db.ctx, &topn),
+            create_executor(&db.ctx(), &topn),
             Err(ExecutionError::NoExecutor("TopN"))
         ));
     }

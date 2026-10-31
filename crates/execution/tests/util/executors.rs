@@ -1,12 +1,14 @@
 //! A database to run executors against, and plans for the executor tests.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use catalog::{Catalog, TableInfo};
 use common::{Column, DataType, PageId, Rid, Schema, Tuple, Value};
 use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::buffer::traced_buffer_pool_manager::TracedBufferPoolManager;
+use storage::concurrency::transaction::Transaction;
+use storage::concurrency::transaction_manager::TransactionManager;
 use storage::disk::disk_manager::DiskManager;
 use storage::index::{Index, IndexTrait};
 use storage::page::intermediate_result_page::IntermediateResultPage;
@@ -14,7 +16,7 @@ use tempfile::TempDir;
 
 use super::{Executor, create_executor};
 use crate::Result;
-use crate::execution_context::ExecutionContext;
+use crate::execution_context::{self, ExecutionContext, ExecutionSettings};
 use crate::expressions::{
     AbstractExpr, ColumnValueExpr, ComparisonExpr, ComparisonOp, ConstantExpr, UNNAMED_COLUMN,
 };
@@ -33,7 +35,11 @@ pub struct Db {
     pub disk: Arc<DiskManager>,
     pub bpm: Arc<BufferPoolManager>,
     catalog: Arc<Catalog>,
-    pub ctx: Arc<ExecutionContext>,
+    pub tm: TransactionManager,
+    settings: ExecutionSettings,
+    /// The transactions of contexts `ctx` handed out, committed when the
+    /// database is dropped.
+    open: Mutex<Vec<Arc<Transaction>>>,
     pub users: Arc<TableInfo>,
 }
 
@@ -48,35 +54,71 @@ impl Db {
             _dir: dir,
             disk,
             bpm,
-            ctx: Arc::new(ExecutionContext::new(Arc::clone(&catalog))),
             catalog,
+            tm: TransactionManager::new(1),
+            settings: ExecutionSettings::default(),
+            open: Mutex::new(Vec::new()),
             users,
         }
     }
 
     /// Gives the joins of later plans `frames` buffers.
     pub fn set_join_frames(&mut self, frames: usize) {
-        let ctx = ExecutionContext::new(Arc::clone(&self.catalog))
-            .with_join_frames(frames)
-            .with_aggregation_frames(self.ctx.aggregation_frames());
-        self.ctx = Arc::new(ctx);
+        self.settings = self.settings.with_join_frames(frames);
     }
 
     /// Gives the aggregations of later plans `frames` buffers.
     pub fn set_aggregation_frames(&mut self, frames: usize) {
-        let ctx = ExecutionContext::new(Arc::clone(&self.catalog))
-            .with_join_frames(self.ctx.join_frames())
-            .with_aggregation_frames(frames);
-        self.ctx = Arc::new(ctx);
+        self.settings = self.settings.with_aggregation_frames(frames);
+    }
+
+    pub fn join_frames(&self) -> usize {
+        self.settings.join_frames()
     }
 
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
 
-    /// Runs `plan` to the end and decodes the rows it produces.
+    /// A context for building executors by hand, in a new transaction that
+    /// stays open until the database is dropped.
+    pub fn ctx(&self) -> Arc<ExecutionContext> {
+        let txn = self.tm.begin();
+        self.open.lock().unwrap().push(Arc::clone(&txn));
+        self.ctx_in(txn)
+    }
+
+    /// A context for a statement in `txn`.
+    pub fn ctx_in(&self, txn: Arc<Transaction>) -> Arc<ExecutionContext> {
+        Arc::new(ExecutionContext::new(
+            Arc::clone(&self.catalog),
+            txn,
+            self.settings,
+        ))
+    }
+
+    /// Runs `plan` to the end in a transaction of its own, and decodes the
+    /// rows it produces. The transaction commits if the plan succeeds and
+    /// aborts if it fails, as a statement outside a transaction block does.
     pub fn run(&self, plan: AbstractPlanNode) -> Result<Vec<Vec<Value>>> {
-        let mut executor = create_executor(&self.ctx, &plan)?;
+        let txn = self.tm.begin();
+        let result = self.run_in(&txn, plan);
+        match result {
+            Ok(_) => self.tm.commit(&txn)?,
+            Err(_) => self.tm.abort(&txn)?,
+        }
+        result
+    }
+
+    /// Runs `plan` to the end in `txn`, leaving it open, and decodes the rows
+    /// it produces.
+    pub fn run_in(
+        &self,
+        txn: &Arc<Transaction>,
+        plan: AbstractPlanNode,
+    ) -> Result<Vec<Vec<Value>>> {
+        let ctx = self.ctx_in(Arc::clone(txn));
+        let mut executor = create_executor(&ctx, &plan)?;
         executor.init()?;
         let (mut tuples, mut rids) = (Vec::new(), Vec::new());
         let mut rows = Vec::new();
@@ -137,7 +179,11 @@ impl Db {
         index.index.scan_key(&key, &mut locators).unwrap();
         locators
             .iter()
-            .map(|locator| self.ctx.locate(&table, locator).unwrap().unwrap())
+            .map(|locator| {
+                execution_context::locate(self.catalog(), &table, locator)
+                    .unwrap()
+                    .unwrap()
+            })
             .collect()
     }
 
@@ -217,6 +263,17 @@ impl Db {
     pub fn users_rows(&self) -> Vec<Vec<Value>> {
         let scan = Arc::unwrap_or_clone(self.scan(None));
         self.run(scan).unwrap()
+    }
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        let open = self.open.get_mut().unwrap_or_else(|e| e.into_inner());
+        for txn in open.drain(..) {
+            if !std::thread::panicking() {
+                self.tm.commit(&txn).unwrap();
+            }
+        }
     }
 }
 

@@ -1,21 +1,15 @@
 //! The database the CLI runs statements against: its files, buffer pool
-//! and catalog, and the pipeline from SQL to rows.
+//! and catalog, and the session that runs statements on them.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use catalog::Catalog;
 use common::{Column, Value};
-use execution::execution_context::ExecutionContext;
-use execution::executors::{Executor, create_executor};
-use parser::Statement;
-use planner::{Binder, BoundStatement, Planner};
+use planner::{ExecutionEngine, TransactionStatus};
 use storage::buffer::buffer_pool_manager::{BufferPoolManager, DEFAULT_POOL_SIZE};
 use storage::disk::disk_manager::DiskManager;
-
-/// Rows pulled from the root executor at a time.
-const BATCH_SIZE: usize = 128;
 
 /// What a statement produced, for printing.
 #[derive(Debug, PartialEq)]
@@ -31,11 +25,22 @@ pub enum Output {
     Done(&'static str),
 }
 
+impl From<planner::Output> for Output {
+    fn from(output: planner::Output) -> Self {
+        match output {
+            planner::Output::Rows { columns, rows } => Output::Rows { columns, rows },
+            planner::Output::Count { command, count } => Output::Count { command, count },
+            planner::Output::Done(command) => Output::Done(command),
+        }
+    }
+}
+
 pub struct Database {
     disk: Arc<DiskManager>,
     bpm: Arc<BufferPoolManager>,
     catalog: Arc<Catalog>,
-    ctx: Arc<ExecutionContext>,
+    /// The CLI's one session.
+    engine: Mutex<ExecutionEngine>,
 }
 
 impl Database {
@@ -45,11 +50,12 @@ impl Database {
         let disk = Arc::new(DiskManager::new(path)?);
         let bpm = Arc::new(BufferPoolManager::new(DEFAULT_POOL_SIZE, Arc::clone(&disk)));
         let catalog = Arc::new(Catalog::open(Arc::clone(&bpm))?);
+        let engine = ExecutionEngine::new(Arc::clone(&catalog))?;
         Ok(Self {
             disk,
             bpm,
-            ctx: Arc::new(ExecutionContext::new(Arc::clone(&catalog))),
             catalog,
+            engine: Mutex::new(engine),
         })
     }
 
@@ -57,58 +63,46 @@ impl Database {
         &self.catalog
     }
 
-    /// Runs the statements in `sql` in order, stopping at the first that
-    /// fails. Everything written is on disk when this returns, whether or
-    /// not a statement failed: there is no write-ahead log to recover from.
-    pub fn execute(&self, sql: &str) -> Result<Vec<Output>> {
-        let result = parser::parse(sql)
-            .map_err(Into::into)
-            .and_then(|stmts| stmts.iter().map(|stmt| self.run(stmt)).collect());
-        self.flush()?;
-        result
+    /// Whether the session is in a transaction block, and if it failed.
+    pub fn transaction_status(&self) -> TransactionStatus {
+        self.engine().status()
     }
 
-    /// Writes everything to disk and closes the files.
+    /// Runs the statements in `sql` in order, stopping at the first that
+    /// fails.
+    ///
+    /// Everything is written to disk after each statement that leaves the
+    /// session outside a transaction block: one that ran in a transaction of
+    /// its own, COMMIT and ROLLBACK. Statements in a block are not flushed
+    /// until it ends. There is no write-ahead log to recover from.
+    pub fn execute(&self, sql: &str) -> Result<Vec<Output>> {
+        let mut engine = self.engine();
+        let stmts = engine.parse(sql)?;
+        let mut outputs = Vec::with_capacity(stmts.len());
+        for stmt in &stmts {
+            let result = engine.execute(stmt);
+            if engine.status() == TransactionStatus::Idle {
+                self.flush()?;
+            }
+            outputs.push(result?.into());
+        }
+        Ok(outputs)
+    }
+
+    /// Rolls back an open transaction block, writes everything to disk and
+    /// closes the files.
     pub fn close(self) -> Result<()> {
+        let mut engine = self.engine.into_inner().unwrap_or_else(|e| e.into_inner());
+        engine.close()?;
+        // Dropping the engine stops its garbage collector, which writes pages.
+        drop(engine);
         self.bpm.flush_all_pages()?;
         self.disk.shut_down()?;
         Ok(())
     }
 
-    fn run(&self, stmt: &Statement) -> Result<Output> {
-        let catalog = self.ctx.catalog();
-        let bound = Binder::new(catalog).bind(stmt)?;
-        let plan = Planner::new(catalog).plan(&bound)?;
-        let mut executor = create_executor(&self.ctx, &plan)?;
-        executor.init()?;
-        let (mut tuples, mut rids) = (Vec::new(), Vec::new());
-        let mut rows = Vec::new();
-        while executor.next(&mut tuples, &mut rids, BATCH_SIZE)? {
-            for tuple in &tuples {
-                rows.push(tuple.decode(executor.get_output_schema())?);
-            }
-        }
-        let command = match bound {
-            BoundStatement::CreateTable(_) => return Ok(Output::Done("CREATE TABLE")),
-            BoundStatement::CreateIndex(_) => return Ok(Output::Done("CREATE INDEX")),
-            BoundStatement::Select(_) | BoundStatement::Explain(_) => {
-                let columns = executor.get_output_schema().columns().to_vec();
-                return Ok(Output::Rows { columns, rows });
-            }
-            BoundStatement::Insert(_) => "INSERT",
-            BoundStatement::Update(_) => "UPDATE",
-            BoundStatement::Delete(_) => "DELETE",
-        };
-        match rows.as_slice() {
-            [row] => match row.as_slice() {
-                [Value::BigInt(count)] => Ok(Output::Count {
-                    command,
-                    count: *count,
-                }),
-                _ => unreachable!("{command} returns one BIGINT, not {row:?}"),
-            },
-            _ => unreachable!("{command} returns one row, not {}", rows.len()),
-        }
+    fn engine(&self) -> std::sync::MutexGuard<'_, ExecutionEngine> {
+        self.engine.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn flush(&self) -> Result<()> {
@@ -225,7 +219,7 @@ mod tests {
         db.close().unwrap();
 
         let db = Database::open(&path).unwrap();
-        let indexes = db.ctx.catalog().table_indexes("t");
+        let indexes = db.catalog().table_indexes("t");
         let names: Vec<_> = indexes.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["t_pkey", "t_name"]);
         assert!(indexes[0].is_primary_key);
@@ -267,6 +261,81 @@ mod tests {
             rows(&one(&db, "SELECT * FROM t")),
             [vec![Value::Int(2), Value::from("b")]]
         );
+    }
+
+    #[test]
+    fn transaction_blocks_commit_and_roll_back() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path().join("test.db")).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        let outputs = db
+            .execute("BEGIN; INSERT INTO t VALUES (1); ROLLBACK")
+            .unwrap();
+        assert_eq!(outputs[0], Output::Done("BEGIN"));
+        assert_eq!(outputs[2], Output::Done("ROLLBACK"));
+        assert!(rows(&one(&db, "SELECT * FROM t")).is_empty());
+
+        assert_eq!(one(&db, "BEGIN"), Output::Done("BEGIN"));
+        assert_eq!(db.transaction_status(), TransactionStatus::InBlock);
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+        assert_eq!(rows(&one(&db, "SELECT * FROM t")), [vec![Value::Int(2)]]);
+        assert_eq!(one(&db, "COMMIT"), Output::Done("COMMIT"));
+        assert_eq!(db.transaction_status(), TransactionStatus::Idle);
+        assert_eq!(rows(&one(&db, "SELECT * FROM t")), [vec![Value::Int(2)]]);
+    }
+
+    #[test]
+    fn a_failed_block_reports_rollback() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path().join("test.db")).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        db.execute("BEGIN; INSERT INTO t VALUES (1)").unwrap();
+        assert!(db.execute("SELECT 1 / 0").is_err());
+        assert_eq!(db.transaction_status(), TransactionStatus::Failed);
+        let err = db.execute("SELECT * FROM t").unwrap_err();
+        assert!(
+            err.to_string().contains("current transaction is aborted"),
+            "{err}"
+        );
+        assert_eq!(one(&db, "COMMIT"), Output::Done("ROLLBACK"));
+        assert!(rows(&one(&db, "SELECT * FROM t")).is_empty());
+    }
+
+    #[test]
+    fn closing_rolls_back_an_open_block() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        db.execute("BEGIN; INSERT INTO t VALUES (2)").unwrap();
+        db.close().unwrap();
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(rows(&one(&db, "SELECT * FROM t")), [vec![Value::Int(1)]]);
+    }
+
+    /// Committed rows carry their transaction's id, so a reopened database
+    /// must hand out ids above them to see them.
+    #[test]
+    fn transaction_ids_continue_after_reopening() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        for id in 1..=5 {
+            db.execute(&format!("INSERT INTO t VALUES ({id})")).unwrap();
+        }
+        let next_tid = db.engine().transaction_manager().next_tid();
+        assert!(next_tid > 5);
+        db.close().unwrap();
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.engine().transaction_manager().next_tid(), next_tid);
+        assert_eq!(rows(&one(&db, "SELECT * FROM t")).len(), 5);
+        db.execute("UPDATE t SET id = id * 10 WHERE id = 5")
+            .unwrap();
+        assert_eq!(rows(&one(&db, "SELECT * FROM t WHERE id = 50")).len(), 1);
     }
 
     /// Each statement is flushed as it runs, so a session that ends without

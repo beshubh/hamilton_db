@@ -25,9 +25,9 @@
 //! a tuple marks an uncommitted version by storing its writer's Tid with
 //! that bit set.
 //!
-//! The counter is not persisted yet. Once real timestamps reach disk, a
-//! restarted counter must not start below any committed `ts` there;
-//! [`Watermark::new`] takes the first Tid so recovery can supply it.
+//! A restarted counter must not start below any committed `ts` on disk, or
+//! the new transactions would not see those versions. The catalog header
+//! keeps the next Tid for that, and [`Watermark::new`] takes it.
 
 use std::collections::BTreeSet;
 
@@ -83,6 +83,11 @@ impl Watermark {
     pub fn end(&self, tid: TxnId) {
         let removed = self.inner.lock().active.remove(&tid);
         assert!(removed, "transaction {tid} is not active");
+    }
+
+    /// The Tid the next transaction will get.
+    pub fn next(&self) -> TxnId {
+        self.inner.lock().next
     }
 
     /// The smallest active Tid, or the next Tid to hand out if none is active.

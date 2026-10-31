@@ -1,14 +1,14 @@
 //! SQL statements taken through the parser, binder and planner, and run by
 //! the executors.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use catalog::Catalog;
 use common::{Tuple, Value};
 use execution::ExecutionError;
-use execution::execution_context::ExecutionContext;
-use execution::executors::{Executor, create_executor};
-use planner::{Binder, Planner, PlannerError};
+use execution::execution_context::{self, ExecutionSettings};
+use planner::{Binder, EngineError, ExecutionEngine, Output, PlannerError};
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::disk::disk_manager::DiskManager;
 use storage::index::IndexTrait;
@@ -16,33 +16,41 @@ use tempfile::TempDir;
 
 struct Db {
     _dir: TempDir,
-    ctx: Arc<ExecutionContext>,
+    engine: RefCell<ExecutionEngine>,
 }
 
 impl Db {
     fn new() -> Self {
-        Self::with_ctx(|ctx| ctx)
+        Self::with_settings(ExecutionSettings::default())
     }
 
     /// A database whose joins get `frames` buffers.
     fn with_join_frames(frames: usize) -> Self {
-        Self::with_ctx(|ctx| ctx.with_join_frames(frames))
+        Self::with_settings(ExecutionSettings::default().with_join_frames(frames))
     }
 
     /// A database whose aggregations get `frames` buffers.
     fn with_aggregation_frames(frames: usize) -> Self {
-        Self::with_ctx(|ctx| ctx.with_aggregation_frames(frames))
+        Self::with_settings(ExecutionSettings::default().with_aggregation_frames(frames))
     }
 
-    fn with_ctx(configure: impl FnOnce(ExecutionContext) -> ExecutionContext) -> Self {
+    fn with_settings(settings: ExecutionSettings) -> Self {
         let dir = TempDir::new().unwrap();
         let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
         let bpm = Arc::new(BufferPoolManager::new(8, dm));
         let catalog = Arc::new(Catalog::open(bpm).unwrap());
+        let engine = ExecutionEngine::new(catalog)
+            .unwrap()
+            .with_settings(settings)
+            .with_batch_size(3);
         Self {
             _dir: dir,
-            ctx: Arc::new(configure(ExecutionContext::new(catalog))),
+            engine: RefCell::new(engine),
         }
+    }
+
+    fn catalog(&self) -> Arc<Catalog> {
+        Arc::clone(self.engine.borrow().catalog())
     }
 
     /// Runs one statement, returning its rows.
@@ -51,31 +59,19 @@ impl Db {
     }
 
     /// Runs one statement, which must bind and plan, returning its rows or
-    /// the error that stopped its executors.
+    /// the error that stopped its executors. INSERT, UPDATE and DELETE
+    /// return their count as a row, and other statements no rows.
     fn try_run(&self, sql: &str) -> Result<Vec<Vec<Value>>, ExecutionError> {
-        let mut stmts = parser::parse(sql).unwrap();
+        let mut engine = self.engine.borrow_mut();
+        let mut stmts = engine.parse(sql).unwrap();
         assert_eq!(stmts.len(), 1, "{sql}");
-        let catalog = self.ctx.catalog();
-        let bound = Binder::new(catalog).bind(&stmts.remove(0)).unwrap();
-        let plan = Planner::new(catalog).plan(&bound).unwrap();
-        let mut executor = create_executor(&self.ctx, &plan)?;
-        executor.init()?;
-        let (mut tuples, mut rids) = (Vec::new(), Vec::new());
-        let mut rows = Vec::new();
-        while executor.next(&mut tuples, &mut rids, 3)? {
-            for tuple in &tuples {
-                rows.push(tuple.decode(executor.get_output_schema())?);
-            }
+        match engine.execute(&stmts.remove(0)) {
+            Ok(Output::Rows { rows, .. }) => Ok(rows),
+            Ok(Output::Count { count, .. }) => Ok(vec![vec![Value::BigInt(count)]]),
+            Ok(Output::Done(_)) => Ok(Vec::new()),
+            Err(EngineError::Execution(e)) => Err(e),
+            Err(e) => panic!("{sql}: {e}"),
         }
-        Ok(rows)
-    }
-
-    fn try_plan(&self, sql: &str) -> Result<(), ExecutionError> {
-        let stmts = parser::parse(sql).unwrap();
-        let catalog = self.ctx.catalog();
-        let bound = Binder::new(catalog).bind(&stmts[0]).unwrap();
-        let plan = Planner::new(catalog).plan(&bound).unwrap();
-        create_executor(&self.ctx, &plan).map(drop)
     }
 }
 
@@ -134,7 +130,7 @@ fn create_table_with_primary_key_and_index() {
     db.run("CREATE TABLE users (id INT, name VARCHAR(16), PRIMARY KEY (id))");
     assert!(db.run("CREATE INDEX users_name ON users (name)").is_empty());
 
-    let catalog = db.ctx.catalog();
+    let catalog = db.catalog();
     let table = catalog.get_table("users").unwrap();
     assert!(!table.schema.column(0).unwrap().nullable);
     let indexes = catalog.table_indexes("users");
@@ -326,7 +322,7 @@ fn plans_without_executors_are_rejected() {
     let db = Db::new();
     db.run("CREATE TABLE t (a INT)");
     assert!(matches!(
-        db.try_plan("SELECT a, row_number() OVER () FROM t"),
+        db.try_run("SELECT a, row_number() OVER () FROM t"),
         Err(ExecutionError::NoExecutor("Window"))
     ));
 }
@@ -390,17 +386,18 @@ fn update_keeps_primary_keys_unique() {
         db.run("UPDATE users SET name = 'dee' WHERE id = 2"),
         count(1)
     );
+    // Updated in place, the rows keep their order in storage.
     assert_eq!(
         db.run("SELECT * FROM users"),
         [
+            vec![Value::Int(2), Value::from("dee")],
             vec![Value::Int(3), Value::from("bo")],
             vec![Value::Int(4), Value::from("cy")],
-            vec![Value::Int(2), Value::from("dee")],
         ]
     );
 
-    // Both indexes point at the rows' new versions.
-    let catalog = db.ctx.catalog();
+    // Both indexes find the rows' new versions.
+    let catalog = db.catalog();
     let table = catalog.get_table("users").unwrap();
     let lookup = |index: &str, key: Value| {
         let index = catalog.get_index(index).unwrap();
@@ -410,7 +407,9 @@ fn update_keeps_primary_keys_unique() {
         locators
             .iter()
             .map(|locator| {
-                let rid = db.ctx.locate(&table, locator).unwrap().unwrap();
+                let rid = execution_context::locate(&catalog, &table, locator)
+                    .unwrap()
+                    .unwrap();
                 table
                     .heap
                     .get(rid)
@@ -432,7 +431,7 @@ fn update_keeps_primary_keys_unique() {
 fn binding_sees_tables_created_by_earlier_statements() {
     let db = Db::new();
     let stmts = parser::parse("SELECT a FROM t").unwrap();
-    let err = Binder::new(db.ctx.catalog()).bind(&stmts[0]).unwrap_err();
+    let err = Binder::new(&db.catalog()).bind(&stmts[0]).unwrap_err();
     assert!(matches!(err, PlannerError::TableNotFound(_)), "{err:?}");
     db.run("CREATE TABLE t (a INT)");
     db.run("INSERT INTO t VALUES (7)");

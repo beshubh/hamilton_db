@@ -33,6 +33,17 @@ pub enum BoundStatement {
     Update(BoundUpdate),
     Delete(BoundDelete),
     Explain(Box<BoundStatement>),
+    /// BEGIN, COMMIT or ROLLBACK. These change the session's transaction
+    /// state rather than data, so they are run by the `ExecutionEngine`
+    /// and never planned.
+    Transaction(TransactionCommand),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionCommand {
+    Begin,
+    Commit,
+    Rollback,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
