@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use catalog::{Catalog, IndexInfo, IndexOid, TableInfo, TableOid};
+use common::Rid;
+use storage::index::{IndexTrait, RowLocator};
 
 use crate::error::{ExecutionError, Result};
 
@@ -67,6 +69,29 @@ impl ExecutionContext {
         self.catalog
             .get_index_by_oid(oid)
             .ok_or(ExecutionError::IndexNotFound(oid))
+    }
+
+    /// The rid of the row of `table` that `locator` points to. A primary key
+    /// is looked up in the table's primary key index; `None` if it isn't
+    /// there, meaning the row is gone.
+    ///
+    /// # Panics
+    /// If `locator` is a primary key and `table` has no primary key index.
+    pub fn locate(&self, table: &TableInfo, locator: &RowLocator) -> Result<Option<Rid>> {
+        let pk = match locator {
+            RowLocator::Rid(rid) => return Ok(Some(*rid)),
+            RowLocator::PrimaryKey(pk) => pk,
+        };
+        let index = self
+            .catalog
+            .primary_key_index(table.oid)
+            .unwrap_or_else(|| panic!("table {} has no primary key index", table.name));
+        let mut found = Vec::with_capacity(1);
+        index.index.scan_key(pk, &mut found)?;
+        debug_assert!(found.len() <= 1, "a primary key index is unique");
+        Ok(found
+            .pop()
+            .map(|locator| locator.as_rid().expect("the primary key index stores rids")))
     }
 
     /// The `B` page-sized buffers a join may hold its rows in, on top of the

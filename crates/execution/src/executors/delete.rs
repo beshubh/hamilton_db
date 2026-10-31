@@ -4,7 +4,7 @@ use common::{Rid, Schema, Tuple};
 use storage::index::IndexTrait;
 use storage::table::table_page::INVALID_UNDO_PTR;
 
-use super::{AbstractExecutor, COMMIT_TS, Executor, count_row, index_keys};
+use super::{AbstractExecutor, COMMIT_TS, Executor, count_row, index_keys, locators};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::plans::{DeletePlan, PlanNode};
@@ -71,8 +71,9 @@ impl Executor for DeleteExecutor {
         for (rid, tuple) in &found {
             table.heap.mark_delete(*rid, COMMIT_TS, INVALID_UNDO_PTR)?;
             let keys = index_keys(&table, &indexes, tuple)?;
-            for (index, key) in indexes.iter().zip(&keys) {
-                index.index.delete_entry(key, *rid)?;
+            let locators = locators(&indexes, &keys, *rid);
+            for ((index, key), locator) in indexes.iter().zip(&keys).zip(&locators) {
+                index.index.delete_entry(key, locator)?;
             }
         }
         tuples.push(count_row(self.plan.get_output_schema(), found.len())?);
@@ -90,7 +91,7 @@ mod tests {
 
     use common::{Value, ValueError};
 
-    use super::super::test_util::{Db, column, compare, int, user};
+    use super::super::test_util::{Db, account, account_column, column, compare, int, user};
     use crate::ExecutionError;
     use crate::expressions::{ArithmeticExpr, ArithmeticOp, ComparisonOp};
     use crate::plans::{DeletePlan, FilterPlan};
@@ -128,6 +129,26 @@ mod tests {
         delete(&db, Some(FilterPlan::new(id_above_2, db.scan(None))));
         assert_eq!(db.index_lookup("users_name", &["user 2".into()]).len(), 1);
         assert!(db.index_lookup("users_name", &["user 3".into()]).is_empty());
+    }
+
+    #[test]
+    fn removes_the_rows_from_every_index_of_a_table_with_a_primary_key() {
+        let db = Db::new();
+        let table =
+            db.create_accounts(&[(1, Some("a"), 10), (2, Some("b"), 20), (3, Some("a"), 30)]);
+        let id_1 = compare(ComparisonOp::Eq, account_column(0), int(1));
+        let child = db.scan_accounts(&table, Some(id_1));
+        let rows = db.run(DeletePlan::new(table.oid, &table.name, child).into());
+        assert_eq!(rows.unwrap(), [[Value::BigInt(1)]]);
+        assert!(
+            db.index_lookup("accounts_pkey", &[Value::Int(1)])
+                .is_empty()
+        );
+        assert_eq!(db.index_entries("accounts_name").len(), 2);
+        assert_eq!(
+            db.index_rows("accounts_name", &["a".into()]),
+            [account(3, Some("a"), 30)]
+        );
     }
 
     #[test]

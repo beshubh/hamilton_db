@@ -6,8 +6,9 @@ use catalog::{Catalog, TableInfo};
 use common::{Column, DataType, PageId, Rid, Schema, Tuple, Value};
 use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
+use storage::buffer::traced_buffer_pool_manager::TracedBufferPoolManager;
 use storage::disk::disk_manager::DiskManager;
-use storage::index::IndexTrait;
+use storage::index::{Index, IndexTrait};
 use storage::page::intermediate_result_page::IntermediateResultPage;
 use tempfile::TempDir;
 
@@ -127,13 +128,89 @@ impl Db {
         Arc::new(scan.into())
     }
 
-    /// The record ids index `name` holds for the key made of `values`.
+    /// The rids of the rows index `name` holds for the key `values`.
     pub fn index_lookup(&self, name: &str, values: &[Value]) -> Vec<Rid> {
         let index = self.catalog().get_index(name).unwrap();
+        let table = self.catalog().get_table_by_oid(index.table_oid).unwrap();
         let key = Tuple::encode(&index.key_schema, values).unwrap();
-        let mut rids = Vec::new();
-        index.index.scan_key(&key, &mut rids).unwrap();
-        rids
+        let mut locators = Vec::new();
+        index.index.scan_key(&key, &mut locators).unwrap();
+        locators
+            .iter()
+            .map(|locator| self.ctx.locate(&table, locator).unwrap().unwrap())
+            .collect()
+    }
+
+    /// The rows the index `name` holds for the key made of `values`, in index
+    /// order.
+    pub fn index_rows(&self, name: &str, values: &[Value]) -> Vec<Vec<Value>> {
+        let index = self.catalog().get_index(name).unwrap();
+        let table = self.catalog().get_table_by_oid(index.table_oid).unwrap();
+        self.index_lookup(name, values)
+            .into_iter()
+            .map(|rid| {
+                let (meta, tuple) = table.heap.get(rid).unwrap();
+                assert!(!meta.is_deleted, "index {name} points at a deleted row");
+                tuple.decode(&table.schema).unwrap()
+            })
+            .collect()
+    }
+
+    /// Every entry of the index `name`, in order, as its raw bytes.
+    pub fn index_entries(&self, name: &str) -> Vec<Vec<u8>> {
+        let index = self.catalog().get_index(name).unwrap();
+        let Index::BtreeIndex(btree) = &*index.index;
+        btree
+            .tree()
+            .begin()
+            .unwrap()
+            .map(|entry| entry.unwrap().0)
+            .collect()
+    }
+
+    /// The buffer pool the index `name` goes through, which can record the
+    /// pages a statement reads and writes in the index.
+    pub fn index_pages(&self, name: &str) -> Arc<TracedBufferPoolManager> {
+        let index = self.catalog().get_index(name).unwrap();
+        let Index::BtreeIndex(btree) = &*index.index;
+        Arc::clone(btree.tree().bpm())
+    }
+
+    /// Creates `accounts`, laid out as [`accounts_schema`] with `id` as its
+    /// primary key and an index `accounts_name` on `name`, which stores
+    /// primary keys. Inserts `rows`, as `(id, name, balance)`.
+    pub fn create_accounts(&self, rows: &[(i32, Option<&str>, i32)]) -> Arc<TableInfo> {
+        let table = self
+            .catalog()
+            .create_table("accounts", accounts_schema(), &["id"])
+            .unwrap();
+        self.catalog()
+            .create_index("accounts_name", "accounts", &["name"])
+            .unwrap();
+        let rows = rows
+            .iter()
+            .map(|&(id, name, balance)| {
+                account(id, name, balance)
+                    .into_iter()
+                    .zip(accounts_schema().columns())
+                    .map(|(value, column)| constant(value, column.data_type))
+                    .collect()
+            })
+            .collect();
+        let values = ValuesPlan::new(accounts_schema(), rows);
+        let insert = InsertPlan::new(table.oid, &table.name, Arc::new(values.into()));
+        self.run(insert.into()).unwrap();
+        table
+    }
+
+    /// A scan of `accounts`, keeping the rows that pass `filter`.
+    pub fn scan_accounts(
+        &self,
+        table: &TableInfo,
+        filter: Option<AbstractExpr>,
+    ) -> Arc<AbstractPlanNode> {
+        let scan = SeqScanPlan::new(table.oid, &table.name, accounts_schema(), filter);
+        Arc::new(scan.into())
     }
 
     /// The users table's rows, in storage order.
@@ -153,6 +230,31 @@ pub fn users_schema() -> Schema {
 /// A `users` row.
 pub fn user(id: i32, name: Option<&str>) -> Vec<Value> {
     vec![Value::Int(id), name.map_or(Value::Null, Value::from)]
+}
+
+/// `accounts (id INT NOT NULL, name VARCHAR(32), balance INT NOT NULL)`; see
+/// [`Db::create_accounts`].
+pub fn accounts_schema() -> Schema {
+    Schema::new(vec![
+        Column::new("id", DataType::Int, false),
+        Column::new("name", DataType::Varchar(32), true),
+        Column::new("balance", DataType::Int, false),
+    ])
+}
+
+/// An `accounts` row.
+pub fn account(id: i32, name: Option<&str>, balance: i32) -> Vec<Value> {
+    vec![
+        Value::Int(id),
+        name.map_or(Value::Null, Value::from),
+        Value::Int(balance),
+    ]
+}
+
+/// Column `idx` of `accounts`.
+pub fn account_column(idx: usize) -> AbstractExpr {
+    let schema = accounts_schema();
+    ColumnValueExpr::new(0, idx, schema.column(idx).unwrap().clone()).into()
 }
 
 /// Column `idx` of `users`.

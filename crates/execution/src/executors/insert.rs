@@ -6,7 +6,9 @@ use common::{Rid, Schema, Tuple};
 use storage::index::IndexTrait;
 use storage::table::table_page::TupleMeta;
 
-use super::{AbstractExecutor, COMMIT_TS, Executor, count_row, duplicate_key, index_keys};
+use super::{
+    AbstractExecutor, COMMIT_TS, Executor, count_row, duplicate_key, index_keys, locators,
+};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::plans::{InsertPlan, PlanNode};
@@ -77,8 +79,9 @@ impl Executor for InsertExecutor {
         check_primary_keys(&indexes, &keys)?;
         for (tuple, keys) in rows.iter().zip(&keys) {
             let rid = table.heap.insert(&TupleMeta::new(COMMIT_TS), tuple)?;
-            for (index, key) in indexes.iter().zip(keys) {
-                if !index.index.insert_entry(key, rid)? {
+            let locators = locators(&indexes, keys, rid);
+            for ((index, key), locator) in indexes.iter().zip(keys).zip(&locators) {
+                if !index.index.insert_entry(key, locator)? {
                     return Err(duplicate_key(index, key));
                 }
             }
@@ -96,7 +99,7 @@ impl Executor for InsertExecutor {
 /// is also an earlier row's. `keys` holds each row's key in each of
 /// `indexes`.
 fn check_primary_keys(indexes: &[Arc<IndexInfo>], keys: &[Vec<Tuple>]) -> Result<()> {
-    let mut rids = Vec::new();
+    let mut found = Vec::new();
     for (i, index) in indexes.iter().enumerate() {
         if !index.is_primary_key {
             continue;
@@ -104,8 +107,8 @@ fn check_primary_keys(indexes: &[Arc<IndexInfo>], keys: &[Vec<Tuple>]) -> Result
         let mut seen = HashSet::new();
         for row_keys in keys {
             let key = &row_keys[i];
-            index.index.scan_key(key, &mut rids)?;
-            if !rids.is_empty() || !seen.insert(key.data()) {
+            index.index.scan_key(key, &mut found)?;
+            if !found.is_empty() || !seen.insert(key.data()) {
                 return Err(duplicate_key(index, key));
             }
         }

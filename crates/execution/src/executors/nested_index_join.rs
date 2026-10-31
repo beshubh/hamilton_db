@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use common::{Rid, Schema, Tuple, Value};
-use storage::index::IndexTrait;
+use storage::index::{IndexTrait, RowLocator};
 
 use super::{AbstractExecutor, Executor};
 use crate::Result;
@@ -20,6 +20,9 @@ use crate::plans::{JoinType, NestedIndexJoinPlan, PlanNode};
 ///             if the pair passes the predicate, output it
 ///         LEFT join: if nothing was output, output the row padded with NULLs
 /// ```
+///
+/// If the index stores primary keys, each match costs a second lookup, in
+/// the primary key index, to find the inner row.
 ///
 /// The inner table is never scanned, so the size of an outer block doesn't
 /// change how much of it is read: the outer rows are taken in the batches
@@ -81,7 +84,10 @@ impl NestedIndexJoinExecutor {
         let inner_schema = self.plan.inner_schema();
         let table = self.ctx.table(self.plan.inner_table_oid())?;
         let mut matched = false;
-        for rid in self.index_lookup(outer)? {
+        for locator in self.index_lookup(outer)? {
+            let Some(rid) = self.ctx.locate(&table, &locator)? else {
+                continue;
+            };
             let (meta, inner) = table.heap.get(rid)?;
             if meta.is_deleted {
                 continue;
@@ -105,10 +111,10 @@ impl NestedIndexJoinExecutor {
         Ok(())
     }
 
-    /// The record ids of the inner rows whose key is the plan's key for
+    /// The locators of the inner rows whose key is the plan's key for
     /// `outer`. None if the key has a NULL: NULL = NULL is not TRUE, though
     /// the index holds NULL keys.
-    fn index_lookup(&self, outer: &Tuple) -> Result<Vec<Rid>> {
+    fn index_lookup(&self, outer: &Tuple) -> Result<Vec<RowLocator>> {
         let values = self
             .plan
             .key_exprs()
@@ -116,12 +122,12 @@ impl NestedIndexJoinExecutor {
             .map(|expr| expr.evaluate(outer, self.outer.get_output_schema()))
             .collect::<Result<Vec<_>>>()?;
         let index = self.ctx.index(self.plan.index_oid())?;
-        let mut rids = Vec::new();
+        let mut locators = Vec::new();
         if !values.iter().any(Value::is_null) {
             let key = Tuple::encode(&index.key_schema, &values)?;
-            index.index.scan_key(&key, &mut rids)?;
+            index.index.scan_key(&key, &mut locators)?;
         }
-        Ok(rids)
+        Ok(locators)
     }
 }
 
@@ -166,11 +172,14 @@ mod tests {
     use catalog::{IndexInfo, TableInfo};
     use common::{Column, DataType, Schema, Value};
 
-    use super::super::test_util::{Db, column, compare, constant, int};
+    use super::super::test_util::{Db, account, account_column, column, compare, constant, int};
     use super::super::{Executor, create_executor};
     use crate::ExecutionError;
     use crate::expressions::{AbstractExpr, ColumnValueExpr, ComparisonOp};
-    use crate::plans::{AbstractPlanNode, InsertPlan, JoinType, NestedIndexJoinPlan, ValuesPlan};
+    use crate::expressions::{ArithmeticExpr, ArithmeticOp};
+    use crate::plans::{
+        AbstractPlanNode, InsertPlan, JoinType, NestedIndexJoinPlan, UpdatePlan, ValuesPlan,
+    };
 
     fn orders_schema() -> Schema {
         Schema::new(vec![
@@ -292,6 +301,55 @@ mod tests {
                 row(2, None, None),
                 row(3, Some(3), Some("ink")),
                 row(4, None, None),
+            ]
+        );
+    }
+
+    /// `accounts_name` stores primary keys, so matches are found through the
+    /// primary key index, even after the rows move.
+    #[test]
+    fn joins_through_an_index_that_points_by_primary_key() {
+        let db = Db::new();
+        db.insert_numbered(3);
+        let accounts = db.create_accounts(&[
+            (10, Some("user 1"), 100),
+            (11, Some("user 3"), 300),
+            (12, Some("user 1"), 120),
+            (13, None, 0),
+        ]);
+        let inner = Inner {
+            table: Arc::clone(&accounts),
+            index: db.catalog().get_index("accounts_name").unwrap(),
+        };
+        let joined = |id: i32, account: Option<Vec<Value>>| {
+            let mut row = vec![Value::Int(id), Value::from(format!("user {id}").as_str())];
+            row.extend(account.unwrap_or_else(|| vec![Value::Null; 3]));
+            row
+        };
+        let join = inner.join(JoinType::Left, db.scan(None), vec![column(1)], None);
+        assert_eq!(
+            db.run(join.clone()).unwrap(),
+            [
+                joined(1, Some(account(10, Some("user 1"), 100))),
+                joined(1, Some(account(12, Some("user 1"), 120))),
+                joined(2, None),
+                joined(3, Some(account(11, Some("user 3"), 300))),
+            ]
+        );
+
+        // Every account moves, leaving `accounts_name` alone.
+        let plus_1 = ArithmeticExpr::new(ArithmeticOp::Add, account_column(2), int(1)).unwrap();
+        let targets = vec![account_column(0), account_column(1), plus_1.into()];
+        let child = db.scan_accounts(&accounts, None);
+        db.run(UpdatePlan::new(accounts.oid, &accounts.name, targets, child).into())
+            .unwrap();
+        assert_eq!(
+            db.run(join).unwrap(),
+            [
+                joined(1, Some(account(10, Some("user 1"), 101))),
+                joined(1, Some(account(12, Some("user 1"), 121))),
+                joined(2, None),
+                joined(3, Some(account(11, Some("user 3"), 301))),
             ]
         );
     }

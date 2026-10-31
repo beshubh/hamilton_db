@@ -3,10 +3,12 @@ use std::sync::Arc;
 
 use catalog::IndexInfo;
 use common::{Rid, Schema, Tuple};
-use storage::index::IndexTrait;
+use storage::index::{IndexTrait, LocatorKind};
 use storage::table::table_page::{INVALID_UNDO_PTR, TupleMeta};
 
-use super::{AbstractExecutor, COMMIT_TS, Executor, count_row, duplicate_key, index_keys};
+use super::{
+    AbstractExecutor, COMMIT_TS, Executor, count_row, duplicate_key, index_keys, locators,
+};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::expressions::Expr;
@@ -24,10 +26,12 @@ use crate::plans::{PlanNode, UpdatePlan};
 /// before it updated.
 ///
 /// An update deletes the old tuple and inserts the new one, so the row gets a
-/// new rid and each of its index entries is replaced. Every old entry is
-/// removed before any new one is added, so rows may swap or shift keys, as in
-/// `SET id = id + 1`, without colliding in a primary key index part way. There
-/// is no undo log yet, so the old tuple gets no undo entry.
+/// new rid. Index entries that store the rid are always rewritten. Entries
+/// that store the primary key are rewritten only if the index key or the
+/// primary key changed.
+///
+/// All old entries are removed before new ones are added, so
+/// `SET id = id + 1` doesn't collide with itself.
 // TODO: update in place, keeping the rid, once there is an undo log.
 pub struct UpdateExecutor {
     ctx: Arc<ExecutionContext>,
@@ -102,17 +106,25 @@ impl Executor for UpdateExecutor {
             .collect::<Result<Vec<_>>>()?;
         check_primary_keys(&indexes, &found, &new_keys)?;
 
-        for ((rid, _), keys) in found.iter().zip(&old_keys) {
-            for (index, key) in indexes.iter().zip(keys) {
-                index.index.delete_entry(key, *rid)?;
+        for (((rid, _), old), new) in found.iter().zip(&old_keys).zip(&new_keys) {
+            let old_locators = locators(&indexes, old, *rid);
+            for (i, index) in indexes.iter().enumerate() {
+                if entry_moves(&indexes, i, old, new) {
+                    index.index.delete_entry(&old[i], &old_locators[i])?;
+                }
             }
         }
-        for (((rid, _), new), keys) in found.iter().zip(&new_rows).zip(&new_keys) {
+        for ((((rid, _), new_row), old), new) in
+            found.iter().zip(&new_rows).zip(&old_keys).zip(&new_keys)
+        {
             table.heap.mark_delete(*rid, COMMIT_TS, INVALID_UNDO_PTR)?;
-            let new_rid = table.heap.insert(&TupleMeta::new(COMMIT_TS), new)?;
-            for (index, key) in indexes.iter().zip(keys) {
-                if !index.index.insert_entry(key, new_rid)? {
-                    return Err(duplicate_key(index, key));
+            let new_rid = table.heap.insert(&TupleMeta::new(COMMIT_TS), new_row)?;
+            let new_locators = locators(&indexes, new, new_rid);
+            for (i, index) in indexes.iter().enumerate() {
+                if entry_moves(&indexes, i, old, new)
+                    && !index.index.insert_entry(&new[i], &new_locators[i])?
+                {
+                    return Err(duplicate_key(index, &new[i]));
                 }
             }
         }
@@ -122,6 +134,26 @@ impl Executor for UpdateExecutor {
 
     fn get_output_schema(&self) -> &Schema {
         self.plan.get_output_schema()
+    }
+}
+
+/// Whether the row's entry in `indexes[i]` must be rewritten. `old_keys` and
+/// `new_keys` hold the row's key in each index before and after the update.
+fn entry_moves(
+    indexes: &[Arc<IndexInfo>],
+    i: usize,
+    old_keys: &[Tuple],
+    new_keys: &[Tuple],
+) -> bool {
+    match indexes[i].locator {
+        LocatorKind::Rid => true,
+        LocatorKind::PrimaryKey => {
+            let pk = indexes
+                .iter()
+                .position(|index| index.is_primary_key)
+                .expect("only a table with a primary key has indexes that store it");
+            old_keys[i] != new_keys[i] || old_keys[pk] != new_keys[pk]
+        }
     }
 }
 
@@ -135,7 +167,7 @@ fn check_primary_keys(
     new_keys: &[Vec<Tuple>],
 ) -> Result<()> {
     let updated: HashSet<Rid> = found.iter().map(|(rid, _)| *rid).collect();
-    let mut rids = Vec::new();
+    let mut holders = Vec::new();
     for (i, index) in indexes.iter().enumerate() {
         if !index.is_primary_key {
             continue;
@@ -146,10 +178,13 @@ fn check_primary_keys(
             if !seen.insert(key.data()) {
                 return Err(duplicate_key(index, key));
             }
-            rids.clear();
-            index.index.scan_key(key, &mut rids)?;
+            holders.clear();
+            index.index.scan_key(key, &mut holders)?;
             // The rows being updated give up their old keys.
-            if rids.iter().any(|rid| !updated.contains(rid)) {
+            if holders.iter().any(|holder| {
+                let rid = holder.as_rid().expect("the primary key index stores rids");
+                !updated.contains(&rid)
+            }) {
                 return Err(duplicate_key(index, key));
             }
         }
@@ -162,9 +197,12 @@ mod tests {
     use std::sync::Arc;
 
     use catalog::TableInfo;
-    use common::{DataType, Value, ValueError};
+    use common::{DataType, Rid, Value, ValueError};
+    use storage::buffer::traced_buffer_pool_manager::{PageAccess, TracedBufferPoolManager};
 
-    use super::super::test_util::{Db, column, compare, constant, int, user, users_schema};
+    use super::super::test_util::{
+        Db, account, account_column, column, compare, constant, int, user, users_schema,
+    };
     use crate::expressions::{AbstractExpr, ArithmeticExpr, ArithmeticOp, ComparisonOp};
     use crate::plans::{
         AbstractPlanNode, FilterPlan, IndexScanPlan, IndexScanRange, InsertPlan, KeyBound,
@@ -379,6 +417,149 @@ mod tests {
         assert!(matches!(err, ExecutionError::DuplicateKey { .. }));
         assert_eq!(rows(&db, &table), [user(1, None), user(2, None)]);
         assert_eq!(db.index_lookup("accounts_pkey", &[Value::Int(1)]).len(), 1);
+    }
+
+    /// `accounts` holding two accounts named `a` and one named `b`.
+    fn three_accounts(db: &Db) -> Arc<TableInfo> {
+        db.create_accounts(&[(1, Some("a"), 10), (2, Some("b"), 20), (3, Some("a"), 30)])
+    }
+
+    /// The accounts with `id`.
+    fn account_with_id(db: &Db, table: &TableInfo, id: i32) -> Arc<AbstractPlanNode> {
+        let predicate = compare(ComparisonOp::Eq, account_column(0), int(id));
+        db.scan_accounts(table, Some(predicate))
+    }
+
+    /// The record id the primary key index holds for each of `ids`.
+    fn pkey_rids(db: &Db, ids: &[i32]) -> Vec<Rid> {
+        ids.iter()
+            .map(|&id| {
+                let [rid] = db
+                    .index_lookup("accounts_pkey", &[Value::Int(id)])
+                    .try_into()
+                    .unwrap();
+                rid
+            })
+            .collect()
+    }
+
+    /// Whether `pages` recorded a write.
+    fn wrote(pages: &TracedBufferPoolManager) -> bool {
+        pages
+            .take_trace()
+            .iter()
+            .any(|access| matches!(access, PageAccess::Write(_)))
+    }
+
+    /// The rows move, but `accounts_name`, which stores primary keys, isn't
+    /// written at all.
+    #[test]
+    fn an_update_of_other_columns_leaves_secondary_entries_alone() {
+        let db = Db::new();
+        let table = three_accounts(&db);
+        let entries = db.index_entries("accounts_name");
+        let rids = pkey_rids(&db, &[1, 2, 3]);
+        let (name_pages, pkey_pages) = (
+            db.index_pages("accounts_name"),
+            db.index_pages("accounts_pkey"),
+        );
+        name_pages.start_tracing();
+        pkey_pages.start_tracing();
+
+        let targets = vec![
+            account_column(0),
+            account_column(1),
+            plus(account_column(2), 1),
+        ];
+        let child = db.scan_accounts(&table, None);
+        assert_eq!(update(&db, &table, targets, child).unwrap(), 3);
+
+        name_pages.stop_tracing();
+        pkey_pages.stop_tracing();
+        assert!(!wrote(&name_pages));
+        assert!(wrote(&pkey_pages));
+        assert_eq!(db.index_entries("accounts_name"), entries);
+        // The primary key index points at the rows' new versions.
+        let new_rids = pkey_rids(&db, &[1, 2, 3]);
+        for (old, new) in rids.iter().zip(&new_rids) {
+            assert_ne!(old, new);
+            assert!(table.heap.get(*old).unwrap().0.is_deleted);
+        }
+        assert_eq!(
+            db.index_rows("accounts_name", &["a".into()]),
+            [account(1, Some("a"), 11), account(3, Some("a"), 31)]
+        );
+        assert_eq!(
+            db.index_rows("accounts_name", &["b".into()]),
+            [account(2, Some("b"), 21)]
+        );
+    }
+
+    #[test]
+    fn an_update_of_the_secondary_key_moves_only_that_rows_entry() {
+        let db = Db::new();
+        let table = three_accounts(&db);
+        let entries = db.index_entries("accounts_name");
+
+        let targets = vec![account_column(0), text("c"), account_column(2)];
+        update(&db, &table, targets, account_with_id(&db, &table, 2)).unwrap();
+
+        let after = db.index_entries("accounts_name");
+        assert_eq!(after.len(), 3);
+        let kept: Vec<_> = entries.iter().filter(|e| after.contains(e)).collect();
+        // The entries of both `a` accounts, untouched.
+        assert_eq!(kept, [&entries[0], &entries[1]]);
+        assert!(db.index_rows("accounts_name", &["b".into()]).is_empty());
+        assert_eq!(
+            db.index_rows("accounts_name", &["c".into()]),
+            [account(2, Some("c"), 20)]
+        );
+    }
+
+    #[test]
+    fn an_update_of_the_primary_key_rewrites_that_rows_secondary_entries() {
+        let db = Db::new();
+        let table = three_accounts(&db);
+        let entries = db.index_entries("accounts_name");
+
+        let targets = vec![
+            plus(account_column(0), 10),
+            account_column(1),
+            account_column(2),
+        ];
+        update(&db, &table, targets, account_with_id(&db, &table, 1)).unwrap();
+
+        let after = db.index_entries("accounts_name");
+        assert_eq!(after.len(), 3);
+        // Account 1's entry is replaced; those of accounts 2 and 3 are not.
+        assert!(!after.contains(&entries[0]));
+        assert!(after.contains(&entries[1]) && after.contains(&entries[2]));
+        assert_eq!(
+            db.index_rows("accounts_name", &["a".into()]),
+            [account(3, Some("a"), 30), account(11, Some("a"), 10)]
+        );
+        assert!(
+            db.index_lookup("accounts_pkey", &[Value::Int(1)])
+                .is_empty()
+        );
+
+        // Shift every primary key up by one: every secondary entry is
+        // rewritten, without collisions.
+        let targets = vec![
+            plus(account_column(0), 1),
+            account_column(1),
+            account_column(2),
+        ];
+        let child = db.scan_accounts(&table, None);
+        assert_eq!(update(&db, &table, targets, child).unwrap(), 3);
+        assert_eq!(
+            db.index_rows("accounts_name", &["a".into()]),
+            [account(4, Some("a"), 30), account(12, Some("a"), 10)]
+        );
+        assert_eq!(
+            db.index_rows("accounts_name", &["b".into()]),
+            [account(3, Some("b"), 20)]
+        );
     }
 
     /// An index scan on the key being raised meets each row once.

@@ -405,10 +405,12 @@ fn update_keeps_primary_keys_unique() {
     let lookup = |index: &str, key: Value| {
         let index = catalog.get_index(index).unwrap();
         let key = Tuple::encode(&index.key_schema, &[key]).unwrap();
-        let mut rids = Vec::new();
-        index.index.scan_key(&key, &mut rids).unwrap();
-        rids.into_iter()
-            .map(|rid| {
+        let mut locators = Vec::new();
+        index.index.scan_key(&key, &mut locators).unwrap();
+        locators
+            .iter()
+            .map(|locator| {
+                let rid = db.ctx.locate(&table, locator).unwrap().unwrap();
                 table
                     .heap
                     .get(rid)

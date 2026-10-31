@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use common::{Rid, Schema, Tuple, Value};
 use storage::index::btree_index::KeySchemaComparator;
-use storage::index::{Index, IndexTrait};
+use storage::index::{Index, IndexTrait, RowLocator};
 use storage::page::btree_page::KeyComparator;
 
 use super::{Executor, passes};
@@ -16,16 +16,19 @@ use crate::plans::{IndexScanPlan, IndexScanRange, KeyBound, PlanNode};
 /// Reads the table rows that the plan's index entries point to, in key
 /// order, keeping those that pass the plan's filter.
 ///
-/// `init` reads the record ids of every entry in the plan's range up front,
+/// `init` reads the locators of every entry in the plan's range up front,
 /// and `next` fetches their rows a batch at a time. Reading the index as the
 /// rows are produced would keep a leaf latched between calls to `next`,
 /// blocking any writer to the index above it, and would let an UPDATE above
 /// it see a row again after moving it further along the index.
+///
+/// If the index stores primary keys, `next` looks each one up in the primary
+/// key index to find the rid, skipping rows that are gone.
 pub struct IndexScanExecutor {
     ctx: Arc<ExecutionContext>,
     plan: IndexScanPlan,
-    /// Record ids of the rows not produced yet, in key order. Set by `init`.
-    rids: VecDeque<Rid>,
+    /// Locators of the rows not produced yet, in key order. Set by `init`.
+    locators: VecDeque<RowLocator>,
 }
 
 impl IndexScanExecutor {
@@ -33,19 +36,19 @@ impl IndexScanExecutor {
         Self {
             ctx,
             plan,
-            rids: VecDeque::new(),
+            locators: VecDeque::new(),
         }
     }
 
-    /// The record ids of the entries in the plan's range, in key order.
-    fn scan_index(&self) -> Result<Vec<Rid>> {
+    /// The locators of the entries in the plan's range, in key order.
+    fn scan_index(&self) -> Result<Vec<RowLocator>> {
         let index = self.ctx.index(self.plan.index_oid())?;
         let Index::BtreeIndex(btree) = &*index.index;
-        let mut rids = Vec::new();
+        let mut locators = Vec::new();
         match self.plan.range() {
             IndexScanRange::Full => {
-                for rid in btree.scan_range(Bound::Unbounded, Bound::Unbounded)? {
-                    rids.push(rid?);
+                for locator in btree.scan_range(Bound::Unbounded, Bound::Unbounded)? {
+                    locators.push(locator?);
                 }
             }
             IndexScanRange::Points(points) => {
@@ -58,23 +61,23 @@ impl IndexScanExecutor {
                 keys.sort_by(|a, b| cmp.compare(a.data(), b.data()));
                 keys.dedup_by(|a, b| cmp.compare(a.data(), b.data()).is_eq());
                 for key in &keys {
-                    btree.scan_key(key, &mut rids)?;
+                    btree.scan_key(key, &mut locators)?;
                 }
             }
             IndexScanRange::Range { lower, upper } => {
                 let (lower, upper) = (bound_values(lower)?, bound_values(upper)?);
-                for rid in btree.scan_range(as_bound(&lower), as_bound(&upper))? {
-                    rids.push(rid?);
+                for locator in btree.scan_range(as_bound(&lower), as_bound(&upper))? {
+                    locators.push(locator?);
                 }
             }
         }
-        Ok(rids)
+        Ok(locators)
     }
 }
 
 impl Executor for IndexScanExecutor {
     fn init(&mut self) -> Result<()> {
-        self.rids = self.scan_index()?.into();
+        self.locators = self.scan_index()?.into();
         Ok(())
     }
 
@@ -88,8 +91,11 @@ impl Executor for IndexScanExecutor {
         rids.clear();
         let table = self.ctx.table(self.plan.table_oid())?;
         while tuples.len() < batch_size {
-            let Some(rid) = self.rids.pop_front() else {
+            let Some(locator) = self.locators.pop_front() else {
                 break;
+            };
+            let Some(rid) = self.ctx.locate(&table, &locator)? else {
+                continue;
             };
             let (meta, tuple) = table.heap.get(rid)?;
             if meta.is_deleted {
@@ -141,15 +147,18 @@ fn as_bound(bound: &Bound<Vec<Value>>) -> Bound<&[Value]> {
 
 #[cfg(test)]
 mod tests {
-    use common::{DataType, Value};
+    use common::{DataType, Tuple, Value};
 
     use super::super::test_util::{
-        BATCH_SIZE, Db, column, compare, constant, int, user, users_schema,
+        BATCH_SIZE, Db, account, account_column, accounts_schema, column, compare, constant, int,
+        user, users_schema,
     };
     use super::super::{Executor, create_executor};
     use crate::ExecutionError;
     use crate::expressions::{AbstractExpr, ComparisonOp};
-    use crate::plans::{AbstractPlanNode, IndexScanPlan, IndexScanRange, KeyBound};
+    use crate::expressions::{ArithmeticExpr, ArithmeticOp};
+    use crate::plans::{AbstractPlanNode, IndexScanPlan, IndexScanRange, KeyBound, UpdatePlan};
+    use storage::index::{IndexTrait, RowLocator};
 
     /// A scan of the users table through index `name`, which must exist.
     fn scan(
@@ -235,6 +244,90 @@ mod tests {
         let points = IndexScanRange::Points(vec![vec![text("a")]]);
         let rows = db.run(scan(&db, "users_name", points, None)).unwrap();
         assert_eq!(rows, [user(1, Some("a")), user(3, Some("a"))]);
+    }
+
+    /// Accounts 1 to 4, and a function that scans them through
+    /// `accounts_name`, which stores primary keys.
+    fn accounts_by_name() -> (Db, impl Fn(&Db, IndexScanRange) -> AbstractPlanNode) {
+        let db = Db::new();
+        db.create_accounts(&[
+            (3, Some("b"), 30),
+            (1, Some("a"), 10),
+            (4, None, 40),
+            (2, Some("a"), 20),
+        ]);
+        let scan = |db: &Db, range| {
+            let table = db.catalog().get_table("accounts").unwrap();
+            let index = db.catalog().get_index("accounts_name").unwrap();
+            let schema = accounts_schema();
+            IndexScanPlan::new(table.oid, index.oid, &index.name, schema, range, None).into()
+        };
+        (db, scan)
+    }
+
+    #[test]
+    fn reads_through_an_index_that_points_by_primary_key() {
+        let (db, scan) = accounts_by_name();
+        assert_eq!(
+            db.run(scan(&db, IndexScanRange::Full)).unwrap(),
+            [
+                account(4, None, 40),
+                account(1, Some("a"), 10),
+                account(2, Some("a"), 20),
+                account(3, Some("b"), 30),
+            ]
+        );
+        let points = IndexScanRange::Points(vec![vec![text("a")], vec![text("z")]]);
+        assert_eq!(
+            db.run(scan(&db, points)).unwrap(),
+            [account(1, Some("a"), 10), account(2, Some("a"), 20)]
+        );
+        let range = IndexScanRange::Range {
+            lower: bound(vec![text("a")], false),
+            upper: None,
+        };
+        assert_eq!(
+            db.run(scan(&db, range)).unwrap(),
+            [account(3, Some("b"), 30)]
+        );
+
+        // Every row moves, leaving the index alone; it still finds them.
+        let table = db.catalog().get_table("accounts").unwrap();
+        let plus_1 = ArithmeticExpr::new(ArithmeticOp::Add, account_column(2), int(1)).unwrap();
+        let targets = vec![account_column(0), account_column(1), plus_1.into()];
+        let update = UpdatePlan::new(
+            table.oid,
+            &table.name,
+            targets,
+            db.scan_accounts(&table, None),
+        );
+        db.run(update.into()).unwrap();
+        let points = IndexScanRange::Points(vec![vec![text("a")]]);
+        assert_eq!(
+            db.run(scan(&db, points)).unwrap(),
+            [account(1, Some("a"), 11), account(2, Some("a"), 21)]
+        );
+    }
+
+    /// A row whose primary key is missing from the primary key index is
+    /// skipped.
+    #[test]
+    fn primary_keys_not_in_the_primary_key_index_are_skipped() {
+        let (db, scan) = accounts_by_name();
+        let pkey = db.catalog().get_index("accounts_pkey").unwrap();
+        let [rid] = db
+            .index_lookup("accounts_pkey", &[Value::Int(1)])
+            .try_into()
+            .unwrap();
+        let key = Tuple::encode(&pkey.key_schema, &[Value::Int(1)]).unwrap();
+        pkey.index
+            .delete_entry(&key, &RowLocator::Rid(rid))
+            .unwrap();
+        let points = IndexScanRange::Points(vec![vec![text("a")]]);
+        assert_eq!(
+            db.run(scan(&db, points)).unwrap(),
+            [account(2, Some("a"), 20)]
+        );
     }
 
     #[test]
