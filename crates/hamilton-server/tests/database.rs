@@ -178,26 +178,6 @@ fn data_and_indexes_survive_reopening() {
     );
 }
 
-/// Each statement is flushed as it runs, so a server killed without
-/// closing loses nothing it committed.
-#[test]
-fn data_survives_without_close() {
-    let dir = TempDir::new().unwrap();
-    let db = open(&dir);
-    run(
-        &mut db.session(),
-        "CREATE TABLE t (id INT NOT NULL); INSERT INTO t VALUES (7)",
-    )
-    .unwrap();
-    drop(db);
-
-    let db = open(&dir);
-    assert_eq!(
-        rows(&mut db.session(), "SELECT * FROM t"),
-        [vec![Value::Int(7)]]
-    );
-}
-
 /// Committed rows carry their transaction's id, so a reopened database
 /// must hand out ids above them to see them.
 #[test]

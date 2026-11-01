@@ -2,17 +2,23 @@
 //! the sessions that run statements on them, one per connection.
 
 use std::fmt;
+use std::marker::PhantomData;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::Result;
 use catalog::Catalog;
 use planner::{EngineError, ExecutionEngine, Output, TransactionStatus};
-use storage::StorageError;
 use storage::buffer::buffer_pool_manager::{BufferPoolManager, DEFAULT_POOL_SIZE};
 use storage::disk::disk_manager::DiskManager;
 
+/// How often dirty pages are written out while the server runs.
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+
 pub struct Database {
+    checkpointer: Checkpointer,
     disk: Arc<DiskManager>,
     bpm: Arc<BufferPoolManager>,
     catalog: Arc<Catalog>,
@@ -31,11 +37,21 @@ impl Database {
         let catalog = Arc::new(Catalog::open(Arc::clone(&bpm))?);
         let root = ExecutionEngine::new(Arc::clone(&catalog))?;
         Ok(Self {
+            checkpointer: Checkpointer::start(Arc::clone(&bpm), Arc::clone(&disk)),
             disk,
             bpm,
             catalog,
             root,
         })
+    }
+
+    /// See [`ExecutionEngine::with_conflict_timeout`]. Zero turns retrying
+    /// off.
+    pub fn with_conflict_timeout(self, timeout: Duration) -> Self {
+        Self {
+            root: self.root.with_conflict_timeout(timeout),
+            ..self
+        }
     }
 
     pub fn catalog(&self) -> &Arc<Catalog> {
@@ -45,7 +61,7 @@ impl Database {
     /// A new session, outside a transaction block.
     pub fn session(&self) -> Session<'_> {
         Session {
-            db: self,
+            db: PhantomData,
             engine: self.root.session(),
         }
     }
@@ -53,6 +69,7 @@ impl Database {
     /// Writes everything to disk and closes the files. Every session has
     /// been dropped by now, rolling back the blocks they had open.
     pub fn close(self) -> Result<()> {
+        drop(self.checkpointer);
         // Dropping the last engine stops the garbage collector, which
         // writes pages.
         drop(self.root);
@@ -60,17 +77,63 @@ impl Database {
         self.disk.shut_down()?;
         Ok(())
     }
+}
 
-    fn flush(&self) -> Result<(), StorageError> {
-        self.bpm.flush_all_pages()?;
-        self.disk.checkpoint()
+/// A thread that writes every dirty page to disk each
+/// `CHECKPOINT_INTERVAL`, until dropped.
+struct Checkpointer {
+    shared: Arc<(Mutex<bool>, Condvar)>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Checkpointer {
+    fn start(bpm: Arc<BufferPoolManager>, disk: Arc<DiskManager>) -> Self {
+        let shared = Arc::new((Mutex::new(false), Condvar::new()));
+        let thread = {
+            let shared = Arc::clone(&shared);
+            thread::Builder::new()
+                .name("checkpoint".into())
+                .spawn(move || {
+                    let (stop, wake) = &*shared;
+                    loop {
+                        let stop = stop.lock().unwrap();
+                        let (stop, _) = wake
+                            .wait_timeout_while(stop, CHECKPOINT_INTERVAL, |stop| !*stop)
+                            .unwrap();
+                        if *stop {
+                            return;
+                        }
+                        drop(stop);
+                        if let Err(err) = bpm.flush_all_pages().and_then(|()| disk.checkpoint()) {
+                            eprintln!("hamilton-server: checkpoint failed: {err}");
+                        }
+                    }
+                })
+                .expect("failed to start the checkpoint thread")
+        };
+        Self {
+            shared,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Checkpointer {
+    fn drop(&mut self) {
+        let (stop, wake) = &*self.shared;
+        *stop.lock().unwrap() = true;
+        wake.notify_one();
+        if let Some(thread) = self.thread.take() {
+            // A checkpoint thread that panicked has already reported it.
+            let _ = thread.join();
+        }
     }
 }
 
 /// One connection's statements and transaction state. Dropping it rolls
 /// back the block it has open.
 pub struct Session<'db> {
-    db: &'db Database,
+    db: PhantomData<&'db Database>,
     engine: ExecutionEngine,
 }
 
@@ -81,20 +144,10 @@ impl Session<'_> {
 
     /// Runs the statements in `sql` in order, handing each one's output to
     /// `each`, and stops at the first that fails.
-    ///
-    /// Everything is written to disk after each statement that leaves the
-    /// session outside a transaction block: one that ran in a transaction of
-    /// its own, COMMIT and ROLLBACK. That includes what other sessions have
-    /// written in blocks still open. There is no write-ahead log to recover
-    /// from.
     pub fn execute(&mut self, sql: &str, mut each: impl FnMut(Output)) -> Result<(), Error> {
         let stmts = self.engine.parse(sql)?;
         for stmt in &stmts {
-            let result = self.engine.execute(stmt);
-            if self.engine.status() == TransactionStatus::Idle {
-                self.db.flush().map_err(Error::Flush)?;
-            }
-            each(result?);
+            each(self.engine.execute(stmt)?);
         }
         Ok(())
     }
@@ -113,8 +166,6 @@ impl Drop for Session<'_> {
 #[derive(Debug)]
 pub enum Error {
     Engine(EngineError),
-    /// The statement ran, but writing to disk afterwards failed.
-    Flush(StorageError),
 }
 
 impl From<EngineError> for Error {
@@ -128,7 +179,6 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let err: &dyn std::error::Error = match self {
             Error::Engine(err) => err,
-            Error::Flush(err) => err,
         };
         write!(f, "{err}")?;
         let mut source = err.source();

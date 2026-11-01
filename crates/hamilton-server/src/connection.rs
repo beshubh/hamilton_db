@@ -190,10 +190,7 @@ fn status(session: &Session) -> wire::TransactionStatus {
 /// The SQLSTATE that tells clients what kind of error `err` is, so that
 /// they can retry on a serialization failure, say.
 fn sqlstate(err: &Error) -> &'static str {
-    let err = match err {
-        Error::Flush(_) => return "58030", // io_error
-        Error::Engine(err) => err,
-    };
+    let Error::Engine(err) = err;
     match err {
         EngineError::Parse(_) => "42601",                 // syntax_error
         EngineError::Planner(_) => "42000",               // syntax_error_or_access_rule_violation

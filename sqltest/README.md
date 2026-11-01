@@ -49,8 +49,8 @@ the named index on the indexed query and no index on the plain one. Each
 query is then timed, after a few untimed warm-up runs, and the median
 reported. Times are what `\timing` reports: from sending the statement until
 its whole result has arrived, not printing. That includes the round trip to
-the server and the flush after each statement. The first statements after a load are slow, as pages are still
-being flushed, so don't read anything into single runs.
+the server, and any periodic checkpoint that runs meanwhile, so don't read
+anything into single runs.
 
 To run the SQL by hand:
 

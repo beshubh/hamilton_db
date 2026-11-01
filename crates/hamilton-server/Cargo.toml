@@ -14,4 +14,6 @@ storage = { path = "../storage" }
 wire = { path = "../wire" }
 
 [dev-dependencies]
+proptest = "1.12.0"
+rand = "0.10.3"
 tempfile = "3.27.0"
