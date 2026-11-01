@@ -1,3 +1,9 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/hamiltondb-logo-dark.svg">
+    <img src="assets/brand/hamiltondb-logo-light.svg" alt="HamiltonDB" width="420">
+  </picture>
+</p>
 # hamilton_db
 
 A small relational database written in Rust. It's an OLTP, row-based engine
