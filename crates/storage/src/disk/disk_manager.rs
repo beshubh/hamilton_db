@@ -271,6 +271,13 @@ impl DiskManager {
         &self.meta_file_name
     }
 
+    /// Blocks every page read and write until the returned guard is dropped,
+    /// so tests can catch a request in the middle of its I/O.
+    #[cfg(test)]
+    pub(crate) fn pause_io(&self) -> impl Sized + '_ {
+        self.state.lock()
+    }
+
     /// Size of the db file on disk, in bytes.
     pub fn db_file_size(&self) -> Result<u64> {
         Ok(self.state.lock().db_io.metadata()?.len())
