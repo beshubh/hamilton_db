@@ -13,6 +13,10 @@ pub mod table;
 pub use error::{Result, StorageError};
 
 #[cfg(test)]
+#[path = "../tests/util/io.rs"]
+pub(crate) mod test_util;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

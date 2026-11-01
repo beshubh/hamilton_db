@@ -496,9 +496,8 @@ impl BufferPoolManager {
 mod tests {
     use super::*;
     use crate::page::PAGE_SIZE;
-    use std::sync::mpsc;
+    use crate::test_util::within_timeout;
     use std::thread;
-    use std::time::Duration;
     use tempfile::TempDir;
 
     fn setup(num_frames: usize) -> (TempDir, Arc<DiskManager>, BufferPoolManager) {
@@ -526,15 +525,6 @@ mod tests {
 
     /// Runs `f` on another thread and fails if it does not finish soon, so a
     /// thread stuck behind paused disk I/O fails the test instead of hanging.
-    fn within_timeout(f: impl FnOnce() + Send + 'static) {
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            f();
-            let _ = tx.send(());
-        });
-        rx.recv_timeout(Duration::from_secs(5))
-            .expect("did not finish while another page's disk I/O was paused");
-    }
 
     /// Writes `bytes` to a new page on disk and returns a pool over `dm` that
     /// has nothing cached.

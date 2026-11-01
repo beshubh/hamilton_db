@@ -41,72 +41,96 @@ impl<T> DiskFuture<T> {
     }
 }
 
-/// Runs disk I/O on a background thread so callers such as the buffer pool can
+/// Number of workers a `DiskScheduler` starts with `new`.
+pub const DEFAULT_NUM_WORKERS: usize = 4;
+
+/// Runs disk I/O on background threads so callers such as the buffer pool can
 /// queue a request and wait on it without holding their own locks.
 ///
-/// Requests are handled one at a time in the order they were scheduled, so a
-/// read always sees an earlier write to the same page.
+/// Each worker has its own queue, and a page's requests always go to queue
+/// `page_id % num_workers`. So requests for one page run one at a time in the
+/// order they were scheduled: a read always sees an earlier write to the
+/// same page, and a delete cannot overtake one. Requests for pages on
+/// different queues run in parallel, in no set order.
 pub struct DiskScheduler {
-    /// `None` only while dropping, to close the channel before joining.
-    sender: Option<Sender<DiskRequest>>,
-    worker: Option<JoinHandle<()>>,
+    /// One per worker. Emptied only while dropping, to close the queues
+    /// before joining.
+    senders: Vec<Sender<DiskRequest>>,
+    workers: Vec<JoinHandle<()>>,
 }
 
 impl DiskScheduler {
     pub fn new(disk_manager: Arc<DiskManager>) -> Self {
-        let (sender, receiver) = mpsc::channel();
-        let worker = thread::Builder::new()
-            .name("disk-scheduler".into())
-            .spawn(move || run_worker(&disk_manager, receiver))
-            .expect("failed to spawn disk scheduler thread");
-        Self {
-            sender: Some(sender),
-            worker: Some(worker),
-        }
+        Self::with_workers(disk_manager, DEFAULT_NUM_WORKERS)
+    }
+
+    /// # Panics
+    /// If `num_workers` is 0.
+    pub fn with_workers(disk_manager: Arc<DiskManager>, num_workers: usize) -> Self {
+        assert!(
+            num_workers > 0,
+            "a disk scheduler needs at least one worker"
+        );
+        let (senders, workers) = (0..num_workers)
+            .map(|i| {
+                let (sender, receiver) = mpsc::channel();
+                let disk_manager = Arc::clone(&disk_manager);
+                let worker = thread::Builder::new()
+                    .name(format!("disk-scheduler-{i}"))
+                    .spawn(move || run_worker(&disk_manager, receiver))
+                    .expect("failed to spawn disk scheduler thread");
+                (sender, worker)
+            })
+            .unzip();
+        Self { senders, workers }
     }
 
     /// Queues a read of `page_id`. The future yields the page contents.
     pub fn read_page(&self, page_id: PageId) -> DiskFuture<PageData> {
-        self.schedule(|done| DiskRequest::Read { page_id, done })
+        self.schedule(page_id, |done| DiskRequest::Read { page_id, done })
     }
 
     /// Queues a write of `data` to `page_id`.
     pub fn write_page(&self, page_id: PageId, data: PageData) -> DiskFuture<()> {
-        self.schedule(|done| DiskRequest::Write {
+        self.schedule(page_id, |done| DiskRequest::Write {
             page_id,
             data,
             done,
         })
     }
 
-    /// Queues freeing `page_id` on disk. Goes through the queue so it cannot
-    /// overtake an earlier write to the same page.
+    /// Queues freeing `page_id` on disk. Goes through the page's queue so it
+    /// cannot overtake an earlier write to the same page.
     pub fn deallocate_page(&self, page_id: PageId) -> DiskFuture<()> {
-        self.schedule(|done| DiskRequest::Delete { page_id, done })
+        self.schedule(page_id, |done| DiskRequest::Delete { page_id, done })
     }
 
-    fn schedule<T>(&self, make: impl FnOnce(Sender<Result<T>>) -> DiskRequest) -> DiskFuture<T> {
+    fn schedule<T>(
+        &self,
+        page_id: PageId,
+        make: impl FnOnce(Sender<Result<T>>) -> DiskRequest,
+    ) -> DiskFuture<T> {
         let (done, rx) = mpsc::channel();
-        let sender = self.sender.as_ref().expect("disk scheduler is shut down");
+        let queue = page_id.rem_euclid(self.senders.len() as PageId) as usize;
         // If the worker has died, `done` is dropped with the request and
         // `wait` reports the error.
-        let _ = sender.send(make(done));
+        let _ = self.senders[queue].send(make(done));
         DiskFuture { rx }
     }
 }
 
 impl Drop for DiskScheduler {
-    /// Lets the worker finish every queued request, then joins it.
+    /// Lets the workers finish every queued request, then joins them.
     fn drop(&mut self) {
-        drop(self.sender.take());
-        if let Some(worker) = self.worker.take() {
+        self.senders.clear();
+        for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
     }
 }
 
 fn run_worker(disk_manager: &DiskManager, receiver: Receiver<DiskRequest>) {
-    // `recv` fails once every sender is gone, i.e. the scheduler was dropped.
+    // `recv` fails once the sender is gone, i.e. the scheduler was dropped.
     while let Ok(request) = receiver.recv() {
         // The caller may have dropped its future; that is not an error.
         match request {
@@ -133,6 +157,7 @@ fn run_worker(disk_manager: &DiskManager, receiver: Receiver<DiskRequest>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{stall_io, within_timeout};
     use common::INVALID_PAGE_ID;
     use tempfile::TempDir;
 
@@ -226,6 +251,46 @@ mod tests {
             .collect();
         for h in handles {
             h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn pages_on_different_queues_run_in_parallel() {
+        let dir = TempDir::new().unwrap();
+        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
+        let scheduler = Arc::new(DiskScheduler::with_workers(Arc::clone(&dm), 2));
+        // Pages 0 and 1 go to different queues; 0 and 2 share one.
+        for id in 0..3 {
+            scheduler
+                .write_page(id, page_filled(id as u8))
+                .wait()
+                .unwrap();
+        }
+
+        let stall = stall_io(&dm, 0);
+        let stalled = scheduler.read_page(0);
+        let same_queue = scheduler.read_page(2);
+        stall.wait_started();
+
+        let other = Arc::clone(&scheduler);
+        within_timeout(move || assert_eq!(other.read_page(1).wait().unwrap(), page_filled(1)));
+        drop(stall);
+        assert_eq!(stalled.wait().unwrap(), page_filled(0));
+        assert_eq!(same_queue.wait().unwrap(), page_filled(2));
+    }
+
+    #[test]
+    fn requests_for_one_page_stay_in_order_across_workers() {
+        let (_dir, _dm, scheduler) = setup();
+        let mut reads = Vec::new();
+        for round in 0..20u8 {
+            for id in 0..8 {
+                let _ = scheduler.write_page(id, page_filled(round + id as u8));
+                reads.push((id, round, scheduler.read_page(id)));
+            }
+        }
+        for (id, round, read) in reads {
+            assert_eq!(read.wait().unwrap(), page_filled(round + id as u8));
         }
     }
 }

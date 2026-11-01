@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use common::PageId;
 use parking_lot::Mutex;
@@ -20,8 +22,15 @@ const META_VERSION: u32 = 1;
 /// writing them.
 ///
 /// Space is allocated lazily: a page only gets an offset in the file the first
-/// time it is read or written. Offsets of deleted pages are reused by later
+/// time it is written. Offsets of deleted pages are reused by later
 /// allocations.
+///
+/// Reads and writes hold the lock only to look up or allocate the page's
+/// slot, and run the `pread`/`pwrite` without it, so I/O on different pages
+/// runs in parallel. Callers must not run two requests for the same page at
+/// once, or delete a page while a request for it is running, since a freed
+/// slot can be given to another page. `DiskScheduler` keeps each page's
+/// requests in order.
 ///
 /// The page directory (each page's offset and free space) and the free-slot
 /// list are kept in memory and saved to a separate `.meta` file by
@@ -31,24 +40,34 @@ pub struct DiskManager {
     db_file_name: PathBuf,
     log_file_name: PathBuf,
     meta_file_name: PathBuf,
+    /// Only read and written with positioned I/O, so it needs no lock.
+    db_io: File,
     state: Mutex<DiskState>,
     log: Mutex<LogState>,
     flush_log: AtomicBool,
+    num_reads: AtomicUsize,
+    num_writes: AtomicUsize,
+    num_deletes: AtomicUsize,
+    #[cfg(test)]
+    before_io: Mutex<Option<IoHook>>,
 }
 
+#[cfg(test)]
+type IoHook = Arc<dyn Fn(PageId) + Send + Sync>;
+
 struct DiskState {
-    db_io: File,
-    /// Where each allocated page lives in the db file.
+    /// Where each written page lives in the db file.
     pages: HashMap<PageId, PageEntry>,
     /// Offsets left behind by deleted pages, ready for reuse.
     free_slots: Vec<u64>,
+    /// Slots taken by first writes still in progress. The page is added to
+    /// `pages` only once its write is done, so a checkpoint never saves a
+    /// slot that does not hold the page yet.
+    first_writes: usize,
     /// Number of pages the db file currently has room for.
     page_capacity: usize,
     /// Whether the metadata changed since it was last saved.
     meta_dirty: bool,
-    num_reads: usize,
-    num_writes: usize,
-    num_deletes: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,14 +98,11 @@ impl DiskManager {
         // The capacity is not saved; it follows from the db file's length.
         let db_len = db_io.metadata()?.len() as usize;
         let mut state = DiskState {
-            db_io,
             pages: HashMap::new(),
             free_slots: Vec::new(),
+            first_writes: 0,
             page_capacity: (db_len / PAGE_SIZE).max(DEFAULT_DB_IO_SIZE),
             meta_dirty: false,
-            num_reads: 0,
-            num_writes: 0,
-            num_deletes: 0,
         };
         match fs::read(&meta_file_name) {
             Ok(bytes) => state.load_meta(&bytes)?,
@@ -103,19 +119,25 @@ impl DiskManager {
         }
         let file_len = file_len_for(state.page_capacity);
         if (db_len as u64) < file_len {
-            state.db_io.set_len(file_len)?;
+            db_io.set_len(file_len)?;
         }
 
         Ok(Self {
             db_file_name,
             log_file_name,
             meta_file_name,
+            db_io,
             state: Mutex::new(state),
             log: Mutex::new(LogState {
                 log_io,
                 num_flushes: 0,
             }),
             flush_log: AtomicBool::new(false),
+            num_reads: AtomicUsize::new(0),
+            num_writes: AtomicUsize::new(0),
+            num_deletes: AtomicUsize::new(0),
+            #[cfg(test)]
+            before_io: Mutex::new(None),
         })
     }
 
@@ -129,8 +151,10 @@ impl DiskManager {
 
     /// Flushes the db file and saves the metadata file if it changed.
     pub fn checkpoint(&self) -> Result<()> {
+        // Held throughout so no first write is added to `pages` after the
+        // sync and saved without its data on disk.
         let mut state = self.state.lock();
-        state.db_io.sync_all()?;
+        self.db_io.sync_all()?;
         state.save_meta(&self.meta_file_name)
     }
 
@@ -169,11 +193,17 @@ impl DiskManager {
     /// a slot first if it does not have one yet.
     pub fn write_page(&self, page_id: PageId, page_data: &[u8; PAGE_SIZE]) -> Result<()> {
         check_page_id(page_id)?;
-        let mut state = self.state.lock();
-        let offset = state.offset_or_allocate(page_id)?;
+        let (offset, first_write) = self.state.lock().slot_for_write(page_id, &self.db_io)?;
 
-        write_all_at(&state.db_io, page_data, offset)?;
-        state.num_writes += 1;
+        #[cfg(test)]
+        self.run_before_io(page_id);
+        let written = write_all_at(&self.db_io, page_data, offset);
+        if first_write {
+            let mut state = self.state.lock();
+            state.finish_first_write(page_id, offset, written.is_ok());
+        }
+        written?;
+        self.num_writes.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -182,15 +212,17 @@ impl DiskManager {
     /// freed by `delete_page` still holds the deleted page's bytes.
     pub fn read_page(&self, page_id: PageId, page_data: &mut [u8; PAGE_SIZE]) -> Result<()> {
         check_page_id(page_id)?;
-        let mut state = self.state.lock();
-        let Some(offset) = state.pages.get(&page_id).map(|entry| entry.offset) else {
+        let offset = self.state.lock().pages.get(&page_id).map(|e| e.offset);
+        let Some(offset) = offset else {
             page_data.fill(0);
             return Ok(());
         };
 
-        let n = read_full_at(&state.db_io, page_data, offset)?;
+        #[cfg(test)]
+        self.run_before_io(page_id);
+        let n = read_full_at(&self.db_io, page_data, offset)?;
         page_data[n..].fill(0);
-        state.num_reads += 1;
+        self.num_reads.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -201,7 +233,7 @@ impl DiskManager {
         if let Some(entry) = state.pages.remove(&page_id) {
             state.free_slots.push(entry.offset);
             state.meta_dirty = true;
-            state.num_deletes += 1;
+            self.num_deletes.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -248,15 +280,15 @@ impl DiskManager {
     /// Pages read from the db file. Reads of pages never written are not
     /// counted, as they do not touch the file.
     pub fn num_reads(&self) -> usize {
-        self.state.lock().num_reads
+        self.num_reads.load(Ordering::Relaxed)
     }
 
     pub fn num_writes(&self) -> usize {
-        self.state.lock().num_writes
+        self.num_writes.load(Ordering::Relaxed)
     }
 
     pub fn num_deletes(&self) -> usize {
-        self.state.lock().num_deletes
+        self.num_deletes.load(Ordering::Relaxed)
     }
 
     pub fn db_file_name(&self) -> &Path {
@@ -271,42 +303,74 @@ impl DiskManager {
         &self.meta_file_name
     }
 
-    /// Blocks every page read and write until the returned guard is dropped,
-    /// so tests can catch a request in the middle of its I/O.
+    /// Keeps every page read and write from starting until the returned guard
+    /// is dropped, so tests can catch a request in the middle of its I/O.
     #[cfg(test)]
     pub(crate) fn pause_io(&self) -> impl Sized + '_ {
         self.state.lock()
     }
 
+    /// Runs `hook` with the page id just before each `pread`/`pwrite`, after
+    /// the lock is released. A hook that blocks stalls only that request.
+    #[cfg(test)]
+    pub(crate) fn set_before_io(&self, hook: impl Fn(PageId) + Send + Sync + 'static) {
+        *self.before_io.lock() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_before_io(&self, page_id: PageId) {
+        // Cloned out so a blocked hook does not hold up other requests.
+        let hook = self.before_io.lock().clone();
+        if let Some(hook) = hook {
+            hook(page_id);
+        }
+    }
+
     /// Size of the db file on disk, in bytes.
     pub fn db_file_size(&self) -> Result<u64> {
-        Ok(self.state.lock().db_io.metadata()?.len())
+        Ok(self.db_io.metadata()?.len())
     }
 }
 
 impl DiskState {
-    fn offset_or_allocate(&mut self, page_id: PageId) -> Result<u64> {
+    /// Returns the page's offset, and whether this is its first write. A
+    /// first write gets a new slot, and must be ended with
+    /// `finish_first_write`.
+    fn slot_for_write(&mut self, page_id: PageId, db_io: &File) -> Result<(u64, bool)> {
         if let Some(entry) = self.pages.get(&page_id) {
-            return Ok(entry.offset);
+            return Ok((entry.offset, false));
         }
-        let offset = self.allocate_page()?;
-        let free_space = PAGE_SIZE as u32;
-        self.pages.insert(page_id, PageEntry { offset, free_space });
-        self.meta_dirty = true;
-        Ok(offset)
+        let offset = self.allocate_slot(db_io)?;
+        self.first_writes += 1;
+        Ok((offset, true))
+    }
+
+    /// Adds the page at `offset` to `pages`, or frees the slot if the write
+    /// failed.
+    fn finish_first_write(&mut self, page_id: PageId, offset: u64, written: bool) {
+        self.first_writes -= 1;
+        if written {
+            let free_space = PAGE_SIZE as u32;
+            self.pages.insert(page_id, PageEntry { offset, free_space });
+            self.meta_dirty = true;
+        } else {
+            self.free_slots.push(offset);
+        }
     }
 
     /// Returns a free offset, doubling the db file when it is full.
-    fn allocate_page(&mut self) -> Result<u64> {
+    fn allocate_slot(&mut self, db_io: &File) -> Result<u64> {
         if let Some(offset) = self.free_slots.pop() {
             return Ok(offset);
         }
-        // With no free slots, every slot below `pages.len()` is in use.
-        if self.pages.len() >= self.page_capacity {
+        // With no free slots, every slot below this one holds a page or a
+        // first write in progress.
+        let slot = self.pages.len() + self.first_writes;
+        if slot >= self.page_capacity {
             self.page_capacity *= 2;
-            self.db_io.set_len(file_len_for(self.page_capacity))?;
+            db_io.set_len(file_len_for(self.page_capacity))?;
         }
-        Ok((self.pages.len() * PAGE_SIZE) as u64)
+        Ok((slot * PAGE_SIZE) as u64)
     }
 
     /// Saves the metadata to `path` if it changed since the last save.
@@ -478,8 +542,13 @@ fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
     std::os::unix::fs::FileExt::write_all_at(file, buf, offset)
 }
 
+/// Moving the shared cursor and then writing is only safe one at a time.
+#[cfg(not(unix))]
+static CURSOR: Mutex<()> = Mutex::new(());
+
 #[cfg(not(unix))]
 fn write_all_at(mut file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    let _cursor = CURSOR.lock();
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(buf)
 }
@@ -503,6 +572,7 @@ fn read_full_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
 
 #[cfg(not(unix))]
 fn read_full_at(mut file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    let _cursor = CURSOR.lock();
     file.seek(SeekFrom::Start(offset))?;
     read_full(file, buf)
 }
@@ -524,6 +594,7 @@ fn read_full(mut file: impl Read, buf: &mut [u8]) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{stall_io, within_timeout};
     use common::INVALID_PAGE_ID;
     use std::sync::Arc;
     use std::thread;
@@ -793,5 +864,63 @@ mod tests {
             assert_eq!(buf, page_filled(id as u8));
         }
         dm.shut_down().unwrap();
+    }
+
+    #[test]
+    fn io_on_one_page_does_not_block_others() {
+        let (_dir, dm) = setup();
+        let dm = Arc::new(dm);
+        dm.write_page(0, &page_filled(1)).unwrap();
+        dm.write_page(1, &page_filled(2)).unwrap();
+
+        let stall = stall_io(&dm, 0);
+        let stalled = {
+            let dm = Arc::clone(&dm);
+            thread::spawn(move || dm.write_page(0, &page_filled(3)).unwrap())
+        };
+        stall.wait_started();
+
+        let other = Arc::clone(&dm);
+        within_timeout(move || {
+            let mut buf = page_filled(0);
+            other.read_page(1, &mut buf).unwrap();
+            assert_eq!(buf, page_filled(2));
+            other.write_page(2, &page_filled(4)).unwrap();
+            other.checkpoint().unwrap();
+        });
+        drop(stall);
+        stalled.join().unwrap();
+
+        let mut buf = page_filled(0);
+        dm.read_page(0, &mut buf).unwrap();
+        assert_eq!(buf, page_filled(3));
+    }
+
+    #[test]
+    fn first_write_is_saved_only_once_done() {
+        let (dir, dm) = setup();
+        let dm = Arc::new(dm);
+        let stall = stall_io(&dm, 0);
+        let stalled = {
+            let dm = Arc::clone(&dm);
+            thread::spawn(move || dm.write_page(0, &page_filled(1)).unwrap())
+        };
+        stall.wait_started();
+
+        // The in-progress write keeps its slot from other pages, but is not
+        // in the metadata a checkpoint saves.
+        dm.write_page(1, &page_filled(2)).unwrap();
+        dm.checkpoint().unwrap();
+        assert_eq!(dm.free_space(0), None);
+        let saved = DiskManager::new(dir.path().join("test.db")).unwrap();
+        assert_eq!(saved.free_space(0), None);
+        assert_eq!(saved.free_space(1), Some(PAGE_SIZE));
+        drop(saved);
+
+        drop(stall);
+        stalled.join().unwrap();
+        let state = dm.state.lock();
+        assert_ne!(state.pages[&0].offset, state.pages[&1].offset);
+        assert_eq!(state.first_writes, 0);
     }
 }
