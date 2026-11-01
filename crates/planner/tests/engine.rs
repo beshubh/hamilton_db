@@ -1,7 +1,9 @@
 //! The execution engine's sessions: autocommit, transaction blocks, failed
-//! blocks, and index entries undone with their transaction.
+//! blocks, index entries undone with their transaction, and indexes created
+//! on tables other sessions are using.
 
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use catalog::Catalog;
 use common::Value;
@@ -397,4 +399,338 @@ fn a_storage_error_in_a_block_fails_it() {
         db.rows("SELECT * FROM accounts"),
         [account(1, "ann", 100), account(2, "bo", 50)]
     );
+}
+
+/// Runs one statement in `session`.
+fn run_in(session: &mut ExecutionEngine, sql: &str) -> Result<Output, EngineError> {
+    let mut stmts = session.parse(sql)?;
+    assert_eq!(stmts.len(), 1, "{sql}");
+    session.execute(&stmts.remove(0))
+}
+
+fn rows_in(session: &mut ExecutionEngine, sql: &str) -> Vec<Vec<Value>> {
+    match run_in(session, sql) {
+        Ok(Output::Rows { rows, .. }) => rows,
+        result => panic!("{sql}: {result:?}"),
+    }
+}
+
+/// Whether `sql`, a SELECT, reads through an index.
+fn uses_an_index(db: &mut Db, sql: &str) -> bool {
+    let plan = db.rows(&format!("EXPLAIN {sql}"));
+    plan.iter()
+        .any(|line| matches!(&line[0], Value::Varchar(s) if s.contains("IndexScan")))
+}
+
+/// A block that began before another session deleted and changed rows still
+/// finds them through every kind of index, by their old keys.
+#[test]
+fn an_older_block_reads_old_versions_through_indexes() {
+    let mut db = Db::with_tables();
+    let mut other = db.engine.session();
+    let by_id = "SELECT * FROM accounts WHERE id = 1";
+    let by_name = "SELECT * FROM accounts WHERE name = 'bo'";
+    let log = "SELECT note FROM log WHERE id = 1";
+    for sql in [by_id, by_name, log] {
+        assert!(uses_an_index(&mut db, sql), "{sql}");
+    }
+
+    db.ok("BEGIN");
+    assert_eq!(db.rows(by_id), [account(1, "ann", 100)]);
+    run_in(&mut other, "DELETE FROM accounts WHERE id = 1").unwrap();
+    run_in(
+        &mut other,
+        "UPDATE accounts SET id = 20, name = 'zed' WHERE id = 2",
+    )
+    .unwrap();
+    run_in(&mut other, "DELETE FROM log WHERE id = 1").unwrap();
+
+    assert_eq!(db.rows(by_id), [account(1, "ann", 100)]);
+    assert_eq!(db.rows(by_name), [account(2, "bo", 50)]);
+    assert_eq!(db.rows(log), [[text("opened")]]);
+    assert!(
+        db.rows("SELECT * FROM accounts WHERE name = 'zed'")
+            .is_empty()
+    );
+    db.ok("COMMIT");
+
+    assert!(db.rows(by_id).is_empty());
+    assert!(db.rows(by_name).is_empty());
+    assert!(db.rows(log).is_empty());
+    assert_eq!(
+        db.rows("SELECT * FROM accounts WHERE name = 'zed'"),
+        [account(20, "zed", 50)]
+    );
+}
+
+#[test]
+fn a_deleted_primary_key_can_be_inserted_again() {
+    let mut db = Db::with_tables();
+    db.ok("DELETE FROM accounts WHERE id = 1");
+    db.ok("INSERT INTO accounts VALUES (1, 'new', 5)");
+    assert_eq!(
+        db.rows("SELECT * FROM accounts WHERE id = 1"),
+        [account(1, "new", 5)]
+    );
+    db.ok("BEGIN");
+    db.ok("DELETE FROM accounts WHERE id = 2");
+    db.ok("INSERT INTO accounts VALUES (2, 'again', 6)");
+    db.ok("COMMIT");
+    assert_eq!(
+        db.rows("SELECT * FROM accounts WHERE id = 2"),
+        [account(2, "again", 6)]
+    );
+}
+
+/// While a block holds a deleted key, another session can't insert it, so
+/// rolling the delete back leaves one row with the key. Deleting used to
+/// remove the index entry, letting the insert in, and the rollback had no
+/// entry to put back.
+#[test]
+fn a_key_a_block_deleted_is_not_free_until_it_commits() {
+    let mut db = Db::with_tables();
+    let mut other = db.engine.session();
+    db.ok("BEGIN");
+    db.ok("DELETE FROM accounts WHERE id = 1");
+    let err = run_in(&mut other, "INSERT INTO accounts VALUES (1, 'cy', 0)");
+    assert!(
+        matches!(
+            err,
+            Err(EngineError::Execution(ExecutionError::Storage(
+                StorageError::Conflict { .. }
+            )))
+        ),
+        "{err:?}"
+    );
+    db.ok("ROLLBACK");
+
+    assert_eq!(
+        db.rows("SELECT * FROM accounts WHERE id = 1"),
+        [account(1, "ann", 100)]
+    );
+    assert_eq!(db.rows("SELECT * FROM accounts").len(), 2);
+    assert_eq!(
+        rows_in(&mut other, "SELECT * FROM accounts WHERE name = 'ann'"),
+        [account(1, "ann", 100)]
+    );
+}
+
+/// An insert that another session's block rolls back doesn't keep the key
+/// taken.
+#[test]
+fn a_key_a_rolled_back_block_inserted_is_free() {
+    let mut db = Db::with_tables();
+    let mut other = db.engine.session();
+    db.ok("BEGIN");
+    db.ok("INSERT INTO accounts VALUES (3, 'cy', 0)");
+    db.ok("ROLLBACK");
+    run_in(&mut other, "INSERT INTO accounts VALUES (3, 'di', 1)").unwrap();
+    assert_eq!(
+        db.rows("SELECT * FROM accounts WHERE id = 3"),
+        [account(3, "di", 1)]
+    );
+}
+
+/// `accounts` and `log` as in [`Db::with_tables`], with their rows but
+/// without the secondary indexes, for tests that create those later.
+fn without_indexes() -> Db {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE accounts (id INT PRIMARY KEY, name VARCHAR(16), balance INT)");
+    db.ok("CREATE TABLE log (id INT, note VARCHAR(16))");
+    db.ok("INSERT INTO accounts VALUES (1, 'ann', 100), (2, 'bo', 50), (3, 'ann', 7)");
+    db.ok("INSERT INTO log VALUES (1, 'opened'), (2, 'opened'), (1, 'closed')");
+    db
+}
+
+fn sorted(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    rows.sort_by_key(|row| format!("{row:?}"));
+    rows
+}
+
+#[test]
+fn create_index_adds_the_rows_already_in_the_table() {
+    let mut db = without_indexes();
+    db.ok("CREATE INDEX accounts_name ON accounts (name)");
+    db.ok("CREATE INDEX log_id ON log (id)");
+    let by_name = "SELECT id FROM accounts WHERE name = 'ann'";
+    let log = "SELECT note FROM log WHERE id = 1";
+    for sql in [by_name, log] {
+        assert!(uses_an_index(&mut db, sql), "{sql}");
+    }
+    assert_eq!(sorted(db.rows(by_name)), [[int(1)], [int(3)]]);
+    assert_eq!(sorted(db.rows(log)), [[text("closed")], [text("opened")]]);
+    assert_eq!(db.index_entries("accounts_name").len(), 3);
+    assert_eq!(db.index_entries("log_id").len(), 3);
+}
+
+/// A block that began before another session changed rows and then created
+/// an index finds the rows' old versions through the new index. The entries
+/// for those versions stay until the block ends.
+#[test]
+fn an_older_block_reads_old_versions_through_a_new_index() {
+    let mut db = without_indexes();
+    let mut other = db.engine.session();
+    db.ok("BEGIN");
+    assert_eq!(db.rows("SELECT * FROM accounts").len(), 3);
+    for sql in [
+        "DELETE FROM accounts WHERE id = 1",
+        "UPDATE accounts SET name = 'zed' WHERE id = 2",
+        "DELETE FROM log WHERE note = 'closed'",
+        "CREATE INDEX accounts_name ON accounts (name)",
+        "CREATE INDEX log_id ON log (id)",
+    ] {
+        run_in(&mut other, sql).unwrap();
+    }
+
+    let ann = "SELECT * FROM accounts WHERE name = 'ann'";
+    let bo = "SELECT * FROM accounts WHERE name = 'bo'";
+    let zed = "SELECT * FROM accounts WHERE name = 'zed'";
+    let log = "SELECT note FROM log WHERE id = 1";
+    assert!(uses_an_index(&mut db, ann));
+    assert!(uses_an_index(&mut db, log));
+    assert_eq!(
+        sorted(db.rows(ann)),
+        [account(1, "ann", 100), account(3, "ann", 7)]
+    );
+    assert_eq!(db.rows(bo), [account(2, "bo", 50)]);
+    assert!(db.rows(zed).is_empty());
+    assert_eq!(sorted(db.rows(log)), [[text("closed")], [text("opened")]]);
+    db.ok("COMMIT");
+
+    assert_eq!(db.rows(ann), [account(3, "ann", 7)]);
+    assert!(db.rows(bo).is_empty());
+    assert_eq!(db.rows(zed), [account(2, "zed", 50)]);
+    assert_eq!(db.rows(log), [[text("opened")]]);
+
+    // Only the entries of the rows' current versions are left.
+    db.engine.transaction_manager().wait_for_gc();
+    assert_eq!(db.index_entries("accounts_name").len(), 2);
+    assert_eq!(db.index_entries("log_id").len(), 2);
+}
+
+/// Rows another session's block inserted or changed, uncommitted while the
+/// index was created, are found by their new keys once the block commits.
+#[test]
+fn a_new_index_has_the_rows_of_a_block_that_commits_later() {
+    let mut db = without_indexes();
+    let mut other = db.engine.session();
+    for sql in [
+        "BEGIN",
+        "INSERT INTO log VALUES (5, 'new')",
+        "UPDATE log SET id = 9 WHERE note = 'closed'",
+    ] {
+        run_in(&mut other, sql).unwrap();
+    }
+    db.ok("CREATE INDEX log_id ON log (id)");
+    run_in(&mut other, "COMMIT").unwrap();
+
+    assert_eq!(
+        db.rows("SELECT note FROM log WHERE id = 5"),
+        [[text("new")]]
+    );
+    assert_eq!(
+        db.rows("SELECT note FROM log WHERE id = 9"),
+        [[text("closed")]]
+    );
+    assert_eq!(
+        db.rows("SELECT note FROM log WHERE id = 1"),
+        [[text("opened")]]
+    );
+    db.engine.transaction_manager().wait_for_gc();
+    assert_eq!(db.index_entries("log_id").len(), 4);
+}
+
+/// The entries a new index got for another block's uncommitted versions
+/// are removed once the block rolls back.
+#[test]
+fn a_new_index_drops_the_rows_of_a_block_that_rolls_back() {
+    let mut db = without_indexes();
+    let mut other = db.engine.session();
+    for sql in [
+        "BEGIN",
+        "INSERT INTO log VALUES (5, 'new')",
+        "UPDATE log SET id = 9 WHERE note = 'closed'",
+    ] {
+        run_in(&mut other, sql).unwrap();
+    }
+    db.ok("CREATE INDEX log_id ON log (id)");
+    run_in(&mut other, "ROLLBACK").unwrap();
+
+    assert!(db.rows("SELECT note FROM log WHERE id = 5").is_empty());
+    assert!(db.rows("SELECT note FROM log WHERE id = 9").is_empty());
+    assert_eq!(
+        sorted(db.rows("SELECT note FROM log WHERE id = 1")),
+        [[text("closed")], [text("opened")]]
+    );
+    db.engine.transaction_manager().wait_for_gc();
+    assert_eq!(db.index_entries("log_id").len(), 3);
+}
+
+/// Runs `sql` in `session` until it doesn't fail with `Conflict`.
+fn run_until_no_conflict(session: &mut ExecutionEngine, sql: &str) {
+    loop {
+        match run_in(session, sql) {
+            Ok(_) => return,
+            Err(EngineError::Execution(ExecutionError::Storage(StorageError::Conflict {
+                ..
+            }))) => {}
+            Err(e) => panic!("{sql}: {e}"),
+        }
+    }
+}
+
+/// Sessions insert and update rows while another creates an index on them:
+/// every row ends up in the index under its current key.
+#[test]
+fn writes_while_an_index_is_created_are_not_lost() {
+    const SEEDED: i32 = 300;
+    const MOVED: i32 = 50;
+    const WRITERS: i32 = 4;
+    const ROWS: i32 = 100;
+
+    let mut db = Db::new();
+    db.ok("CREATE TABLE log (id INT, note VARCHAR(16))");
+    let seeded: Vec<String> = (0..SEEDED).map(|id| format!("({id}, 'seed')")).collect();
+    db.ok(&format!("INSERT INTO log VALUES {}", seeded.join(", ")));
+
+    let start = Barrier::new(WRITERS as usize + 2);
+    let writers: Vec<_> = (0..WRITERS).map(|_| db.engine.session()).collect();
+    let mut mover = db.engine.session();
+    let mut creator = db.engine.session();
+    thread::scope(|s| {
+        for (writer, mut session) in (0..).zip(writers) {
+            let start = &start;
+            s.spawn(move || {
+                start.wait();
+                for i in 0..ROWS {
+                    let id = 1000 + writer * ROWS + i;
+                    run_in(&mut session, &format!("INSERT INTO log VALUES ({id}, 'w')")).unwrap();
+                }
+            });
+        }
+        s.spawn(|| {
+            start.wait();
+            for id in 0..MOVED {
+                let sql = format!("UPDATE log SET id = {} WHERE id = {id}", id + 1_000_000);
+                run_until_no_conflict(&mut mover, &sql);
+            }
+        });
+        s.spawn(|| {
+            start.wait();
+            run_in(&mut creator, "CREATE INDEX log_id ON log (id)").unwrap();
+        });
+    });
+
+    let by_id = |id: i32| format!("SELECT note FROM log WHERE id = {id}");
+    assert!(uses_an_index(&mut db, &by_id(0)));
+    for id in 0..MOVED {
+        assert!(db.rows(&by_id(id)).is_empty(), "{id}");
+        assert_eq!(db.rows(&by_id(id + 1_000_000)), [[text("seed")]], "{id}");
+    }
+    for id in MOVED..SEEDED {
+        assert_eq!(db.rows(&by_id(id)), [[text("seed")]], "{id}");
+    }
+    for id in 1000..1000 + WRITERS * ROWS {
+        assert_eq!(db.rows(&by_id(id)), [[text("w")]], "{id}");
+    }
 }

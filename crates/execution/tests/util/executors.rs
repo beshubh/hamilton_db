@@ -170,36 +170,48 @@ impl Db {
         Arc::new(scan.into())
     }
 
-    /// The rids of the rows index `name` holds for the key `values`.
+    /// The rids of the rows a new transaction finds through index `name`
+    /// with the key `values`, in index order: following each entry, and
+    /// keeping the rows whose visible version has the key.
     pub fn index_lookup(&self, name: &str, values: &[Value]) -> Vec<Rid> {
-        let index = self.catalog().get_index(name).unwrap();
-        let table = self.catalog().get_table_by_oid(index.table_oid).unwrap();
-        let key = Tuple::encode(&index.key_schema, values).unwrap();
-        let mut locators = Vec::new();
-        index.index.scan_key(&key, &mut locators).unwrap();
-        locators
-            .iter()
-            .map(|locator| {
-                execution_context::locate(self.catalog(), &table, locator)
-                    .unwrap()
-                    .unwrap()
-            })
+        self.index_find(name, values)
+            .into_iter()
+            .map(|(rid, _)| rid)
             .collect()
     }
 
-    /// The rows the index `name` holds for the key made of `values`, in index
-    /// order.
+    /// The rows [`Db::index_lookup`] finds, decoded.
     pub fn index_rows(&self, name: &str, values: &[Value]) -> Vec<Vec<Value>> {
         let index = self.catalog().get_index(name).unwrap();
         let table = self.catalog().get_table_by_oid(index.table_oid).unwrap();
-        self.index_lookup(name, values)
+        self.index_find(name, values)
             .into_iter()
-            .map(|rid| {
-                let (meta, tuple) = table.heap.get(rid).unwrap();
-                assert!(!meta.is_deleted, "index {name} points at a deleted row");
-                tuple.decode(&table.schema).unwrap()
-            })
+            .map(|(_, tuple)| tuple.decode(&table.schema).unwrap())
             .collect()
+    }
+
+    fn index_find(&self, name: &str, values: &[Value]) -> Vec<(Rid, Tuple)> {
+        let index = self.catalog().get_index(name).unwrap();
+        let table = self.catalog().get_table_by_oid(index.table_oid).unwrap();
+        let indexed = execution_context::indexed_table(self.catalog(), &table);
+        let key = Tuple::encode(&index.key_schema, values).unwrap();
+        let mut locators = Vec::new();
+        index.index.scan_key(&key, &mut locators).unwrap();
+        let txn = self.tm.begin();
+        let mut found = Vec::new();
+        for locator in &locators {
+            let Some((rid, tuple)) = txn.row_at(&indexed, locator).unwrap() else {
+                continue;
+            };
+            let own_key = tuple
+                .to_key(&table.schema, &index.key_schema, &index.key_columns)
+                .unwrap();
+            if own_key.decode(&index.key_schema).unwrap() == values {
+                found.push((rid, tuple));
+            }
+        }
+        self.tm.commit(&txn).unwrap();
+        found
     }
 
     /// Every entry of the index `name`, in order, as its raw bytes.

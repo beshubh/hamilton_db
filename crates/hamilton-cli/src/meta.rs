@@ -11,6 +11,9 @@ pub enum Command {
     Describe(String),
     /// `\timing`: show how long each statement took, or stop showing it.
     Timing,
+    /// `\session [NAME]`: switch to session NAME, opening it if it is new,
+    /// or show the current one.
+    Session(Option<String>),
     Clear,
     Unknown(String),
 }
@@ -21,6 +24,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("\\clear", "clear the screen"),
     ("\\d", "list tables, or describe one"),
     ("\\q", "quit"),
+    ("\\session", "switch to another session, or show this one"),
     ("\\timing", "toggle statement timing"),
 ];
 
@@ -41,6 +45,8 @@ pub fn parse(line: &str) -> Option<Command> {
         ("\\d" | "\\dt", "") => Command::ListTables,
         ("\\d" | "\\dt", name) => Command::Describe(name.to_owned()),
         ("\\timing", _) => Command::Timing,
+        ("\\session", "") => Command::Session(None),
+        ("\\session", name) => Command::Session(Some(name.to_owned())),
         ("\\clear", _) => Command::Clear,
         (command, _) => Command::Unknown(command.to_owned()),
     })
@@ -70,6 +76,11 @@ mod tests {
         assert_eq!(parse("\\d"), Some(Command::ListTables));
         assert_eq!(parse("\\d users;"), Some(Command::Describe("users".into())));
         assert_eq!(parse("\\timing"), Some(Command::Timing));
+        assert_eq!(parse("\\session"), Some(Command::Session(None)));
+        assert_eq!(
+            parse("\\session b"),
+            Some(Command::Session(Some("b".into())))
+        );
         assert_eq!(parse("\\x"), Some(Command::Unknown("\\x".into())));
         assert_eq!(parse("SELECT 1;"), None);
         assert_eq!(parse("exit now"), None);

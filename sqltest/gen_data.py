@@ -23,13 +23,15 @@ def rows():
         yield f"({id_}, {age}, '{email}', {score})"
 
 
-def main():
+def sql() -> str:
     data = list(rows())
+    inserts = []
     for table in ("users_plain", "users"):
         for start in range(0, ROWS, BATCH):
             batch = ",\n".join(data[start : start + BATCH])
-            sys.stdout.write(f"INSERT INTO {table} VALUES\n{batch};\n")
+            inserts.append(f"INSERT INTO {table} VALUES\n{batch};\n")
+    return "".join(inserts)
 
 
 if __name__ == "__main__":
-    main()
+    sys.stdout.write(sql())

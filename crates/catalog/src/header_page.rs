@@ -29,8 +29,9 @@ pub const CATALOG_PAGE_ID: PageId = 0;
 const MAGIC: u64 = u64::from_le_bytes(*b"HAMDBCAT");
 /// Bump when the on-disk format changes, so old files fail to open instead
 /// of being misread. 3: secondary indexes store the primary key, on tables
-/// that have one. 4: the header keeps the next transaction id.
-const VERSION: u32 = 4;
+/// that have one. 4: the header keeps the next transaction id. 5: primary
+/// key index entries hold the rid after the key.
+const VERSION: u32 = 5;
 
 /// The Tid a new database's first transaction gets. 0 is `INVALID_TXN_ID`,
 /// the `ts` of rows written outside transactions.

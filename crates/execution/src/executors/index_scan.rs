@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use catalog::{IndexInfo, TableInfo};
 use common::{Rid, Schema, Tuple, Value};
+use storage::concurrency::index_versions::IndexedTable;
 use storage::index::btree_index::{KeySchemaComparator, compare_key_prefix};
 use storage::index::{Index, IndexTrait, RowLocator};
 use storage::page::btree_page::KeyComparator;
@@ -25,7 +26,7 @@ use crate::plans::{IndexScanPlan, IndexScanRange, KeyBound, PlanNode};
 /// it see a row again after moving it further along the index.
 ///
 /// If the index stores primary keys, `next` looks each one up in the primary
-/// key index to find the rid, skipping rows that are gone.
+/// key index to find the row (`Transaction::row_at`).
 ///
 /// Rows are read as the statement's transaction sees them, skipping those it
 /// doesn't see. Index entries are not versioned, so the version it sees may
@@ -38,6 +39,8 @@ pub struct IndexScanExecutor {
     locators: VecDeque<RowLocator>,
     /// The keys the rows must have. Set by `init`.
     keys: KeyRange,
+    /// The table, for following index entries. Set by `init`.
+    table: Option<Arc<IndexedTable>>,
 }
 
 /// The keys an index scan reads, as values.
@@ -79,6 +82,7 @@ impl IndexScanExecutor {
             plan,
             locators: VecDeque::new(),
             keys: KeyRange::Full,
+            table: None,
         }
     }
 
@@ -130,6 +134,8 @@ impl Executor for IndexScanExecutor {
         let (keys, locators) = self.scan_index()?;
         self.keys = keys;
         self.locators = locators.into();
+        let table = self.ctx.table(self.plan.table_oid())?;
+        self.table = Some(self.ctx.indexed_table(&table));
         Ok(())
     }
 
@@ -143,14 +149,12 @@ impl Executor for IndexScanExecutor {
         rids.clear();
         let table = self.ctx.table(self.plan.table_oid())?;
         let index = self.ctx.index(self.plan.index_oid())?;
+        let indexed = self.table.as_ref().expect("`init` sets the table");
         while tuples.len() < batch_size {
             let Some(locator) = self.locators.pop_front() else {
                 break;
             };
-            let Some(rid) = self.ctx.locate(&table, &locator)? else {
-                continue;
-            };
-            let Some((_, tuple)) = self.ctx.txn().get(&table.heap, &table.schema, rid)? else {
+            let Some((rid, tuple)) = self.ctx.txn().row_at(indexed, &locator)? else {
                 continue;
             };
             if !self.keys.contains(&key_values(&table, &index, &tuple)?) {
@@ -333,6 +337,41 @@ mod tests {
         (db, scan)
     }
 
+    /// Newer transactions rename every account and then change every
+    /// primary key. An older one still reads the accounts by their old
+    /// names, through entries holding their old primary keys.
+    #[test]
+    fn older_transactions_read_through_old_entries() {
+        let (db, scan) = accounts_by_name();
+        let table = db.catalog().get_table("accounts").unwrap();
+        let older = db.tm.begin();
+        let rename = vec![account_column(0), text("z"), account_column(2)];
+        let plus_10 = ArithmeticExpr::new(ArithmeticOp::Add, account_column(0), int(10)).unwrap();
+        let shift = vec![plus_10.into(), account_column(1), account_column(2)];
+        for targets in [rename, shift] {
+            let child = db.scan_accounts(&table, None);
+            let update = UpdatePlan::new(table.oid, &table.name, targets, child);
+            db.run(update.into()).unwrap();
+        }
+
+        let points = |name| IndexScanRange::Points(vec![vec![text(name)]]);
+        assert_eq!(
+            db.run_in(&older, scan(&db, points("a"))).unwrap(),
+            [account(1, Some("a"), 10), account(2, Some("a"), 20)]
+        );
+        assert!(
+            db.run_in(&older, scan(&db, points("z")))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.run(scan(&db, points("a"))).unwrap().is_empty());
+        assert_eq!(
+            db.run(scan(&db, points("z"))).unwrap(),
+            [11, 12, 13, 14].map(|id| account(id, Some("z"), id * 10 - 100))
+        );
+        db.tm.commit(&older).unwrap();
+    }
+
     #[test]
     fn reads_through_an_index_that_points_by_primary_key() {
         let (db, scan) = accounts_by_name();
@@ -398,9 +437,10 @@ mod tests {
         );
     }
 
-    /// A newer transaction moves user 1 to id 10 in place, which moves its
-    /// index entry at once. An older one still sees id 1, so the entry for
-    /// 10 leads it to a row whose key isn't 10: it is skipped.
+    /// A newer transaction moves user 1 to id 10 in place, which adds an
+    /// entry for 10 at once. An older one still sees id 1: it finds the row
+    /// through the entry for 1, which stays, and the entry for 10 leads it
+    /// to a row whose key isn't 10, so it is skipped.
     #[test]
     fn rows_whose_visible_key_left_the_range_are_skipped() {
         let db = with_ids(&[1, 2, 3]);
@@ -415,6 +455,11 @@ mod tests {
         db.run(update.into()).unwrap();
 
         let point = |id| IndexScanRange::Points(vec![vec![int(id)]]);
+        assert_eq!(
+            db.run_in(&older, scan(&db, "users_id", point(1), None))
+                .unwrap(),
+            [user(1, Some("user 1"))]
+        );
         let at_10 = db.run_in(&older, scan(&db, "users_id", point(10), None));
         assert!(at_10.unwrap().is_empty());
         let range = IndexScanRange::Range {

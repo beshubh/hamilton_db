@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use common::{Rid, Schema, Tuple};
 
-use super::{AbstractExecutor, Executor, count_row, duplicate_key, index_keys, locators};
+use super::{
+    AbstractExecutor, Executor, count_row, duplicate_key, index_keys, locators, write_indexes,
+};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::plans::{InsertPlan, PlanNode};
@@ -52,7 +54,6 @@ impl Executor for InsertExecutor {
         }
         self.done = true;
         let table = self.ctx.table(self.plan.table_oid())?;
-        let indexes = self.ctx.catalog().table_indexes(&table.name);
         let mut rows = Vec::new();
         while self
             .child
@@ -60,6 +61,8 @@ impl Executor for InsertExecutor {
         {
             rows.append(&mut self.child_tuples);
         }
+        let (_writes, indexes) = write_indexes(&self.ctx, &table);
+        let indexed = self.ctx.indexed_table(&table);
         let txn = self.ctx.txn();
         // The child's rows are already in the table's layout.
         for tuple in &rows {
@@ -67,7 +70,7 @@ impl Executor for InsertExecutor {
             let rid = txn.insert(&table.heap, &table.schema, tuple)?;
             let locators = locators(&indexes, &keys, rid);
             for ((index, key), locator) in indexes.iter().zip(&keys).zip(&locators) {
-                if !txn.insert_entry(&index.index, key, locator)? {
+                if !txn.insert_entry(&indexed, &index.index, key, locator)? {
                     return Err(duplicate_key(index, key));
                 }
             }

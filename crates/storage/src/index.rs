@@ -145,8 +145,9 @@ impl fmt::Display for IndexMetadata {
 }
 
 /// An index from keys to rows. Keys are tuples in the index's key schema, as
-/// `Tuple::to_key` builds them. A primary key index holds each key at most
-/// once; other indexes may hold a key for many rows.
+/// `Tuple::to_key` builds them. Any index may hold a key for many rows, a
+/// primary key index included: the index doesn't check uniqueness,
+/// `Transaction::insert_entry` does.
 ///
 /// Rows are given as `RowLocator`s of the kind `IndexMetadata::locator`
 /// says. Passing the wrong kind is a bug, checked in debug builds.
@@ -155,11 +156,10 @@ pub trait IndexTrait {
     fn metadata(&self) -> &IndexMetadata;
 
     /// Adds `key` for the row at `locator`. Returns `false`, changing
-    /// nothing, if that entry exists, or if this is a primary key index and
-    /// `key` is taken.
+    /// nothing, if that entry exists.
     ///
     /// Entries are not versioned. Writers inside a transaction go through
-    /// `Transaction::insert_entry`, which undoes the write on abort.
+    /// `Transaction::insert_entry` instead; see `concurrency::index_versions`.
     fn insert_entry(&self, key: &Tuple, locator: &RowLocator) -> Result<bool>;
 
     /// Removes `key` for the row at `locator`, if present, and returns

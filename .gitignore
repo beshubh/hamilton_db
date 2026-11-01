@@ -25,3 +25,4 @@ target/
 /hamilton.db
 /hamilton.meta
 /hamilton.log
+__pycache__/

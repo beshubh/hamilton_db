@@ -1,8 +1,9 @@
 //! The database the CLI runs statements against: its files, buffer pool
-//! and catalog, and the session that runs statements on them.
+//! and catalog, and the sessions that run statements on them.
 
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::Result;
 use catalog::Catalog;
@@ -10,6 +11,9 @@ use common::{Column, Value};
 use planner::{ExecutionEngine, TransactionStatus};
 use storage::buffer::buffer_pool_manager::{BufferPoolManager, DEFAULT_POOL_SIZE};
 use storage::disk::disk_manager::DiskManager;
+
+/// The session statements run in until `\session` picks another.
+pub const DEFAULT_SESSION: &str = "main";
 
 /// What a statement produced, for printing.
 #[derive(Debug, PartialEq)]
@@ -39,8 +43,22 @@ pub struct Database {
     disk: Arc<DiskManager>,
     bpm: Arc<BufferPoolManager>,
     catalog: Arc<Catalog>,
-    /// The CLI's one session.
-    engine: Mutex<ExecutionEngine>,
+    sessions: Mutex<Sessions>,
+}
+
+/// Named sessions, each with its own transaction state, so that one CLI can
+/// interleave transactions. Statements run in the current one.
+struct Sessions {
+    current: String,
+    engines: BTreeMap<String, ExecutionEngine>,
+}
+
+impl Sessions {
+    fn current(&mut self) -> &mut ExecutionEngine {
+        self.engines
+            .get_mut(&self.current)
+            .expect("the current session exists")
+    }
 }
 
 impl Database {
@@ -55,7 +73,10 @@ impl Database {
             disk,
             bpm,
             catalog,
-            engine: Mutex::new(engine),
+            sessions: Mutex::new(Sessions {
+                current: DEFAULT_SESSION.to_owned(),
+                engines: BTreeMap::from([(DEFAULT_SESSION.to_owned(), engine)]),
+            }),
         })
     }
 
@@ -63,20 +84,38 @@ impl Database {
         &self.catalog
     }
 
-    /// Whether the session is in a transaction block, and if it failed.
-    pub fn transaction_status(&self) -> TransactionStatus {
-        self.engine().status()
+    /// The name of the session statements run in.
+    pub fn session(&self) -> String {
+        self.sessions().current.clone()
     }
 
-    /// Runs the statements in `sql` in order, stopping at the first that
-    /// fails.
+    /// Makes `name` the session statements run in, opening it if it is new.
+    pub fn switch_session(&self, name: &str) {
+        let mut sessions = self.sessions();
+        if !sessions.engines.contains_key(name) {
+            let engine = sessions.current().session();
+            sessions.engines.insert(name.to_owned(), engine);
+        }
+        sessions.current = name.to_owned();
+    }
+
+    /// Whether the current session is in a transaction block, and if it
+    /// failed.
+    pub fn transaction_status(&self) -> TransactionStatus {
+        self.sessions().current().status()
+    }
+
+    /// Runs the statements in `sql` in order in the current session,
+    /// stopping at the first that fails.
     ///
     /// Everything is written to disk after each statement that leaves the
     /// session outside a transaction block: one that ran in a transaction of
-    /// its own, COMMIT and ROLLBACK. Statements in a block are not flushed
-    /// until it ends. There is no write-ahead log to recover from.
+    /// its own, COMMIT and ROLLBACK. That includes what other sessions have
+    /// written in blocks still open. There is no write-ahead log to recover
+    /// from.
     pub fn execute(&self, sql: &str) -> Result<Vec<Output>> {
-        let mut engine = self.engine();
+        let mut sessions = self.sessions();
+        let engine = sessions.current();
         let stmts = engine.parse(sql)?;
         let mut outputs = Vec::with_capacity(stmts.len());
         for stmt in &stmts {
@@ -89,20 +128,26 @@ impl Database {
         Ok(outputs)
     }
 
-    /// Rolls back an open transaction block, writes everything to disk and
-    /// closes the files.
+    /// Rolls back every open transaction block, writes everything to disk
+    /// and closes the files.
     pub fn close(self) -> Result<()> {
-        let mut engine = self.engine.into_inner().unwrap_or_else(|e| e.into_inner());
-        engine.close()?;
-        // Dropping the engine stops its garbage collector, which writes pages.
-        drop(engine);
+        let sessions = self
+            .sessions
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner());
+        for mut engine in sessions.engines.into_values() {
+            engine.close()?;
+            // Dropping the last engine stops the garbage collector, which
+            // writes pages.
+            drop(engine);
+        }
         self.bpm.flush_all_pages()?;
         self.disk.shut_down()?;
         Ok(())
     }
 
-    fn engine(&self) -> std::sync::MutexGuard<'_, ExecutionEngine> {
-        self.engine.lock().unwrap_or_else(|e| e.into_inner())
+    fn sessions(&self) -> MutexGuard<'_, Sessions> {
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn flush(&self) -> Result<()> {
@@ -315,6 +360,25 @@ mod tests {
         assert_eq!(rows(&one(&db, "SELECT * FROM t")), [vec![Value::Int(1)]]);
     }
 
+    #[test]
+    fn sessions_run_their_own_transactions() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path().join("test.db")).unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
+        // b begins first: a reader newer than a's insert would conflict.
+        db.switch_session("b");
+        db.execute("BEGIN").unwrap();
+        db.switch_session("a");
+        db.execute("BEGIN; INSERT INTO t VALUES (1)").unwrap();
+        db.switch_session("b");
+        assert_eq!(db.transaction_status(), TransactionStatus::InBlock);
+        assert!(rows(&one(&db, "SELECT * FROM t")).is_empty());
+        db.switch_session("a");
+        assert_eq!(one(&db, "COMMIT"), Output::Done("COMMIT"));
+        db.switch_session(DEFAULT_SESSION);
+        assert_eq!(rows(&one(&db, "SELECT * FROM t")), [vec![Value::Int(1)]]);
+    }
+
     /// Committed rows carry their transaction's id, so a reopened database
     /// must hand out ids above them to see them.
     #[test]
@@ -326,12 +390,15 @@ mod tests {
         for id in 1..=5 {
             db.execute(&format!("INSERT INTO t VALUES ({id})")).unwrap();
         }
-        let next_tid = db.engine().transaction_manager().next_tid();
+        let next_tid = db.sessions().current().transaction_manager().next_tid();
         assert!(next_tid > 5);
         db.close().unwrap();
 
         let db = Database::open(&path).unwrap();
-        assert_eq!(db.engine().transaction_manager().next_tid(), next_tid);
+        assert_eq!(
+            db.sessions().current().transaction_manager().next_tid(),
+            next_tid
+        );
         assert_eq!(rows(&one(&db, "SELECT * FROM t")).len(), 5);
         db.execute("UPDATE t SET id = id * 10 WHERE id = 5")
             .unwrap();

@@ -396,29 +396,30 @@ fn update_keeps_primary_keys_unique() {
         ]
     );
 
-    // Both indexes find the rows' new versions.
+    // Both indexes find the rows' new versions, as a new transaction sees
+    // them.
     let catalog = db.catalog();
     let table = catalog.get_table("users").unwrap();
+    let indexed = execution_context::indexed_table(&catalog, &table);
     let lookup = |index: &str, key: Value| {
         let index = catalog.get_index(index).unwrap();
         let key = Tuple::encode(&index.key_schema, &[key]).unwrap();
         let mut locators = Vec::new();
         index.index.scan_key(&key, &mut locators).unwrap();
-        locators
+        let engine = db.engine.borrow();
+        let tm = engine.transaction_manager();
+        let txn = tm.begin();
+        let rows = locators
             .iter()
-            .map(|locator| {
-                let rid = execution_context::locate(&catalog, &table, locator)
-                    .unwrap()
-                    .unwrap();
-                table
-                    .heap
-                    .get(rid)
-                    .unwrap()
-                    .1
-                    .decode(&table.schema)
-                    .unwrap()
+            .filter_map(|locator| txn.row_at(&indexed, locator).unwrap())
+            .map(|(_, tuple)| tuple.decode(&table.schema).unwrap())
+            .filter(|row| {
+                let own = Tuple::encode(&index.key_schema, &[row[index.key_columns[0]].clone()]);
+                own.unwrap() == key
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        tm.commit(&txn).unwrap();
+        rows
     };
     let dee = vec![vec![Value::Int(2), Value::from("dee")]];
     assert_eq!(lookup("users_pkey", Value::Int(2)), dee);

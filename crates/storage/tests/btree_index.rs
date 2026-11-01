@@ -398,30 +398,28 @@ fn entries_end_in_their_record_id() {
 }
 
 #[test]
-fn primary_key_entries_are_the_key_alone() {
+fn primary_key_entries_end_in_their_record_id() {
     let f = age_pk_index();
-    f.insert(&row(0, Some(30), ""), rid(7));
+    f.insert(&row(0, Some(30), ""), Rid::new(0x0102_0304, 0x0506).into());
     let [(key, entry)] = &raw_entries(&f)[..] else {
         panic!("not one entry");
     };
-    assert_eq!(key, entry);
     assert_eq!(key, f.key(&row(0, Some(30), "")).data());
-    assert_eq!(f.lookup(&row(0, Some(30), "")), [rid(7)]);
+    assert_eq!(entry[key.len()..], [4, 3, 2, 1, 6, 5]);
 }
 
+/// The index holds a primary key for many rids: old versions of a row keep
+/// their entries. `Transaction::insert_entry` checks uniqueness.
 #[test]
-fn primary_key_rejects_an_existing_key() {
+fn primary_key_holds_a_key_for_many_rids() {
     let f = age_pk_index();
     let key = f.key(&row(1, Some(30), ""));
     assert!(f.index.insert_entry(&key, &rid(1)).unwrap());
-    assert!(!f.index.insert_entry(&key, &rid(2)).unwrap());
+    assert!(f.index.insert_entry(&key, &rid(2)).unwrap());
     assert!(!f.index.insert_entry(&key, &rid(1)).unwrap());
-    assert_eq!(f.lookup(&row(0, Some(30), "")), [rid(1)]);
-    // NULLs are equal, so they collide too.
-    let null = f.key(&row(3, None, ""));
-    assert!(f.index.insert_entry(&null, &rid(3)).unwrap());
-    assert!(!f.index.insert_entry(&null, &rid(4)).unwrap());
-    assert_eq!(f.lookup(&row(0, None, "")), [rid(3)]);
+    assert_eq!(f.lookup(&row(0, Some(30), "")), [rid(1), rid(2)]);
+    assert!(f.index.delete_entry(&key, &rid(1)).unwrap());
+    assert_eq!(f.lookup(&row(0, Some(30), "")), [rid(2)]);
 }
 
 #[test]

@@ -1,15 +1,20 @@
 //! The prompt: `hamilton ❯`, its arrow red after a statement fails, with the
-//! database's name on the right. Lines already entered keep the prompt but
-//! lose the name, so it shows only on the line being edited.
+//! database's name on the right, and the session's if it isn't the default
+//! one. Lines already entered keep the prompt but lose the names, so they
+//! show only on the line being edited.
 
 use std::borrow::Cow;
 
 use nu_ansi_term::Color;
 use reedline::{Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus};
 
+use crate::database::DEFAULT_SESSION;
+
 pub struct SqlPrompt {
     /// Shown on the right; empty for lines already entered.
     database: String,
+    /// The session statements run in.
+    pub session: String,
     /// Whether the last input failed.
     pub failed: bool,
 }
@@ -18,6 +23,7 @@ impl SqlPrompt {
     pub fn new(database: impl Into<String>) -> Self {
         Self {
             database: database.into(),
+            session: DEFAULT_SESSION.to_owned(),
             failed: false,
         }
     }
@@ -34,7 +40,11 @@ impl Prompt for SqlPrompt {
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
-        Cow::Borrowed(&self.database)
+        if self.database.is_empty() || self.session == DEFAULT_SESSION {
+            Cow::Borrowed(&self.database)
+        } else {
+            Cow::Owned(format!("{} · {}", self.database, self.session))
+        }
     }
 
     fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {

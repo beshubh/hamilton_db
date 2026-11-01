@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use common::{Rid, Schema, Tuple, Value};
+use storage::concurrency::index_versions::IndexedTable;
 use storage::index::IndexTrait;
 use storage::index::btree_index::compare_key_prefix;
 
@@ -48,6 +49,8 @@ pub struct NestedIndexJoinExecutor {
     next_outer: usize,
     /// Joined rows not returned by `next` yet.
     output: VecDeque<Tuple>,
+    /// The inner table, for following index entries. Set by `init`.
+    inner: Option<Arc<IndexedTable>>,
 }
 
 impl NestedIndexJoinExecutor {
@@ -64,6 +67,7 @@ impl NestedIndexJoinExecutor {
             outer_rids: Vec::new(),
             next_outer: 0,
             output: VecDeque::new(),
+            inner: None,
         }
     }
 
@@ -98,11 +102,9 @@ impl NestedIndexJoinExecutor {
         index
             .index
             .scan_key(&Tuple::encode(&index.key_schema, &key)?, &mut locators)?;
+        let indexed = Arc::clone(self.inner.as_ref().expect("`init` sets the inner table"));
         for locator in locators {
-            let Some(rid) = self.ctx.locate(&table, &locator)? else {
-                continue;
-            };
-            let Some((_, inner)) = self.ctx.txn().get(&table.heap, &table.schema, rid)? else {
+            let Some((_, inner)) = self.ctx.txn().row_at(&indexed, &locator)? else {
                 continue;
             };
             if !compare_key_prefix(&key_values(&table, &index, &inner)?, &key).is_eq() {
@@ -155,6 +157,8 @@ impl Executor for NestedIndexJoinExecutor {
         self.outer_block.clear();
         self.next_outer = 0;
         self.output.clear();
+        let table = self.ctx.table(self.plan.inner_table_oid())?;
+        self.inner = Some(self.ctx.indexed_table(&table));
         Ok(())
     }
 
