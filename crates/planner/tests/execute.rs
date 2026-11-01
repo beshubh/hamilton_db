@@ -679,9 +679,8 @@ fn explain_does_not_run_the_statement() {
         lines("EXPLAIN DELETE FROM orders WHERE user_id = 1"),
         [
             "Delete on orders",
-            "  ->  Filter",
-            "        Condition: user_id = 1",
-            "        ->  SeqScan on orders",
+            "  ->  SeqScan on orders",
+            "        Filter: user_id = 1",
         ]
         .map(text)
     );
