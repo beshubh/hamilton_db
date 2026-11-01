@@ -1,10 +1,10 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use common::{Rid, Schema, Tuple};
 use storage::concurrency::transaction::TransactionScan;
+use storage::table::table_iterator::TableRow;
 
-use super::{Executor, passes};
+use super::{Executor, RowPredicate};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::plans::{PlanNode, SeqScanPlan};
@@ -17,17 +17,27 @@ pub struct SeqScanExecutor {
     plan: SeqScanPlan,
     /// Set by `init`.
     iter: Option<TransactionScan>,
-    /// Rows of the page read last that have not been produced yet.
-    rows: VecDeque<Tuple>,
+    /// Rows of the page read last; those from `next_row` on have not been
+    /// produced yet. Produced rows trade buffers with the caller's batch, so
+    /// reading the next page writes over buffers instead of allocating.
+    rows: Vec<TableRow>,
+    next_row: usize,
+    /// The plan's filter, made ready to test rows.
+    filter: Option<RowPredicate>,
 }
 
 impl SeqScanExecutor {
     pub fn new(ctx: Arc<ExecutionContext>, plan: SeqScanPlan) -> Self {
+        let filter = plan
+            .filter()
+            .map(|filter| RowPredicate::new(filter, plan.get_output_schema()));
         Self {
             ctx,
             plan,
+            filter,
             iter: None,
-            rows: VecDeque::new(),
+            rows: Vec::new(),
+            next_row: 0,
         }
     }
 }
@@ -37,6 +47,7 @@ impl Executor for SeqScanExecutor {
         let table = self.ctx.table(self.plan.table_oid())?;
         self.iter = Some(self.ctx.txn().scan(&table.heap, &table.schema)?);
         self.rows.clear();
+        self.next_row = 0;
         Ok(())
     }
 
@@ -46,26 +57,32 @@ impl Executor for SeqScanExecutor {
         rids: &mut Vec<Rid>,
         batch_size: usize,
     ) -> Result<bool> {
-        tuples.clear();
         rids.clear();
         let iter = self.iter.as_mut().expect("init is called before next");
-        while tuples.len() < batch_size {
-            let Some(tuple) = self.rows.pop_front() else {
-                match iter.next_batch()? {
-                    Some(rows) => self.rows.extend(rows.into_iter().map(|(_, tuple)| tuple)),
-                    None => break,
+        let mut n = 0;
+        while n < batch_size {
+            if self.next_row == self.rows.len() {
+                self.next_row = 0;
+                if !iter.next_batch_into(&mut self.rows)? {
+                    break;
                 }
-                continue;
-            };
-            if let Some(filter) = self.plan.filter()
-                && !passes(filter, &tuple, self.plan.get_output_schema())?
+            }
+            let (_, tuple) = &mut self.rows[self.next_row];
+            self.next_row += 1;
+            if let Some(filter) = &self.filter
+                && !filter.passes(tuple, self.plan.get_output_schema())?
             {
                 continue;
             }
             rids.push(tuple.rid().expect("rows read from a table carry their rid"));
-            tuples.push(tuple);
+            if n == tuples.len() {
+                tuples.push(Tuple::default());
+            }
+            std::mem::swap(&mut tuples[n], tuple);
+            n += 1;
         }
-        Ok(!tuples.is_empty())
+        tuples.truncate(n);
+        Ok(n > 0)
     }
 
     fn get_output_schema(&self) -> &Schema {

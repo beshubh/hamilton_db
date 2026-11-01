@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use common::hash::IntKeys;
 use common::{FrameId, PageId};
 use hashlink::LinkedHashSet;
 use parking_lot::Mutex;
@@ -32,14 +33,14 @@ pub struct FrameStatus {
 /// All lists are ordered oldest-first: `insert` adds the most recent entry at
 /// the back and the eviction candidate is at the front.
 struct ArcState {
-    mru: LinkedHashSet<FrameId>,
-    mfu: LinkedHashSet<FrameId>,
-    mru_ghost: LinkedHashSet<PageId>,
-    mfu_ghost: LinkedHashSet<PageId>,
+    mru: LinkedHashSet<FrameId, IntKeys>,
+    mfu: LinkedHashSet<FrameId, IntKeys>,
+    mru_ghost: LinkedHashSet<PageId, IntKeys>,
+    mfu_ghost: LinkedHashSet<PageId, IntKeys>,
     /// Alive entries keyed by frame id (in `mru` or `mfu`).
-    alive_map: HashMap<FrameId, FrameStatus>,
+    alive_map: HashMap<FrameId, FrameStatus, IntKeys>,
     /// Dead entries keyed by page id (in `mru_ghost` or `mfu_ghost`).
-    ghost_map: HashMap<PageId, FrameStatus>,
+    ghost_map: HashMap<PageId, FrameStatus, IntKeys>,
     /// Number of evictable frames.
     curr_size: usize,
     mru_target_size: usize,
@@ -51,6 +52,86 @@ pub struct ArcReplacer {
 }
 
 impl ArcState {
+    /// See [`ArcReplacer::record_access`].
+    fn record_access(&mut self, frame_id: FrameId, page_id: PageId) {
+        // Case 1: hit in mru or mfu.
+        if let Some(frame) = self.alive_map.get_mut(&frame_id) {
+            match frame.status {
+                ArcStatus::Mru => {
+                    self.mru.remove(&frame_id);
+                    self.mfu.insert(frame_id);
+                }
+                _ => {
+                    self.mfu.to_back(&frame_id);
+                }
+            }
+            frame.status = ArcStatus::Mfu;
+            return;
+        }
+
+        // Cases 2/3: hit in mru_ghost or mfu_ghost.
+        if let Some(mut frame) = self.ghost_map.remove(&page_id) {
+            let target = self.mru_target_size;
+            if frame.status == ArcStatus::MruGhost {
+                let delta = (self.mfu_ghost.len() / self.mru_ghost.len()).max(1);
+                self.mru_target_size = (target + delta).min(self.replacer_size);
+                self.mru_ghost.remove(&page_id);
+            } else {
+                let delta = (self.mru_ghost.len() / self.mfu_ghost.len()).max(1);
+                self.mru_target_size = target.saturating_sub(delta);
+                self.mfu_ghost.remove(&page_id);
+            }
+
+            self.mfu.insert(frame_id);
+            frame.frame_id = frame_id;
+            frame.evictable = false;
+            frame.status = ArcStatus::Mfu;
+            self.alive_map.insert(frame_id, frame);
+            return;
+        }
+
+        // Case 4: miss in all lists. Trim the ghost lists to keep the
+        // directory within bounds before adding the new entry.
+        let recency_size = self.mru.len() + self.mru_ghost.len();
+        let total_size = recency_size + self.mfu.len() + self.mfu_ghost.len();
+        if recency_size == self.replacer_size {
+            if let Some(pid) = self.mru_ghost.pop_front() {
+                self.ghost_map.remove(&pid);
+            }
+        } else if recency_size < self.replacer_size && total_size == 2 * self.replacer_size {
+            if let Some(pid) = self.mfu_ghost.pop_front() {
+                self.ghost_map.remove(&pid);
+            }
+        }
+
+        self.mru.insert(frame_id);
+        self.alive_map.insert(
+            frame_id,
+            FrameStatus {
+                page_id,
+                frame_id,
+                evictable: false,
+                status: ArcStatus::Mru,
+            },
+        );
+    }
+
+    /// See [`ArcReplacer::set_evictable`].
+    fn set_evictable(&mut self, frame_id: FrameId, set_evictable: bool) {
+        let Some(frame) = self.alive_map.get_mut(&frame_id) else {
+            return;
+        };
+        if frame.evictable == set_evictable {
+            return;
+        }
+        frame.evictable = set_evictable;
+        if set_evictable {
+            self.curr_size += 1;
+        } else {
+            self.curr_size -= 1;
+        }
+    }
+
     /// Evicts the oldest evictable frame from `mru` (or `mfu` when `from_mfu`)
     /// into the matching ghost list.
     fn try_evict(&mut self, from_mfu: bool) -> Option<FrameId> {
@@ -79,12 +160,12 @@ impl ArcReplacer {
     pub fn new(num_frames: usize) -> Self {
         Self {
             state: Mutex::new(ArcState {
-                mru: LinkedHashSet::new(),
-                mfu: LinkedHashSet::new(),
-                mru_ghost: LinkedHashSet::new(),
-                mfu_ghost: LinkedHashSet::new(),
-                alive_map: HashMap::new(),
-                ghost_map: HashMap::new(),
+                mru: LinkedHashSet::default(),
+                mfu: LinkedHashSet::default(),
+                mru_ghost: LinkedHashSet::default(),
+                mfu_ghost: LinkedHashSet::default(),
+                alive_map: HashMap::default(),
+                ghost_map: HashMap::default(),
                 curr_size: 0,
                 mru_target_size: 0,
                 replacer_size: num_frames,
@@ -110,83 +191,22 @@ impl ArcReplacer {
     /// `mru`. Performs everything from the ARC paper except REPLACE, which is
     /// left to `evict`.
     pub fn record_access(&self, frame_id: FrameId, page_id: PageId, _access_type: AccessType) {
+        self.state.lock().record_access(frame_id, page_id);
+    }
+
+    /// [`record_access`](Self::record_access), then
+    /// [`set_evictable`](Self::set_evictable) to `false`, under one lock, as
+    /// pinning a page does.
+    pub fn record_pin(&self, frame_id: FrameId, page_id: PageId, _access_type: AccessType) {
         let mut state = self.state.lock();
-        let state = &mut *state;
-
-        // Case 1: hit in mru or mfu.
-        if let Some(frame) = state.alive_map.get_mut(&frame_id) {
-            match frame.status {
-                ArcStatus::Mru => state.mru.remove(&frame_id),
-                _ => state.mfu.remove(&frame_id),
-            };
-            state.mfu.insert(frame_id);
-            frame.status = ArcStatus::Mfu;
-            return;
-        }
-
-        // Cases 2/3: hit in mru_ghost or mfu_ghost.
-        if let Some(mut frame) = state.ghost_map.remove(&page_id) {
-            let target = state.mru_target_size;
-            if frame.status == ArcStatus::MruGhost {
-                let delta = (state.mfu_ghost.len() / state.mru_ghost.len()).max(1);
-                state.mru_target_size = (target + delta).min(state.replacer_size);
-                state.mru_ghost.remove(&page_id);
-            } else {
-                let delta = (state.mru_ghost.len() / state.mfu_ghost.len()).max(1);
-                state.mru_target_size = target.saturating_sub(delta);
-                state.mfu_ghost.remove(&page_id);
-            }
-
-            state.mfu.insert(frame_id);
-            frame.frame_id = frame_id;
-            frame.evictable = false;
-            frame.status = ArcStatus::Mfu;
-            state.alive_map.insert(frame_id, frame);
-            return;
-        }
-
-        // Case 4: miss in all lists. Trim the ghost lists to keep the
-        // directory within bounds before adding the new entry.
-        let recency_size = state.mru.len() + state.mru_ghost.len();
-        let total_size = recency_size + state.mfu.len() + state.mfu_ghost.len();
-        if recency_size == state.replacer_size {
-            if let Some(pid) = state.mru_ghost.pop_front() {
-                state.ghost_map.remove(&pid);
-            }
-        } else if recency_size < state.replacer_size && total_size == 2 * state.replacer_size {
-            if let Some(pid) = state.mfu_ghost.pop_front() {
-                state.ghost_map.remove(&pid);
-            }
-        }
-
-        state.mru.insert(frame_id);
-        state.alive_map.insert(
-            frame_id,
-            FrameStatus {
-                page_id,
-                frame_id,
-                evictable: false,
-                status: ArcStatus::Mru,
-            },
-        );
+        state.record_access(frame_id, page_id);
+        state.set_evictable(frame_id, false);
     }
 
     /// Marks a frame evictable or not, adjusting the replacer size. Unknown
     /// frames are ignored.
     pub fn set_evictable(&self, frame_id: FrameId, set_evictable: bool) {
-        let mut state = self.state.lock();
-        let Some(frame) = state.alive_map.get_mut(&frame_id) else {
-            return;
-        };
-        if frame.evictable == set_evictable {
-            return;
-        }
-        frame.evictable = set_evictable;
-        if set_evictable {
-            state.curr_size += 1;
-        } else {
-            state.curr_size -= 1;
-        }
+        self.state.lock().set_evictable(frame_id, set_evictable);
     }
 
     /// Removes an evictable frame from the replacer without moving it to a

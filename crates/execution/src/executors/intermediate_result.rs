@@ -5,10 +5,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use common::hash::IntKeys;
 use common::{INVALID_PAGE_ID, PageId, Tuple};
 use storage::StorageError;
 use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
+use storage::page::PAGE_SIZE;
 use storage::page::intermediate_result_page::{IntermediateResultPage, TUPLE_SPACE, space_for};
 
 use crate::Result;
@@ -65,18 +67,79 @@ impl PageCount {
     }
 }
 
+/// Appends rows to several intermediate results at once, as an executor
+/// splitting rows into partitions does, giving the same pages as
+/// [`IntermediatePages::append`]. Each result's last page is filled in
+/// memory, the frame that result writes to, and goes to the buffer pool once
+/// full, so a page is pinned once rather than once per row.
+/// [`finish`](Self::finish) writes the pages still being filled.
+pub(super) struct PartitionWriter {
+    results: Vec<IntermediateResult>,
+    /// The last page of each result, while it is being filled.
+    filling: Vec<Option<Box<[u8; PAGE_SIZE]>>>,
+}
+
+impl PartitionWriter {
+    pub fn new(count: usize) -> Self {
+        Self {
+            results: (0..count).map(|_| IntermediateResult::new()).collect(),
+            filling: (0..count).map(|_| None).collect(),
+        }
+    }
+
+    /// Appends `tuple` to result `i`.
+    pub fn append(&mut self, pages: &mut IntermediatePages, i: usize, tuple: &Tuple) -> Result<()> {
+        let result = &mut self.results[i];
+        if let Some(page) = &mut self.filling[i] {
+            match IntermediateResultPage::new(&mut **page)?.insert_tuple(tuple.data()) {
+                Ok(_) => {
+                    result.tuple_count += 1;
+                    return Ok(());
+                }
+                Err(StorageError::PageFull) => {}
+                Err(e) => return Err(e.into()),
+            }
+            let next_page_id = pages.allocate();
+            IntermediateResultPage::new(&mut **page)?.set_next_page_id(next_page_id);
+            pages.write(result.last_page_id, page)?;
+            page.fill(0);
+            result.last_page_id = next_page_id;
+        } else {
+            let page_id = pages.allocate();
+            result.first_page_id = page_id;
+            result.last_page_id = page_id;
+            self.filling[i] = Some(Box::new([0; PAGE_SIZE]));
+        }
+        let page = self.filling[i].as_mut().expect("a page is being filled");
+        IntermediateResultPage::init(&mut **page).insert_tuple(tuple.data())?;
+        result.page_count += 1;
+        result.tuple_count += 1;
+        Ok(())
+    }
+
+    /// Writes the pages still being filled, and returns the results.
+    pub fn finish(self, pages: &mut IntermediatePages) -> Result<Vec<IntermediateResult>> {
+        for (result, page) in self.results.iter().zip(&self.filling) {
+            if let Some(page) = page {
+                pages.write(result.last_page_id, page)?;
+            }
+        }
+        Ok(self.results)
+    }
+}
+
 /// The intermediate result pages one executor has allocated. Any it has not
 /// freed are freed when it is dropped.
 pub(super) struct IntermediatePages {
     exec_ctx: Arc<ExecutionContext>,
-    page_ids: HashSet<PageId>,
+    page_ids: HashSet<PageId, IntKeys>,
 }
 
 impl IntermediatePages {
     pub fn new(exec_ctx: Arc<ExecutionContext>) -> Self {
         Self {
             exec_ctx,
-            page_ids: HashSet::new(),
+            page_ids: HashSet::default(),
         }
     }
 
@@ -88,6 +151,22 @@ impl IntermediatePages {
     #[cfg(test)]
     pub fn page_ids(&self) -> impl Iterator<Item = PageId> + '_ {
         self.page_ids.iter().copied()
+    }
+
+    /// A new page, for a [`PartitionWriter`] to fill.
+    fn allocate(&mut self) -> PageId {
+        let page_id = self.bpm().new_page();
+        self.page_ids.insert(page_id);
+        page_id
+    }
+
+    /// Writes `data`, a whole page, to page `page_id`.
+    fn write(&self, page_id: PageId, data: &[u8; PAGE_SIZE]) -> Result<()> {
+        let mut guard = self
+            .bpm()
+            .checked_write_page(page_id, AccessType::Unknown)?;
+        *guard.get_data_mut() = *data;
+        Ok(())
     }
 
     /// Appends `tuple` to the last page of `result`, or to a new page linked
@@ -146,6 +225,37 @@ impl IntermediatePages {
             .map(|data| Tuple::from_bytes(data.to_vec()))
             .collect();
         Ok((tuples, page.next_page_id()))
+    }
+
+    /// Calls `f` with each row on page `page_id`, in order, and returns the
+    /// page after it. The page stays latched meanwhile.
+    pub fn for_each_tuple(
+        &self,
+        page_id: PageId,
+        mut f: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<PageId> {
+        let guard = self.bpm().checked_read_page(page_id, AccessType::Scan)?;
+        let page = IntermediateResultPage::new(guard.get_data())?;
+        for data in page.tuples() {
+            f(data)?;
+        }
+        Ok(page.next_page_id())
+    }
+
+    /// [`read_page`](Self::read_page) into `tuples`, replacing what it holds
+    /// and writing over its tuples' buffers rather than allocating new ones.
+    pub fn read_page_into(&self, page_id: PageId, tuples: &mut Vec<Tuple>) -> Result<PageId> {
+        let mut n = 0;
+        let next_page_id = self.for_each_tuple(page_id, |data| {
+            if n == tuples.len() {
+                tuples.push(Tuple::default());
+            }
+            tuples[n].set_bytes(data);
+            n += 1;
+            Ok(())
+        })?;
+        tuples.truncate(n);
+        Ok(next_page_id)
     }
 
     /// Replaces the rows on page `page_id` with `tuples`, which must fit,

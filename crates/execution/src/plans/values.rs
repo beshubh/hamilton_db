@@ -11,15 +11,16 @@ use crate::expressions::AbstractExpr;
 #[derive(Clone, Debug)]
 pub struct ValuesPlan {
     output_schema: Schema,
-    /// One expression per output column in every row.
-    rows: Vec<Vec<AbstractExpr>>,
+    /// One expression per output column in every row. Shared, as the
+    /// optimizer clones every plan node and `INSERT` can have many rows.
+    rows: Arc<Vec<Vec<AbstractExpr>>>,
 }
 
 impl ValuesPlan {
     pub fn new(output_schema: Schema, rows: Vec<Vec<AbstractExpr>>) -> Self {
         Self {
             output_schema,
-            rows,
+            rows: Arc::new(rows),
         }
     }
 

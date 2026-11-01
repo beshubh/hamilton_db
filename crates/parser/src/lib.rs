@@ -1,4 +1,5 @@
 pub mod ast;
+mod dialect;
 pub mod error;
 mod parse;
 

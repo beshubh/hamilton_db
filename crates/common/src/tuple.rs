@@ -28,7 +28,7 @@ use std::ops::Range;
 
 use crate::error::{Result, ValueError};
 use crate::rid::Rid;
-use crate::schema::Schema;
+use crate::schema::{Column, Schema};
 use crate::value::{DataType, Value, ValueRef};
 
 /// Offsets in a tuple are u16, so no tuple can be longer than this.
@@ -105,6 +105,39 @@ impl Tuple {
         self.data.is_empty()
     }
 
+    /// Replaces the tuple's bytes with a copy of `bytes`, keeping its buffer,
+    /// and forgets its rid.
+    pub fn set_bytes(&mut self, bytes: &[u8]) {
+        self.rid = None;
+        self.data.clear();
+        extend_short(&mut self.data, bytes);
+    }
+
+    /// Starts encoding a row of `schema` over this tuple's bytes, one column
+    /// at a time, keeping its buffer. Forgets its rid.
+    pub fn writer<'a>(&'a mut self, schema: &'a Schema) -> TupleWriter<'a> {
+        self.rid = None;
+        TupleWriter::new(schema, &mut self.data)
+    }
+
+    /// [`join`](Self::join) into this tuple's buffer, replacing its bytes
+    /// and forgetting its rid. Its bytes are unspecified if it fails.
+    pub fn join_into(
+        &mut self,
+        schema: &Schema,
+        left: &Tuple,
+        left_schema: &Schema,
+        right: Option<&Tuple>,
+        right_schema: &Schema,
+    ) -> Result<()> {
+        self.rid = None;
+        let sides = [
+            (Some(left.data.as_slice()), left_schema),
+            (right.map(|right| right.data.as_slice()), right_schema),
+        ];
+        join(&mut self.data, schema, sides)
+    }
+
     /// How many of the tuple's bytes its columns use with `schema`: the
     /// fixed-width part and the strings, which `encode` and `join` lay out
     /// with nothing after the last one. Bytes past this are not part of any
@@ -130,9 +163,11 @@ impl Tuple {
 
     /// Decodes every column.
     pub fn decode(&self, schema: &Schema) -> Result<Vec<Value>> {
-        (0..schema.len())
-            .map(|idx| decode_column(schema, &self.data, idx))
-            .collect()
+        let mut values = Vec::with_capacity(schema.len());
+        for idx in 0..schema.len() {
+            values.push(decode_column(schema, &self.data, idx)?);
+        }
+        Ok(values)
     }
 
     /// Decodes column `idx`, reading only its null bit, its slot and, for a
@@ -147,6 +182,12 @@ impl Tuple {
         read_column(schema, &self.data, idx)
     }
 
+    /// [`value_ref`](Self::value_ref) of the tuple whose bytes are `data`,
+    /// for callers holding just the bytes, such as a page's.
+    pub fn value_ref_in<'a>(data: &'a [u8], schema: &Schema, idx: usize) -> Result<ValueRef<'a>> {
+        read_column(schema, data, idx)
+    }
+
     /// Joins `left` and `right` into one tuple of `schema`, whose columns
     /// are `left_schema`'s followed by `right_schema`'s, as a join outputs.
     /// The columns' bytes are copied over without decoding them. A `right`
@@ -159,11 +200,9 @@ impl Tuple {
         right: Option<&Tuple>,
         right_schema: &Schema,
     ) -> Result<Self> {
-        let sides = [
-            (Some(left.data.as_slice()), left_schema),
-            (right.map(|right| right.data.as_slice()), right_schema),
-        ];
-        Ok(Self::from_bytes(join(schema, sides)?))
+        let mut tuple = Self::default();
+        tuple.join_into(schema, left, left_schema, right, right_schema)?;
+        Ok(tuple)
     }
 
     /// Whether column `idx` is NULL, from the null bitmap alone.
@@ -179,11 +218,20 @@ impl Tuple {
         key_schema: &Schema,
         key_attrs: &[usize],
     ) -> Result<Self> {
-        let values = key_attrs
-            .iter()
-            .map(|&idx| self.value(schema, idx))
-            .collect::<Result<Vec<_>>>()?;
-        Self::encode(key_schema, &values)
+        if key_attrs.len() != key_schema.len() {
+            return Err(ValueError::ColumnCountMismatch {
+                expected: key_schema.len(),
+                found: key_attrs.len(),
+            });
+        }
+        // The key's columns are copied over without decoding them.
+        let mut key = Self::from_bytes(Vec::with_capacity(key_schema.fixed_len() + self.len()));
+        let mut writer = key.writer(key_schema);
+        for &idx in key_attrs {
+            writer.push_column(self, schema, idx)?;
+        }
+        writer.finish()?;
+        Ok(key)
     }
 }
 
@@ -203,40 +251,69 @@ fn encode(schema: &Schema, values: &[Value]) -> Result<Vec<u8>> {
         })
         .sum();
     let mut buf = Vec::with_capacity(schema.fixed_len() + strings_len);
-    buf.resize(schema.fixed_len(), 0);
-    for (idx, (column, value)) in schema.columns().iter().zip(values).enumerate() {
-        let at = schema.fixed_offset(idx);
+    let mut writer = TupleWriter::new(schema, &mut buf);
+    for value in values {
+        writer.push(value.as_value_ref())?;
+    }
+    writer.finish()?;
+    Ok(buf)
+}
+
+/// Encodes a row into a buffer one column at a time, as [`Tuple::encode`]
+/// does, checking each value against its column. Made by [`Tuple::writer`].
+/// The buffer's bytes are unspecified until [`finish`](Self::finish)
+/// succeeds.
+pub struct TupleWriter<'a> {
+    schema: &'a Schema,
+    buf: &'a mut Vec<u8>,
+    /// The column the next value is for.
+    idx: usize,
+}
+
+impl<'a> TupleWriter<'a> {
+    fn new(schema: &'a Schema, buf: &'a mut Vec<u8>) -> Self {
+        buf.clear();
+        buf.resize(schema.fixed_len(), 0);
+        Self {
+            schema,
+            buf,
+            idx: 0,
+        }
+    }
+
+    /// The next column, or `ColumnCountMismatch` if every column has a value.
+    fn next_column(&self) -> Result<&'a Column> {
+        self.schema
+            .columns()
+            .get(self.idx)
+            .ok_or(ValueError::ColumnCountMismatch {
+                expected: self.schema.len(),
+                found: self.idx + 1,
+            })
+    }
+
+    /// Encodes `value` as the next column.
+    pub fn push(&mut self, value: ValueRef<'_>) -> Result<()> {
+        let column = self.next_column()?;
+        let (idx, at) = (self.idx, self.schema.fixed_offset(self.idx));
+        let buf = &mut *self.buf;
         match (column.data_type, value) {
-            (_, Value::Null) => {
+            (_, ValueRef::Null) => {
                 if !column.nullable {
                     return Err(ValueError::NullNotAllowed(column.name.clone()));
                 }
                 buf[idx / 8] |= 1 << (idx % 8);
             }
-            (DataType::Int, Value::Int(v)) => buf[at..at + 4].copy_from_slice(&v.to_le_bytes()),
-            (DataType::BigInt, Value::BigInt(v)) => {
+            (DataType::Int, ValueRef::Int(v)) => buf[at..at + 4].copy_from_slice(&v.to_le_bytes()),
+            (DataType::BigInt, ValueRef::BigInt(v)) => {
                 buf[at..at + 8].copy_from_slice(&v.to_le_bytes())
             }
-            (DataType::Double, Value::Double(v)) => {
+            (DataType::Double, ValueRef::Double(v)) => {
                 buf[at..at + 8].copy_from_slice(&v.to_le_bytes())
             }
-            (DataType::Bool, Value::Bool(v)) => buf[at] = u8::from(*v),
-            (DataType::Varchar(max), Value::Varchar(s)) => {
-                if s.len() > max as usize {
-                    return Err(ValueError::ValueTooLong {
-                        column: column.name.clone(),
-                        len: s.len(),
-                        max,
-                    });
-                }
-                let offset = buf.len();
-                buf.extend_from_slice(s.as_bytes());
-                // Checked before the casts below, which it makes lossless.
-                if buf.len() > MAX_TUPLE_SIZE {
-                    return Err(ValueError::TupleTooLarge);
-                }
-                buf[at..at + 2].copy_from_slice(&(offset as u16).to_le_bytes());
-                buf[at + 2..at + 4].copy_from_slice(&(s.len() as u16).to_le_bytes());
+            (DataType::Bool, ValueRef::Bool(v)) => buf[at] = u8::from(v),
+            (DataType::Varchar(max), ValueRef::Varchar(s)) => {
+                push_varchar(buf, column, max, at, s.as_bytes())?;
             }
             (DataType::Array, _) => {
                 return Err(ValueError::NotStorable {
@@ -252,18 +329,462 @@ fn encode(schema: &Schema, values: &[Value]) -> Result<Vec<u8>> {
                 });
             }
         }
+        self.idx += 1;
+        Ok(())
     }
 
+    /// Encodes column `from_idx` of `from`, a row of `from_schema`, as the
+    /// next column, copying its bytes without decoding them, as
+    /// [`Tuple::join`] does. The two columns must have the same type, and a
+    /// VARCHAR must fit the next column's length.
+    pub fn push_column(
+        &mut self,
+        from: &Tuple,
+        from_schema: &Schema,
+        from_idx: usize,
+    ) -> Result<()> {
+        let column = self.next_column()?;
+        let from_type = from_schema
+            .columns()
+            .get(from_idx)
+            .ok_or(ValueError::ColumnOutOfRange {
+                idx: from_idx,
+                count: from_schema.len(),
+            })?
+            .data_type;
+        let (idx, at) = (self.idx, self.schema.fixed_offset(self.idx));
+        let bytes = from.data.as_slice();
+        if is_null(from_schema, bytes, from_idx)? {
+            if !column.nullable {
+                return Err(ValueError::NullNotAllowed(column.name.clone()));
+            }
+            self.buf[idx / 8] |= 1 << (idx % 8);
+            self.idx += 1;
+            return Ok(());
+        }
+        let from_at = from_schema.fixed_offset(from_idx);
+        match (column.data_type, from_type) {
+            (DataType::Varchar(max), DataType::Varchar(_)) => {
+                let string = varchar_range(from_schema, bytes, from_at)?;
+                push_varchar(self.buf, column, max, at, &bytes[string])?;
+            }
+            (DataType::Array, _) | (_, DataType::Array) => {
+                return Err(ValueError::CorruptTuple("ARRAY is not NULL"));
+            }
+            (to, from) if to == from => {
+                let width = fixed_width(to);
+                self.buf[at..at + width].copy_from_slice(&bytes[from_at..from_at + width]);
+            }
+            (to, from) => {
+                return Err(ValueError::TypeMismatch {
+                    column: column.name.clone(),
+                    expected: to,
+                    found: from.type_name(),
+                });
+            }
+        }
+        self.idx += 1;
+        Ok(())
+    }
+
+    /// Checks that every column has a value and the row fits in a tuple.
+    pub fn finish(self) -> Result<()> {
+        if self.idx != self.schema.len() {
+            return Err(ValueError::ColumnCountMismatch {
+                expected: self.schema.len(),
+                found: self.idx,
+            });
+        }
+        if self.buf.len() > MAX_TUPLE_SIZE {
+            return Err(ValueError::TupleTooLarge);
+        }
+        Ok(())
+    }
+}
+
+/// Joins rows of two schemas into rows of a third, as [`Tuple::join`] does,
+/// for an operator that joins many rows of the same schemas. The schemas are
+/// checked once, when it is made, so that joining a row copies each side's
+/// fixed-width slots as one block and only VARCHARs and the null bitmap are
+/// handled column by column.
+#[derive(Clone, Debug)]
+pub struct TupleJoiner {
+    schema: Schema,
+    sides: [JoinSide; 2],
+}
+
+#[derive(Clone, Debug)]
+struct JoinSide {
+    schema: Schema,
+    /// The output column of the side's first column.
+    first: usize,
+    /// Where the side's slots go in the output.
+    slots_at: usize,
+    /// The bits of the last byte of the side's null bitmap that are its
+    /// columns'.
+    last_bitmap_mask: u8,
+    /// For each VARCHAR column: its index on the side and its slot in the
+    /// output.
+    varchars: Vec<(usize, usize)>,
+    /// The side's columns whose output column is NOT NULL.
+    not_null: Vec<usize>,
+}
+
+impl TupleJoiner {
+    /// A joiner for `schema` from `left_schema` and `right_schema`, or `None`
+    /// if `Tuple::join` would fail for every row: the columns do not line up.
+    pub fn new(schema: &Schema, left_schema: &Schema, right_schema: &Schema) -> Option<Self> {
+        if left_schema.len() + right_schema.len() != schema.len() {
+            return None;
+        }
+        let mut slots_at = bitmap_len(schema.len());
+        let mut sides = [left_schema, right_schema].map(|side| JoinSide {
+            schema: side.clone(),
+            first: 0,
+            slots_at: 0,
+            last_bitmap_mask: match side.len() % 8 {
+                0 => u8::MAX,
+                bits => (1 << bits) - 1,
+            },
+            varchars: Vec::new(),
+            not_null: Vec::new(),
+        });
+        let mut idx = 0;
+        for side in &mut sides {
+            side.first = idx;
+            side.slots_at = slots_at;
+            for (side_idx, side_column) in side.schema.columns().iter().enumerate() {
+                let column = &schema.columns()[idx];
+                if side_column.data_type != column.data_type || column.data_type == DataType::Array
+                {
+                    return None;
+                }
+                if matches!(column.data_type, DataType::Varchar(_)) {
+                    side.varchars.push((side_idx, schema.fixed_offset(idx)));
+                }
+                if !column.nullable {
+                    side.not_null.push(side_idx);
+                }
+                idx += 1;
+            }
+            slots_at += side.schema.fixed_len() - bitmap_len(side.schema.len());
+        }
+        Some(Self {
+            schema: schema.clone(),
+            sides,
+        })
+    }
+
+    /// Joins `left` and `right` into `out`, as [`Tuple::join_into`] does.
+    #[inline]
+    pub fn join_into(&self, out: &mut Tuple, left: &Tuple, right: Option<&Tuple>) -> Result<()> {
+        out.rid = None;
+        let fixed_len = self.schema.fixed_len();
+        let [left_side, right_side] = &self.sides;
+        let right = right.map(|right| right.data.as_slice());
+        if fixed_len > FIXED_ON_STACK {
+            let buf = &mut out.data;
+            buf.clear();
+            buf.resize(fixed_len, 0);
+            left_side.copy_fixed(buf, &self.schema, Some(&left.data))?;
+            right_side.copy_fixed(buf, &self.schema, right)?;
+        } else {
+            // Built on the stack and copied over at once, which beats
+            // growing the tuple's buffer a column at a time.
+            let mut fixed = [0; FIXED_ON_STACK];
+            left_side.copy_fixed(&mut fixed[..fixed_len], &self.schema, Some(&left.data))?;
+            right_side.copy_fixed(&mut fixed[..fixed_len], &self.schema, right)?;
+            out.data.clear();
+            extend_short(&mut out.data, &fixed[..fixed_len]);
+        }
+        left_side.copy_strings(&mut out.data, Some(&left.data))?;
+        right_side.copy_strings(&mut out.data, right)
+    }
+}
+
+/// Copies chosen columns of rows of one schema into rows of another, giving
+/// what [`TupleWriter::push_column`] of each in turn gives, for an operator
+/// that projects many rows the same way. The columns are checked once, when
+/// it is made.
+#[derive(Clone, Debug)]
+pub struct TupleProjector {
+    schema: Schema,
+    input: Schema,
+    /// One per output column, in order.
+    columns: Vec<ProjectedColumn>,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectedColumn {
+    /// The input column it is copied from, and that column's slot.
+    from: usize,
+    from_at: usize,
+    /// The output column's slot.
+    to_at: usize,
+    /// The slot's width.
+    width: usize,
+    /// For a VARCHAR, the output column's length limit.
+    max_len: Option<u32>,
+}
+
+impl TupleProjector {
+    /// A projector of rows of `input` onto `schema`, whose column `i` is
+    /// `input`'s column `from[i]`. `None` if writing them would fail for
+    /// every row: the counts or the types do not line up.
+    pub fn new(schema: &Schema, input: &Schema, from: &[usize]) -> Option<Self> {
+        if from.len() != schema.len() {
+            return None;
+        }
+        let mut columns = Vec::with_capacity(from.len());
+        for (idx, (column, &from)) in schema.columns().iter().zip(from).enumerate() {
+            let from_type = input.column(from)?.data_type;
+            let max_len = match (column.data_type, from_type) {
+                (DataType::Varchar(max), DataType::Varchar(_)) => Some(max),
+                (DataType::Array, _) | (_, DataType::Array) => return None,
+                (to, from) if to == from => None,
+                _ => return None,
+            };
+            columns.push(ProjectedColumn {
+                from,
+                from_at: input.fixed_offset(from),
+                to_at: schema.fixed_offset(idx),
+                width: fixed_width(column.data_type),
+                max_len,
+            });
+        }
+        Some(Self {
+            schema: schema.clone(),
+            input: input.clone(),
+            columns,
+        })
+    }
+
+    /// Writes the projection of `input` into `out`, replacing its bytes and
+    /// forgetting its rid. Its bytes are unspecified if it fails.
+    pub fn project_into(&self, out: &mut Tuple, input: &Tuple) -> Result<()> {
+        out.rid = None;
+        let fixed_len = self.schema.fixed_len();
+        let bytes = input.data.as_slice();
+        if !self.columns.is_empty() && bytes.len() < self.input.fixed_len() {
+            return Err(ValueError::CorruptTuple(
+                "shorter than its fixed-width part",
+            ));
+        }
+        let buf = &mut out.data;
+        buf.clear();
+        buf.resize(fixed_len, 0);
+        for (idx, column) in self.columns.iter().enumerate() {
+            if bytes[column.from / 8] & (1 << (column.from % 8)) != 0 {
+                let out_column = &self.schema.columns()[idx];
+                if !out_column.nullable {
+                    return Err(ValueError::NullNotAllowed(out_column.name.clone()));
+                }
+                buf[idx / 8] |= 1 << (idx % 8);
+                continue;
+            }
+            let at = column.to_at;
+            match column.max_len {
+                Some(max) => {
+                    let string = varchar_range(&self.input, bytes, column.from_at)?;
+                    if string.len() > max as usize {
+                        return Err(ValueError::ValueTooLong {
+                            column: self.schema.columns()[idx].name.clone(),
+                            len: string.len(),
+                            max,
+                        });
+                    }
+                    let offset = buf.len();
+                    extend_short(buf, &bytes[string.clone()]);
+                    if buf.len() > MAX_TUPLE_SIZE {
+                        return Err(ValueError::TupleTooLarge);
+                    }
+                    buf[at..at + 2].copy_from_slice(&(offset as u16).to_le_bytes());
+                    buf[at + 2..at + 4].copy_from_slice(&(string.len() as u16).to_le_bytes());
+                }
+                None => {
+                    let from = &bytes[column.from_at..column.from_at + column.width];
+                    copy_small(&mut buf[at..at + column.width], from);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The largest fixed-width part [`TupleJoiner`] builds on the stack.
+const FIXED_ON_STACK: usize = 128;
+
+impl JoinSide {
+    /// Writes the side's slots and null bits from `bytes` into `fixed`, the
+    /// output's fixed-width part, zeroed; a side without bytes is all NULLs.
+    #[inline(always)]
+    fn copy_fixed(&self, fixed: &mut [u8], out: &Schema, bytes: Option<&[u8]>) -> Result<()> {
+        let schema = &self.schema;
+        let Some(bytes) = bytes else {
+            if let Some(&idx) = self.not_null.first() {
+                let column = &out.columns()[self.first + idx];
+                return Err(ValueError::NullNotAllowed(column.name.clone()));
+            }
+            for idx in self.first..self.first + schema.len() {
+                fixed[idx / 8] |= 1 << (idx % 8);
+            }
+            return Ok(());
+        };
+        if bytes.len() < schema.fixed_len() {
+            return Err(ValueError::CorruptTuple(
+                "shorter than its fixed-width part",
+            ));
+        }
+        let side_bitmap = bitmap_len(schema.len());
+        let slots = &bytes[side_bitmap..schema.fixed_len()];
+        copy_small(
+            &mut fixed[self.slots_at..self.slots_at + slots.len()],
+            slots,
+        );
+        // The side's bitmap, shifted to where its columns are in the output.
+        let shift = self.first % 8;
+        for (byte_idx, &byte) in bytes[..side_bitmap].iter().enumerate() {
+            let nulls = if byte_idx + 1 == side_bitmap {
+                byte & self.last_bitmap_mask
+            } else {
+                byte
+            };
+            if nulls == 0 {
+                continue;
+            }
+            let at = self.first / 8 + byte_idx;
+            fixed[at] |= nulls << shift;
+            if shift != 0 && nulls >> (8 - shift) != 0 {
+                fixed[at + 1] |= nulls >> (8 - shift);
+            }
+        }
+        for &idx in &self.not_null {
+            if bytes[idx / 8] & (1 << (idx % 8)) != 0 {
+                let column = &out.columns()[self.first + idx];
+                return Err(ValueError::NullNotAllowed(column.name.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends the side's VARCHARs from `bytes` to `buf`, pointing their
+    /// slots at them.
+    #[inline(always)]
+    fn copy_strings(&self, buf: &mut Vec<u8>, bytes: Option<&[u8]>) -> Result<()> {
+        let Some(bytes) = bytes else {
+            return Ok(());
+        };
+        if self.varchars.is_empty() {
+            return Ok(());
+        }
+        for &(idx, at) in &self.varchars {
+            if bytes[idx / 8] & (1 << (idx % 8)) != 0 {
+                continue;
+            }
+            let string = varchar_range(&self.schema, bytes, self.schema.fixed_offset(idx))?;
+            let offset = buf.len();
+            extend_short(buf, &bytes[string.clone()]);
+            if buf.len() > MAX_TUPLE_SIZE {
+                return Err(ValueError::TupleTooLarge);
+            }
+            buf[at..at + 2].copy_from_slice(&(offset as u16).to_le_bytes());
+            buf[at + 2..at + 4].copy_from_slice(&(string.len() as u16).to_le_bytes());
+        }
+        Ok(())
+    }
+}
+
+/// `buf.extend_from_slice(src)`, with a short `src`, as most strings and
+/// rows are, copied as a fixed-size block, which beats calling `memcpy`.
+#[inline(always)]
+fn extend_short(buf: &mut Vec<u8>, src: &[u8]) {
+    match src.len() {
+        0..=16 => extend_block::<16>(buf, src),
+        17..=32 => extend_block::<32>(buf, src),
+        33..=64 => extend_block::<64>(buf, src),
+        _ => buf.extend_from_slice(src),
+    }
+}
+
+#[inline(always)]
+fn extend_block<const N: usize>(buf: &mut Vec<u8>, src: &[u8]) {
+    // Writing the whole block would grow a buffer sized for `src` exactly.
+    if buf.capacity() - buf.len() < N {
+        buf.extend_from_slice(src);
+        return;
+    }
+    let mut block = [0; N];
+    copy_small(&mut block[..src.len()], src);
+    let end = buf.len() + src.len();
+    buf.extend_from_slice(&block);
+    buf.truncate(end);
+}
+
+/// `dst.copy_from_slice(src)`, with the short copies a row's slots take
+/// done as two overlapping fixed-size moves instead of a call to `memcpy`.
+#[inline(always)]
+fn copy_small(dst: &mut [u8], src: &[u8]) {
+    let len = src.len();
+    assert_eq!(dst.len(), len);
+    match len {
+        0 => {}
+        1..=3 => {
+            dst[0] = src[0];
+            dst[len / 2] = src[len / 2];
+            dst[len - 1] = src[len - 1];
+        }
+        4..=8 => {
+            let head: [u8; 4] = src[..4].try_into().unwrap();
+            let tail: [u8; 4] = src[len - 4..].try_into().unwrap();
+            dst[..4].copy_from_slice(&head);
+            dst[len - 4..].copy_from_slice(&tail);
+        }
+        9..=16 => {
+            let head: [u8; 8] = src[..8].try_into().unwrap();
+            let tail: [u8; 8] = src[len - 8..].try_into().unwrap();
+            dst[..8].copy_from_slice(&head);
+            dst[len - 8..].copy_from_slice(&tail);
+        }
+        17..=32 => {
+            let head: [u8; 16] = src[..16].try_into().unwrap();
+            let tail: [u8; 16] = src[len - 16..].try_into().unwrap();
+            dst[..16].copy_from_slice(&head);
+            dst[len - 16..].copy_from_slice(&tail);
+        }
+        33..=64 => {
+            let head: [u8; 32] = src[..32].try_into().unwrap();
+            let tail: [u8; 32] = src[len - 32..].try_into().unwrap();
+            dst[..32].copy_from_slice(&head);
+            dst[len - 32..].copy_from_slice(&tail);
+        }
+        _ => dst.copy_from_slice(src),
+    }
+}
+
+/// Appends `s` to `buf` as the VARCHAR of `column`, whose slot is at `at`.
+fn push_varchar(buf: &mut Vec<u8>, column: &Column, max: u32, at: usize, s: &[u8]) -> Result<()> {
+    if s.len() > max as usize {
+        return Err(ValueError::ValueTooLong {
+            column: column.name.clone(),
+            len: s.len(),
+            max,
+        });
+    }
+    let offset = buf.len();
+    extend_short(buf, s);
+    // Checked before the casts below, which it makes lossless.
     if buf.len() > MAX_TUPLE_SIZE {
         return Err(ValueError::TupleTooLarge);
     }
-    Ok(buf)
+    buf[at..at + 2].copy_from_slice(&(offset as u16).to_le_bytes());
+    buf[at + 2..at + 4].copy_from_slice(&(s.len() as u16).to_le_bytes());
+    Ok(())
 }
 
-/// Lays out the columns of each side one after another, copying each
-/// column's slot and, for a VARCHAR, its bytes, which get a new offset.
+/// Lays out the columns of each side one after another in `buf`, copying
+/// each column's slot and, for a VARCHAR, its bytes, which get a new offset.
 /// A side without bytes is all NULLs.
-fn join(schema: &Schema, sides: [(Option<&[u8]>, &Schema); 2]) -> Result<Vec<u8>> {
+fn join(buf: &mut Vec<u8>, schema: &Schema, sides: [(Option<&[u8]>, &Schema); 2]) -> Result<()> {
     let found: usize = sides.iter().map(|(_, side)| side.len()).sum();
     if found != schema.len() {
         return Err(ValueError::ColumnCountMismatch {
@@ -276,7 +797,8 @@ fn join(schema: &Schema, sides: [(Option<&[u8]>, &Schema); 2]) -> Result<Vec<u8>
         .iter()
         .map(|&(bytes, side)| bytes.map_or(0, |b| b.len().saturating_sub(side.fixed_len())))
         .sum();
-    let mut buf = Vec::with_capacity(schema.fixed_len() + strings_len);
+    buf.clear();
+    buf.reserve(schema.fixed_len() + strings_len);
     buf.resize(schema.fixed_len(), 0);
     let mut idx = 0;
     for (bytes, side) in sides {
@@ -322,7 +844,7 @@ fn join(schema: &Schema, sides: [(Option<&[u8]>, &Schema); 2]) -> Result<Vec<u8>
             idx += 1;
         }
     }
-    Ok(buf)
+    Ok(())
 }
 
 fn decode_column(schema: &Schema, bytes: &[u8], idx: usize) -> Result<Value> {
@@ -345,13 +867,238 @@ fn read_column<'a>(schema: &Schema, bytes: &'a [u8], idx: usize) -> Result<Value
             1 => ValueRef::Bool(true),
             _ => return Err(ValueError::CorruptTuple("BOOL is not 0 or 1")),
         },
-        DataType::Varchar(_) => {
-            let s = std::str::from_utf8(&bytes[varchar_range(schema, bytes, at)?])
-                .map_err(|_| ValueError::CorruptTuple("VARCHAR is not UTF-8"))?;
-            ValueRef::Varchar(s)
-        }
+        DataType::Varchar(_) => ValueRef::Varchar(utf8(&bytes[varchar_range(schema, bytes, at)?])?),
         DataType::Array => return Err(ValueError::CorruptTuple("ARRAY is not NULL")),
     })
+}
+
+/// Reads one column of a schema's tuples in place, as
+/// [`Tuple::value_ref`] does, with the column's position in the tuple found
+/// once instead of on every read.
+#[derive(Clone, Copy, Debug)]
+pub struct ColumnReader {
+    data_type: DataType,
+    /// The byte of the null bitmap with the column's bit, and the bit.
+    null_byte: usize,
+    null_bit: u8,
+    /// Where the column's slot is.
+    at: usize,
+    /// Where the strings start: the schema's fixed-width part ends.
+    fixed_len: usize,
+}
+
+impl ColumnReader {
+    /// A reader of column `idx` of `schema`, or `None` if it has no such
+    /// column.
+    pub fn new(schema: &Schema, idx: usize) -> Option<Self> {
+        let column = schema.column(idx)?;
+        Some(Self {
+            data_type: column.data_type,
+            null_byte: idx / 8,
+            null_bit: 1 << (idx % 8),
+            at: schema.fixed_offset(idx),
+            fixed_len: schema.fixed_len(),
+        })
+    }
+
+    pub fn data_type(&self) -> DataType {
+        self.data_type
+    }
+
+    /// For an INT or BIGINT column: whether it is NULL in `tuple`, and its
+    /// slot as a BIGINT, read without branching on either, so that a loop
+    /// over many rows can test them without mispredicting. Fails as
+    /// [`read`](Self::read) does, and for a column of another type.
+    #[inline]
+    pub fn read_integer(&self, tuple: &Tuple) -> Result<(bool, i64)> {
+        let bytes = tuple.data.as_slice();
+        if bytes.len() < self.fixed_len {
+            return Err(ValueError::CorruptTuple(
+                "shorter than its fixed-width part",
+            ));
+        }
+        let null = bytes[self.null_byte] & self.null_bit != 0;
+        let value = match self.data_type {
+            DataType::Int => i64::from(i32::from_le_bytes(read_array(bytes, self.at))),
+            DataType::BigInt => i64::from_le_bytes(read_array(bytes, self.at)),
+            data_type => {
+                return Err(ValueError::InvalidOperand {
+                    op: "read_integer",
+                    operand: data_type.type_name(),
+                });
+            }
+        };
+        Ok((null, value))
+    }
+
+    /// Whether the column of `tuple` is `value`, an INT, BIGINT or VARCHAR of
+    /// the column's own type and not NULL, comparing their bytes. Unlike
+    /// [`read`](Self::read), a VARCHAR's UTF-8 is not checked: for callers
+    /// that read the column with `read` before, as a hash table does when it
+    /// hashes a row. `None` for other types, which the caller compares itself.
+    #[inline]
+    pub fn equals_raw(&self, tuple: &Tuple, value: ValueRef<'_>) -> Result<Option<bool>> {
+        let bytes = tuple.data.as_slice();
+        if bytes.len() < self.fixed_len {
+            return Err(ValueError::CorruptTuple(
+                "shorter than its fixed-width part",
+            ));
+        }
+        let null = bytes[self.null_byte] & self.null_bit != 0;
+        let at = self.at;
+        Ok(Some(match (self.data_type, value) {
+            (DataType::Int, ValueRef::Int(v)) => {
+                !null && i32::from_le_bytes(read_array(bytes, at)) == v
+            }
+            (DataType::BigInt, ValueRef::BigInt(v)) => {
+                !null && i64::from_le_bytes(read_array(bytes, at)) == v
+            }
+            (DataType::Varchar(_), ValueRef::Varchar(v)) => {
+                if null {
+                    return Ok(Some(false));
+                }
+                let offset = usize::from(u16::from_le_bytes(read_array(bytes, at)));
+                let len = usize::from(u16::from_le_bytes(read_array(bytes, at + 2)));
+                if offset < self.fixed_len || offset + len > bytes.len() {
+                    return Err(ValueError::CorruptTuple("VARCHAR is out of bounds"));
+                }
+                crate::value::bytes_equal(&bytes[offset..offset + len], v.as_bytes())
+            }
+            _ => return Ok(None),
+        }))
+    }
+
+    /// The column of `tuple`, a row of the reader's schema.
+    #[inline]
+    pub fn read<'a>(&self, tuple: &'a Tuple) -> Result<ValueRef<'a>> {
+        self.read_in(&tuple.data)
+    }
+
+    /// Orders the column of two rows of the reader's schema, whose bytes are
+    /// `a` and `b`, with NULL first: what reading both and comparing them
+    /// gives, without building the values for INT, BIGINT and VARCHAR.
+    #[inline]
+    pub fn compare_in(&self, a: &[u8], b: &[u8]) -> Result<std::cmp::Ordering> {
+        if a.len() < self.fixed_len || b.len() < self.fixed_len {
+            return Err(ValueError::CorruptTuple(
+                "shorter than its fixed-width part",
+            ));
+        }
+        let a_null = a[self.null_byte] & self.null_bit != 0;
+        let b_null = b[self.null_byte] & self.null_bit != 0;
+        if a_null || b_null {
+            return Ok(b_null.cmp(&a_null));
+        }
+        let at = self.at;
+        Ok(match self.data_type {
+            DataType::Int => {
+                i32::from_le_bytes(read_array(a, at)).cmp(&i32::from_le_bytes(read_array(b, at)))
+            }
+            DataType::BigInt => {
+                i64::from_le_bytes(read_array(a, at)).cmp(&i64::from_le_bytes(read_array(b, at)))
+            }
+            DataType::Varchar(_) => {
+                let (a, b) = (self.varchar_bytes_in(a)?, self.varchar_bytes_in(b)?);
+                match compare_short_ascii(a, b) {
+                    Some(order) => order,
+                    None => {
+                        utf8(a)?;
+                        utf8(b)?;
+                        a.cmp(b)
+                    }
+                }
+            }
+            _ => self
+                .read_in(a)?
+                .compare(self.read_in(b)?)?
+                .expect("neither value is NULL"),
+        })
+    }
+
+    /// The bytes of the VARCHAR column, not NULL, in `bytes`, with their
+    /// bounds checked but not their UTF-8.
+    #[inline]
+    fn varchar_bytes_in<'a>(&self, bytes: &'a [u8]) -> Result<&'a [u8]> {
+        let offset = usize::from(u16::from_le_bytes(read_array(bytes, self.at)));
+        let len = usize::from(u16::from_le_bytes(read_array(bytes, self.at + 2)));
+        if offset < self.fixed_len || offset + len > bytes.len() {
+            return Err(ValueError::CorruptTuple("VARCHAR is out of bounds"));
+        }
+        Ok(&bytes[offset..offset + len])
+    }
+
+    /// [`read`](Self::read) of the tuple whose bytes are `bytes`.
+    #[inline]
+    pub fn read_in<'a>(&self, bytes: &'a [u8]) -> Result<ValueRef<'a>> {
+        if bytes.len() < self.fixed_len {
+            return Err(ValueError::CorruptTuple(
+                "shorter than its fixed-width part",
+            ));
+        }
+        if bytes[self.null_byte] & self.null_bit != 0 {
+            return Ok(ValueRef::Null);
+        }
+        let at = self.at;
+        Ok(match self.data_type {
+            DataType::Int => ValueRef::Int(i32::from_le_bytes(read_array(bytes, at))),
+            DataType::BigInt => ValueRef::BigInt(i64::from_le_bytes(read_array(bytes, at))),
+            DataType::Double => ValueRef::Double(f64::from_le_bytes(read_array(bytes, at))),
+            DataType::Bool => match bytes[at] {
+                0 => ValueRef::Bool(false),
+                1 => ValueRef::Bool(true),
+                _ => return Err(ValueError::CorruptTuple("BOOL is not 0 or 1")),
+            },
+            DataType::Varchar(_) => {
+                let offset = usize::from(u16::from_le_bytes(read_array(bytes, at)));
+                let len = usize::from(u16::from_le_bytes(read_array(bytes, at + 2)));
+                if offset < self.fixed_len || offset + len > bytes.len() {
+                    return Err(ValueError::CorruptTuple("VARCHAR is out of bounds"));
+                }
+                ValueRef::Varchar(utf8(&bytes[offset..offset + len])?)
+            }
+            DataType::Array => return Err(ValueError::CorruptTuple("ARRAY is not NULL")),
+        })
+    }
+}
+
+/// Orders `a` and `b` bytewise if both are ASCII and at most 16 bytes, as
+/// most keys are, comparing them as zero-padded big-endian words and then
+/// by length, which gives the same order without a call to `memcmp`. `None`
+/// otherwise.
+#[inline]
+fn compare_short_ascii(a: &[u8], b: &[u8]) -> Option<std::cmp::Ordering> {
+    if a.len() > 16 || b.len() > 16 {
+        return None;
+    }
+    let words = |s: &[u8]| {
+        let mut padded = [0; 16];
+        copy_small(&mut padded[..s.len()], s);
+        let (high, low) = padded.split_at(8);
+        (
+            u64::from_be_bytes(high.try_into().unwrap()),
+            u64::from_be_bytes(low.try_into().unwrap()),
+        )
+    };
+    let ((a_high, a_low), (b_high, b_low)) = (words(a), words(b));
+    if (a_high | a_low | b_high | b_low) & 0x8080_8080_8080_8080 != 0 {
+        return None;
+    }
+    Some(
+        (a_high, a_low)
+            .cmp(&(b_high, b_low))
+            .then(a.len().cmp(&b.len())),
+    )
+}
+
+/// `bytes` as a string. Checking for ASCII first is much quicker than full
+/// UTF-8 validation for the short strings rows mostly hold.
+#[inline]
+fn utf8(bytes: &[u8]) -> Result<&str> {
+    if bytes.is_ascii() {
+        // SAFETY: ASCII is valid UTF-8.
+        return Ok(unsafe { std::str::from_utf8_unchecked(bytes) });
+    }
+    std::str::from_utf8(bytes).map_err(|_| ValueError::CorruptTuple("VARCHAR is not UTF-8"))
 }
 
 /// Where the bytes of the VARCHAR whose slot is at `at` are in the tuple.
