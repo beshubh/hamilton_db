@@ -211,6 +211,57 @@ fn conflicts_are_serialization_failures() {
 }
 
 #[test]
+fn a_statement_outside_a_block_waits_for_another_connections_block() {
+    let server = Running::start();
+    let (mut a, mut b) = (server.connect(), server.connect());
+    query(
+        &mut a,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT NOT NULL)",
+    );
+    query(&mut a, "INSERT INTO t VALUES (1, 100)");
+    query(&mut a, "BEGIN; UPDATE t SET n = n + 10 WHERE id = 1");
+    thread::scope(|s| {
+        let waiter = s.spawn(|| query(&mut b, "UPDATE t SET n = n + 20 WHERE id = 1"));
+        thread::sleep(std::time::Duration::from_millis(50));
+        query(&mut a, "COMMIT");
+        assert_eq!(
+            waiter.join().unwrap(),
+            [QueryResult::Command("UPDATE 1".into())]
+        );
+    });
+    assert_eq!(rows(&mut a, "SELECT n FROM t"), values(&[&["130"]]));
+    server.stop();
+}
+
+#[test]
+fn concurrent_increments_over_connections_all_count() {
+    const CONNECTIONS: usize = 4;
+    const INCREMENTS: usize = 25;
+    let server = Running::start();
+    query(
+        &mut server.connect(),
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT NOT NULL)",
+    );
+    query(&mut server.connect(), "INSERT INTO t VALUES (1, 0)");
+    thread::scope(|s| {
+        for _ in 0..CONNECTIONS {
+            let mut c = server.connect();
+            s.spawn(move || {
+                for _ in 0..INCREMENTS {
+                    query(&mut c, "UPDATE t SET n = n + 1 WHERE id = 1");
+                }
+            });
+        }
+    });
+    let total = (CONNECTIONS * INCREMENTS).to_string();
+    assert_eq!(
+        rows(&mut server.connect(), "SELECT n FROM t"),
+        values(&[&[&total]])
+    );
+    server.stop();
+}
+
+#[test]
 fn hanging_up_rolls_back_the_open_block() {
     let server = Running::start();
     let mut a = server.connect();

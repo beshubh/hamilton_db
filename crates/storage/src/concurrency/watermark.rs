@@ -30,13 +30,16 @@
 //! keeps the next Tid for that, and [`Watermark::new`] takes it.
 
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use common::{INVALID_TXN_ID, TXN_UNCOMMITTED_BIT, TxnId};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 /// Allocates Tids and tracks which are active, to give the watermark.
 pub struct Watermark {
     inner: Mutex<Inner>,
+    /// Wakes `wait_for_end` callers whenever a transaction ends.
+    ended: Condvar,
 }
 
 struct Inner {
@@ -59,6 +62,7 @@ impl Watermark {
                 next,
                 active: BTreeSet::new(),
             }),
+            ended: Condvar::new(),
         }
     }
 
@@ -83,6 +87,19 @@ impl Watermark {
     pub fn end(&self, tid: TxnId) {
         let removed = self.inner.lock().active.remove(&tid);
         assert!(removed, "transaction {tid} is not active");
+        self.ended.notify_all();
+    }
+
+    /// Blocks until `tid` is not active, or until `deadline`. Returns
+    /// whether it has ended. A Tid never handed out counts as ended.
+    pub fn wait_for_end(&self, tid: TxnId, deadline: Instant) -> bool {
+        let mut inner = self.inner.lock();
+        while inner.active.contains(&tid) {
+            if self.ended.wait_until(&mut inner, deadline).timed_out() {
+                return !inner.active.contains(&tid);
+            }
+        }
+        true
     }
 
     /// The Tid the next transaction will get.

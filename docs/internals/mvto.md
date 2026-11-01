@@ -32,7 +32,9 @@ A writer T fails with `Conflict` if the head is:
 
 A version keeps its writer's Tid as its `ts` when it commits, so a long transaction commits "in the past". That is safe because every newer transaction that touched those tuples while it ran has already failed with `Conflict`.
 
-`Conflict` never waits. The caller aborts the transaction, and the engine fails the whole block, as Postgres does ([`engine.rs`](../../crates/planner/src/engine.rs)).
+Storage never waits: it returns `Conflict` and the caller aborts the transaction. What happens next depends on where the statement ran ([`engine.rs`](../../crates/planner/src/engine.rs)):
+- **In a block**, the engine fails the whole block, and the client sees SQLSTATE `40001` and retries it. There are no savepoints, so a statement that wrote some rows before conflicting can't be undone on its own.
+- **Outside a block**, the statement was the whole transaction and nobody has seen it, so the engine runs it again with a new Tid. If the other transaction is newer, the new Tid is newer still and the retry goes ahead at once. If it is older, only its end changes anything, so the engine waits for it (`TransactionManager::wait_for_end`). It gives up after the conflict timeout and returns the `Conflict`, so a block left open can't hang a statement for good. The waiting statement holds nothing, so waits can't deadlock.
 
 ## Watermark and garbage collection
 

@@ -22,6 +22,12 @@
 //!   catalog isn't transactional. Outside a block they run as other
 //!   statements do.
 //! - Dropping the engine with a block open rolls it back.
+//! - A statement outside a block that fails with a storage `Conflict` is
+//!   run again in a new transaction, until it gets past the conflict or the
+//!   conflict timeout runs out (see `wait_to_retry`). Nothing it did is
+//!   visible yet, so no one can tell. In a block that can't be done: the
+//!   failed statement may have written rows, which only aborting the whole
+//!   transaction undoes, so the block fails and the client retries it.
 //!
 //! [`ExecutionEngine::session`] opens another session on the same database.
 //! Sessions share one `TransactionManager`, so their transactions are
@@ -34,14 +40,17 @@
 
 use std::mem;
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use catalog::Catalog;
-use common::{Column, Value};
+use common::{Column, TxnId, Value};
 use execution::ExecutionError;
 use execution::execution_context::{ExecutionContext, ExecutionSettings};
 use execution::executors::{Executor, create_executor};
 use execution::plans::AbstractPlanNode;
 use parser::{ParseError, Statement};
+use storage::StorageError;
 use storage::concurrency::transaction::{Transaction, TransactionState};
 use storage::concurrency::transaction_manager::TransactionManager;
 use thiserror::Error;
@@ -53,6 +62,12 @@ use crate::planner::Planner;
 
 /// Rows pulled from the root executor at a time, unless set otherwise.
 pub const DEFAULT_BATCH_SIZE: usize = 128;
+
+/// How long a statement outside a transaction block keeps retrying after
+/// conflicts, unless set otherwise: long enough for a short transaction
+/// holding its rows to finish, short enough that a block left open doesn't
+/// hang it for good.
+pub const DEFAULT_CONFLICT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What a statement produced.
 #[derive(Debug, PartialEq)]
@@ -113,6 +128,7 @@ pub struct ExecutionEngine {
     txn_manager: Arc<TransactionManager>,
     settings: ExecutionSettings,
     batch_size: usize,
+    conflict_timeout: Duration,
     state: State,
 }
 
@@ -133,6 +149,7 @@ impl ExecutionEngine {
             txn_manager: Arc::new(TransactionManager::new(next_tid)),
             settings: ExecutionSettings::default(),
             batch_size: DEFAULT_BATCH_SIZE,
+            conflict_timeout: DEFAULT_CONFLICT_TIMEOUT,
             state: State::Idle,
         })
     }
@@ -146,6 +163,7 @@ impl ExecutionEngine {
             txn_manager: Arc::clone(&self.txn_manager),
             settings: self.settings,
             batch_size: self.batch_size,
+            conflict_timeout: self.conflict_timeout,
             state: State::Idle,
         }
     }
@@ -161,6 +179,14 @@ impl ExecutionEngine {
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         assert!(batch_size > 0, "a batch holds at least one row");
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Retries statements outside a block that conflict for up to
+    /// `timeout` instead of [`DEFAULT_CONFLICT_TIMEOUT`]. Zero turns retrying
+    /// off.
+    pub fn with_conflict_timeout(mut self, timeout: Duration) -> Self {
+        self.conflict_timeout = timeout;
         self
     }
 
@@ -259,15 +285,49 @@ impl ExecutionEngine {
         if let State::InBlock(txn) = &self.state {
             return self.run_plan(txn, &plan, bound);
         }
-        let txn = self.txn_manager.begin();
-        let result = self
-            .run_plan(&txn, &plan, bound)
-            .and_then(|output| self.commit(&txn).map(|()| output));
-        if txn.state() == TransactionState::Running {
-            // The statement failed. Its error is the one to report.
-            let _ = self.txn_manager.abort(&txn);
+        let deadline = Instant::now() + self.conflict_timeout;
+        let mut attempt = 0;
+        loop {
+            let txn = self.txn_manager.begin();
+            let result = self
+                .run_plan(&txn, &plan, bound)
+                .and_then(|output| self.commit(&txn).map(|()| output));
+            if txn.state() == TransactionState::Running && self.txn_manager.abort(&txn).is_err() {
+                // The statement failed, and its error is the one to report.
+                // Its writes are still locked, so a retry would only
+                // conflict with them.
+                return result;
+            }
+            // DDL isn't retried: the catalog isn't transactional.
+            let other = match &result {
+                Err(err) if ddl.is_none() => conflicting_txn(err),
+                _ => None,
+            };
+            match other {
+                Some(other) if self.wait_to_retry(txn.tid(), other, attempt, deadline) => {
+                    attempt += 1;
+                }
+                _ => return result,
+            }
         }
-        result
+    }
+
+    /// Waits until a statement whose transaction `tid` conflicted with
+    /// transaction `other` is worth running again in a new one. Returns
+    /// `false` once `deadline` has passed.
+    fn wait_to_retry(&self, tid: TxnId, other: TxnId, attempt: u32, deadline: Instant) -> bool {
+        // An older transaction holds a row the statement needs, or wrote one
+        // it must see, and only its end changes that. A newer one is still
+        // older than the retry's Tid, which gets past it at once.
+        if other < tid && !self.txn_manager.wait_for_end(other, deadline) {
+            return false;
+        }
+        // Conflicting again means others keep getting in first.
+        if attempt > 0 {
+            let backoff = Duration::from_millis(1 << attempt.min(6));
+            thread::sleep(backoff.min(deadline.saturating_duration_since(Instant::now())));
+        }
+        Instant::now() < deadline
     }
 
     /// Records the next Tid in the catalog header, then commits `txn`.
@@ -353,5 +413,15 @@ impl ExecutionEngine {
 impl Drop for ExecutionEngine {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+/// The transaction `err` conflicted with, if it is a storage `Conflict`.
+fn conflicting_txn(err: &EngineError) -> Option<TxnId> {
+    match err {
+        EngineError::Execution(ExecutionError::Storage(StorageError::Conflict {
+            other, ..
+        })) => Some(*other),
+        _ => None,
     }
 }
