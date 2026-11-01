@@ -61,16 +61,25 @@ impl Db {
         Binder::new(&self.catalog).bind(&stmts.remove(0)).unwrap()
     }
 
+    /// The plan before optimizing: these tests check how SQL becomes a
+    /// plan, and the optimizer has its own tests in `execution`.
     fn try_plan(&self, sql: &str) -> Result<Arc<AbstractPlanNode>> {
-        Planner::new(&self.catalog).plan(&self.bind(sql))
+        Ok(Arc::new(
+            Planner::new(&self.catalog).plan_unoptimized(&self.bind(sql))?,
+        ))
     }
 
     fn plan(&self, sql: &str) -> Arc<AbstractPlanNode> {
         self.try_plan(sql).unwrap()
     }
+
+    /// The optimized plan, which is what EXPLAIN shows.
+    fn optimized(&self, sql: &str) -> Arc<AbstractPlanNode> {
+        Planner::new(&self.catalog).plan(&self.bind(sql)).unwrap()
+    }
 }
 
-/// The plan tree as `Name(child, ...)`.
+/// The plan tree as `Name(child, ...)`, or just `Name` for a leaf.
 fn shape(plan: &AbstractPlanNode) -> String {
     let name = match plan {
         AbstractPlanNode::CreateTablePlan(_) => "CreateTable",
@@ -95,6 +104,9 @@ fn shape(plan: &AbstractPlanNode) -> String {
         AbstractPlanNode::ExplainPlan(_) => "Explain",
     };
     let children: Vec<_> = plan.get_children().iter().map(|c| shape(c)).collect();
+    if children.is_empty() {
+        return name.to_string();
+    }
     format!("{name}({})", children.join(", "))
 }
 
@@ -132,7 +144,7 @@ fn select_stacks_filter_sort_limit_and_projection() {
 fn select_without_from_projects_one_empty_row() {
     let db = Db::new();
     let plan = db.plan("SELECT 1 + 2 AS three");
-    assert_eq!(shape(&plan), "Projection(Values())");
+    assert_eq!(shape(&plan), "Projection(Values)");
     let AbstractPlanNode::ValuesPlan(values) = &*plan.get_child_at(0) else {
         panic!("expected values");
     };
@@ -140,9 +152,7 @@ fn select_without_from_projects_one_empty_row() {
     assert!(values.rows()[0].is_empty());
 }
 
-/// The hash join `plan` is, or the one under `plan`'s filter. `SELECT *`
-/// has no projection above it: the optimizer removes the one the planner
-/// puts there, as it copies every column.
+/// The hash join `plan` is, or the one under `plan`'s filter.
 fn hash_join(plan: Arc<AbstractPlanNode>) -> HashJoinPlan {
     match &*plan {
         AbstractPlanNode::HashJoinPlan(join) => join.clone(),
@@ -185,7 +195,7 @@ fn nested_join_splits_on_its_own_left_side() {
         "SELECT * FROM users u JOIN orders o ON u.id = o.user_id \
          JOIN users v ON o.id = v.id",
     );
-    let outer = hash_join(Arc::clone(&plan));
+    let outer = hash_join(plan.get_child_at(0));
     assert_eq!(column_ref(&outer.left_keys()[0]), (0, 4));
     assert_eq!(column_ref(&outer.right_keys()[0]), (0, 0));
     assert_eq!(plan.get_output_schema().len(), 11);
@@ -200,7 +210,7 @@ fn join_keys_and_the_rest_of_the_condition() {
         "SELECT * FROM users u JOIN orders o \
          ON o.user_id = u.id AND o.total > 10 AND u.score = o.total + 1",
     );
-    let join = hash_join(Arc::clone(&plan));
+    let join = hash_join(plan.get_child_at(0));
     let left_keys: Vec<_> = join.left_keys().iter().map(column_ref).collect();
     assert_eq!(left_keys, [(0, 0), (0, 2)]);
     assert_eq!(column_ref(&join.right_keys()[0]), (0, 1));
@@ -224,7 +234,7 @@ fn join_without_keys() {
         "u.id = 1 AND o.id = o.user_id",
     ] {
         let plan = db.plan(&format!("SELECT * FROM users u JOIN orders o ON {on}"));
-        let join = hash_join(plan);
+        let join = hash_join(plan.get_child_at(0));
         assert!(join.left_keys().is_empty(), "{on}");
         assert!(join.predicate().is_some(), "{on}");
     }
@@ -236,9 +246,9 @@ fn cross_join_is_an_inner_join_without_a_condition() {
     let plan = db.plan("SELECT * FROM users, orders WHERE users.id = orders.user_id");
     assert_eq!(
         shape(&plan),
-        "Filter(HashJoin(SeqScan users, SeqScan orders))"
+        "Projection(Filter(HashJoin(SeqScan users, SeqScan orders)))"
     );
-    let join = hash_join(plan);
+    let join = hash_join(plan.get_child_at(0));
     assert_eq!(join.join_type(), JoinType::Inner);
     assert!(join.left_keys().is_empty());
     assert!(join.predicate().is_none());
@@ -248,7 +258,7 @@ fn cross_join_is_an_inner_join_without_a_condition() {
 fn insert_values_in_table_order() {
     let db = Db::new();
     let plan = db.plan("INSERT INTO orders (total, id) VALUES (10, 1), (20, 2)");
-    assert_eq!(shape(&plan), "Insert(Values())");
+    assert_eq!(shape(&plan), "Insert(Values)");
     let AbstractPlanNode::ValuesPlan(values) = &*plan.get_child_at(0) else {
         panic!("expected values");
     };
@@ -302,23 +312,25 @@ fn explain_sits_above_the_plan() {
     );
     assert_eq!(
         shape(&plan),
-        "Explain(Limit(Sort(Aggregation(Filter(HashJoin(SeqScan users, SeqScan orders))))))"
+        "Explain(Projection(Limit(Sort(Aggregation(Filter(HashJoin(SeqScan users, SeqScan orders)))))))"
     );
     assert_eq!(names(plan.get_output_schema()), ["QUERY PLAN"]);
     assert_eq!(
         plan.get_child_at(0).to_string(),
-        "Limit 3
-  ->  Sort
-        Key: sum DESC
-        ->  Aggregation
-              Group By: name
-              Aggregates: sum(total)
-              ->  Filter
-                    Condition: total > 10
-                    ->  HashJoin (inner)
-                          Keys: left.id = right.user_id
-                          ->  SeqScan on users
-                          ->  SeqScan on orders"
+        "Projection
+  Output: name, sum
+  ->  Limit 3
+        ->  Sort
+              Key: sum DESC
+              ->  Aggregation
+                    Group By: name
+                    Aggregates: sum(total)
+                    ->  Filter
+                          Condition: total > 10
+                          ->  HashJoin (inner)
+                                Keys: left.id = right.user_id
+                                ->  SeqScan on users
+                                ->  SeqScan on orders"
     );
 }
 
@@ -329,7 +341,7 @@ fn explain_shows_the_optimized_plan() {
     db.catalog
         .create_index("users_id", "users", &["id"])
         .unwrap();
-    let plan = db.plan("EXPLAIN SELECT name FROM users WHERE id = 1");
+    let plan = db.optimized("EXPLAIN SELECT name FROM users WHERE id = 1");
     assert_eq!(shape(&plan), "Explain(Projection(IndexScan))");
     assert_eq!(
         plan.get_child_at(0).to_string(),
@@ -344,17 +356,17 @@ fn explain_shows_the_optimized_plan() {
 fn explain_dml() {
     let db = Db::new();
     assert_eq!(
-        db.plan("INSERT INTO orders VALUES (1, 2, 3)").to_string(),
+        db.optimized("INSERT INTO orders VALUES (1, 2, 3)")
+            .to_string(),
         "Insert on orders\n  ->  Values (1 row)"
     );
     assert_eq!(
-        db.plan("UPDATE users SET name = 'x', score = score + 1 WHERE id = 1")
+        db.optimized("UPDATE users SET name = 'x', score = score + 1 WHERE id = 1")
             .to_string(),
         "Update on users
   Set: name = 'x', score = score + 1
-  ->  Filter
-        Condition: id = 1
-        ->  SeqScan on users"
+  ->  SeqScan on users
+        Filter: id = 1"
     );
 }
 
@@ -367,9 +379,9 @@ fn expressions_keep_the_bound_types() {
         panic!("expected a select");
     };
     let plan = Planner::new(&db.catalog)
-        .plan(&BoundStatement::Select(select.clone()))
+        .plan_unoptimized(&BoundStatement::Select(select.clone()))
         .unwrap();
-    let AbstractPlanNode::ProjectionPlan(projection) = &*plan else {
+    let AbstractPlanNode::ProjectionPlan(projection) = &plan else {
         panic!("expected a projection");
     };
     for (item, expr) in select.projection.iter().zip(projection.exprs()) {
@@ -450,7 +462,7 @@ fn aggregate_without_group_by_still_aggregates() {
     let db = Db::new();
     assert_eq!(
         shape(&db.plan("SELECT count(*) FROM users")),
-        "Aggregation(SeqScan users)"
+        "Projection(Aggregation(SeqScan users))"
     );
 }
 
