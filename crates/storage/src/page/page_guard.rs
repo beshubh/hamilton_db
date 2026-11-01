@@ -11,7 +11,7 @@ use crate::{
             BpmLatch, BufferPoolManagerState, FrameHeader, FrameReadLatch, FrameWriteLatch,
         },
     },
-    disk::disk_scheduler::DiskScheduler,
+    disk::disk_scheduler::{DiskFuture, DiskScheduler},
     error::Result,
     page::{PAGE_SIZE, PageBuf, page_header::stamp_checksum},
 };
@@ -59,6 +59,29 @@ impl ReadPageGuard {
         }
     }
 
+    /// Like `new`, but returns `None` instead of waiting if a writer holds
+    /// the latch. The frame is unpinned then.
+    pub(crate) fn try_new(
+        page_id: PageId,
+        frame: Arc<FrameHeader>,
+        replacer: Arc<ArcReplacer>,
+        bpm_latch: BpmLatch,
+        disk_scheduler: Arc<DiskScheduler>,
+    ) -> Option<Self> {
+        let Some(latch) = frame.try_get_data() else {
+            unpin_frame(&frame, &replacer, &bpm_latch);
+            return None;
+        };
+        Some(Self {
+            page_id,
+            frame,
+            replacer,
+            bpm_latch,
+            disk_scheduler,
+            latch: Some(latch),
+        })
+    }
+
     pub fn page_id(&self) -> PageId {
         self.page_id
     }
@@ -84,8 +107,31 @@ impl ReadPageGuard {
         flush_page(self.page_id, &self.frame, self.buf(), &self.disk_scheduler)
     }
 
+    /// Like `flush`, but only queues the write, so many pages can be written
+    /// at once. Returns `None` if the page is clean.
+    pub(crate) fn start_flush(self) -> Option<PendingFlush> {
+        let write = queue_write(self.page_id, &self.frame, self.buf(), &self.disk_scheduler)?;
+        Some(PendingFlush { guard: self, write })
+    }
+
     fn buf(&self) -> &PageBuf {
         self.latch.as_ref().expect("latch is held until drop")
+    }
+}
+
+/// A page write queued by `ReadPageGuard::start_flush`. Keeps the guard, and
+/// so the page's read latch, until the write is done.
+pub(crate) struct PendingFlush {
+    guard: ReadPageGuard,
+    write: DiskFuture<()>,
+}
+
+impl PendingFlush {
+    /// Waits for the write, then marks the page clean.
+    pub(crate) fn wait(self) -> Result<()> {
+        self.write.wait()?;
+        self.guard.frame.set_dirty(false);
+        Ok(())
     }
 }
 
@@ -237,14 +283,27 @@ pub(crate) fn flush_page(
     data: &PageBuf,
     disk_scheduler: &DiskScheduler,
 ) -> Result<()> {
+    if let Some(write) = queue_write(page_id, frame, data, disk_scheduler) {
+        write.wait()?;
+        frame.set_dirty(false);
+    }
+    Ok(())
+}
+
+/// Queues a write of the page if it is dirty. The caller marks it clean once
+/// the write is done, holding the latch until then (see `flush_page`).
+fn queue_write(
+    page_id: PageId,
+    frame: &FrameHeader,
+    data: &PageBuf,
+    disk_scheduler: &DiskScheduler,
+) -> Option<DiskFuture<()>> {
     if !frame.is_dirty() {
-        return Ok(());
+        return None;
     }
     let mut data = Box::new(data.0);
     stamp_checksum(page_id, &mut data);
-    disk_scheduler.write_page(page_id, data).wait()?;
-    frame.set_dirty(false);
-    Ok(())
+    Some(disk_scheduler.write_page(page_id, data))
 }
 
 #[cfg(test)]
