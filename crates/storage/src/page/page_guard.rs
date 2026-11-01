@@ -228,7 +228,10 @@ fn unpin_frame(
     }
 }
 
-fn flush_page(
+/// Writes the page to disk if it is dirty, then marks it clean. `data` must
+/// be the frame's data seen through its latch, held until this returns, so no
+/// writer can change the page between the copy and clearing the dirty flag.
+pub(crate) fn flush_page(
     page_id: PageId,
     frame: &FrameHeader,
     data: &PageBuf,
