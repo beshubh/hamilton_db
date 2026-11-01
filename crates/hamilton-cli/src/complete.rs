@@ -1,48 +1,32 @@
 //! Tab completion of keywords, functions, backslash commands, and the
-//! tables and columns in the catalog.
+//! server's tables and columns.
 //!
 //! Where the cursor is decides what is offered: table names after FROM,
 //! JOIN, INTO and UPDATE; the columns of a table after `name.`; otherwise
 //! the columns of the tables the statement mentions, then functions, tables
 //! and keywords.
 
-use std::sync::Arc;
-
-use catalog::Catalog;
-use common::Column;
 use reedline::{Completer, CompletionResult, Span, Suggestion};
 
 use crate::lexer::{FUNCTIONS, KEYWORDS, Token, TokenKind, is_word_char, tokenize};
 use crate::meta;
+use crate::schema::{SharedSchema, Table};
 
 pub struct SqlCompleter {
-    catalog: Arc<Catalog>,
+    schema: SharedSchema,
 }
 
 impl SqlCompleter {
-    pub fn new(catalog: Arc<Catalog>) -> Self {
-        Self { catalog }
+    pub fn new(schema: SharedSchema) -> Self {
+        Self { schema }
     }
 }
 
 impl Completer for SqlCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
-        let infos = self.catalog.tables();
-        let tables: Vec<Table> = infos
-            .iter()
-            .map(|t| Table {
-                name: &t.name,
-                columns: t.schema.columns(),
-            })
-            .collect();
-        CompletionResult::fresh(suggest(&tables, line, pos))
+        let schema = self.schema.read().unwrap_or_else(|e| e.into_inner());
+        CompletionResult::fresh(suggest(&schema.tables, line, pos))
     }
-}
-
-/// A table as completion sees it.
-pub struct Table<'a> {
-    pub name: &'a str,
-    pub columns: &'a [Column],
 }
 
 /// What may go where the cursor is.
@@ -115,7 +99,7 @@ pub fn suggest(tables: &[Table], line: &str, pos: usize) -> Vec<Suggestion> {
         Context::Anything => {
             let mentioned: Vec<&Table> = tables
                 .iter()
-                .filter(|table| statement.iter().any(|t| names(t, table.name)))
+                .filter(|table| statement.iter().any(|t| names(t, &table.name)))
                 .collect();
             if mentioned.is_empty() {
                 out.columns(&tables.iter().collect::<Vec<_>>());
@@ -157,15 +141,15 @@ impl Suggestions<'_> {
         for table in tables {
             let count = table.columns.len();
             let plural = if count == 1 { "" } else { "s" };
-            self.push(table.name, format!("table · {count} column{plural}"), true);
+            self.push(&table.name, format!("table · {count} column{plural}"), true);
         }
     }
 
     fn columns(&mut self, tables: &[&Table]) {
         for table in tables {
-            for column in table.columns {
+            for column in &table.columns {
                 let null = if column.nullable { "" } else { " NOT NULL" };
-                let about = format!("{}{null} · {}", column.data_type, table.name);
+                let about = format!("{}{null} · {}", column.type_name, table.name);
                 self.push(&column.name, about, false);
             }
         }
@@ -275,12 +259,8 @@ fn names(token: &Token, name: &str) -> bool {
 /// The table that `name` refers to in the statement: a table of that name,
 /// or one the statement aliases as `name`, as in `FROM users u` or
 /// `FROM users AS u`.
-fn resolve<'a, 'b>(
-    tables: &'b [Table<'a>],
-    statement: &[&Token],
-    name: &str,
-) -> Option<&'b Table<'a>> {
-    let table = |token: &Token| tables.iter().find(|t| names(token, t.name));
+fn resolve<'a>(tables: &'a [Table], statement: &[&Token], name: &str) -> Option<&'a Table> {
+    let table = |token: &Token| tables.iter().find(|t| names(token, &t.name));
     if let Some(table) = tables.iter().find(|t| t.name.eq_ignore_ascii_case(name)) {
         return Some(table);
     }
@@ -295,28 +275,32 @@ fn resolve<'a, 'b>(
 
 #[cfg(test)]
 mod tests {
-    use common::DataType;
-
     use super::*;
+    use crate::schema::Column;
+
+    fn table(name: &str, columns: &[(&str, &str, bool)]) -> Table {
+        let columns = columns
+            .iter()
+            .map(|&(name, type_name, nullable)| Column {
+                name: name.to_owned(),
+                type_name: type_name.to_owned(),
+                nullable,
+            })
+            .collect();
+        Table {
+            name: name.to_owned(),
+            columns,
+            indexes: Vec::new(),
+        }
+    }
 
     fn complete(line: &str) -> Vec<String> {
-        let users = [
-            Column::new("id", DataType::Int, false),
-            Column::new("name", DataType::Varchar(32), true),
-        ];
-        let orders = [
-            Column::new("id", DataType::Int, false),
-            Column::new("user_id", DataType::Int, false),
-        ];
         let tables = [
-            Table {
-                name: "orders",
-                columns: &orders,
-            },
-            Table {
-                name: "users",
-                columns: &users,
-            },
+            table("orders", &[("id", "INT", false), ("user_id", "INT", false)]),
+            table(
+                "users",
+                &[("id", "INT", false), ("name", "VARCHAR(32)", true)],
+            ),
         ];
         // The cursor is at `|`, or at the end.
         let pos = line.find('|').unwrap_or(line.len());
@@ -384,10 +368,7 @@ mod tests {
 
     #[test]
     fn backslash_commands() {
-        assert_eq!(
-            complete("\\"),
-            ["\\?", "\\clear", "\\d", "\\q", "\\session", "\\timing"]
-        );
+        assert_eq!(complete("\\"), ["\\?", "\\clear", "\\d", "\\q", "\\timing"]);
         assert_eq!(complete("\\t"), ["\\timing"]);
     }
 }

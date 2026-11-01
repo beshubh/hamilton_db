@@ -213,13 +213,18 @@ impl Catalog {
         Ok(read_next_tid(guard.get_data()))
     }
 
-    /// Records `tid` as the next Tid in the header page. It reaches disk when
-    /// the page is flushed, like any other.
+    /// Records `tid` as the next Tid in the header page, unless a larger one
+    /// is recorded already. It reaches disk when the page is flushed, like
+    /// any other.
+    ///
+    /// Commits call this with a `tid` read before they take the page, so
+    /// one that is slow to get here must not undo a later commit's record.
     pub fn set_next_tid(&self, tid: TxnId) -> Result<()> {
         let mut guard = self
             .bpm
             .checked_write_page(CATALOG_PAGE_ID, AccessType::Lookup)?;
-        write_next_tid(guard.get_data_mut(), tid);
+        let recorded = read_next_tid(guard.get_data());
+        write_next_tid(guard.get_data_mut(), recorded.max(tid));
         Ok(())
     }
 
@@ -715,9 +720,10 @@ mod tests {
         ])
     }
 
-    /// Checks that `a` and `b` describe the same index.
-    fn assert_same_index(a: &IndexInfo, b: &IndexInfo) {
-        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    /// What tells two `IndexInfo`s apart. Tests keep this across a restart,
+    /// not the info: that holds the old files open.
+    fn described(index: &IndexInfo) -> String {
+        format!("{index:?}")
     }
 
     fn names(indexes: &[Arc<IndexInfo>]) -> Vec<&str> {
@@ -928,9 +934,13 @@ mod tests {
             .unwrap();
         assert!(!index.is_primary_key);
 
+        let (pkey_before, index_before) = (described(&pkey), described(&index));
+        drop((table, pkey, index));
         let db = db.restart();
-        assert_same_index(&db.catalog.get_index("users_pkey").unwrap(), &pkey);
-        assert_same_index(&db.catalog.get_index("users_name").unwrap(), &index);
+        let pkey = db.catalog.get_index("users_pkey").unwrap();
+        assert_eq!(described(&pkey), pkey_before);
+        let index = db.catalog.get_index("users_name").unwrap();
+        assert_eq!(described(&index), index_before);
     }
 
     #[test]
@@ -994,8 +1004,12 @@ mod tests {
     #[test]
     fn indexes_point_by_primary_key_on_tables_with_one() {
         let db = Db::new(16);
-        let users_info = db.catalog.create_table("users", users(), &["id"]).unwrap();
-        let logs = db.catalog.create_table("logs", users(), &[]).unwrap();
+        let users_oid = db
+            .catalog
+            .create_table("users", users(), &["id"])
+            .unwrap()
+            .oid;
+        let logs_oid = db.catalog.create_table("logs", users(), &[]).unwrap().oid;
         db.catalog
             .create_index("users_name", "users", &["name"])
             .unwrap();
@@ -1012,9 +1026,9 @@ mod tests {
             assert_eq!(locator("users_pkey"), LocatorKind::Rid);
             assert_eq!(locator("users_name"), LocatorKind::PrimaryKey);
             assert_eq!(locator("logs_name"), LocatorKind::Rid);
-            let pkey = db.catalog.primary_key_index(users_info.oid).unwrap();
+            let pkey = db.catalog.primary_key_index(users_oid).unwrap();
             assert_eq!(pkey.name, "users_pkey");
-            assert!(db.catalog.primary_key_index(logs.oid).is_none());
+            assert!(db.catalog.primary_key_index(logs_oid).is_none());
         };
         check(&db);
         check(&db.restart());
@@ -1026,6 +1040,14 @@ mod tests {
         assert_eq!(db.catalog.next_tid().unwrap(), 1);
         db.catalog.set_next_tid(17).unwrap();
         let db = db.restart();
+        assert_eq!(db.catalog.next_tid().unwrap(), 17);
+    }
+
+    #[test]
+    fn next_tid_never_goes_down() {
+        let db = Db::new(8);
+        db.catalog.set_next_tid(17).unwrap();
+        db.catalog.set_next_tid(12).unwrap();
         assert_eq!(db.catalog.next_tid().unwrap(), 17);
     }
 
@@ -1052,23 +1074,31 @@ mod tests {
         .unwrap();
         users_info.heap.insert(&TupleMeta::new(1), &row).unwrap();
 
+        let (users_oid, users_first_page) = (users_info.oid, users_info.first_page_id());
+        let empty_oid = empty.oid;
+        let (users_id_before, users_name_before) = (described(&users_id), described(&users_name));
+        let (users_name_oid, users_name_page) = (users_name.oid, users_name.header_page_id);
+        drop((users_info, empty, users_id, users_name));
         let db = db.restart();
         let users_after = db.catalog.get_table("users").unwrap();
-        assert_eq!(users_after.oid, users_info.oid);
+        assert_eq!(users_after.oid, users_oid);
         assert_eq!(users_after.schema, users());
-        assert_eq!(users_after.first_page_id(), users_info.first_page_id());
+        assert_eq!(users_after.first_page_id(), users_first_page);
         let rows: Vec<_> = users_after.heap.iter().unwrap().collect();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].as_ref().unwrap().1.data(), row.data());
 
         let empty_after = db.catalog.get_table("empty").unwrap();
-        assert_eq!(empty_after.oid, empty.oid);
+        assert_eq!(empty_after.oid, empty_oid);
         assert!(empty_after.schema.is_empty());
 
-        assert_same_index(&db.catalog.get_index("users_id").unwrap(), &users_id);
-        assert_same_index(
-            &db.catalog.get_index("users_name_active").unwrap(),
-            &users_name,
+        assert_eq!(
+            described(&db.catalog.get_index("users_id").unwrap()),
+            users_id_before
+        );
+        assert_eq!(
+            described(&db.catalog.get_index("users_name_active").unwrap()),
+            users_name_before
         );
         assert_eq!(
             names(&db.catalog.table_indexes("users")),
@@ -1077,17 +1107,22 @@ mod tests {
 
         // New objects get fresh oids and pages after the restart.
         let orders = db.catalog.create_table("orders", users(), &[]).unwrap();
-        assert!(orders.oid > empty.oid);
-        assert!(orders.first_page_id() > users_name.header_page_id);
+        assert!(orders.oid > empty_oid);
+        assert!(orders.first_page_id() > users_name_page);
         let orders_id = db
             .catalog
             .create_index("orders_id", "orders", &["id"])
             .unwrap();
-        assert!(orders_id.oid > users_name.oid);
+        assert!(orders_id.oid > users_name_oid);
 
+        let (orders_oid, orders_id_before) = (orders.oid, described(&orders_id));
+        drop((users_after, empty_after, orders, orders_id));
         let db = db.restart();
-        assert_eq!(db.catalog.get_table("orders").unwrap().oid, orders.oid);
-        assert_same_index(&db.catalog.get_index("orders_id").unwrap(), &orders_id);
+        assert_eq!(db.catalog.get_table("orders").unwrap().oid, orders_oid);
+        assert_eq!(
+            described(&db.catalog.get_index("orders_id").unwrap()),
+            orders_id_before
+        );
     }
 
     #[test]
@@ -1131,6 +1166,7 @@ mod tests {
         let table = db.catalog.create_table("users", users(), &[]).unwrap();
         assert!(table.oid > orphan_oid);
 
+        drop(table);
         let db = db.restart();
         assert_eq!(db.catalog.get_table("users").unwrap().schema, users());
     }

@@ -9,7 +9,8 @@ Hamilton DB is a relational OLTP DBMS built in rust, that speaks postgres dialec
 - Test-only files live in each crate's `tests/` directory, not in `src/`. Helpers for in-file `#[cfg(test)]` blocks go under `tests/util/` and are pulled in with `#[path]`; Cargo doesn't build `tests/` subdirectories as test targets.
 
 # How does it works  
-- To start the CLI fresh (or after bumping the catalog `VERSION`), delete all three database files: `<name>.db`, `<name>.meta` and `<name>.log`. Deleting only the `.db` leaves a stale `.meta` that claims pages exist, and opening fails with "page 0 is not a catalog header page".
+- `hamilton-server` owns the database files and serves them on port 6942; `hamilton-cli` is only a client and never opens files. Only one process can have a database open: a second gets "already open in another process".
+- To start the server fresh (or after bumping the catalog `VERSION`), stop it and delete all three database files: `<name>.db`, `<name>.meta` and `<name>.log`. Deleting only the `.db` leaves a stale `.meta` that claims pages exist, and opening fails with "page 0 is not a catalog header page".
 
 ## A small glossary
  - **you** means the agent reading this file and chaning HamiltonDB

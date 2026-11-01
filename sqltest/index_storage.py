@@ -45,13 +45,14 @@ def parse(path: Path) -> list[Case]:
     return cases
 
 
-def load(db: Path) -> list[str]:
-    """Loads the schema and rows into `db`. Returns the errors."""
-    blocks = cli.run(db, (HERE / "schema.sql").read_text() + gen_data.sql())
+def load(server: cli.Server) -> list[str]:
+    """Loads the schema and rows into the server's database. Returns the
+    errors."""
+    blocks = cli.run(server, (HERE / "schema.sql").read_text() + gen_data.sql())
     return [b for b in blocks if b.startswith("error:")]
 
 
-def run_case(db: Path, case: Case, warmup: int, runs: int):
+def run_case(server: cli.Server, case: Case, warmup: int, runs: int):
     """Returns (plain ms, indexed ms, row count, problems)."""
     n = warmup + runs
     script = "\n".join(
@@ -59,7 +60,7 @@ def run_case(db: Path, case: Case, warmup: int, runs: int):
         + [case.plain] * n
         + [case.indexed] * n
     )
-    results = [cli.split_time(b) for b in cli.run(db, script)[1:]]  # Skip "Timing is on."
+    results = [cli.split_time(b) for b in cli.run(server, script)[1:]]  # Skip "Timing is on."
     (plain_plan, _), (indexed_plan, _) = results[:2]
     plain, indexed = results[2 : 2 + n], results[2 + n :]
 
@@ -84,16 +85,15 @@ def run(args) -> tuple[int, int]:
     if not cases:
         return 0, 0
     print("\nindex_storage\n")
-    with tempfile.TemporaryDirectory() as tmp:
-        db = Path(tmp) / "sqltest.db"
-        if errors := load(db):
+    with tempfile.TemporaryDirectory() as tmp, cli.Server(Path(tmp) / "sqltest.db") as server:
+        if errors := load(server):
             print(f"  FAIL  loading the data: {errors[0]}")
             return len(cases), 1
         print(f"  {'':4}  {'case (median of %d runs, ms)' % args.runs:40} "
               f"{'rows':>6} {'no index':>10} {'index':>10} {'speedup':>8}")
         failed = 0
         for case in cases:
-            plain, indexed, rows, problems = run_case(db, case, args.warmup, args.runs)
+            plain, indexed, rows, problems = run_case(server, case, args.warmup, args.runs)
             status = "FAIL" if problems else "ok  "
             speedup = f"{plain / indexed:7.1f}x" if indexed else ""
             print(

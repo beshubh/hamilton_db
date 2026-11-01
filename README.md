@@ -31,7 +31,9 @@ crates/
   parser        SQL → AST
   planner       binder and planning
   execution     expressions and executors
-  hamilton-cli  interactive shell
+  wire          the Postgres wire protocol, server and client sides
+  hamilton-server  serves a database over the wire protocol
+  hamilton-cli  interactive shell, a client of the server
   bench         benchmarks
 ```
 
@@ -40,8 +42,14 @@ crates/
 ```sh
 cargo build --workspace
 cargo nextest run --workspace   # cargo install cargo-nextest
-cargo run -p hamilton-cli
+cargo run -p hamilton-server    # serves hamilton.db on 127.0.0.1:6942
+cargo run -p hamilton-cli       # in another terminal: connects to it
 ```
+
+The server speaks the Postgres wire protocol (simple queries, text format,
+no authentication), so `psql -h 127.0.0.1 -p 6942` can run SQL too.
+psql's own backslash commands, such as `\d`, query `pg_catalog`, which
+HamiltonDB doesn't have; use `hamilton-cli` for those.
 
 To time join queries against a local Postgres on the same data (flags are
 listed at the top of `crates/bench/src/main.rs`):

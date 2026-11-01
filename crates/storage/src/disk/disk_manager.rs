@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -86,13 +86,20 @@ struct LogState {
 impl DiskManager {
     /// Opens (or creates) `db_file` with matching `.log` and `.meta` files
     /// next to it. The page directory of an existing database is loaded from
-    /// its `.meta` file.
+    /// its `.meta` file. Fails with `DatabaseLocked` while another manager
+    /// has `db_file` open.
     pub fn new(db_file: impl AsRef<Path>) -> Result<Self> {
         let db_file_name = db_file.as_ref().to_path_buf();
         let log_file_name = db_file_name.with_extension("log");
         let meta_file_name = db_file_name.with_extension("meta");
 
         let db_io = open_rw(&db_file_name)?;
+        // Two managers on one file would hand out the same slots and
+        // overwrite each other's `.meta`. The lock goes when `db_io` closes.
+        db_io.try_lock().map_err(|e| match e {
+            TryLockError::WouldBlock => StorageError::DatabaseLocked(db_file_name.clone()),
+            TryLockError::Error(e) => e.into(),
+        })?;
         let log_io = open_rw(&log_file_name)?;
 
         // The capacity is not saved; it follows from the db file's length.
@@ -738,10 +745,38 @@ mod tests {
         assert!(!dm.read_log(&mut buf, 100).unwrap());
     }
 
+    /// The page directory the last save left in the `.meta` file, read
+    /// without opening a second manager on the database.
+    fn saved_pages(dm: &DiskManager) -> HashMap<PageId, PageEntry> {
+        let mut saved = DiskState {
+            pages: HashMap::new(),
+            free_slots: Vec::new(),
+            first_writes: 0,
+            page_capacity: dm.state.lock().page_capacity,
+            meta_dirty: false,
+        };
+        saved
+            .load_meta(&fs::read(dm.meta_file_name()).unwrap())
+            .unwrap();
+        saved.pages
+    }
+
     fn reopen(dir: &TempDir, dm: DiskManager) -> DiskManager {
         dm.shut_down().unwrap();
         drop(dm);
         DiskManager::new(dir.path().join("test.db")).unwrap()
+    }
+
+    #[test]
+    fn a_second_manager_on_the_same_file_is_refused() {
+        let (dir, dm) = setup();
+        let path = dir.path().join("test.db");
+        assert!(matches!(
+            DiskManager::new(&path),
+            Err(StorageError::DatabaseLocked(locked)) if locked == path
+        ));
+        drop(dm);
+        DiskManager::new(&path).unwrap();
     }
 
     #[test]
@@ -898,7 +933,7 @@ mod tests {
 
     #[test]
     fn first_write_is_saved_only_once_done() {
-        let (dir, dm) = setup();
+        let (_dir, dm) = setup();
         let dm = Arc::new(dm);
         let stall = stall_io(&dm, 0);
         let stalled = {
@@ -912,10 +947,9 @@ mod tests {
         dm.write_page(1, &page_filled(2)).unwrap();
         dm.checkpoint().unwrap();
         assert_eq!(dm.free_space(0), None);
-        let saved = DiskManager::new(dir.path().join("test.db")).unwrap();
-        assert_eq!(saved.free_space(0), None);
-        assert_eq!(saved.free_space(1), Some(PAGE_SIZE));
-        drop(saved);
+        let saved = saved_pages(&dm);
+        assert!(!saved.contains_key(&0));
+        assert_eq!(saved[&1].free_space, PAGE_SIZE as u32);
 
         drop(stall);
         stalled.join().unwrap();
