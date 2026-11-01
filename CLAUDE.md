@@ -1,4 +1,5 @@
 # Hamilton DB
+Hamilton DB is a relational OLTP DBMS built in rust, that speaks postgres dialect of SQL.
 
 # Formatting
   - Don't run `cargo fmt --all`: it reformats unrelated files. Format only the files you changed (`rustfmt --edition 2024 <file>`).
@@ -43,3 +44,10 @@ Most code changes do not need an internal documentation change. Agents can read 
 - Outside hot paths, write plain readable code; don't optimize setup/DDL/error paths.
 - Verify before and after: `samply record` for CPU time, `dhat-rs` for allocations.
 - Don't claim a perf win without numbers. 
+
+
+# Verification
+---
+- Before you push, run `cargo nextest run -p <crate>`, to test the changes in the crate where you made a change.
+- if you have made changes on sql or index storage or transactions, run `uv run sqltest/run.py <transaction>` for testing transaction invariants and `uv run sqltest/run.py index_storage` for testing index storage invariants.
+
