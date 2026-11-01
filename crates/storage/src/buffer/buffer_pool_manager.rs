@@ -4,7 +4,7 @@ use crate::{
     error::{Result, StorageError},
     page::{
         PageBuf,
-        page_guard::{ReadPageGuard, WritePageGuard, flush_page},
+        page_guard::{PendingFlush, ReadPageGuard, WritePageGuard, flush_page},
         page_header::{stamp_checksum, verify_checksum},
     },
 };
@@ -278,17 +278,8 @@ impl BufferPoolManager {
     /// clean. Takes the page's latch in shared mode, so it waits for any
     /// writer to finish. Returns `false` if the page is not in memory.
     pub fn flush_page(&self, page_id: PageId) -> Result<bool> {
-        let frame = {
-            let state = self.latch.lock();
-            let Some(&frame_id) = state.page_table.get(&page_id) else {
-                return Ok(false);
-            };
-            // Pin without recording an access, so flushing does not count as
-            // a use of the page for the replacement policy.
-            let frame = self.frame(frame_id);
-            frame.pin();
-            self.replacer.set_evictable(frame_id, false);
-            Arc::clone(frame)
+        let Some(frame) = self.pin_for_flush(&self.latch.lock(), page_id) else {
+            return Ok(false);
         };
         // The guard waits for the latch outside the buffer pool latch and
         // unpins when it goes out of scope.
@@ -334,12 +325,76 @@ impl BufferPoolManager {
 
     /// Flushes every page currently in memory. Pages evicted while this runs
     /// were already written back by the eviction.
+    ///
+    /// Pages are written in batches, with every write in a batch queued
+    /// before waiting on any, so the disk scheduler's workers run them in
+    /// parallel.
     pub fn flush_all_pages(&self) -> Result<()> {
         let page_ids: Vec<PageId> = self.latch.lock().page_table.keys().copied().collect();
-        for page_id in page_ids {
+        // Each batch keeps its pages pinned, so a small pool flushes fewer at
+        // once to leave frames free for other threads.
+        let batch_size = (self.num_frames / 8).clamp(1, 64);
+        let mut busy = Vec::new();
+        for batch in page_ids.chunks(batch_size) {
+            busy.extend(self.flush_batch(batch)?);
+        }
+        for page_id in busy {
             self.flush_page(page_id)?;
         }
         Ok(())
+    }
+
+    /// Writes the dirty pages among `page_ids` at once. Each page's read latch
+    /// is held until its write is done, so only latches that are free are
+    /// taken: waiting for one while holding others could deadlock. Returns the
+    /// pages whose latch a writer held, for the caller to flush one at a time.
+    fn flush_batch(&self, page_ids: &[PageId]) -> Result<Vec<PageId>> {
+        let frames: Vec<_> = {
+            let state = self.latch.lock();
+            page_ids
+                .iter()
+                .filter_map(|&page_id| Some((page_id, self.pin_for_flush(&state, page_id)?)))
+                .collect()
+        };
+        let mut busy = Vec::new();
+        let mut writes = Vec::new();
+        for (page_id, frame) in frames {
+            let Some(guard) = ReadPageGuard::try_new(
+                page_id,
+                Arc::clone(&frame),
+                Arc::clone(&self.replacer),
+                Arc::clone(&self.latch),
+                Arc::clone(&self.disk_scheduler),
+            ) else {
+                busy.push(page_id);
+                continue;
+            };
+            // Skips a page whose load failed (see `checked_read_page`).
+            if frame.page_id() == Some(page_id) {
+                writes.extend(guard.start_flush());
+            }
+        }
+        // Waits on every write, even after one fails.
+        writes
+            .into_iter()
+            .map(PendingFlush::wait)
+            .fold(Ok(()), Result::and)?;
+        Ok(busy)
+    }
+
+    /// Pins the page's frame for a flush, or returns `None` if the page is not
+    /// in memory. No access is recorded, so flushing does not count as a use
+    /// of the page for the replacement policy.
+    fn pin_for_flush(
+        &self,
+        state: &BufferPoolManagerState,
+        page_id: PageId,
+    ) -> Option<Arc<FrameHeader>> {
+        let &frame_id = state.page_table.get(&page_id)?;
+        let frame = self.frame(frame_id);
+        frame.pin();
+        self.replacer.set_evictable(frame_id, false);
+        Some(Arc::clone(frame))
     }
 
     /// Pin count of the page, or `None` if it is not in memory.
@@ -495,8 +550,9 @@ impl BufferPoolManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk::disk_scheduler::DEFAULT_NUM_WORKERS;
     use crate::page::PAGE_SIZE;
-    use crate::test_util::within_timeout;
+    use crate::test_util::{stall_io, within_timeout};
     use std::thread;
     use tempfile::TempDir;
 
@@ -522,9 +578,6 @@ mod tests {
             thread::yield_now();
         }
     }
-
-    /// Runs `f` on another thread and fails if it does not finish soon, so a
-    /// thread stuck behind paused disk I/O fails the test instead of hanging.
 
     /// Writes `bytes` to a new page on disk and returns a pool over `dm` that
     /// has nothing cached.
@@ -730,6 +783,75 @@ mod tests {
             dm.read_page(pid, &mut buf).unwrap();
             assert_eq!(&buf[..4], [pid as u8 + 1; 4]);
         }
+    }
+
+    #[test]
+    fn flush_all_pages_writes_pages_in_parallel() {
+        let (_dir, dm, bpm) = setup(64);
+        let bpm = Arc::new(bpm);
+        let pids: Vec<_> = (0..8).map(|_| bpm.new_page()).collect();
+        for &pid in &pids {
+            write_bytes(&bpm, pid, &[pid as u8 + 1; 4]);
+        }
+        // Stall the page flushed first. Pages on other disk queues must still
+        // be written.
+        let first = *bpm.latch.lock().page_table.keys().next().unwrap();
+        let queue = |pid: PageId| pid as usize % DEFAULT_NUM_WORKERS;
+        let others = pids.iter().filter(|&&p| queue(p) != queue(first)).count();
+        let stall = stall_io(&dm, first);
+        let flusher = {
+            let bpm = Arc::clone(&bpm);
+            thread::spawn(move || bpm.flush_all_pages().unwrap())
+        };
+        stall.wait_started();
+
+        let disk = Arc::clone(&dm);
+        within_timeout(move || {
+            while disk.num_writes() < others {
+                thread::yield_now();
+            }
+        });
+        drop(stall);
+        flusher.join().unwrap();
+
+        assert_eq!(dm.num_writes(), pids.len());
+        let mut buf = [0u8; PAGE_SIZE];
+        for &pid in &pids {
+            dm.read_page(pid, &mut buf).unwrap();
+            assert_eq!(&buf[..4], [pid as u8 + 1; 4]);
+            assert!(!bpm.read_page(pid, AccessType::Unknown).is_dirty());
+        }
+    }
+
+    #[test]
+    fn flush_all_pages_waits_for_a_page_being_written() {
+        let (_dir, dm, bpm) = setup(64);
+        let bpm = Arc::new(bpm);
+        let (busy, other) = (bpm.new_page(), bpm.new_page());
+        write_bytes(&bpm, other, b"other");
+        let mut guard = bpm.write_page(busy, AccessType::Unknown);
+        guard.get_data_mut()[..4].copy_from_slice(b"busy");
+
+        let flusher = {
+            let bpm = Arc::clone(&bpm);
+            thread::spawn(move || bpm.flush_all_pages().unwrap())
+        };
+        // The other page is written while the writer holds `busy`.
+        let disk = Arc::clone(&dm);
+        within_timeout(move || {
+            while disk.num_writes() < 1 {
+                thread::yield_now();
+            }
+        });
+        assert!(!flusher.is_finished());
+        drop(guard);
+        flusher.join().unwrap();
+
+        assert_eq!(dm.num_writes(), 2);
+        let mut buf = [0u8; PAGE_SIZE];
+        dm.read_page(busy, &mut buf).unwrap();
+        assert_eq!(&buf[..4], b"busy");
+        assert!(!bpm.read_page(busy, AccessType::Unknown).is_dirty());
     }
 
     #[test]

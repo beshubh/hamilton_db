@@ -1,4 +1,5 @@
-# CLAUDE.md
+# Hamilton DB
+Hamilton DB is a relational OLTP DBMS written in rust. It supports postgres's SQL dialect and is written as a side project for learning and building database systems.
 
 Use this file to write down any surprises we face in development or testing. Any time you are corrected you should note that down here for future purposes. Don't record what the code already says: the code and its module docs are the source of truth for design.
 
@@ -24,3 +25,25 @@ Use this file to write down any surprises we face in development or testing. Any
 - In a `thread::scope` stress test, stop helper loops from a drop guard in the worker threads, not after joining them: a failed assertion in a worker otherwise leaves the helper looping, and the test hangs instead of failing.
 - Keep a plan short and concrete: a code sketch of the core change and a few bullets, not pages of prose. The first index backfill plan was an essay the user would not read.
 - Don't offer to leave out what makes a feature correct as an option ("handle concurrent writers, or note it as a known gap?"). An index that can miss rows is broken; just handle it.
+
+
+## A small glossary
+ - **you** means the agent reading this file and chaning HamiltonDB
+ - **we** means Shubham and people building HamiltonDB
+ - **Hamilton** means this project, the database being built.
+
+# Documentation
+---
+Most code changes do not need an internal documentation change. Agents can read the code.
+
+ - `docs/internals/` is for architectural decisions and their reasons, constraints that span components, and implementation traps that are hard to discover from the source. Before adding a paragraph, ask what a maintainer would get wrong without it. If reading the relevant code answers the question, leave it out.
+ - Do not document every feature, enumerate fields or methods, narrate control flow, maintain file catalogs, or append PR summaries. Types, tests, and code already record the implementation. The glossary defines shared vocabulary; it is not a feature index.
+ - A local reason the code can't show goes in a short nearby code comment. Use an internal doc when the reasoning crosses boundaries or needs context the code cannot carry well. Link to the relevant source instead of copying it.
+ - When a documented decision or constraint changes, rewrite or remove the affected text. Do not append another account of the new behavior. A new internal page needs a distinct, durable reason to exist.
+
+# Plans and work artifacts
+- Do not commit implementation plans, research notes, or agent scratch files. Keep temporary working material outside the worktree. .plans/ is gitignored only as a safety net for legacy tooling.
+ - Track active maintainer work in the GitHub issue or project item that owns it. External proposals follow CONTRIBUTING.md and belong in Ideas discussions.
+- A merged PR is the implementation record. Close or update its tracking item when the work lands; do not preserve a second checklist in the repository.
+
+  
