@@ -31,7 +31,9 @@ crates/
   parser        SQL → AST
   planner       binder and planning
   execution     expressions and executors
-  hamilton-cli  interactive shell
+  wire          the Postgres wire protocol, server and client sides
+  hamilton-server  serves a database over the wire protocol
+  hamilton-cli  interactive shell, a client of the server
   bench         benchmarks
 ```
 
@@ -40,7 +42,43 @@ crates/
 ```sh
 cargo build --workspace
 cargo nextest run --workspace   # cargo install cargo-nextest
-cargo run -p hamilton-cli
+cargo run -p hamilton-server    # serves hamilton.db on 127.0.0.1:6942
+cargo run -p hamilton-cli       # in another terminal: connects to it
+```
+
+The server speaks the Postgres wire protocol (simple queries, text format,
+no authentication), so `psql -h 127.0.0.1 -p 6942` can run SQL too.
+psql's own backslash commands, such as `\d`, query `pg_catalog`, which
+HamiltonDB doesn't have; use `hamilton-cli` for those.
+
+### Databases
+
+A database is a file, with a `.meta` and a `.log` file next to it. Give the
+server a path to serve another one; it creates the files if they don't
+exist, though not the directory they go in:
+
+```sh
+cargo run -p hamilton-server -- data/shop.db
+```
+
+A server serves one database, and there's no `CREATE DATABASE`: the
+database name a client asks for at startup (`psql -d`) is ignored. To serve
+several at once, give each server its own port:
+
+```sh
+cargo run -p hamilton-server -- --port 6942 shop.db
+cargo run -p hamilton-server -- --port 6943 analytics.db
+cargo run -p hamilton-cli -- -p 6943   # analytics.db
+```
+
+Only one process can have a database open; a second server on the same file
+fails with "already open in another process". To start a database over,
+stop its server and delete all three files. Deleting only the `.db` leaves a
+stale `.meta`, and opening then fails with "page 0 is not a catalog header
+page".
+
+```sh
+rm shop.db shop.meta shop.log
 ```
 
 To time join queries against a local Postgres on the same data (flags are

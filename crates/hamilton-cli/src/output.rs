@@ -4,10 +4,9 @@
 use std::fmt::{self, Write};
 use std::time::Duration;
 
-use common::{Column, DataType, Value};
 use nu_ansi_term::{Color, Style};
 
-use crate::database::Output;
+use crate::connection::{Output, OutputColumn};
 
 impl fmt::Display for Output {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -50,10 +49,14 @@ impl Printer {
                 format!(
                     "{} {} {count}",
                     check(),
-                    Style::new().bold().paint(*command)
+                    Style::new().bold().paint(command.as_str())
                 )
             }
-            Output::Done(command) => format!("{} {}", check(), Style::new().bold().paint(*command)),
+            Output::Done(command) => format!(
+                "{} {}",
+                check(),
+                Style::new().bold().paint(command.as_str())
+            ),
         };
         if let Some(elapsed) = elapsed {
             write!(text, "{}", dim().paint(format!(" · {}", duration(elapsed)))).unwrap();
@@ -79,7 +82,7 @@ impl Printer {
     }
 
     /// A table without the row count, for describing the database.
-    pub fn table(&self, columns: &[Column], rows: &[Vec<Value>]) -> String {
+    pub fn table(&self, columns: &[OutputColumn], rows: &[Vec<Option<String>>]) -> String {
         let grid = Grid::new(columns, rows, "");
         if self.color {
             boxed(&grid)
@@ -101,16 +104,13 @@ struct Grid<'a> {
 }
 
 impl<'a> Grid<'a> {
-    fn new(columns: &'a [Column], rows: &[Vec<Value>], null: &str) -> Self {
+    fn new(columns: &'a [OutputColumn], rows: &[Vec<Option<String>>], null: &str) -> Self {
         let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
         let cells: Vec<Vec<String>> = rows
             .iter()
             .map(|row| {
                 row.iter()
-                    .map(|value| match value {
-                        Value::Null => null.to_owned(),
-                        value => value.to_string(),
-                    })
+                    .map(|value| value.as_deref().unwrap_or(null).to_owned())
                     .collect()
             })
             .collect();
@@ -128,9 +128,9 @@ impl<'a> Grid<'a> {
             .collect();
         let nulls = rows
             .iter()
-            .map(|row| row.iter().map(|value| *value == Value::Null).collect())
+            .map(|row| row.iter().map(Option::is_none).collect())
             .collect();
-        let numeric = columns.iter().map(|c| is_numeric(c.data_type)).collect();
+        let numeric = columns.iter().map(|c| c.numeric).collect();
         Self {
             names,
             cells,
@@ -242,28 +242,29 @@ fn dim() -> Style {
     Color::DarkGray.normal()
 }
 
-fn is_numeric(data_type: DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int | DataType::BigInt | DataType::Double
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn columns() -> Vec<OutputColumn> {
+        vec![
+            OutputColumn::new("id", true),
+            OutputColumn::new("name", false),
+        ]
+    }
+
+    fn rows() -> Vec<Vec<Option<String>>> {
+        vec![
+            vec![Some("1".into()), Some("ann".into())],
+            vec![Some("200".into()), None],
+        ]
+    }
+
     #[test]
     fn rows_as_a_table() {
         let output = Output::Rows {
-            columns: vec![
-                Column::new("id", DataType::Int, false),
-                Column::new("name", DataType::Varchar(8), true),
-            ],
-            rows: vec![
-                vec![Value::Int(1), Value::from("ann")],
-                vec![Value::Int(200), Value::Null],
-            ],
+            columns: columns(),
+            rows: rows(),
         };
         assert_eq!(
             output.to_string(),
@@ -280,14 +281,7 @@ mod tests {
 
     #[test]
     fn rows_in_a_box() {
-        let columns = [
-            Column::new("id", DataType::Int, false),
-            Column::new("name", DataType::Varchar(8), true),
-        ];
-        let rows = [
-            vec![Value::Int(1), Value::from("ann")],
-            vec![Value::Int(200), Value::Null],
-        ];
+        let (columns, rows) = (columns(), rows());
         let boxed = boxed(&Grid::new(&columns, &rows, "NULL"));
         let plain = String::from_utf8(strip_ansi_escapes::strip(boxed)).unwrap();
         assert_eq!(
@@ -307,7 +301,7 @@ mod tests {
     #[test]
     fn no_rows() {
         let output = Output::Rows {
-            columns: vec![Column::new("a", DataType::Bool, true)],
+            columns: vec![OutputColumn::new("a", false)],
             rows: vec![],
         };
         assert_eq!(output.to_string(), " a\n---\n(0 rows)");
@@ -316,11 +310,14 @@ mod tests {
     #[test]
     fn counts_and_commands() {
         let insert = Output::Count {
-            command: "INSERT",
+            command: "INSERT".into(),
             count: 1,
         };
         assert_eq!(insert.to_string(), "INSERT 1");
-        assert_eq!(Output::Done("CREATE TABLE").to_string(), "CREATE TABLE");
+        assert_eq!(
+            Output::Done("CREATE TABLE".into()).to_string(),
+            "CREATE TABLE"
+        );
     }
 
     #[test]
@@ -329,7 +326,7 @@ mod tests {
             color: false,
             timing: true,
         };
-        let done = Output::Done("CREATE TABLE");
+        let done = Output::Done("CREATE TABLE".into());
         assert_eq!(
             printer.output(&done, Duration::from_micros(1500)),
             "CREATE TABLE\nTime: 1.500 ms"

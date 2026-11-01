@@ -1,0 +1,468 @@
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::thread::{self, JoinHandle};
+
+use hamilton_server::{Database, Server, ShutdownHandle};
+use tempfile::TempDir;
+use wire::backend::{self, Message};
+use wire::{Client, QueryResult, Response, TransactionStatus, frontend, oid};
+
+/// A server on a free port, serving a database in its own directory.
+struct Running {
+    dir: TempDir,
+    addr: SocketAddr,
+    handle: ShutdownHandle,
+    thread: JoinHandle<Database>,
+}
+
+impl Running {
+    fn start() -> Self {
+        Self::start_in(TempDir::new().unwrap())
+    }
+
+    fn start_in(dir: TempDir) -> Self {
+        let db = Database::open(dir.path().join("test.db")).unwrap();
+        let server = Server::bind(db, "127.0.0.1:0").unwrap();
+        let (addr, handle) = (server.local_addr(), server.shutdown_handle());
+        let thread = thread::spawn(move || server.run());
+        Self {
+            dir,
+            addr,
+            handle,
+            thread,
+        }
+    }
+
+    fn connect(&self) -> Client {
+        Client::connect(self.addr, "test").unwrap()
+    }
+
+    /// Shuts the server down and closes the database, keeping its files.
+    fn stop(self) -> TempDir {
+        self.handle.shutdown();
+        self.thread.join().unwrap().close().unwrap();
+        self.dir
+    }
+
+    fn restart(self) -> Self {
+        Self::start_in(self.stop())
+    }
+}
+
+fn query(client: &mut Client, sql: &str) -> Vec<QueryResult> {
+    let response = client.simple_query(sql).unwrap();
+    assert_eq!(response.error, None, "{sql}");
+    response.results
+}
+
+/// The rows of a query of one statement, `None` being NULL.
+fn rows(client: &mut Client, sql: &str) -> Vec<Vec<Option<String>>> {
+    match query(client, sql).as_mut_slice() {
+        [QueryResult::Rows { rows, .. }] => std::mem::take(rows),
+        results => panic!("{results:?}"),
+    }
+}
+
+fn values(rows: &[&[&str]]) -> Vec<Vec<Option<String>>> {
+    rows.iter()
+        .map(|row| row.iter().map(|v| Some(v.to_string())).collect())
+        .collect()
+}
+
+/// The SQLSTATE of the error `sql` fails with.
+fn error_code(client: &mut Client, sql: &str) -> String {
+    let response = client.simple_query(sql).unwrap();
+    response.error.expect(sql).code
+}
+
+#[test]
+fn runs_statements_and_reports_what_they_did() {
+    let server = Running::start();
+    let mut c = server.connect();
+    assert_eq!(
+        query(
+            &mut c,
+            "CREATE TABLE t (id INT NOT NULL, name VARCHAR(8), ok BOOL)"
+        ),
+        [QueryResult::Command("CREATE TABLE".into())]
+    );
+    assert_eq!(
+        query(
+            &mut c,
+            "INSERT INTO t VALUES (1, 'a', true), (2, NULL, false)"
+        ),
+        [QueryResult::Command("INSERT 0 2".into())]
+    );
+    let results = query(&mut c, "SELECT id, name, ok FROM t");
+    let [QueryResult::Rows { fields, rows, tag }] = results.as_slice() else {
+        panic!("{results:?}")
+    };
+    let types: Vec<_> = fields
+        .iter()
+        .map(|f| (f.name.as_str(), f.type_oid, f.type_modifier))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            ("id", oid::INT4, -1),
+            ("name", oid::VARCHAR, 12),
+            ("ok", oid::BOOL, -1)
+        ]
+    );
+    assert_eq!(
+        *rows,
+        [
+            vec![Some("1".into()), Some("a".into()), Some("t".into())],
+            vec![Some("2".into()), None, Some("f".into())],
+        ]
+    );
+    assert_eq!(tag, "SELECT 2");
+    assert_eq!(
+        query(&mut c, "UPDATE t SET id = 3 WHERE id = 2; DELETE FROM t"),
+        [
+            QueryResult::Command("UPDATE 1".into()),
+            QueryResult::Command("DELETE 2".into())
+        ]
+    );
+    assert_eq!(query(&mut c, "  "), [QueryResult::Empty]);
+    server.stop();
+}
+
+#[test]
+fn a_failing_statement_stops_the_query_and_reports_its_sqlstate() {
+    let server = Running::start();
+    let mut c = server.connect();
+    let response = c
+        .simple_query("CREATE TABLE t (id INT PRIMARY KEY); SELECT 1 / 0; SELECT 2")
+        .unwrap();
+    assert_eq!(
+        response.results,
+        [QueryResult::Command("CREATE TABLE".into())]
+    );
+    let error = response.error.unwrap();
+    assert_eq!(
+        (error.severity.as_str(), error.code.as_str()),
+        ("ERROR", "22000")
+    );
+    assert!(error.message.contains("division by zero"), "{error}");
+
+    assert_eq!(error_code(&mut c, "SELEC 1"), "42601");
+    assert_eq!(error_code(&mut c, "SELECT * FROM missing"), "42000");
+    query(&mut c, "INSERT INTO t VALUES (1)");
+    assert_eq!(error_code(&mut c, "INSERT INTO t VALUES (1)"), "23505");
+    server.stop();
+}
+
+#[test]
+fn ready_for_query_reports_the_transaction_status() {
+    let server = Running::start();
+    let mut c = server.connect();
+    query(&mut c, "CREATE TABLE t (id INT NOT NULL)");
+    assert_eq!(c.status(), TransactionStatus::Idle);
+    query(&mut c, "BEGIN; INSERT INTO t VALUES (1)");
+    assert_eq!(c.status(), TransactionStatus::InBlock);
+    assert_eq!(error_code(&mut c, "SELECT 1 / 0"), "22000");
+    assert_eq!(c.status(), TransactionStatus::Failed);
+    assert_eq!(error_code(&mut c, "SELECT 1"), "25P02");
+    assert_eq!(
+        query(&mut c, "COMMIT"),
+        [QueryResult::Command("ROLLBACK".into())]
+    );
+    assert_eq!(c.status(), TransactionStatus::Idle);
+    assert_eq!(error_code(&mut c, "COMMIT"), "25P01");
+    server.stop();
+}
+
+#[test]
+fn each_connection_is_a_session() {
+    let server = Running::start();
+    let (mut a, mut b) = (server.connect(), server.connect());
+    query(&mut a, "CREATE TABLE t (id INT NOT NULL)");
+    // b begins first: a reader newer than a's insert would conflict.
+    query(&mut b, "BEGIN");
+    query(&mut a, "BEGIN; INSERT INTO t VALUES (1)");
+    assert!(rows(&mut b, "SELECT * FROM t").is_empty());
+    query(&mut a, "COMMIT");
+    assert!(rows(&mut b, "SELECT * FROM t").is_empty());
+    query(&mut b, "COMMIT");
+    assert_eq!(rows(&mut b, "SELECT * FROM t"), values(&[&["1"]]));
+    server.stop();
+}
+
+#[test]
+fn conflicts_are_serialization_failures() {
+    let server = Running::start();
+    let (mut a, mut b) = (server.connect(), server.connect());
+    query(
+        &mut a,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT NOT NULL)",
+    );
+    query(&mut a, "INSERT INTO t VALUES (1, 100)");
+    query(&mut b, "BEGIN");
+    query(&mut a, "BEGIN");
+    rows(&mut a, "SELECT n FROM t WHERE id = 1");
+    // b is older than a, which has read the row.
+    assert_eq!(
+        error_code(&mut b, "UPDATE t SET n = 50 WHERE id = 1"),
+        "40001"
+    );
+    assert_eq!(b.status(), TransactionStatus::Failed);
+    server.stop();
+}
+
+#[test]
+fn a_statement_outside_a_block_waits_for_another_connections_block() {
+    let server = Running::start();
+    let (mut a, mut b) = (server.connect(), server.connect());
+    query(
+        &mut a,
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT NOT NULL)",
+    );
+    query(&mut a, "INSERT INTO t VALUES (1, 100)");
+    query(&mut a, "BEGIN; UPDATE t SET n = n + 10 WHERE id = 1");
+    thread::scope(|s| {
+        let waiter = s.spawn(|| query(&mut b, "UPDATE t SET n = n + 20 WHERE id = 1"));
+        thread::sleep(std::time::Duration::from_millis(50));
+        query(&mut a, "COMMIT");
+        assert_eq!(
+            waiter.join().unwrap(),
+            [QueryResult::Command("UPDATE 1".into())]
+        );
+    });
+    assert_eq!(rows(&mut a, "SELECT n FROM t"), values(&[&["130"]]));
+    server.stop();
+}
+
+#[test]
+fn concurrent_increments_over_connections_all_count() {
+    const CONNECTIONS: usize = 4;
+    const INCREMENTS: usize = 25;
+    let server = Running::start();
+    query(
+        &mut server.connect(),
+        "CREATE TABLE t (id INT PRIMARY KEY, n INT NOT NULL)",
+    );
+    query(&mut server.connect(), "INSERT INTO t VALUES (1, 0)");
+    thread::scope(|s| {
+        for _ in 0..CONNECTIONS {
+            let mut c = server.connect();
+            s.spawn(move || {
+                for _ in 0..INCREMENTS {
+                    query(&mut c, "UPDATE t SET n = n + 1 WHERE id = 1");
+                }
+            });
+        }
+    });
+    let total = (CONNECTIONS * INCREMENTS).to_string();
+    assert_eq!(
+        rows(&mut server.connect(), "SELECT n FROM t"),
+        values(&[&[&total]])
+    );
+    server.stop();
+}
+
+#[test]
+fn hanging_up_rolls_back_the_open_block() {
+    let server = Running::start();
+    let mut a = server.connect();
+    query(
+        &mut a,
+        "CREATE TABLE t (id INT NOT NULL); INSERT INTO t VALUES (1)",
+    );
+    let mut b = server.connect();
+    query(&mut b, "BEGIN; INSERT INTO t VALUES (2)");
+    drop(b);
+    // Shutting down waits for b's session to end.
+    let server = server.restart();
+    assert_eq!(
+        rows(&mut server.connect(), "SELECT * FROM t"),
+        values(&[&["1"]])
+    );
+    drop(a);
+    server.stop();
+}
+
+#[test]
+fn shutting_down_rolls_back_blocks_still_open() {
+    let server = Running::start();
+    let mut c = server.connect();
+    query(
+        &mut c,
+        "CREATE TABLE t (id INT NOT NULL); BEGIN; INSERT INTO t VALUES (1)",
+    );
+    let server = server.restart();
+    assert!(
+        c.simple_query("COMMIT").is_err(),
+        "the old connection is closed"
+    );
+    assert!(rows(&mut server.connect(), "SELECT * FROM t").is_empty());
+    server.stop();
+}
+
+#[test]
+fn connections_write_in_parallel() {
+    const THREADS: usize = 8;
+    const ROWS: usize = 50;
+    let server = Running::start();
+    query(
+        &mut server.connect(),
+        "CREATE TABLE t (id INT PRIMARY KEY, writer INT NOT NULL)",
+    );
+    thread::scope(|s| {
+        for writer in 0..THREADS {
+            let mut c = server.connect();
+            s.spawn(move || {
+                for i in 0..ROWS {
+                    let id = writer * ROWS + i;
+                    query(&mut c, &format!("INSERT INTO t VALUES ({id}, {writer})"));
+                }
+            });
+        }
+    });
+    let count = (THREADS * ROWS).to_string();
+    let server = server.restart();
+    assert_eq!(
+        rows(&mut server.connect(), "SELECT count(*) FROM t"),
+        values(&[&[&count]])
+    );
+    server.stop();
+}
+
+#[test]
+fn the_database_cannot_be_opened_while_served() {
+    let server = Running::start();
+    let err = Database::open(server.dir.path().join("test.db"))
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("already open"), "{err}");
+    server.stop();
+}
+
+#[test]
+fn schema_request_lists_columns_and_indexes() {
+    let server = Running::start();
+    let mut c = server.connect();
+    query(
+        &mut c,
+        "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(16));
+         CREATE TABLE logs (at BIGINT NOT NULL, ok BOOL);
+         CREATE INDEX users_name_id ON users (name, id)",
+    );
+    let results = query(&mut c, wire::SCHEMA_REQUEST);
+    let row_sets: Vec<_> = results
+        .into_iter()
+        .map(|result| match result {
+            QueryResult::Rows { rows, .. } => rows,
+            result => panic!("{result:?}"),
+        })
+        .collect();
+    assert_eq!(
+        row_sets,
+        [
+            values(&[
+                &["logs", "at", "BIGINT", "f"],
+                &["logs", "ok", "BOOL", "t"],
+                &["users", "id", "INT", "f"],
+                &["users", "name", "VARCHAR(16)", "t"],
+            ]),
+            values(&[
+                &["users_pkey", "users", "t", "id"],
+                &["users_name_id", "users", "f", "name, id"],
+            ]),
+        ]
+    );
+    server.stop();
+}
+
+/// A connection made by hand, to send what `Client` doesn't.
+struct Raw {
+    stream: TcpStream,
+    body: Vec<u8>,
+}
+
+impl Raw {
+    fn connect(addr: SocketAddr) -> Self {
+        Self {
+            stream: TcpStream::connect(addr).unwrap(),
+            body: Vec::new(),
+        }
+    }
+
+    fn send(&mut self, bytes: &[u8]) {
+        self.stream.write_all(bytes).unwrap();
+    }
+
+    fn startup(&mut self) {
+        let mut buf = Vec::new();
+        frontend::startup(&mut buf, &[("user", "test")]);
+        self.send(&buf);
+        self.until_ready();
+    }
+
+    /// The messages up to and including the next ReadyForQuery.
+    fn until_ready(&mut self) -> Vec<Message> {
+        let mut messages = Vec::new();
+        loop {
+            let tag = wire::read_message(&mut self.stream, &mut self.body)
+                .unwrap()
+                .expect("the server hung up");
+            let message = backend::decode(tag, &self.body).unwrap();
+            let ready = matches!(message, Message::ReadyForQuery(_));
+            messages.push(message);
+            if ready {
+                return messages;
+            }
+        }
+    }
+}
+
+#[test]
+fn ssl_requests_are_declined() {
+    let server = Running::start();
+    let mut raw = Raw::connect(server.addr);
+    raw.send(&[0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f]);
+    let mut answer = [0u8];
+    raw.stream.read_exact(&mut answer).unwrap();
+    assert_eq!(&answer, b"N");
+    raw.startup();
+    server.stop();
+}
+
+#[test]
+fn extended_queries_are_refused_until_sync() {
+    let server = Running::start();
+    let mut raw = Raw::connect(server.addr);
+    raw.startup();
+    // Parse, Bind, Execute, then Sync.
+    raw.send(&[
+        b'P', 0, 0, 0, 4, b'B', 0, 0, 0, 4, b'E', 0, 0, 0, 4, b'S', 0, 0, 0, 4,
+    ]);
+    let messages = raw.until_ready();
+    let [
+        Message::ErrorResponse(error),
+        Message::ReadyForQuery(TransactionStatus::Idle),
+    ] = messages.as_slice()
+    else {
+        panic!("{messages:?}");
+    };
+    assert_eq!(error.code, "0A000");
+
+    let mut buf = Vec::new();
+    frontend::query(&mut buf, "SELECT 1");
+    raw.send(&buf);
+    assert!(matches!(raw.until_ready()[0], Message::RowDescription(_)));
+    server.stop();
+}
+
+#[test]
+fn closed_clients_are_forgotten() {
+    let server = Running::start();
+    for _ in 0..20 {
+        let mut c = server.connect();
+        query(&mut c, "SELECT 1");
+        c.close().unwrap();
+    }
+    let response: Response = server.connect().simple_query("SELECT 1").unwrap();
+    assert_eq!(response.error, None);
+    server.stop();
+}

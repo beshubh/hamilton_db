@@ -1,25 +1,23 @@
 //! Colors the SQL being typed, and the bracket matching the one at the
 //! cursor.
 
-use std::sync::Arc;
-
-use catalog::Catalog;
 use nu_ansi_term::{Color, Style};
 use reedline::{Highlighter, StyledText};
 
 use crate::lexer::{CONSTANTS, Token, TokenKind, tokenize};
 use crate::meta;
+use crate::schema::{Schema, SharedSchema};
 
 pub struct SqlHighlighter {
-    catalog: Arc<Catalog>,
+    schema: SharedSchema,
 }
 
 impl SqlHighlighter {
-    pub fn new(catalog: Arc<Catalog>) -> Self {
-        Self { catalog }
+    pub fn new(schema: SharedSchema) -> Self {
+        Self { schema }
     }
 
-    fn style(&self, tokens: &[Token], i: usize) -> Style {
+    fn style(schema: &Schema, tokens: &[Token], i: usize) -> Style {
         let token = &tokens[i];
         match token.kind {
             TokenKind::Keyword if CONSTANTS.iter().any(|c| token.is_keyword(c)) => {
@@ -27,9 +25,7 @@ impl SqlHighlighter {
             }
             TokenKind::Keyword => Color::Blue.bold(),
             TokenKind::Identifier if is_call(tokens, i) => Color::Cyan.normal(),
-            TokenKind::Identifier if self.catalog.get_table(token.text).is_some() => {
-                Color::Yellow.normal()
-            }
+            TokenKind::Identifier if schema.table(token.text).is_some() => Color::Yellow.normal(),
             TokenKind::Number => Color::Purple.normal(),
             TokenKind::String => Color::Green.normal(),
             TokenKind::Comment => Color::DarkGray.italic(),
@@ -51,6 +47,7 @@ impl Highlighter for SqlHighlighter {
             styled.push((Style::new(), args.to_owned()));
             return styled;
         }
+        let schema = self.schema.read().unwrap_or_else(|e| e.into_inner());
         let tokens = tokenize(line);
         let brackets = Brackets::find(&tokens);
         let active = brackets.at_cursor(&tokens, cursor);
@@ -60,7 +57,7 @@ impl Highlighter for SqlHighlighter {
             } else if brackets.unmatched.contains(&i) {
                 Color::Red.bold()
             } else {
-                self.style(&tokens, i)
+                Self::style(&schema, &tokens, i)
             };
             styled.push((style, token.text.to_owned()));
         }

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::mem;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::TxnId;
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
@@ -173,6 +173,12 @@ impl TransactionManager {
     /// it never goes below a committed `ts` on disk; see `watermark`.
     pub fn next_tid(&self) -> TxnId {
         self.shared.watermark.next()
+    }
+
+    /// Blocks until transaction `tid` has committed or aborted, or until
+    /// `deadline`. Returns whether it has ended.
+    pub fn wait_for_end(&self, tid: TxnId, deadline: Instant) -> bool {
+        self.shared.watermark.wait_for_end(tid, deadline)
     }
 
     /// The oldest Tid any running transaction reads at. See `Watermark`.

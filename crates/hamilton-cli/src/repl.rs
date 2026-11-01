@@ -2,7 +2,7 @@
 //! statements, on top of reedline.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use nu_ansi_term::{Color, Style};
@@ -13,33 +13,23 @@ use reedline::{
 };
 
 use crate::complete::SqlCompleter;
-use crate::database::Database;
 use crate::highlight::SqlHighlighter;
 use crate::lexer::ends_statement;
 use crate::meta;
-use crate::output::Printer;
 use crate::prompt::SqlPrompt;
+use crate::schema::SharedSchema;
 use crate::{Outcome, Session};
 
 const HISTORY_FILE: &str = ".hamilton_history";
 const HISTORY_SIZE: usize = 1000;
 const COMPLETION_MENU: &str = "completion_menu";
 
-pub fn run(db: &Database, path: &str) -> anyhow::Result<()> {
-    let mut editor = editor(db)?;
-    let name = Path::new(path)
-        .file_name()
-        .map_or(path.into(), |n| n.to_string_lossy());
-    let mut prompt = SqlPrompt::new(name);
-    let mut session = Session::new(
-        db,
-        Printer {
-            color: true,
-            timing: true,
-        },
-    );
+pub fn run(mut session: Session) -> anyhow::Result<()> {
+    session.refresh_schema()?;
+    let mut editor = editor(session.schema())?;
+    let mut prompt = SqlPrompt::new(session.server());
     let mut stdout = io::stdout();
-    banner(path);
+    banner(session.server());
 
     loop {
         match editor.read_line(&prompt)? {
@@ -48,7 +38,7 @@ pub fn run(db: &Database, path: &str) -> anyhow::Result<()> {
                 // that is killed loses none of it.
                 editor.sync_history()?;
                 let outcome = session.run(&input, &mut stdout)?;
-                prompt.session = db.session();
+                session.refresh_schema()?;
                 match outcome {
                     Outcome::Done { failed } => prompt.failed = failed,
                     Outcome::Clear => editor.clear_screen()?,
@@ -64,8 +54,7 @@ pub fn run(db: &Database, path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn editor(db: &Database) -> anyhow::Result<Reedline> {
-    let catalog = Arc::clone(db.catalog());
+fn editor(schema: &SharedSchema) -> anyhow::Result<Reedline> {
     let menu = IdeMenu::default()
         .with_name(COMPLETION_MENU)
         // Shown in place of the prompt's arrow while the menu is open.
@@ -80,8 +69,8 @@ fn editor(db: &Database) -> anyhow::Result<Reedline> {
         .with_match_text_style(Color::Cyan.bold())
         .with_selected_match_text_style(Color::Black.bold().on(Color::Cyan));
     let mut editor = Reedline::create()
-        .with_highlighter(Box::new(SqlHighlighter::new(Arc::clone(&catalog))))
-        .with_completer(Box::new(SqlCompleter::new(catalog)))
+        .with_highlighter(Box::new(SqlHighlighter::new(Arc::clone(schema))))
+        .with_completer(Box::new(SqlCompleter::new(Arc::clone(schema))))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(menu)))
         .with_quick_completions(true)
         .with_partial_completions(true)
@@ -151,7 +140,7 @@ fn history_file() -> Option<PathBuf> {
     std::env::home_dir().map(|home| home.join(HISTORY_FILE))
 }
 
-fn banner(path: &str) {
+fn banner(server: &str) {
     let dim = Color::DarkGray.normal();
     let key = Style::new().bold();
     println!(
@@ -159,7 +148,7 @@ fn banner(path: &str) {
         Color::Cyan.bold().paint("hamilton_db"),
         dim.paint(concat!("v", env!("CARGO_PKG_VERSION"))),
         dim.paint("·"),
-        Color::Yellow.paint(path),
+        Color::Yellow.paint(server),
     );
     println!(
         "{}{}{}",

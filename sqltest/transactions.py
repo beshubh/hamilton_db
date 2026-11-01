@@ -11,8 +11,11 @@ line each, and may end with their expected result:
     -- => UPDATE 1            a command tag
     -- => error: conflicts    an error containing the text
 
-A statement with no `-- =>` must not fail. `\\session x` lines switch
-sessions, as in the CLI.
+A statement with no `-- =>` must not fail. A `\\session x` line sends the
+statements after it down connection x, opened on first use; until the
+first, they go down `main`, as the schema does. Each statement waits for
+its result before the next is sent, so the order of statements across
+connections is the order in the file.
 """
 import re
 import tempfile
@@ -20,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import cli
+import pgwire
 
 FILE = Path(__file__).resolve().parent / "transactions.sql"
 STATEMENT = re.compile(r"^(.*?;)\s*(?:--\s*=>\s*(.*))?$")
@@ -49,13 +53,18 @@ def parse(path: Path) -> tuple[str, list[tuple[str, list[Line]]]]:
     return "\n".join(schema), cases
 
 
-def result(block: str) -> str:
-    """A statement's printed output, in the `-- =>` form."""
-    lines = block.splitlines()
-    if len(lines) < 3 or not re.fullmatch(r"\(\d+ rows?\)", lines[-1]):
-        return block
-    rows = [", ".join(v.strip() for v in row.split("|")) for row in lines[2:-1]]
-    return "; ".join(rows) or "(no rows)"
+def result(results: list) -> str:
+    """A statement's result, in the `-- =>` form."""
+    if len(results) != 1:
+        return f"{len(results)} results: {results}"
+    match results[0]:
+        case pgwire.Error(message=message):
+            return f"error: {message}"
+        case pgwire.Rows(rows=rows):
+            return "; ".join(", ".join(v or "" for v in row) for row in rows) or "(no rows)"
+        case pgwire.Command(tag=tag):
+            # As the CLI prints it, without INSERT's oid.
+            return re.sub(r"^INSERT 0 ", "INSERT ", tag)
 
 
 def matches(expected: str | None, actual: str) -> bool:
@@ -68,16 +77,27 @@ def matches(expected: str | None, actual: str) -> bool:
 
 def run_case(schema: str, lines: list[Line]) -> list[str]:
     """Runs a case on a fresh database and returns its failures."""
-    with tempfile.TemporaryDirectory() as tmp:
-        blocks = cli.run(Path(tmp) / "test.db", "\n".join([schema] + [l.text for l in lines]))
-    schema_blocks = len(blocks) - len(lines)
-    failures = [f"schema: {b}" for b in blocks[:schema_blocks] if b.startswith("error:")]
-    for line, block in zip(lines, blocks[schema_blocks:]):
+    with tempfile.TemporaryDirectory() as tmp, cli.Server(Path(tmp) / "test.db") as server:
+        sessions = {"main": pgwire.Connection(server.port)}
+        try:
+            return run_lines(server, sessions, schema, lines)
+        finally:
+            for conn in sessions.values():
+                conn.close()
+
+
+def run_lines(server, sessions: dict, schema: str, lines: list[Line]) -> list[str]:
+    errors = [r.message for r in sessions["main"].query(schema) if isinstance(r, pgwire.Error)]
+    failures = [f"schema: {e}" for e in errors]
+    conn = sessions["main"]
+    for line in lines:
         if line.text.startswith("\\session"):
-            if not block.startswith('Session "'):
-                return ["output out of step with the statements:\n" + "\n\n".join(blocks)]
+            name = line.text.removeprefix("\\session").strip()
+            if name not in sessions:
+                sessions[name] = pgwire.Connection(server.port)
+            conn = sessions[name]
             continue
-        actual = result(block)
+        actual = result(conn.query(line.text))
         if not matches(line.expected, actual):
             failures.append(
                 f"line {line.number}: {line.text}\n"

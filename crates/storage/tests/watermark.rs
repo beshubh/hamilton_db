@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use storage::concurrency::watermark::Watermark;
 
@@ -124,4 +125,35 @@ fn concurrent_begin_and_end() {
     // Every active Tid is below the counter, so reaching it means none is
     // left active.
     assert_eq!(wm.get(), 1 + THREADS * ITERS);
+}
+
+#[test]
+fn waiting_for_a_transaction_returns_when_it_ends() {
+    let wm = Arc::new(Watermark::new(1));
+    let tid = wm.begin();
+    let ender = {
+        let wm = Arc::clone(&wm);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            wm.end(tid);
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(wm.wait_for_end(tid, deadline));
+    assert!(Instant::now() < deadline);
+    ender.join().unwrap();
+}
+
+#[test]
+fn waiting_for_a_transaction_gives_up_at_the_deadline() {
+    let wm = Watermark::new(1);
+    let tid = wm.begin();
+    let start = Instant::now();
+    assert!(!wm.wait_for_end(tid, start + Duration::from_millis(20)));
+    assert!(start.elapsed() >= Duration::from_millis(20));
+    // Ended, or never begun: no wait.
+    let ended = wm.begin();
+    wm.end(ended);
+    assert!(wm.wait_for_end(ended, start));
+    assert!(wm.wait_for_end(1000, start));
 }

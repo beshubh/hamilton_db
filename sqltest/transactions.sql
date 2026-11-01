@@ -1,10 +1,11 @@
 -- Concurrent transactions: the anomalies MVTO must prevent.
 --
--- `\session x` switches to session x. A transaction's age is set by when
--- its BEGIN runs. Under MVTO the result must equal running the transactions
--- in that order, so where they clash, one fails with a conflict and rolls
--- back. `-- =>` is the statement's expected result; check.py runs each case
--- on a fresh database with the tables below.
+-- `\session x` sends the statements after it down connection x. A
+-- transaction's age is set by when its BEGIN runs. Under MVTO the result
+-- must equal running the transactions in that order, so where they clash,
+-- one fails with a conflict and rolls back. `-- =>` is the statement's
+-- expected result; transactions.py runs each case on a fresh server with
+-- the tables below.
 
 CREATE TABLE accounts (id INT PRIMARY KEY, balance INT NOT NULL);
 INSERT INTO accounts VALUES (1, 100), (2, 100);

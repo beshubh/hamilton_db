@@ -15,6 +15,11 @@ pub enum StorageError {
     #[error(transparent)]
     Io(#[from] io::Error),
 
+    /// Another `DiskManager`, in this process or another, has the database
+    /// file open.
+    #[error("database {0} is already open in another process")]
+    DatabaseLocked(PathBuf),
+
     /// The page id is negative, or was never handed out by the buffer pool.
     #[error("invalid page id {0}")]
     InvalidPageId(PageId),

@@ -4,6 +4,7 @@
 
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use catalog::Catalog;
 use common::Value;
@@ -489,7 +490,8 @@ fn a_deleted_primary_key_can_be_inserted_again() {
 #[test]
 fn a_key_a_block_deleted_is_not_free_until_it_commits() {
     let mut db = Db::with_tables();
-    let mut other = db.engine.session();
+    // Would otherwise wait for the block, which this thread has to end.
+    let mut other = db.engine.session().with_conflict_timeout(Duration::ZERO);
     db.ok("BEGIN");
     db.ok("DELETE FROM accounts WHERE id = 1");
     let err = run_in(&mut other, "INSERT INTO accounts VALUES (1, 'cy', 0)");
@@ -733,4 +735,105 @@ fn writes_while_an_index_is_created_are_not_lost() {
     for id in 1000..1000 + WRITERS * ROWS {
         assert_eq!(db.rows(&by_id(id)), [[text("w")]], "{id}");
     }
+}
+
+fn is_conflict(result: &Result<Output, EngineError>) -> bool {
+    matches!(
+        result,
+        Err(EngineError::Execution(ExecutionError::Storage(
+            StorageError::Conflict { .. }
+        )))
+    )
+}
+
+/// A statement outside a block that finds its row locked waits for the
+/// block to end, then runs in a new transaction, seeing the block's write.
+#[test]
+fn a_write_outside_a_block_waits_for_the_block_holding_its_row() {
+    let mut db = Db::with_tables();
+    let mut other = db.engine.session();
+    db.ok("BEGIN");
+    db.ok("UPDATE accounts SET balance = balance + 10 WHERE id = 1");
+    thread::scope(|s| {
+        let waiter = s.spawn(|| {
+            run_in(
+                &mut other,
+                "UPDATE accounts SET balance = balance + 20 WHERE id = 1",
+            )
+        });
+        thread::sleep(Duration::from_millis(50));
+        assert!(!waiter.is_finished(), "the update waits for the block");
+        db.ok("COMMIT");
+        let result = waiter.join().unwrap();
+        assert!(
+            matches!(result, Ok(Output::Count { count: 1, .. })),
+            "{result:?}"
+        );
+    });
+    assert_eq!(
+        db.rows("SELECT balance FROM accounts WHERE id = 1"),
+        [[int(130)]]
+    );
+}
+
+/// A read that meets a row an older transaction is writing waits for it,
+/// rather than failing as it would in a block.
+#[test]
+fn a_read_outside_a_block_waits_for_an_older_writer() {
+    let mut db = Db::with_tables();
+    let mut other = db.engine.session();
+    db.ok("BEGIN");
+    db.ok("UPDATE accounts SET balance = 0 WHERE id = 1");
+    thread::scope(|s| {
+        let reader = s.spawn(|| rows_in(&mut other, "SELECT balance FROM accounts WHERE id = 1"));
+        thread::sleep(Duration::from_millis(50));
+        db.ok("ROLLBACK");
+        assert_eq!(reader.join().unwrap(), [[int(100)]]);
+    });
+}
+
+#[test]
+fn a_conflict_that_outlasts_the_timeout_is_reported() {
+    let mut db = Db::with_tables();
+    let timeout = Duration::from_millis(100);
+    let mut other = db.engine.session().with_conflict_timeout(timeout);
+    db.ok("BEGIN");
+    db.ok("UPDATE accounts SET balance = 0 WHERE id = 1");
+    let start = Instant::now();
+    let result = run_in(&mut other, "UPDATE accounts SET balance = 1 WHERE id = 1");
+    assert!(is_conflict(&result), "{result:?}");
+    assert!(start.elapsed() >= timeout);
+    assert_eq!(other.status(), TransactionStatus::Idle);
+    db.ok("ROLLBACK");
+    assert_eq!(
+        db.rows("SELECT balance FROM accounts WHERE id = 1"),
+        [[int(100)]]
+    );
+}
+
+/// Sessions incrementing one row at once conflict all the time; retried,
+/// every increment lands exactly once.
+#[test]
+fn concurrent_increments_outside_blocks_all_count() {
+    const THREADS: i32 = 4;
+    const INCREMENTS: i32 = 25;
+    let mut db = Db::with_tables();
+    let sessions: Vec<_> = (0..THREADS).map(|_| db.engine.session()).collect();
+    let start = Barrier::new(THREADS as usize);
+    thread::scope(|s| {
+        for mut session in sessions {
+            let start = &start;
+            s.spawn(move || {
+                start.wait();
+                for _ in 0..INCREMENTS {
+                    let sql = "UPDATE accounts SET balance = balance + 1 WHERE id = 1";
+                    run_in(&mut session, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+                }
+            });
+        }
+    });
+    assert_eq!(
+        db.rows("SELECT balance FROM accounts WHERE id = 1"),
+        [[int(100 + THREADS * INCREMENTS)]]
+    );
 }
