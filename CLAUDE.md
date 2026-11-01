@@ -16,7 +16,8 @@ Use this file to write down any surprises we face in development or testing. Any
 - Write executors so the algorithm is visible in the code. The first index nested loop join was a `State` enum stepped through with `mem::replace`, so resuming between `next` calls was correct but nobody could see where outer rows were fetched or the index was queried. Prefer plain helpers (`next_outer_row`, `join_outer_row`) and a small output buffer that `next` drains.
 - Write comments so a reader gets the point fast: what the code does, in a few plain sentences, without restating every case the code already shows. Explain a design once, where its type is defined, and link to it from elsewhere. Use one phrase for one idea (index entries "store the rid" or "store the primary key", not a mix of "points by", "locator" and "record id"). A 14-line comment on `UpdateExecutor`'s index handling was unreadable and had to be cut to 4.
 - Some tests use a feature that isn't supported yet as their example of an error (a plan with no executor, a literal the parser rejects). They go stale when that feature lands: `ORDER BY` was still the "no executor" example in two tests after the sort executor was added. When adding a feature, grep the tests for it being expected to fail (`NoExecutor`, `assert_unsupported`).
-- `cargo test --workspace` stops at the first test binary that fails, so the binaries after it never run. Take a baseline with `--no-fail-fast`: one failure in `planner/tests/execute.rs` once hid 14 more in `planner/tests/planner.rs`.
+- Run tests with `cargo nextest run --workspace`, not `cargo test`; `.config/nextest.toml` turns off fail-fast so one failure can't hide the rest. Nextest skips doctests, so if you add one, run `cargo test --doc` too.
+  - Nextest runs each test in its own process, all at once, so timing races show up more often than under `cargo test`. A test that passes under `cargo test` but fails under nextest is usually racing the GC collector (see the `wait_for_gc` note below), not a nextest problem.
 - `planner` depends on `execution`, so nothing in `execution` can bind or plan. The session that runs SQL in transactions (`ExecutionEngine`) lives in `planner::engine`, not in `execution`.
 - Under MVTO a reader newer than a lock holder fails with `Conflict`, so a test that has two transactions write the same row must begin the one that takes the lock first. The newer one fails on its scan, before its write.
 - The shell is zsh: `for f in $FILES` doesn't split the list, so `rustfmt` gets one long "file" name. Pipe the names into `while read -r f` instead.
@@ -36,14 +37,30 @@ Use this file to write down any surprises we face in development or testing. Any
 ---
 Most code changes do not need an internal documentation change. Agents can read the code.
 
- - `docs/internals/` is for architectural decisions and their reasons, constraints that span components, and implementation traps that are hard to discover from the source. Before adding a paragraph, ask what a maintainer would get wrong without it. If reading the relevant code answers the question, leave it out.
- - Do not document every feature, enumerate fields or methods, narrate control flow, maintain file catalogs, or append PR summaries. Types, tests, and code already record the implementation. The glossary defines shared vocabulary; it is not a feature index.
- - A local reason the code can't show goes in a short nearby code comment. Use an internal doc when the reasoning crosses boundaries or needs context the code cannot carry well. Link to the relevant source instead of copying it.
- - When a documented decision or constraint changes, rewrite or remove the affected text. Do not append another account of the new behavior. A new internal page needs a distinct, durable reason to exist.
+- `docs/internals/` is for architectural decisions and their reasons, constraints that span components, and implementation traps that are hard to discover from the source. Before adding a paragraph, ask what a maintainer would get wrong without it. If reading the relevant code answers the question, leave it out.
+- Do not document every feature, enumerate fields or methods, narrate control flow, maintain file catalogs, or append PR summaries. Types, tests, and code already record the implementation. The glossary defines shared vocabulary; it is not a feature index.
+- A local reason the code can't show goes in a short nearby code comment. Use an internal doc when the reasoning crosses boundaries or needs context the code cannot carry well. Link to the relevant source instead of copying it.
+- When a documented decision or constraint changes, rewrite or remove the affected text. Do not append another account of the new behavior. A new internal page needs a distinct, durable reason to exist.****
 
 # Plans and work artifacts
+---
 - Do not commit implementation plans, research notes, or agent scratch files. Keep temporary working material outside the worktree. .plans/ is gitignored only as a safety net for legacy tooling.
- - Track active maintainer work in the GitHub issue or project item that owns it. External proposals follow CONTRIBUTING.md and belong in Ideas discussions.
+- Track active maintainer work in the GitHub issue or project item that owns it. External proposals follow CONTRIBUTING.md and belong in Ideas discussions.
 - A merged PR is the implementation record. Close or update its tracking item when the work lands; do not preserve a second checklist in the repository.
 
-  
+
+# Taste
+---
+- Default to no comment. Write one only for a constraint, an external quirk, or an invariant the code can't show, in one line where you can and four at most. Don't restate names or signatures, narrate steps, record history, or explain the fix you just made; the PR carries that.
+- Do not add complex state machinery for simple nitpick features, and prefer state machine where we would want to concretely remove the wrong state transformations.
+
+
+# Performance
+---
+## Hot paths (scans, filters, comparisons, page/tuple decoding, executor loops)
+- No per-row heap allocations: borrow from page buffers (&[u8], &str), reuse
+  buffers (clear() not new), no clone()/to_vec()/format!() in loops.
+- Prefer predictable or branchless code over data-dependent branches.
+- Outside hot paths, write plain readable code; don't optimize setup/DDL/error paths.
+- Verify before and after: `samply record` for CPU time, `dhat-rs` for allocations.
+- Don't claim a perf win without numbers. 

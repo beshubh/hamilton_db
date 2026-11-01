@@ -39,7 +39,7 @@ crates/
 
 ```sh
 cargo build --workspace
-cargo test --workspace
+cargo nextest run --workspace   # cargo install cargo-nextest
 cargo run -p hamilton-cli
 ```
 

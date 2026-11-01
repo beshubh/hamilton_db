@@ -1,0 +1,5 @@
+[profile.default]
+# Run every test after a failure, so one failing test doesn't hide the rest.
+fail-fast = false
+# Kill a test that runs past 2 minutes: a hung stress test then fails the run instead of blocking it.
+slow-timeout = { period = "30s", terminate-after = 4 }

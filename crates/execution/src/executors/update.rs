@@ -506,11 +506,15 @@ mod tests {
         let table = three_accounts(&db);
         let entries = db.index_entries("accounts_name");
 
+        let older = db.tm.begin();
         let targets = vec![account_column(0), text("c"), account_column(2)];
         update(&db, &table, targets, account_with_id(&db, &table, 2)).unwrap();
 
-        // The old entry stays until garbage collection removes it.
+        // The old entry stays for the older transaction until garbage
+        // collection removes it.
+        db.tm.wait_for_gc();
         assert_eq!(db.index_entries("accounts_name").len(), 4);
+        db.tm.commit(&older).unwrap();
         db.tm.wait_for_gc();
         let after = db.index_entries("accounts_name");
         assert_eq!(after.len(), 3);
