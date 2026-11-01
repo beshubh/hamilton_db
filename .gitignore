@@ -21,8 +21,12 @@ target/
 # macOS
 .DS_Store
 
-# Database files made by `cargo run -p hamilton-cli`
+# Database files made by `cargo run -p hamilton-server`
 /hamilton.db
 /hamilton.meta
 /hamilton.log
 __pycache__/
+
+*.db
+*.meta
+*.log
