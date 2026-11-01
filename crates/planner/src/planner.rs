@@ -54,12 +54,12 @@ impl<'a> Planner<'a> {
     /// The root of the optimized plan for `stmt`. For EXPLAIN, the plan
     /// shown is the optimized one, as that is what would run.
     pub fn plan(&self, stmt: &BoundStatement) -> Result<Arc<AbstractPlanNode>> {
-        let plan = self.plan_statement(stmt)?;
+        let plan = self.plan_unoptimized(stmt)?;
         Ok(Arc::new(Optimizer::new(self.catalog).optimize(&plan)))
     }
 
-    /// The plain plan for `stmt`, before optimizing.
-    fn plan_statement(&self, stmt: &BoundStatement) -> Result<AbstractPlanNode> {
+    /// The plain plan for `stmt`, before the optimizer rewrites it.
+    pub fn plan_unoptimized(&self, stmt: &BoundStatement) -> Result<AbstractPlanNode> {
         let plan = match stmt {
             BoundStatement::CreateTable(create) => CreateTablePlan::new(
                 &create.name,
@@ -75,7 +75,7 @@ impl<'a> Planner<'a> {
             BoundStatement::Update(update) => self.plan_update(update)?,
             BoundStatement::Delete(delete) => self.plan_delete(delete)?,
             BoundStatement::Explain(stmt) => {
-                ExplainPlan::new(Arc::new(self.plan_statement(stmt)?)).into()
+                ExplainPlan::new(Arc::new(self.plan_unoptimized(stmt)?)).into()
             }
             BoundStatement::Transaction(command) => {
                 return Err(PlannerError::Unsupported(format!("planning {command:?}")));
