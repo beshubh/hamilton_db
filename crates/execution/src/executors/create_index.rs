@@ -3,15 +3,12 @@ use std::sync::Arc;
 use common::{Rid, Schema, Tuple};
 
 use super::Executor;
-use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::plans::{CreateIndexPlan, PlanNode};
+use crate::{ExecutionError, Result};
 
-/// Creates the index on the first call to `next`. Produces no rows.
-///
-/// The index starts out empty: rows already in the table are not added to
-/// it.
-// TODO: fill the index from the table once executors maintain indexes.
+/// Creates the index on the first call to `next`, with an entry for every
+/// row already in the table (`Transaction::build_index`). Produces no rows.
 pub struct CreateIndexExecutor {
     ctx: Arc<ExecutionContext>,
     plan: CreateIndexPlan,
@@ -46,10 +43,15 @@ impl Executor for CreateIndexExecutor {
             self.done = true;
             let key_columns: Vec<&str> =
                 self.plan.key_columns().iter().map(String::as_str).collect();
-            self.ctx.catalog().create_index(
+            let txn = self.ctx.txn();
+            self.ctx.catalog().create_index_with(
                 self.plan.index_name(),
                 self.plan.table_name(),
                 &key_columns,
+                |table, index| {
+                    let table = self.ctx.indexed_table(table);
+                    Ok::<_, ExecutionError>(txn.build_index(&table, index)?)
+                },
             )?;
         }
         Ok(false)
@@ -62,11 +64,14 @@ impl Executor for CreateIndexExecutor {
 
 #[cfg(test)]
 mod tests {
-    use catalog::CatalogError;
+    use std::sync::Arc;
 
-    use super::super::test_util::Db;
+    use catalog::CatalogError;
+    use common::{DataType, Value};
+
+    use super::super::test_util::{Db, constant, int, user, users_schema};
     use crate::ExecutionError;
-    use crate::plans::CreateIndexPlan;
+    use crate::plans::{CreateIndexPlan, InsertPlan, ValuesPlan};
 
     fn plan(name: &str, table: &str, columns: &[&str]) -> CreateIndexPlan {
         let columns = columns.iter().map(|&c| c.to_owned()).collect();
@@ -93,5 +98,52 @@ mod tests {
             err,
             ExecutionError::Catalog(CatalogError::IndexExists(name)) if name == "i"
         ));
+    }
+
+    #[test]
+    fn adds_the_rows_already_in_the_table() {
+        let db = Db::new();
+        db.insert(&[(1, Some("a")), (2, Some("b")), (3, Some("a")), (4, None)]);
+        db.run(plan("users_name", "users", &["name"]).into())
+            .unwrap();
+        assert_eq!(db.index_entries("users_name").len(), 4);
+        assert_eq!(
+            db.index_rows("users_name", &[Value::from("a")]),
+            [user(1, Some("a")), user(3, Some("a"))]
+        );
+        assert_eq!(
+            db.index_rows("users_name", &[Value::from("b")]),
+            [user(2, Some("b"))]
+        );
+    }
+
+    /// A transaction newer than CREATE INDEX's can still have written the
+    /// table before the index existed, so it never touches the index. The
+    /// entry the index got for its row is removed once it rolls back, not
+    /// as soon as CREATE INDEX's transaction is collected.
+    #[test]
+    fn a_newer_writer_that_rolls_back_leaves_no_entry() {
+        let db = Db::new();
+        db.insert(&[(1, Some("a"))]);
+        let create = db.tm.begin();
+        let writer = db.tm.begin();
+        let row = vec![int(2), constant(Value::from("b"), DataType::Varchar(32))];
+        let values = ValuesPlan::new(users_schema(), vec![row]);
+        let insert = InsertPlan::new(db.users.oid, &db.users.name, Arc::new(values.into()));
+        db.run_in(&writer, insert.into()).unwrap();
+
+        db.run_in(&create, plan("users_name", "users", &["name"]).into())
+            .unwrap();
+        db.tm.commit(&create).unwrap();
+        db.tm.wait_for_gc();
+        assert_eq!(db.index_entries("users_name").len(), 2);
+
+        db.tm.abort(&writer).unwrap();
+        db.tm.wait_for_gc();
+        assert_eq!(db.index_entries("users_name").len(), 1);
+        assert_eq!(
+            db.index_rows("users_name", &[Value::from("a")]),
+            [user(1, Some("a"))]
+        );
     }
 }

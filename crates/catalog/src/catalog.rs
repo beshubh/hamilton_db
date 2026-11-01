@@ -3,7 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use common::{Column, DataType, PageId, Schema, TxnId, ValueError};
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard};
 use storage::StorageError;
 use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
@@ -24,6 +24,9 @@ pub type IndexOid = u32;
 /// Longest table, column or index name, in bytes.
 pub const MAX_NAME_LEN: u32 = 128;
 
+/// Holds off index creation on a table; see [`TableInfo::lock_writes`].
+pub type TableWriteGuard<'a> = RwLockReadGuard<'a, ()>;
+
 /// A table: its name, its schema, and the heap that stores its rows.
 pub struct TableInfo {
     pub oid: TableOid,
@@ -32,12 +35,34 @@ pub struct TableInfo {
     /// The one heap for this table. Every user of the table must go through
     /// it, since inserts rely on its lock on the last page.
     pub heap: Arc<TableHeap>,
+    /// See `lock_writes`.
+    writes: RwLock<()>,
 }
 
 impl TableInfo {
+    fn new(oid: TableOid, name: String, schema: Schema, heap: Arc<TableHeap>) -> Self {
+        Self {
+            oid,
+            name,
+            schema,
+            heap,
+            writes: RwLock::new(()),
+        }
+    }
+
     /// First page of the table's heap.
     pub fn first_page_id(&self) -> PageId {
         self.heap.first_page_id()
+    }
+
+    /// Locks the table against index creation. A statement that writes the
+    /// table takes this before listing its indexes and holds it until its
+    /// last write. Creating an index waits for those statements, and makes
+    /// later ones wait until the index is filled and in the catalog
+    /// (`Catalog::create_index_with`), so every write either is in the
+    /// table when the index is filled or adds its own entries.
+    pub fn lock_writes(&self) -> TableWriteGuard<'_> {
+        self.writes.read()
     }
 }
 
@@ -214,12 +239,12 @@ impl Catalog {
             state.next_table_oid = state.next_table_oid.max(row.oid + 1);
             let columns = columns.remove(&row.oid).unwrap_or_default();
             let columns = in_position_order(columns, |c| c.position, &row.name)?;
-            let info = TableInfo {
-                oid: row.oid,
-                schema: Schema::new(columns.into_iter().map(|c| c.column).collect()),
-                heap: Arc::new(TableHeap::open(Arc::clone(&bpm), row.first_page_id)?),
-                name: row.name,
-            };
+            let info = TableInfo::new(
+                row.oid,
+                row.name,
+                Schema::new(columns.into_iter().map(|c| c.column).collect()),
+                Arc::new(TableHeap::open(Arc::clone(&bpm), row.first_page_id)?),
+            );
             state.add_table(Arc::new(info)).map_err(corrupt)?;
         }
 
@@ -345,15 +370,11 @@ impl Catalog {
             first_page_id: heap.first_page_id(),
         })?;
 
-        let info = Arc::new(TableInfo {
-            oid,
-            name: name.to_owned(),
-            schema,
-            heap: Arc::new(heap),
-        });
+        let info = Arc::new(TableInfo::new(oid, name.to_owned(), schema, Arc::new(heap)));
         state.add_table(Arc::clone(&info))?;
         if let Some((index_name, key)) = pkey {
-            self.add_index(&mut state, &index_name, &info, key, true)?;
+            let index = self.new_index(&mut state, &index_name, &info, key, true)?;
+            self.add_index(&mut state, &info, index)?;
         }
         Ok(info)
     }
@@ -373,39 +394,66 @@ impl Catalog {
         tables
     }
 
-    /// Records an index on `key_columns` of `table_name` and allocates the
-    /// header page for its B+ tree. Index names are unique across the
-    /// database. The index is not a primary key: a table gets that only when
-    /// it is created.
+    /// Records an empty index on `key_columns` of `table_name`; see
+    /// `create_index_with`. For a table with no rows yet: CREATE INDEX fills
+    /// the index from the table's rows.
     pub fn create_index(
         &self,
         name: &str,
         table_name: &str,
         key_columns: &[&str],
     ) -> Result<Arc<IndexInfo>> {
-        check_name(name)?;
-        let mut state = self.state.write();
-        if state.index_names.contains_key(name) {
-            return Err(CatalogError::IndexExists(name.to_owned()));
-        }
-        let table = state
-            .table(table_name)
-            .cloned()
-            .ok_or_else(|| CatalogError::TableNotFound(table_name.to_owned()))?;
-        let key = resolve_key(table_name, &table.schema, key_columns)?;
-        self.add_index(&mut state, name, &table, key, false)
+        self.create_index_with(name, table_name, key_columns, |_, _| Ok(()))
     }
 
-    /// Writes out a new index on the `key` columns of `table`, whose name the
-    /// caller has checked is free.
-    fn add_index(
+    /// Creates an index on `key_columns` of `table_name`, calls `fill` with
+    /// the table and the index's B+ tree to add the entries of the rows
+    /// already there, and records the index. Index names are unique across
+    /// the database. The index is not a primary key: a table gets that only
+    /// when it is created.
+    ///
+    /// Writes to the table wait while `fill` runs (`TableInfo::lock_writes`),
+    /// and no statement is planned on the index until it is recorded. If
+    /// `fill` fails, nothing is recorded; the tree's pages are left unused.
+    pub fn create_index_with<E: From<CatalogError>>(
+        &self,
+        name: &str,
+        table_name: &str,
+        key_columns: &[&str],
+        fill: impl FnOnce(&TableInfo, &Arc<Index>) -> Result<(), E>,
+    ) -> Result<Arc<IndexInfo>, E> {
+        check_name(name)?;
+        let (table, index) = {
+            let mut state = self.state.write();
+            check_index_name_free(&state, name)?;
+            let table = state
+                .table(table_name)
+                .cloned()
+                .ok_or_else(|| CatalogError::TableNotFound(table_name.to_owned()))?;
+            let key = resolve_key(table_name, &table.schema, key_columns)?;
+            let index = self.new_index(&mut state, name, &table, key, false)?;
+            (table, index)
+        };
+        // Taken without holding `state`: a writer holding the table's lock
+        // may still look something up in the catalog.
+        let _writes = table.writes.write();
+        fill(&table, &index.index)?;
+        let mut state = self.state.write();
+        // Another create may have taken the name meanwhile.
+        check_index_name_free(&state, name)?;
+        Ok(self.add_index(&mut state, &table, index)?)
+    }
+
+    /// Opens the B+ tree of a new index named `name` on the `key` columns of
+    /// `table`, giving the index its oid. Nothing is recorded yet.
+    fn new_index(
         &self,
         state: &mut CatalogState,
         name: &str,
         table: &TableInfo,
         key: Vec<usize>,
         is_primary_key: bool,
-    ) -> Result<Arc<IndexInfo>> {
+    ) -> Result<NewIndex> {
         let key_schema = key_schema(&table.schema, &key).expect("key columns were resolved");
         let table_has_primary_key = is_primary_key || primary_key_index(state, table.oid).is_some();
         let locator = locator_kind(is_primary_key, table_has_primary_key);
@@ -423,10 +471,33 @@ impl Catalog {
         // Opening the tree formats its header page, which dirties it, so it
         // is written out and keeps its id across a restart.
         let index = open_index(&self.bpm, table, &row, &key, &key_schema, locator)?;
+        Ok(NewIndex {
+            row,
+            key,
+            key_schema,
+            locator,
+            index,
+        })
+    }
 
+    /// Writes out `index`, a new index on `table` whose name the caller has
+    /// checked is free, and adds it to the catalog.
+    fn add_index(
+        &self,
+        state: &mut CatalogState,
+        table: &TableInfo,
+        index: NewIndex,
+    ) -> Result<Arc<IndexInfo>> {
+        let NewIndex {
+            row,
+            key,
+            key_schema,
+            locator,
+            index,
+        } = index;
         for (position, &column) in key.iter().enumerate() {
             self.system.insert_index_column(&IndexColumnRow {
-                index_oid: oid,
+                index_oid: row.oid,
                 position,
                 column,
             })?;
@@ -434,14 +505,14 @@ impl Catalog {
         self.system.insert_index(&row)?;
 
         let info = Arc::new(IndexInfo {
-            oid,
-            name: name.to_owned(),
+            oid: row.oid,
+            name: row.name,
             table_oid: table.oid,
             table_name: table.name.clone(),
             key_columns: key,
             key_schema,
             header_page_id: row.header_page_id,
-            is_primary_key,
+            is_primary_key: row.is_primary_key,
             locator,
             index,
         });
@@ -478,6 +549,22 @@ impl Catalog {
             .map(|oid| Arc::clone(&state.indexes[oid]))
             .collect()
     }
+}
+
+/// An index whose B+ tree is open but which is not in the catalog yet.
+struct NewIndex {
+    row: IndexRow,
+    key: Vec<usize>,
+    key_schema: Schema,
+    locator: LocatorKind,
+    index: Arc<Index>,
+}
+
+fn check_index_name_free(state: &CatalogState, name: &str) -> Result<()> {
+    if state.index_names.contains_key(name) {
+        return Err(CatalogError::IndexExists(name.to_owned()));
+    }
+    Ok(())
 }
 
 fn check_name(name: &str) -> Result<()> {
@@ -747,6 +834,49 @@ mod tests {
             &index
         ));
         assert_ne!(index.header_page_id, table.first_page_id());
+    }
+
+    #[test]
+    fn writes_to_the_table_wait_while_an_index_is_filled() {
+        let db = Db::new(8);
+        let table = db.catalog.create_table("users", users(), &[]).unwrap();
+        db.catalog
+            .create_index_with("users_name", "users", &["name"], |table, _| {
+                assert!(table.writes.try_read().is_none());
+                Ok::<_, CatalogError>(())
+            })
+            .unwrap();
+        assert!(table.writes.try_read().is_some());
+    }
+
+    /// An index whose fill fails is not recorded, in memory or on disk, and
+    /// its name is free again.
+    #[test]
+    fn an_index_that_fails_to_fill_is_not_created() {
+        let db = Db::new(8);
+        db.catalog.create_table("users", users(), &[]).unwrap();
+        let failed = db
+            .catalog
+            .create_index_with("users_name", "users", &["name"], |_, _| {
+                Err(CatalogError::Corrupt("fill failed".to_owned()))
+            });
+        assert!(matches!(failed, Err(CatalogError::Corrupt(_))));
+        assert!(db.catalog.get_index("users_name").is_none());
+        assert!(db.catalog.table_indexes("users").is_empty());
+
+        let db = db.restart();
+        assert!(db.catalog.table_indexes("users").is_empty());
+        db.catalog
+            .create_index("users_name", "users", &["name"])
+            .unwrap();
+        let db = db.restart();
+        let names: Vec<_> = db
+            .catalog
+            .table_indexes("users")
+            .iter()
+            .map(|index| index.name.clone())
+            .collect();
+        assert_eq!(names, ["users_name"]);
     }
 
     #[test]

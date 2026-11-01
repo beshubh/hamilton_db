@@ -34,6 +34,18 @@
 //! key is taken if the version this transaction sees has it. Adding before
 //! checking means that of two transactions inserting a key at once, at
 //! least one sees the other.
+//!
+//! **Building an index.** CREATE INDEX fills the new index from its table
+//! (`Transaction::build_index`) while writes to the table wait (see the
+//! catalog's `create_index_with`), so no write misses the index. A reader
+//! that began before the index existed may use it in its next statement, so
+//! the build adds an entry for every version a reader at or above the
+//! watermark might see, locked ones included, not just the newest. Some of
+//! those versions are later rolled back or replaced by writes that never
+//! knew the index, so nothing would retire their entries. The build
+//! therefore retires every entry it adds. Garbage collection checks them
+//! once every transaction running when the build ended has ended, and
+//! keeps those still needed.
 
 use std::sync::Arc;
 
@@ -41,9 +53,10 @@ use common::{Rid, Schema, Tuple};
 
 use crate::error::Result;
 use crate::index::btree_index::KeySchemaComparator;
-use crate::index::{Index, IndexTrait, RowLocator};
+use crate::index::{Index, IndexTrait, LocatorKind, RowLocator};
 use crate::page::btree_page::KeyComparator;
 use crate::table::table_heap::TableHeap;
+use crate::table::table_iterator::TableRow;
 use crate::table::undo_log::UndoLog;
 
 /// A table as its index entries need it: the heap and schema that rows are
@@ -119,6 +132,68 @@ impl TableEntry {
             }
         }
         Ok(false)
+    }
+}
+
+/// The entries `index`, one of `table`'s, needs for the row at `rid`: one for
+/// each version a reader at or above `watermark` might see, without
+/// duplicates.
+pub(crate) fn row_entries(
+    table: &IndexedTable,
+    index: &Index,
+    rid: Rid,
+    watermark: u64,
+    undo: &UndoLog,
+) -> Result<Vec<(Tuple, RowLocator)>> {
+    let schema = &table.schema;
+    let metadata = index.metadata();
+    let mut entries = Vec::new();
+    for (meta, version) in stable_versions(table, rid, watermark, undo)? {
+        if meta.is_deleted {
+            continue;
+        }
+        let key = version.to_key(schema, metadata.key_schema(), metadata.key_attrs())?;
+        let locator = match metadata.locator() {
+            LocatorKind::Rid => RowLocator::Rid(rid),
+            LocatorKind::PrimaryKey => {
+                let primary_key = table
+                    .primary_key
+                    .as_ref()
+                    .expect("only a table with a primary key has indexes that store it")
+                    .metadata();
+                RowLocator::PrimaryKey(version.to_key(
+                    schema,
+                    primary_key.key_schema(),
+                    primary_key.key_attrs(),
+                )?)
+            }
+        };
+        let entry = (key, locator);
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+/// `TableHeap::versions_since` for the row at `rid`, read again if its head
+/// changed during the walk. A commit or abort can end the transaction
+/// holding the head, and garbage collection may then free the records the
+/// walk was following, which would cut off the version now at the head.
+fn stable_versions(
+    table: &IndexedTable,
+    rid: Rid,
+    watermark: u64,
+    undo: &UndoLog,
+) -> Result<Vec<TableRow>> {
+    loop {
+        let versions = table
+            .heap
+            .versions_since(rid, watermark, &table.schema, undo)?;
+        let head = versions.first().map(|(meta, _)| *meta);
+        if table.heap.head_meta(rid)? == head {
+            return Ok(versions);
+        }
     }
 }
 

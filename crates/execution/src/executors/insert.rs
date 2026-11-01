@@ -54,8 +54,6 @@ impl Executor for InsertExecutor {
         }
         self.done = true;
         let table = self.ctx.table(self.plan.table_oid())?;
-        let indexes = write_indexes(&self.ctx, &table);
-        let indexed = self.ctx.indexed_table(&table);
         let mut rows = Vec::new();
         while self
             .child
@@ -63,6 +61,8 @@ impl Executor for InsertExecutor {
         {
             rows.append(&mut self.child_tuples);
         }
+        let (_writes, indexes) = write_indexes(&self.ctx, &table);
+        let indexed = self.ctx.indexed_table(&table);
         let txn = self.ctx.txn();
         // The child's rows are already in the table's layout.
         for tuple in &rows {

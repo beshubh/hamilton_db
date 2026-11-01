@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::mem;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -23,7 +24,8 @@ use crate::table::undo_log::UndoLog;
 /// future reader can see the tuples, and a pass of `garbage_collect`
 /// reclaims them all at once, with the undo records and read timestamps
 /// below the watermark. It removes each entry no reader needs any more, as
-/// `index_versions` describes.
+/// `index_versions` describes. The entries an index build added wait
+/// longer, until every transaction running when the build ended has ended.
 ///
 /// Commit and abort only wake the collector thread and return, so the work
 /// stays off their latency. Wakes that arrive during a pass are served by one
@@ -184,11 +186,23 @@ impl TransactionManager {
             "transaction {} was begun by another manager",
             txn.tid()
         );
-        let garbage = txn.finish(outcome)?;
+        let mut garbage = txn.finish(outcome)?;
         // Queued before the Tid ends, so the watermark cannot pass it first.
-        if !garbage.is_empty() {
-            self.shared.garbage.lock().insert(txn.tid(), garbage);
+        // An index build's entries wait for the newest Tid begun so far, so
+        // every transaction running now ends first (see `index_versions`).
+        // Another transaction may queue at that Tid too, so queues merge.
+        let built = Garbage {
+            built: mem::take(&mut garbage.built),
+            ..Garbage::default()
+        };
+        let newest = self.shared.watermark.next() - 1;
+        let mut queue = self.shared.garbage.lock();
+        for (tid, garbage) in [(txn.tid(), garbage), (newest, built)] {
+            if !garbage.is_empty() {
+                queue.entry(tid).or_default().append(garbage);
+            }
         }
+        drop(queue);
         self.shared.watermark.end(txn.tid());
         drop(self.shared.request_pass());
         Ok(())
@@ -258,7 +272,7 @@ impl Shared {
                     }
                 }
             }
-            for entry in garbage.entries {
+            for entry in garbage.entries.into_iter().chain(garbage.built) {
                 let _entries = self.entry_lock.write();
                 let removed = match entry.is_needed(watermark, &self.undo) {
                     Ok(true) => Ok(false),

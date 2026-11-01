@@ -70,6 +70,19 @@ impl TableIterator {
         Ok(None)
     }
 
+    /// The rows of the next page that has any, deleted ones too, as their
+    /// newest versions, or `None` once the scan is done. Nothing is checked
+    /// or recorded: this is for finding every row an old reader might still
+    /// see, not for reading rows.
+    pub fn next_batch_with_deleted(&mut self) -> Result<Option<Vec<TableRow>>> {
+        while let Some(rows) = self.next_page(|_| true, |_| Ok(()))? {
+            if !rows.is_empty() {
+                return Ok(Some(rows));
+            }
+        }
+        Ok(None)
+    }
+
     /// The rows of the next page that has any rows visible at `ts`, each the
     /// version visible at `ts` with its meta, or `None` once the scan is
     /// done. Pass the same arguments on every call. Fails as

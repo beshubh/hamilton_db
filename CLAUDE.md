@@ -22,3 +22,5 @@ Use this file to write down any surprises we face in development or testing. Any
 - Show plans in the chat reply in full. If a delegate needs the plan as a file, paste it in chat as well: the index indirection plan was only linked as a scratchpad file, and the user could not see it.
 - The transaction manager's collector thread runs after every commit, so a test that counts raw index entries (`index_entries`) right after a statement passes or fails by timing. Call `tm.wait_for_gc()` first, and hold an older transaction open to check that entries are kept for it.
 - In a `thread::scope` stress test, stop helper loops from a drop guard in the worker threads, not after joining them: a failed assertion in a worker otherwise leaves the helper looping, and the test hangs instead of failing.
+- Keep a plan short and concrete: a code sketch of the core change and a few bullets, not pages of prose. The first index backfill plan was an essay the user would not read.
+- Don't offer to leave out what makes a feature correct as an option ("handle concurrent writers, or note it as a known gap?"). An index that can miss rows is broken; just handle it.
