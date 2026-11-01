@@ -235,6 +235,12 @@ impl DiskManager {
 
     /// Frees the page's slot so a later allocation can reuse it. Unknown pages
     /// are ignored.
+    /// Whether `page_id` has been written and not deleted since: whether it
+    /// has a slot on disk.
+    pub fn has_page(&self, page_id: PageId) -> bool {
+        self.state.lock().pages.contains_key(&page_id)
+    }
+
     pub fn delete_page(&self, page_id: PageId) {
         let mut state = self.state.lock();
         if let Some(entry) = state.pages.remove(&page_id) {

@@ -17,7 +17,7 @@ pub use ids::{
 };
 pub use rid::{Rid, SlotId};
 pub use schema::{Column, Schema};
-pub use tuple::Tuple;
+pub use tuple::{ColumnReader, Tuple, TupleJoiner, TupleProjector, TupleWriter};
 pub use value::{DataType, Value, ValueRef};
 
 #[cfg(test)]

@@ -32,6 +32,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use common::hash::IntKeys;
 use common::{Rid, TxnId};
 use parking_lot::Mutex;
 
@@ -45,7 +46,7 @@ pub struct ReadTimestamps {
 
 #[derive(Default)]
 struct Inner {
-    read_ts: HashMap<Rid, TxnId>,
+    read_ts: HashMap<Rid, TxnId, IntKeys>,
     /// The tuples whose read-ts each reader raised, so that `collect` visits
     /// only the entries it frees. A `Rid` stays under an older reader after a
     /// newer one raises it again, or after `remove`; `collect` skips those.

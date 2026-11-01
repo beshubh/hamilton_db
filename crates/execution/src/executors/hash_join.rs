@@ -1,15 +1,20 @@
-use std::cmp::Ordering;
-use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use common::hash::{ValuesHasher, partition_index};
-use common::{INVALID_PAGE_ID, PageId, Rid, Schema, Tuple, Value};
+use common::{
+    ColumnReader, DataType, INVALID_PAGE_ID, PageId, Rid, Schema, Tuple, TupleJoiner, Value,
+    ValueRef,
+};
 
-use super::intermediate_result::{IntermediatePages, IntermediateResult, PageCount};
+use super::intermediate_result::{
+    IntermediatePages, IntermediateResult, PageCount, PartitionWriter,
+};
 use super::{AbstractExecutor, Executor};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
-use crate::expressions::{AbstractExpr, Expr, evaluate_in_place};
+use crate::expressions::{
+    AbstractExpr, ComparisonOp, Evaluated, Expr, column_reader, evaluate_with,
+};
 use crate::plans::{HashJoinPlan, JoinType, PlanNode};
 
 /// How many rows a child is asked for at a time: while partitioning it,
@@ -82,9 +87,9 @@ const HASH_TABLE_SEED: u64 = 0;
 /// compared without being copied, and a joined row is made by copying the
 /// bytes of the two rows ([`Tuple::join`]) without decoding them.
 ///
-/// One left row can have more matches than fit in a batch, so its joined
-/// rows wait in `output` until `next` returns them. That holds every joined
-/// row of one left row and one chunk in memory at once.
+/// One left row can have more matches than fit in a batch, so `probe`
+/// remembers where in the hash table its matches stopped, and the next
+/// batch carries on from there.
 ///
 /// [`ExecutionContext::join_frames`]: crate::execution_context::ExecutionContext::join_frames
 pub struct HashJoinExecutor {
@@ -107,7 +112,7 @@ pub struct HashJoinExecutor {
     next_pair: usize,
     /// The right rows being joined with, by the hash of their keys: all of
     /// them, or the current chunk of the pair's right partition.
-    hash_table: HashMap<u64, Vec<Tuple>>,
+    hash_table: JoinTable,
     /// The first page of the right partition's next chunk, or
     /// `INVALID_PAGE_ID` if `hash_table` holds its last chunk, or all the
     /// right rows.
@@ -125,8 +130,226 @@ pub struct HashJoinExecutor {
     /// in any chunk so far. When the right side fit in memory, there is one
     /// chunk, and this only covers the batch of left rows being probed with.
     matched: Vec<bool>,
-    /// Joined rows not returned by `next` yet.
-    output: VecDeque<Tuple>,
+    /// The left row being joined with the hash table, if `next` has not
+    /// output all its rows yet.
+    probe: Option<Probe>,
+    /// Joins a left and a right row into an output row, if the schemas line
+    /// up; if not, `Tuple::join_into` reports why for each row.
+    joiner: Option<Box<TupleJoiner>>,
+    /// The predicate, if it compares a left column with a right column.
+    column_predicate: Option<Box<ColumnPredicate>>,
+    /// For each side, a reader for each key that is a column.
+    key_readers: Box<[Vec<Option<ColumnReader>>; 2]>,
+}
+
+/// Hashes the values of `keys`, read with `readers` where they are columns,
+/// on `tuple`, a row of `schema`, with `seed`. `None` if a key is NULL.
+fn hash_row(
+    readers: &[Option<ColumnReader>],
+    keys: &[AbstractExpr],
+    schema: &Schema,
+    tuple: &Tuple,
+    seed: u64,
+) -> Result<Option<u64>> {
+    let mut hasher = ValuesHasher::new(seed);
+    for (key, &reader) in keys.iter().zip(readers) {
+        let value = evaluate_with(reader, key, tuple, schema)?;
+        if value.as_value_ref().is_null() {
+            return Ok(None);
+        }
+        hasher.add(value.as_value_ref());
+    }
+    Ok(Some(hasher.finish()))
+}
+
+/// A reader for each of `keys`, rows of `schema`, that is a column.
+fn key_readers(keys: &[AbstractExpr], schema: &Schema) -> Vec<Option<ColumnReader>> {
+    keys.iter().map(|key| column_reader(key, schema)).collect()
+}
+
+/// A join predicate `left column <op> right column`, or the other way
+/// round. The probe reads the left column once per left row.
+struct ColumnPredicate {
+    op: ComparisonOp,
+    left_column: ColumnReader,
+    right_column: ColumnReader,
+    /// Whether the left column is the comparison's right operand.
+    flipped: bool,
+    /// Whether both columns are INT or BIGINT, for `holds_integer`.
+    integers: bool,
+}
+
+impl ColumnPredicate {
+    fn of(predicate: &AbstractExpr, left_schema: &Schema, right_schema: &Schema) -> Option<Self> {
+        let AbstractExpr::ComparisonExpr(comparison) = predicate else {
+            return None;
+        };
+        let [
+            AbstractExpr::ColumnValueExpr(a),
+            AbstractExpr::ColumnValueExpr(b),
+        ] = comparison.children()
+        else {
+            return None;
+        };
+        let (left, right, flipped) = match (a.tuple_idx(), b.tuple_idx()) {
+            (0, 1) => (a, b, false),
+            (1, 0) => (b, a, true),
+            _ => return None,
+        };
+        let left_column = ColumnReader::new(left_schema, left.col_idx())?;
+        let right_column = ColumnReader::new(right_schema, right.col_idx())?;
+        let is_integer =
+            |reader: &ColumnReader| matches!(reader.data_type(), DataType::Int | DataType::BigInt);
+        Some(Self {
+            op: comparison.op(),
+            integers: is_integer(&left_column) && is_integer(&right_column),
+            left_column,
+            right_column,
+            flipped,
+        })
+    }
+
+    /// [`holds`](Self::holds) for INT or BIGINT columns, `left` not NULL,
+    /// without branching on the outcome.
+    #[inline]
+    fn holds_integer(&self, left: i64, right: &Tuple) -> Result<bool> {
+        let (null, right) = self.right_column.read_integer(right)?;
+        let ordering = if self.flipped {
+            right.cmp(&left)
+        } else {
+            left.cmp(&right)
+        };
+        Ok(!null & self.op.holds(ordering))
+    }
+
+    /// Whether the predicate is true for a left row whose column is `left`
+    /// and the right row `right`.
+    #[inline]
+    fn holds(&self, left: ValueRef<'_>, right: &Tuple) -> Result<bool> {
+        let right = self.right_column.read(right)?;
+        let ordering = if self.flipped {
+            right.compare(left)?
+        } else {
+            left.compare(right)?
+        };
+        Ok(ordering.is_some_and(|ordering| self.op.holds(ordering)))
+    }
+}
+
+/// The most keys whose left values a probe keeps; past this, they are read
+/// again for each candidate.
+const CACHED_KEYS: usize = 4;
+
+/// How many candidates a keyless probe tests before joining those that pass.
+const SELECTION: usize = 64;
+
+/// Whether two key values are equal under `=`.
+#[inline]
+fn keys_match(left: ValueRef<'_>, right: ValueRef<'_>) -> Result<bool> {
+    Ok(left.equals(right)? == Some(true))
+}
+
+/// Where the join of one left row with the hash table is.
+#[derive(Clone, Copy)]
+struct Probe {
+    /// The row's index in `left_rows`.
+    row: usize,
+    /// Where the row is among the rows `matched` covers.
+    position: usize,
+    /// The hash of the row's keys, or `None` if one is NULL.
+    hash: Option<u64>,
+    /// The next right row to try, or `NO_ROW` once there are none.
+    candidate: u32,
+    /// Whether `hash` and `candidate` are still to be found.
+    fresh: bool,
+}
+
+/// Ends a chain of rows in a [`JoinTable`].
+const NO_ROW: u32 = u32::MAX;
+
+/// The right rows of a hash join, chained by the hash of their keys. Rows
+/// with the same hash keep the order they were added in.
+#[derive(Default)]
+struct JoinTable {
+    /// The rows, `len` of them. The ones after are buffers left by earlier
+    /// rows, which `push_bytes` writes over.
+    rows: Vec<Tuple>,
+    len: usize,
+    /// The hash of each row's keys.
+    hashes: Vec<u64>,
+    /// The row after each one in its bucket, or `NO_ROW`.
+    next: Vec<u32>,
+    /// The first row of each bucket, or `NO_ROW`. A power of two long.
+    heads: Vec<u32>,
+}
+
+impl JoinTable {
+    fn clear(&mut self) {
+        self.len = 0;
+        self.hashes.clear();
+        self.next.clear();
+        self.heads.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Adds a row; [`build`](Self::build) must run before it is found.
+    fn push(&mut self, hash: u64, tuple: Tuple) {
+        if self.len < self.rows.len() {
+            self.rows[self.len] = tuple;
+        } else {
+            self.rows.push(tuple);
+        }
+        self.len += 1;
+        self.hashes.push(hash);
+    }
+
+    /// Adds a row with a copy of `bytes` and returns it, for the caller to
+    /// hash and then [`keep`](Self::keep) or [`drop_last`](Self::drop_last).
+    fn push_bytes(&mut self, bytes: &[u8]) -> &Tuple {
+        if self.len == self.rows.len() {
+            self.rows.push(Tuple::default());
+        }
+        self.rows[self.len].set_bytes(bytes);
+        self.len += 1;
+        &self.rows[self.len - 1]
+    }
+
+    /// Keeps the row `push_bytes` added, under `hash`.
+    fn keep(&mut self, hash: u64) {
+        self.hashes.push(hash);
+    }
+
+    /// Takes back the row `push_bytes` added.
+    fn drop_last(&mut self) {
+        self.len -= 1;
+    }
+
+    /// Chains the rows added into buckets.
+    fn build(&mut self) {
+        let buckets = (self.len * 2).next_power_of_two();
+        self.heads.clear();
+        self.heads.resize(buckets, NO_ROW);
+        self.next.clear();
+        self.next.resize(self.len, NO_ROW);
+        let mask = buckets - 1;
+        // Backwards, so that each chain runs in the order rows were added.
+        for row in (0..self.len).rev() {
+            let bucket = self.hashes[row] as usize & mask;
+            self.next[row] = self.heads[bucket];
+            self.heads[bucket] = u32::try_from(row).expect("fewer than 2^32 rows fit in memory");
+        }
+    }
+
+    /// The first row in the bucket of `hash`, which may have another hash.
+    fn first(&self, hash: u64) -> u32 {
+        match self.heads.len() {
+            0 => NO_ROW,
+            len => self.heads[hash as usize & (len - 1)],
+        }
+    }
 }
 
 /// Rows with keys that hash alike. Its page count decides whether a hash
@@ -141,8 +364,8 @@ struct PartitionPair {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Side {
-    Left,
-    Right,
+    Left = 0,
+    Right = 1,
 }
 
 /// Where the left rows come from.
@@ -162,7 +385,28 @@ impl HashJoinExecutor {
         left: Box<AbstractExecutor>,
         right: Box<AbstractExecutor>,
     ) -> Self {
+        let joiner = TupleJoiner::new(
+            plan.get_output_schema(),
+            left.get_output_schema(),
+            right.get_output_schema(),
+        )
+        .map(Box::new);
+        let column_predicate = plan.predicate().and_then(|predicate| {
+            ColumnPredicate::of(
+                predicate,
+                left.get_output_schema(),
+                right.get_output_schema(),
+            )
+            .map(Box::new)
+        });
+        let key_readers = Box::new([
+            key_readers(plan.left_keys(), left.get_output_schema()),
+            key_readers(plan.right_keys(), right.get_output_schema()),
+        ]);
         Self {
+            joiner,
+            column_predicate,
+            key_readers,
             pages: IntermediatePages::new(Arc::clone(&ctx)),
             exec_ctx: ctx,
             plan,
@@ -171,7 +415,7 @@ impl HashJoinExecutor {
             left_input: LeftInput::Partitions,
             partition_pairs: Vec::new(),
             next_pair: 0,
-            hash_table: HashMap::new(),
+            hash_table: JoinTable::default(),
             next_right_page: INVALID_PAGE_ID,
             left_rows: Vec::new(),
             left_rids: Vec::new(),
@@ -179,7 +423,7 @@ impl HashJoinExecutor {
             next_left_page: INVALID_PAGE_ID,
             left_position: 0,
             matched: Vec::new(),
-            output: VecDeque::new(),
+            probe: None,
         }
     }
 
@@ -206,25 +450,28 @@ impl HashJoinExecutor {
     /// round of partitioning uses another one. `None` if a key is NULL, as
     /// the row then matches nothing.
     fn hash_keys(&self, tuple: &Tuple, side: Side, seed: u64) -> Result<Option<u64>> {
-        let mut hasher = ValuesHasher::new(seed);
-        for key in self.keys(side) {
-            let value = evaluate_in_place(key, tuple, self.schema(side))?;
-            if value.as_value_ref().is_null() {
-                return Ok(None);
-            }
-            hasher.add(value.as_value_ref());
-        }
-        Ok(Some(hasher.finish()))
+        let readers = &self.key_readers[side as usize];
+        hash_row(readers, self.keys(side), self.schema(side), tuple, seed)
+    }
+
+    /// The value of `side`'s key `i` on `tuple`, read in place.
+    fn key<'a>(&'a self, side: Side, i: usize, tuple: &'a Tuple) -> Result<Evaluated<'a>> {
+        let readers = &self.key_readers[side as usize];
+        evaluate_with(readers[i], &self.keys(side)[i], tuple, self.schema(side))
     }
 
     /// Whether the keys of `left` and `right`, neither of them NULL, are
     /// equal under `=`, which compares an INT and a BIGINT by value.
     fn keys_equal(&self, left: &Tuple, right: &Tuple) -> Result<bool> {
-        let keys = self.plan.left_keys().iter().zip(self.plan.right_keys());
-        for (left_key, right_key) in keys {
-            let l = evaluate_in_place(left_key, left, self.schema(Side::Left))?;
-            let r = evaluate_in_place(right_key, right, self.schema(Side::Right))?;
-            if l.as_value_ref().compare(r.as_value_ref())? != Some(Ordering::Equal) {
+        let keys = self
+            .plan
+            .left_keys()
+            .len()
+            .min(self.plan.right_keys().len());
+        for i in 0..keys {
+            let l = self.key(Side::Left, i, left)?;
+            let r = self.key(Side::Right, i, right)?;
+            if !keys_match(l.as_value_ref(), r.as_value_ref())? {
                 return Ok(false);
             }
         }
@@ -286,17 +533,18 @@ impl HashJoinExecutor {
         read: Vec<Tuple>,
     ) -> Result<(Vec<Partition>, Partition)> {
         let keep_null_keys = side == Side::Left && self.plan.join_type() == JoinType::Left;
-        let mut partitions: Vec<_> = (0..self.fan_out()).map(|_| Partition::new()).collect();
-        let mut null_key_rows = Partition::new();
+        // The last result holds the rows with a NULL key.
+        let fan_out = self.fan_out();
+        let mut writer = PartitionWriter::new(fan_out + 1);
         let (mut tuples, mut rids) = (read, Vec::new());
         loop {
             for tuple in &tuples {
                 match self.hash_keys(tuple, side, 0)? {
                     Some(hash) => {
-                        let i = partition_index(hash, partitions.len());
-                        self.pages.append(&mut partitions[i], tuple)?;
+                        let i = partition_index(hash, fan_out);
+                        writer.append(&mut self.pages, i, tuple)?;
                     }
-                    None if keep_null_keys => self.pages.append(&mut null_key_rows, tuple)?,
+                    None if keep_null_keys => writer.append(&mut self.pages, fan_out, tuple)?,
                     None => {}
                 }
             }
@@ -308,6 +556,8 @@ impl HashJoinExecutor {
                 break;
             }
         }
+        let mut partitions = writer.finish(&mut self.pages)?;
+        let null_key_rows = partitions.pop().expect("the NULL key rows are last");
         Ok((partitions, null_key_rows))
     }
 
@@ -319,7 +569,8 @@ impl HashJoinExecutor {
         side: Side,
         seed: u64,
     ) -> Result<Vec<Partition>> {
-        let mut partitions: Vec<_> = (0..self.fan_out()).map(|_| Partition::new()).collect();
+        let fan_out = self.fan_out();
+        let mut writer = PartitionWriter::new(fan_out);
         let mut page_id = partition.first_page_id;
         while page_id != INVALID_PAGE_ID {
             let (tuples, next_page_id) = self.pages.read_page(page_id)?;
@@ -327,12 +578,12 @@ impl HashJoinExecutor {
                 let hash = self
                     .hash_keys(tuple, side, seed)?
                     .expect("rows with a NULL key are not partitioned");
-                let i = partition_index(hash, partitions.len());
-                self.pages.append(&mut partitions[i], tuple)?;
+                let i = partition_index(hash, fan_out);
+                writer.append(&mut self.pages, i, tuple)?;
             }
             page_id = next_page_id;
         }
-        Ok(partitions)
+        writer.finish(&mut self.pages)
     }
 
     /// Adds `left` and `right` to the pairs to join, first partitioning both
@@ -377,7 +628,7 @@ impl HashJoinExecutor {
     /// with a NULL key matches nothing, so it is left out.
     fn add_to_hash_table(&mut self, tuple: Tuple) -> Result<()> {
         if let Some(hash) = self.hash_keys(&tuple, Side::Right, HASH_TABLE_SEED)? {
-            self.hash_table.entry(hash).or_default().push(tuple);
+            self.hash_table.push(hash, tuple);
         }
         Ok(())
     }
@@ -412,19 +663,28 @@ impl HashJoinExecutor {
             if self.next_right_page == INVALID_PAGE_ID {
                 break;
             }
-            let (rows, next_page_id) = self.pages.read_page(self.next_right_page)?;
-            for tuple in rows {
-                self.add_to_hash_table(tuple)?;
-            }
-            self.next_right_page = next_page_id;
+            let table = &mut self.hash_table;
+            let readers = &self.key_readers[Side::Right as usize];
+            let keys = self.plan.right_keys();
+            let schema = self.right.get_output_schema();
+            self.next_right_page = self.pages.for_each_tuple(self.next_right_page, |bytes| {
+                let tuple = table.push_bytes(bytes);
+                match hash_row(readers, keys, schema, tuple, HASH_TABLE_SEED)? {
+                    Some(hash) => table.keep(hash),
+                    None => table.drop_last(),
+                }
+                Ok(())
+            })?;
         }
+        self.hash_table.build();
         Ok(())
     }
 
-    /// The next left row and where it is among the rows `matched` covers,
-    /// reading the next batch of the left child, or page of the pair's left
-    /// partition, when this one is done. None once they are done.
-    fn next_left_row(&mut self) -> Result<Option<(usize, Tuple)>> {
+    /// The index in `left_rows` of the next left row, and where it is among
+    /// the rows `matched` covers, reading the next batch of the left child,
+    /// or page of the pair's left partition, when this one is done. None once
+    /// they are done.
+    fn next_left_row(&mut self) -> Result<Option<(usize, usize)>> {
         while self.next_left == self.left_rows.len() {
             match self.left_input {
                 LeftInput::Child => {
@@ -446,50 +706,237 @@ impl HashJoinExecutor {
                     if self.next_left_page == INVALID_PAGE_ID {
                         return Ok(None);
                     }
-                    (self.left_rows, self.next_left_page) =
-                        self.pages.read_page(self.next_left_page)?;
+                    self.next_left_page = self
+                        .pages
+                        .read_page_into(self.next_left_page, &mut self.left_rows)?;
                     self.next_left = 0;
                 }
             }
         }
-        let row = std::mem::take(&mut self.left_rows[self.next_left]);
+        let row = self.next_left;
         self.next_left += 1;
         self.left_position += 1;
-        Ok(Some((self.left_position - 1, row)))
+        Ok(Some((row, self.left_position - 1)))
     }
 
-    /// Joins `left`, the row at `position` among the rows `matched` covers,
-    /// with the right rows in the hash table under its keys, adding the
-    /// joined rows to `output`. In a LEFT join, once the last chunk is built,
-    /// a row that never matched is added padded with NULLs.
-    fn join_left_row(&mut self, position: usize, left: &Tuple) -> Result<()> {
+    /// Starts joining the left row at `row` in `left_rows`, at `position`
+    /// among the rows `matched` covers.
+    fn start_probe(&mut self, row: usize, position: usize) {
+        // `continue_probe` hashes the keys, as it reads them anyway.
+        self.probe = Some(Probe {
+            row,
+            position,
+            hash: None,
+            candidate: NO_ROW,
+            fresh: true,
+        });
+    }
+
+    /// Joins the probe's left row with the right rows in the hash table under
+    /// its keys, writing the joined rows to `tuples` from index `n` on, until
+    /// `batch_size` rows are there. In a LEFT join, once the last chunk is
+    /// built, a row that never matched is written padded with NULLs. Returns
+    /// the index after the last row written, and clears `probe` once the
+    /// left row is done.
+    fn continue_probe(
+        &mut self,
+        tuples: &mut Vec<Tuple>,
+        mut n: usize,
+        batch_size: usize,
+    ) -> Result<usize> {
+        let mut probe = self.probe.take().expect("a probe is under way");
+        let left = &self.left_rows[probe.row];
         let left_schema = self.left.get_output_schema();
         let right_schema = self.right.get_output_schema();
         let schema = self.plan.get_output_schema();
-        if let Some(hash) = self.hash_keys(left, Side::Left, HASH_TABLE_SEED)? {
-            for right in self.hash_table.get(&hash).into_iter().flatten() {
-                if !self.keys_equal(left, right)? {
+        // The left row's keys, when they are columns or constants and few
+        // enough to keep; otherwise `keys_equal` reads them each time.
+        let left_keys = self.plan.left_keys();
+        let mut cached = [ValueRef::Null; CACHED_KEYS];
+        let mut keys_cached = left_keys.len() <= CACHED_KEYS;
+        if keys_cached {
+            for (i, slot) in cached.iter_mut().take(left_keys.len()).enumerate() {
+                let key = &left_keys[i];
+                match evaluate_with(self.key_readers[0][i], key, left, left_schema)? {
+                    Evaluated::InPlace(value) => *slot = value,
+                    Evaluated::Computed(_) => keys_cached = false,
+                }
+            }
+        }
+        if probe.fresh {
+            probe.fresh = false;
+            probe.hash = if keys_cached {
+                let keys = &cached[..left_keys.len()];
+                let mut hasher = ValuesHasher::new(HASH_TABLE_SEED);
+                keys.iter().for_each(|&key| hasher.add(key));
+                (!keys.iter().any(|key| key.is_null())).then(|| hasher.finish())
+            } else {
+                self.hash_keys(left, Side::Left, HASH_TABLE_SEED)?
+            };
+            probe.candidate = probe
+                .hash
+                .map_or(NO_ROW, |hash| self.hash_table.first(hash));
+        }
+        if probe.hash.is_some()
+            && self.plan.left_keys().is_empty()
+            && self.plan.right_keys().is_empty()
+            && let Some(predicate) = self.column_predicate.as_ref().filter(|p| p.integers)
+        {
+            // Every right row is a candidate, and the predicate alone decides.
+            // Test a run of candidates first and join the ones that pass
+            // after, so the loop doesn't branch on each outcome.
+            let left_value = match predicate.left_column.read(left)? {
+                ValueRef::Int(value) => Some(i64::from(value)),
+                ValueRef::BigInt(value) => Some(value),
+                _ => None,
+            };
+            let Some(left_value) = left_value else {
+                probe.candidate = NO_ROW;
+                return self.finish_probe(probe, tuples, n, batch_size);
+            };
+            let mut passed = [0u32; SELECTION];
+            while probe.candidate != NO_ROW {
+                if n == batch_size {
+                    self.probe = Some(probe);
+                    return Ok(n);
+                }
+                let room = (batch_size - n).min(SELECTION);
+                let mut count = 0;
+                while count < room && probe.candidate != NO_ROW {
+                    let candidate = probe.candidate as usize;
+                    probe.candidate = self.hash_table.next[candidate];
+                    passed[count] = candidate as u32;
+                    let right = &self.hash_table.rows[candidate];
+                    count += usize::from(predicate.holds_integer(left_value, right)?);
+                }
+                for &candidate in &passed[..count] {
+                    let right = &self.hash_table.rows[candidate as usize];
+                    let out = output_slot(tuples, n);
+                    match &self.joiner {
+                        Some(joiner) => joiner.join_into(out, left, Some(right))?,
+                        None => {
+                            out.join_into(schema, left, left_schema, Some(right), right_schema)?
+                        }
+                    }
+                    n += 1;
+                }
+                if count > 0 {
+                    self.matched[probe.position] = true;
+                }
+            }
+        } else if let Some(hash) = probe.hash {
+            let mut left_column = None;
+            while probe.candidate != NO_ROW {
+                if n == batch_size {
+                    self.probe = Some(probe);
+                    return Ok(n);
+                }
+                let candidate = probe.candidate as usize;
+                probe.candidate = self.hash_table.next[candidate];
+                if self.hash_table.hashes[candidate] != hash {
                     continue;
                 }
-                if let Some(predicate) = self.plan.predicate()
+                let right = &self.hash_table.rows[candidate];
+                let keys_equal = if keys_cached {
+                    let mut equal = true;
+                    for (i, &left) in cached.iter().take(left_keys.len()).enumerate() {
+                        let reader = self.key_readers[1][i];
+                        // The table's rows were read in full when hashed.
+                        if let Some(reader) = reader
+                            && let Some(same) = reader.equals_raw(right, left)?
+                        {
+                            if !same {
+                                equal = false;
+                                break;
+                            }
+                            continue;
+                        }
+                        let key = &self.plan.right_keys()[i];
+                        let right = evaluate_with(reader, key, right, right_schema)?;
+                        if !keys_match(left, right.as_value_ref())? {
+                            equal = false;
+                            break;
+                        }
+                    }
+                    equal
+                } else {
+                    self.keys_equal(left, right)?
+                };
+                if !keys_equal {
+                    continue;
+                }
+                if let Some(predicate) = &self.column_predicate {
+                    let left_value = match left_column {
+                        Some(value) => value,
+                        None => *left_column.insert(predicate.left_column.read(left)?),
+                    };
+                    if !predicate.holds(left_value, right)? {
+                        continue;
+                    }
+                } else if let Some(predicate) = self.plan.predicate()
                     && predicate.evaluate_join(left, left_schema, right, right_schema)?
                         != Value::Bool(true)
                 {
                     continue;
                 }
-                let joined = Tuple::join(schema, left, left_schema, Some(right), right_schema)?;
-                self.output.push_back(joined);
-                self.matched[position] = true;
+                let out = output_slot(tuples, n);
+                match &self.joiner {
+                    Some(joiner) => joiner.join_into(out, left, Some(right))?,
+                    None => out.join_into(schema, left, left_schema, Some(right), right_schema)?,
+                }
+                n += 1;
+                self.matched[probe.position] = true;
             }
         }
 
-        let last_chunk = self.next_right_page == INVALID_PAGE_ID;
-        if last_chunk && !self.matched[position] && self.plan.join_type() == JoinType::Left {
-            let padded = Tuple::join(schema, left, left_schema, None, right_schema)?;
-            self.output.push_back(padded);
-        }
-        Ok(())
+        self.finish_probe(probe, tuples, n, batch_size)
     }
+
+    /// Ends the probe of a left row whose matches are all written: in a LEFT
+    /// join, once the last chunk is built, a row that never matched is
+    /// written padded with NULLs. Returns the index after the last row
+    /// written.
+    fn finish_probe(
+        &mut self,
+        probe: Probe,
+        tuples: &mut Vec<Tuple>,
+        mut n: usize,
+        batch_size: usize,
+    ) -> Result<usize> {
+        let last_chunk = self.next_right_page == INVALID_PAGE_ID;
+        if last_chunk && !self.matched[probe.position] && self.plan.join_type() == JoinType::Left {
+            if n == batch_size {
+                self.probe = Some(Probe {
+                    candidate: NO_ROW,
+                    ..probe
+                });
+                return Ok(n);
+            }
+            let left = &self.left_rows[probe.row];
+            let out = output_slot(tuples, n);
+            match &self.joiner {
+                Some(joiner) => joiner.join_into(out, left, None)?,
+                None => out.join_into(
+                    self.plan.get_output_schema(),
+                    left,
+                    self.left.get_output_schema(),
+                    None,
+                    self.right.get_output_schema(),
+                )?,
+            }
+            n += 1;
+        }
+        Ok(n)
+    }
+}
+
+/// The tuple at `n` in `tuples`, a batch being written over, adding one if
+/// the batch is that short. Writing over a tuple reuses its buffer.
+fn output_slot(tuples: &mut Vec<Tuple>, n: usize) -> &mut Tuple {
+    if n == tuples.len() {
+        tuples.push(Tuple::default());
+    }
+    &mut tuples[n]
 }
 
 impl Executor for HashJoinExecutor {
@@ -510,7 +957,7 @@ impl Executor for HashJoinExecutor {
         self.next_left_page = INVALID_PAGE_ID;
         self.left_position = 0;
         self.matched.clear();
-        self.output.clear();
+        self.probe = None;
 
         let (right_rows, all_read) = self.read_right_while_it_fits()?;
         if !all_read {
@@ -519,6 +966,7 @@ impl Executor for HashJoinExecutor {
         for tuple in right_rows {
             self.add_to_hash_table(tuple)?;
         }
+        self.hash_table.build();
         // Without right rows to match, only a LEFT join outputs anything.
         // An inner join is left with no pairs to join, so it is done at once.
         if !self.hash_table.is_empty() || self.plan.join_type() == JoinType::Left {
@@ -533,18 +981,19 @@ impl Executor for HashJoinExecutor {
         rids: &mut Vec<Rid>,
         batch_size: usize,
     ) -> Result<bool> {
-        tuples.clear();
         rids.clear();
-        while tuples.len() < batch_size {
-            if let Some(row) = self.output.pop_front() {
-                tuples.push(row);
-            } else if let Some((position, left)) = self.next_left_row()? {
-                self.join_left_row(position, &left)?;
+        let mut n = 0;
+        while n < batch_size {
+            if self.probe.is_some() {
+                n = self.continue_probe(tuples, n, batch_size)?;
+            } else if let Some((row, position)) = self.next_left_row()? {
+                self.start_probe(row, position);
             } else if !self.start_next_chunk()? {
                 break;
             }
         }
-        Ok(!tuples.is_empty())
+        tuples.truncate(n);
+        Ok(n > 0)
     }
 
     fn get_output_schema(&self) -> &Schema {

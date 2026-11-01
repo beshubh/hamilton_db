@@ -67,13 +67,13 @@ pub use values::ValuesExecutor;
 use std::sync::Arc;
 
 use catalog::{IndexInfo, TableInfo, TableWriteGuard};
-use common::{Rid, Schema, Tuple, Value};
+use common::{ColumnReader, Rid, Schema, Tuple, Value};
 use enum_dispatch::enum_dispatch;
 use storage::index::{LocatorKind, RowLocator};
 
 use crate::error::{ExecutionError, Result};
 use crate::execution_context::ExecutionContext;
-use crate::expressions::{AbstractExpr, Expr};
+use crate::expressions::{AbstractExpr, ComparisonOp, Expr, LogicOp};
 use crate::plans::AbstractPlanNode;
 
 #[enum_dispatch]
@@ -86,6 +86,10 @@ pub trait Executor {
     /// `batch_size` of them, and of `rids` with where those rows are stored,
     /// for rows read from a table. Returns `false`, leaving both empty, once
     /// there are no more rows.
+    ///
+    /// The tuples already in `tuples` may be written over to reuse their
+    /// buffers, so a caller that keeps the vector between calls saves an
+    /// allocation per row.
     fn next(
         &mut self,
         tuples: &mut Vec<Tuple>,
@@ -247,6 +251,116 @@ fn duplicate_key(index: &IndexInfo, key: &Tuple) -> ExecutionError {
 /// Whether `tuple` passes `predicate`: only TRUE does, not FALSE or NULL.
 fn passes(predicate: &AbstractExpr, tuple: &Tuple, schema: &Schema) -> Result<bool> {
     Ok(predicate.evaluate(tuple, schema)? == Value::Bool(true))
+}
+
+/// A predicate made ready to test many rows of one schema, passing the rows
+/// [`passes`] does. A column compared with a constant, or tested for NULL,
+/// is read in place, and AND of those combines them; anything else is
+/// evaluated as an expression.
+enum RowPredicate {
+    Compare {
+        column: ColumnReader,
+        op: ComparisonOp,
+        constant: Value,
+        /// Whether the column is the comparison's right operand.
+        flipped: bool,
+    },
+    IsNull {
+        column: ColumnReader,
+        negated: bool,
+    },
+    And(Box<RowPredicate>, Box<RowPredicate>),
+    Expr(AbstractExpr),
+}
+
+impl RowPredicate {
+    fn new(predicate: &AbstractExpr, schema: &Schema) -> Self {
+        Self::compile(predicate, schema).unwrap_or_else(|| RowPredicate::Expr(predicate.clone()))
+    }
+
+    fn compile(predicate: &AbstractExpr, schema: &Schema) -> Option<Self> {
+        let column = |expr: &AbstractExpr| match expr {
+            AbstractExpr::ColumnValueExpr(column) if column.tuple_idx() == 0 => {
+                ColumnReader::new(schema, column.col_idx())
+            }
+            _ => None,
+        };
+        Some(match predicate {
+            AbstractExpr::ComparisonExpr(comparison) => {
+                let (column, constant, flipped) = match comparison.children() {
+                    [left, AbstractExpr::ConstantExpr(constant)] => {
+                        (column(left)?, constant, false)
+                    }
+                    [AbstractExpr::ConstantExpr(constant), right] => {
+                        (column(right)?, constant, true)
+                    }
+                    _ => return None,
+                };
+                RowPredicate::Compare {
+                    column,
+                    op: comparison.op(),
+                    constant: constant.value().clone(),
+                    flipped,
+                }
+            }
+            AbstractExpr::IsNullExpr(is_null) => RowPredicate::IsNull {
+                column: column(&is_null.children()[0])?,
+                negated: is_null.negated(),
+            },
+            AbstractExpr::LogicExpr(logic) if logic.op() == LogicOp::And => {
+                let [left, right] = logic.children() else {
+                    return None;
+                };
+                RowPredicate::And(
+                    Box::new(Self::compile(left, schema)?),
+                    Box::new(Self::compile(right, schema)?),
+                )
+            }
+            _ => return None,
+        })
+    }
+
+    /// Whether `tuple`, a row of `schema`, passes.
+    #[inline]
+    fn passes(&self, tuple: &Tuple, schema: &Schema) -> Result<bool> {
+        Ok(self.test(tuple, schema)? == Some(true))
+    }
+
+    /// The predicate's value on `tuple`: TRUE, FALSE or NULL (`None`).
+    fn test(&self, tuple: &Tuple, schema: &Schema) -> Result<Option<bool>> {
+        Ok(match self {
+            RowPredicate::Compare {
+                column,
+                op,
+                constant,
+                flipped,
+            } => {
+                let value = column.read(tuple)?;
+                let ordering = if *flipped {
+                    constant.as_value_ref().compare(value)?
+                } else {
+                    value.compare(constant.as_value_ref())?
+                };
+                ordering.map(|ordering| op.holds(ordering))
+            }
+            RowPredicate::IsNull { column, negated } => {
+                Some(column.read(tuple)?.is_null() != *negated)
+            }
+            // As AND evaluates: FALSE on the left decides it.
+            RowPredicate::And(left, right) => match left.test(tuple, schema)? {
+                Some(false) => Some(false),
+                left => match (left, right.test(tuple, schema)?) {
+                    (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                },
+            },
+            RowPredicate::Expr(expr) => match expr.evaluate(tuple, schema)? {
+                Value::Bool(value) => Some(value),
+                _ => None,
+            },
+        })
+    }
 }
 
 /// The output of INSERT, UPDATE and DELETE: one row holding `count`.

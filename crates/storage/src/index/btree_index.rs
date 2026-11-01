@@ -2,7 +2,9 @@ use std::cmp::Ordering;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use common::{INVALID_PAGE_ID, PageId, Rid, Schema, SlotId, Tuple, Value, ValueError};
+use common::{
+    ColumnReader, INVALID_PAGE_ID, PageId, Rid, Schema, SlotId, Tuple, Value, ValueError, ValueRef,
+};
 
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::buffer::traced_buffer_pool_manager::TracedBufferPoolManager;
@@ -37,11 +39,19 @@ fn no_rid() -> Rid {
 /// its schema does not.
 pub struct KeySchemaComparator {
     key_schema: Arc<Schema>,
+    /// A reader of each key column, for comparing whole keys.
+    readers: Vec<ColumnReader>,
 }
 
 impl KeySchemaComparator {
     pub fn new(key_schema: Arc<Schema>) -> Self {
-        Self { key_schema }
+        let readers = (0..key_schema.len())
+            .map(|idx| ColumnReader::new(&key_schema, idx).expect("the column is in the schema"))
+            .collect();
+        Self {
+            key_schema,
+            readers,
+        }
     }
 }
 
@@ -50,20 +60,17 @@ impl KeySchemaComparator {
     /// `prefix`, a tuple of just those columns as `prefix_schema` encodes
     /// them.
     fn compare_prefix(&self, key: &[u8], prefix: &[u8], prefix_schema: &Schema) -> Ordering {
-        let (key, prefix) = (
-            Tuple::from_bytes(key.to_vec()),
-            Tuple::from_bytes(prefix.to_vec()),
-        );
+        if std::ptr::eq(prefix_schema, &*self.key_schema) {
+            // A whole key, such as `scan_key` looks for.
+            return self.compare(key, prefix);
+        }
         for idx in 0..prefix_schema.len() {
-            let decode = |tuple: &Tuple, schema| {
-                tuple
-                    .value(schema, idx)
+            let read = |bytes, schema| {
+                Tuple::value_ref_in(bytes, schema, idx)
                     .unwrap_or_else(|e| panic!("corrupt index key: {e}"))
             };
-            let order = compare_values(
-                &decode(&key, &self.key_schema),
-                &decode(&prefix, prefix_schema),
-            );
+            let order =
+                compare_value_refs(read(key, &self.key_schema), read(prefix, prefix_schema));
             if order.is_ne() {
                 return order;
             }
@@ -74,7 +81,15 @@ impl KeySchemaComparator {
 
 impl KeyComparator for KeySchemaComparator {
     fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-        self.compare_prefix(a, b, &self.key_schema)
+        for reader in &self.readers {
+            let order = reader
+                .compare_in(a, b)
+                .unwrap_or_else(|e| panic!("corrupt index key: {e}"));
+            if order.is_ne() {
+                return order;
+            }
+        }
+        Ordering::Equal
     }
 }
 
@@ -94,6 +109,11 @@ pub fn compare_key_prefix(key: &[Value], prefix: &[Value]) -> Ordering {
 
 /// Orders two values of a key column, with NULL first.
 fn compare_values(a: &Value, b: &Value) -> Ordering {
+    compare_value_refs(a.as_value_ref(), b.as_value_ref())
+}
+
+/// [`compare_values`] of values read in place.
+fn compare_value_refs(a: ValueRef<'_>, b: ValueRef<'_>) -> Ordering {
     match (a.is_null(), b.is_null()) {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Less,
@@ -130,7 +150,11 @@ pub struct EntryComparator {
 impl EntryComparator {
     /// The entry for `key` in the row at `locator`.
     fn entry(&self, key: &[u8], locator: &RowLocator) -> Vec<u8> {
-        let mut entry = Vec::with_capacity(key.len() + RID_SIZE);
+        let locator_len = match locator {
+            RowLocator::Rid(_) => RID_SIZE,
+            RowLocator::PrimaryKey(pk) => pk.data().len() + size_of::<u16>(),
+        };
+        let mut entry = Vec::with_capacity(key.len() + locator_len);
         entry.extend_from_slice(key);
         match (self.layout, locator) {
             (EntryLayout::KeyRid, RowLocator::Rid(rid)) => {
@@ -424,12 +448,25 @@ impl IndexTrait for BtreeIndex {
     }
 
     fn scan_key(&self, key: &Tuple, result: &mut Vec<RowLocator>) -> Result<()> {
-        let key = KeyPrefix {
-            key: key.clone(),
-            schema: Arc::clone(self.metadata.key_schema()),
+        // `scan` from and to `key`, without copying it into the bounds.
+        let cmp = self.tree.comparator();
+        let schema: &Schema = self.metadata.key_schema();
+        let probe = PrefixProbe {
+            entries: cmp,
+            schema,
+            tie: Ordering::Greater,
         };
-        for locator in self.scan(Bound::Included(key.clone()), Bound::Included(key))? {
-            result.push(locator?);
+        for entry in self.tree.begin_at_by(key.data(), &probe)? {
+            let (entry, rid) = entry?;
+            let entry_key = cmp.key_of(&entry);
+            if cmp
+                .keys
+                .compare_prefix(entry_key, key.data(), schema)
+                .is_gt()
+            {
+                break;
+            }
+            result.push(cmp.locator(&entry, rid));
         }
         Ok(())
     }

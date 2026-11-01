@@ -11,7 +11,7 @@
 //! give unrelated hashes, so an operator that splits rows more than once,
 //! like a grace hash join, uses a new seed for each round.
 
-use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
+use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::value::{TWO_POW_63, Value, ValueRef};
 
@@ -78,17 +78,22 @@ pub fn hash_values<'a>(values: impl IntoIterator<Item = &'a Value>, seed: u64) -
 
 /// Hashes values one at a time, giving what [`hash_values`] gives for all
 /// of them, for callers that read each value in place.
+#[derive(Clone, Copy)]
 pub struct ValuesHasher {
     seed: u64,
     hash: u64,
 }
 
+/// `hash_bytes(&[], 0)`, where every hash of values with seed 0 starts.
+const EMPTY_HASH_SEED_0: u64 = 0x2D06_8005_38D3_94C2;
+
 impl ValuesHasher {
     pub fn new(seed: u64) -> Self {
-        Self {
-            seed,
-            hash: hash_bytes(&[], seed),
-        }
+        let hash = match seed {
+            0 => EMPTY_HASH_SEED_0,
+            seed => hash_bytes(&[], seed),
+        };
+        Self { seed, hash }
     }
 
     pub fn add(&mut self, value: ValueRef<'_>) {
@@ -100,6 +105,100 @@ impl ValuesHasher {
     }
 }
 
+/// Builds hashers for maps keyed by a hash from this module, which is
+/// already well mixed, so hashing it again would only cost time.
+#[derive(Clone, Copy, Default)]
+pub struct HashedKeys;
+
+impl std::hash::BuildHasher for HashedKeys {
+    type Hasher = HashedKeyHasher;
+
+    fn build_hasher(&self) -> HashedKeyHasher {
+        HashedKeyHasher(0)
+    }
+}
+
+/// Passes a `u64` key through as its own hash. See [`HashedKeys`].
+#[derive(Default)]
+pub struct HashedKeyHasher(u64);
+
+impl std::hash::Hasher for HashedKeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
+        }
+    }
+
+    fn write_u64(&mut self, v: u64) {
+        self.0 = v;
+    }
+}
+
+/// Builds hashers for maps keyed by small integers, such as page and frame
+/// ids and rids, which need mixing but not a hash that resists attacks.
+#[derive(Clone, Copy, Default)]
+pub struct IntKeys;
+
+impl std::hash::BuildHasher for IntKeys {
+    type Hasher = IntKeyHasher;
+
+    fn build_hasher(&self) -> IntKeyHasher {
+        IntKeyHasher(0)
+    }
+}
+
+/// Mixes each integer in with a rotate and a multiply, as FxHash does. See
+/// [`IntKeys`].
+#[derive(Default)]
+pub struct IntKeyHasher(u64);
+
+impl IntKeyHasher {
+    #[inline]
+    fn add(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl std::hash::Hasher for IntKeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.add(u64::from(byte));
+        }
+    }
+
+    fn write_u16(&mut self, v: u16) {
+        self.add(u64::from(v));
+    }
+
+    fn write_u32(&mut self, v: u32) {
+        self.add(u64::from(v));
+    }
+
+    fn write_i32(&mut self, v: i32) {
+        self.add(v as u32 as u64);
+    }
+
+    fn write_u64(&mut self, v: u64) {
+        self.add(v);
+    }
+
+    fn write_i64(&mut self, v: i64) {
+        self.add(v as u64);
+    }
+
+    fn write_usize(&mut self, v: usize) {
+        self.add(v as u64);
+    }
+}
+
 /// The partition, out of `partitions`, a row whose key hashes to `hash`
 /// goes to.
 pub fn partition_index(hash: u64, partitions: usize) -> usize {
@@ -107,12 +206,13 @@ pub fn partition_index(hash: u64, partitions: usize) -> usize {
 }
 
 /// Mixes two hashes into one. The order matters: `(a, b)` and `(b, a)` give
-/// different hashes.
+/// different hashes. Both are already well mixed, so a multiply-fold, as in
+/// wyhash, is enough and much quicker than hashing their bytes again.
+#[inline]
 pub fn combine_hashes(left: u64, right: u64) -> u64 {
-    let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&left.to_le_bytes());
-    bytes[8..].copy_from_slice(&right.to_le_bytes());
-    xxh3_64(&bytes)
+    let product =
+        u128::from(left ^ 0xa076_1d64_78bd_642f) * u128::from(right ^ 0xe703_7ed1_a0b4_28db);
+    (product as u64) ^ ((product >> 64) as u64)
 }
 
 #[cfg(test)]

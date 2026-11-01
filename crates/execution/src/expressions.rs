@@ -32,7 +32,7 @@ pub use logic::{LogicExpr, LogicOp};
 pub use string::{StringExpr, StringOp};
 pub use unary::{UnaryExpr, UnaryOp};
 
-use common::{Column, DataType, Schema, Tuple, Value, ValueRef};
+use common::{Column, ColumnReader, DataType, Schema, Tuple, Value, ValueRef};
 use enum_dispatch::enum_dispatch;
 
 use crate::Result;
@@ -113,6 +113,32 @@ pub fn evaluate_in_place<'a>(
         AbstractExpr::ConstantExpr(constant) => Evaluated::InPlace(constant.value().as_value_ref()),
         expr => Evaluated::Computed(expr.evaluate(tuple, schema)?),
     })
+}
+
+/// A reader of `expr` on rows of `schema`, if it is a column of the only
+/// input, for [`evaluate_with`].
+pub fn column_reader(expr: &AbstractExpr, schema: &Schema) -> Option<ColumnReader> {
+    match expr {
+        AbstractExpr::ColumnValueExpr(column) if column.tuple_idx() == 0 => {
+            ColumnReader::new(schema, column.col_idx())
+        }
+        _ => None,
+    }
+}
+
+/// [`evaluate_in_place`], reading the column with `reader` if `expr` is one
+/// ([`column_reader`]), which saves finding it in the tuple on every row.
+#[inline]
+pub fn evaluate_with<'a>(
+    reader: Option<ColumnReader>,
+    expr: &'a AbstractExpr,
+    tuple: &'a Tuple,
+    schema: &Schema,
+) -> Result<Evaluated<'a>> {
+    match reader {
+        Some(reader) => Ok(Evaluated::InPlace(reader.read(tuple)?)),
+        None => evaluate_in_place(expr, tuple, schema),
+    }
 }
 
 /// [`evaluate_in_place`] on a pair of tuples from the two inputs of a join,

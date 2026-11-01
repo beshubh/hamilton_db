@@ -32,14 +32,19 @@ impl ComparisonOp {
         let Some(ordering) = left.compare(right)? else {
             return Ok(Value::Null);
         };
-        Ok(Value::Bool(match self {
+        Ok(Value::Bool(self.holds(ordering)))
+    }
+
+    /// Whether `left <op> right` is true for two values ordered `ordering`.
+    pub fn holds(self, ordering: std::cmp::Ordering) -> bool {
+        match self {
             ComparisonOp::Eq => ordering.is_eq(),
             ComparisonOp::NotEq => ordering.is_ne(),
             ComparisonOp::Lt => ordering.is_lt(),
             ComparisonOp::LtEq => ordering.is_le(),
             ComparisonOp::Gt => ordering.is_gt(),
             ComparisonOp::GtEq => ordering.is_ge(),
-        }))
+        }
     }
 }
 

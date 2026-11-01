@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+use common::hash::IntKeys;
 use common::{PageId, Rid, Schema, TXN_UNCOMMITTED_BIT, Tuple, TxnId};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 
@@ -97,7 +98,7 @@ pub struct Transaction {
     watermark: Arc<Watermark>,
     /// Set once this is the oldest running transaction, which it then stays.
     oldest: AtomicBool,
-    write_set: Mutex<HashMap<PageId, TableWrites>>,
+    write_set: Mutex<HashMap<PageId, TableWrites, IntKeys>>,
     /// The manager's entry lock; see `index_versions`.
     entry_lock: Arc<RwLock<()>>,
     /// The index entries this transaction added or found already there,
@@ -114,7 +115,7 @@ pub struct Transaction {
 struct TableWrites {
     heap: Arc<TableHeap>,
     schema: Schema,
-    rids: HashSet<Rid>,
+    rids: HashSet<Rid, IntKeys>,
 }
 
 /// An index entry a transaction needs: one it `added`, or found already in
@@ -139,7 +140,7 @@ impl Transaction {
             read_ts,
             watermark,
             oldest: AtomicBool::new(false),
-            write_set: Mutex::new(HashMap::new()),
+            write_set: Mutex::new(HashMap::default()),
             entry_lock,
             index_writes: Mutex::new(Vec::new()),
             retired: Mutex::new(Vec::new()),
@@ -499,7 +500,7 @@ impl Transaction {
             .or_insert_with(|| TableWrites {
                 heap: Arc::clone(heap),
                 schema: schema.clone(),
-                rids: HashSet::new(),
+                rids: HashSet::default(),
             })
             .rids
             .insert(rid);
@@ -535,5 +536,18 @@ impl TransactionScan {
         let _running = self.txn.running()?;
         self.iter
             .next_batch_at(self.txn.tid, &self.schema, &self.txn.undo, self.txn.reads())
+    }
+
+    /// [`next_batch`](Self::next_batch) into `rows`, reusing its tuples'
+    /// buffers. Returns `false`, leaving it empty, once the scan is done.
+    pub fn next_batch_into(&mut self, rows: &mut Vec<TableRow>) -> Result<bool> {
+        let _running = self.txn.running()?;
+        self.iter.next_batch_at_into(
+            self.txn.tid,
+            &self.schema,
+            &self.txn.undo,
+            self.txn.reads(),
+            rows,
+        )
     }
 }
