@@ -532,15 +532,20 @@ impl Transaction {
             }
             return Ok(true);
         }
-        let mut others = Vec::new();
+        // The rows behind each primary key, all in one buffer: a row found
+        // twice, after its primary key changed, is only checked twice.
+        let primary_key = table.primary_key_index();
+        let mut found = Vec::new();
         for locator in &holders {
-            table.rids_into(locator, &mut others)?;
+            let RowLocator::PrimaryKey(pk) = locator else {
+                unreachable!("checked the locator kind");
+            };
+            primary_key.scan_key(pk, &mut found)?;
         }
-        others.sort_unstable();
-        others.dedup();
-        // Not `locator`: an entry storing another primary key can lead back
-        // to `rid`, when this transaction changed the row's primary key.
-        for other in others {
+        for locator in &found {
+            let other = locator.as_rid().expect("the primary key index stores rids");
+            // By rid: a holder storing another primary key can lead back to
+            // `rid`, when this transaction changed the row's primary key.
             if other != rid && self.has_key_at(table, index, key, other)? {
                 return Ok(false);
             }

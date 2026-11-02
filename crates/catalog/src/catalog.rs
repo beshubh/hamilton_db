@@ -434,7 +434,8 @@ impl Catalog {
         }
         // As Postgres does, the primary key comes first, and a constraint
         // copying an earlier one's key and NULL handling is dropped, giving
-        // its name to the earlier one if that has none.
+        // its name to the earlier one if that has none. Unlike Postgres, the
+        // primary key's NOT NULL columns match either NULL handling.
         let mut planned: Vec<PlannedIndex> = Vec::new();
         if !primary_key.is_empty() {
             let key = resolve_key(name, &schema, primary_key)?;
@@ -468,7 +469,9 @@ impl Catalog {
             }
             let kind = constraint.kind();
             let copied = planned.iter_mut().find(|prior| {
-                prior.key == key && nulls_distinct(prior.kind) == nulls_distinct(kind)
+                prior.key == key
+                    && (prior.kind.is_primary_key()
+                        || nulls_distinct(prior.kind) == nulls_distinct(kind))
             });
             match copied {
                 Some(prior) => {
@@ -1329,9 +1332,10 @@ mod tests {
         assert_eq!(after, before);
     }
 
-    /// As in Postgres, a constraint with the key and NULL handling of the
-    /// primary key or of an earlier constraint gets no index of its own, and
-    /// gives its name to the earlier one if that has none.
+    /// As in Postgres, a constraint with the key and NULL handling of an
+    /// earlier one gets no index of its own, and gives its name to the
+    /// earlier one if that has none. The primary key, whose columns are NOT
+    /// NULL, matches either NULL handling.
     #[test]
     fn copied_unique_constraints_share_one_index() {
         let db = Db::new(8);
@@ -1357,7 +1361,6 @@ mod tests {
             names(&indexes),
             [
                 "users_id_uniq",
-                "users_id_key",
                 "users_name_uniq",
                 "users_name_key",
                 "users_score_name_key",
@@ -1406,14 +1409,17 @@ mod tests {
         let db = Db::new(8);
         let table = "t".repeat(100);
         let column = "c".repeat(100);
-        let schema = Schema::new(vec![Column::new(&column, DataType::Int, false)]);
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::Int, false),
+            Column::new(&column, DataType::Int, false),
+        ]);
         db.catalog
             .create_table_with_constraints(
                 &table,
                 schema,
-                &[&column],
+                &["id"],
                 &[],
-                &[unique(&[&column], false)],
+                &[unique(&[&column], true)],
             )
             .unwrap();
         let indexes = db.catalog.table_indexes(&table);

@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use hamilton_server::{Database, Server, ShutdownHandle};
 use tempfile::TempDir;
@@ -20,8 +21,19 @@ impl Running {
         Self::start_in(TempDir::new().unwrap())
     }
 
+    /// A server whose statements give up retrying after `timeout`.
+    fn start_with_conflict_timeout(timeout: Duration) -> Self {
+        let dir = TempDir::new().unwrap();
+        let db = Database::open(dir.path().join("test.db")).unwrap();
+        Self::serve(dir, db.with_conflict_timeout(timeout))
+    }
+
     fn start_in(dir: TempDir) -> Self {
         let db = Database::open(dir.path().join("test.db")).unwrap();
+        Self::serve(dir, db)
+    }
+
+    fn serve(dir: TempDir, db: Database) -> Self {
         let server = Server::bind(db, "127.0.0.1:0").unwrap();
         let (addr, handle) = (server.local_addr(), server.shutdown_handle());
         let thread = thread::spawn(move || server.run());
@@ -341,6 +353,27 @@ fn create_unique_index_waits_for_an_uncommitted_duplicate() {
     server.stop();
 }
 
+/// The duplicate is held until CREATE UNIQUE INDEX returns, so it can only
+/// return by retrying until the conflict timeout runs out.
+#[test]
+fn create_unique_index_retries_until_the_conflict_timeout() {
+    const TIMEOUT: Duration = Duration::from_millis(300);
+    let server = Running::start_with_conflict_timeout(TIMEOUT);
+    let (mut a, mut b) = (server.connect(), server.connect());
+    query(&mut a, "CREATE TABLE t (v INT)");
+    query(&mut a, "INSERT INTO t VALUES (1)");
+    query(&mut a, "BEGIN; INSERT INTO t VALUES (1)");
+    let started = Instant::now();
+    assert_eq!(
+        error_code(&mut b, "CREATE UNIQUE INDEX t_v ON t (v)"),
+        "40001"
+    );
+    assert!(started.elapsed() >= TIMEOUT, "{:?}", started.elapsed());
+    query(&mut a, "ROLLBACK");
+    query(&mut b, "CREATE UNIQUE INDEX t_v ON t (v)");
+    server.stop();
+}
+
 /// Has `b` create a unique index on `t (v)` while `a` holds an uncommitted
 /// duplicate of `v = 1`, which `a` then ends with `end`. Returns the SQLSTATE
 /// `b` got, if any.
@@ -348,7 +381,9 @@ fn create_while_held(a: &mut Client, b: &mut Client, end: &str) -> Option<String
     query(a, "BEGIN; INSERT INTO t VALUES (1)");
     thread::scope(|s| {
         let creator = s.spawn(|| b.simple_query("CREATE UNIQUE INDEX t_v ON t (v)"));
-        thread::sleep(std::time::Duration::from_millis(50));
+        // Best-effort: the CREATE may not have reached the server yet; the
+        // test below shows the wait deterministically.
+        thread::sleep(Duration::from_millis(200));
         assert!(!creator.is_finished(), "CREATE UNIQUE INDEX didn't wait");
         query(a, end);
         creator

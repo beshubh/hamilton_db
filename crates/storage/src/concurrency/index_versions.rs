@@ -84,32 +84,23 @@ impl IndexedTable {
     /// The rids that `locator` may lead to: itself, or each one the primary
     /// key index holds the primary key for.
     pub fn rids(&self, locator: &RowLocator) -> Result<Vec<Rid>> {
-        let mut rids = Vec::new();
-        self.rids_into(locator, &mut rids)?;
-        Ok(rids)
-    }
-
-    /// Appends `rids(locator)` to `rids`.
-    pub fn rids_into(&self, locator: &RowLocator, rids: &mut Vec<Rid>) -> Result<()> {
         let pk = match locator {
-            RowLocator::Rid(rid) => {
-                rids.push(*rid);
-                return Ok(());
-            }
+            RowLocator::Rid(rid) => return Ok(vec![*rid]),
             RowLocator::PrimaryKey(pk) => pk,
         };
-        let index = self
-            .primary_key
-            .as_ref()
-            .expect("only a table with a primary key has indexes that store it");
         let mut found = Vec::new();
-        index.scan_key(pk, &mut found)?;
-        rids.extend(
-            found
-                .iter()
-                .map(|locator| locator.as_rid().expect("the primary key index stores rids")),
-        );
-        Ok(())
+        self.primary_key_index().scan_key(pk, &mut found)?;
+        Ok(found
+            .iter()
+            .map(|locator| locator.as_rid().expect("the primary key index stores rids"))
+            .collect())
+    }
+
+    /// The primary key index, which the table must have.
+    pub fn primary_key_index(&self) -> &Index {
+        self.primary_key
+            .as_ref()
+            .expect("only a table with a primary key has indexes that store it")
     }
 }
 
