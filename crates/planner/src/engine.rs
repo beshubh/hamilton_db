@@ -72,8 +72,10 @@ pub const DEFAULT_CONFLICT_TIMEOUT: Duration = Duration::from_secs(2);
 /// What a statement produced.
 #[derive(Debug, PartialEq)]
 pub enum Output {
-    /// The rows of a SELECT or EXPLAIN.
+    /// The rows of a SELECT or EXPLAIN, whose `command` is `SELECT`, or of
+    /// an INSERT ... RETURNING, whose `command` is `INSERT`.
     Rows {
+        command: &'static str,
         columns: Vec<Column>,
         rows: Vec<Vec<Value>>,
     },
@@ -364,18 +366,23 @@ impl ExecutionEngine {
                 );
             }
         }
-        let command = match bound {
+        let (command, returns_rows) = match bound {
             BoundStatement::CreateTable(_) => return Ok(Output::Done("CREATE TABLE")),
             BoundStatement::CreateIndex(_) => return Ok(Output::Done("CREATE INDEX")),
-            BoundStatement::Select(_) | BoundStatement::Explain(_) => {
-                let columns = executor.get_output_schema().columns().to_vec();
-                return Ok(Output::Rows { columns, rows });
-            }
-            BoundStatement::Insert(_) => "INSERT",
-            BoundStatement::Update(_) => "UPDATE",
-            BoundStatement::Delete(_) => "DELETE",
+            BoundStatement::Select(_) | BoundStatement::Explain(_) => ("SELECT", true),
+            BoundStatement::Insert(insert) => ("INSERT", !insert.returning.is_empty()),
+            BoundStatement::Update(_) => ("UPDATE", false),
+            BoundStatement::Delete(_) => ("DELETE", false),
             BoundStatement::Transaction(_) => unreachable!("transaction commands are not planned"),
         };
+        if returns_rows {
+            let columns = executor.get_output_schema().columns().to_vec();
+            return Ok(Output::Rows {
+                command,
+                columns,
+                rows,
+            });
+        }
         match rows.as_slice() {
             [row] => match row.as_slice() {
                 [Value::BigInt(count)] => Ok(Output::Count {

@@ -168,6 +168,7 @@ impl<'a> Rewriter<'a> {
             // row; subqueries are bound on their own rows.
             kind @ (BoundExprKind::Column { .. }
             | BoundExprKind::Constant(_)
+            | BoundExprKind::NextIdentity(_)
             | BoundExprKind::Subquery(_)
             | BoundExprKind::Exists { .. }) => kind,
             BoundExprKind::Aggregate(_) | BoundExprKind::Window(_) => {

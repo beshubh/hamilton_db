@@ -341,6 +341,7 @@ fn dropping_the_engine_rolls_back_an_open_block() {
     assert_eq!(
         outputs,
         [Output::Rows {
+            command: "SELECT",
             columns: vec![common::Column::new("a", common::DataType::Int, true)],
             rows: vec![],
         }]

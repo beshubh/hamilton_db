@@ -5,9 +5,9 @@ use std::io::{self, BufReader, Write};
 use std::net::TcpStream;
 
 use catalog::{Catalog, MAX_NAME_LEN};
-use common::{Column, DataType, Value};
+use common::{Column, DataType, Value, ValueError};
 use execution::ExecutionError;
-use planner::{EngineError, Output, TransactionStatus};
+use planner::{EngineError, Output, PlannerError, TransactionStatus};
 use storage::StorageError;
 use wire::backend::{self, DataRow, Field};
 use wire::frontend::{self, Message, Startup};
@@ -16,12 +16,14 @@ use wire::oid;
 use crate::database::{Database, Error, Session};
 
 /// What the server tells clients it is. Clients such as psql read the
-/// version to decide what they may send.
+/// version to decide what they may send, and Django sets the time zone with
+/// `set_config` unless `TimeZone` already names the one it wants.
 const PARAMETERS: &[(&str, &str)] = &[
     ("server_version", "16.0"),
     ("server_encoding", "UTF8"),
     ("client_encoding", "UTF8"),
     ("DateStyle", "ISO, MDY"),
+    ("TimeZone", "UTC"),
     ("integer_datetimes", "on"),
     ("standard_conforming_strings", "on"),
 ];
@@ -130,7 +132,11 @@ fn query(catalog: &Catalog, session: &mut Session, sql: &str, out: &mut Vec<u8>)
 
 fn write_output(out: &mut Vec<u8>, output: &Output) {
     match output {
-        Output::Rows { columns, rows } => {
+        Output::Rows {
+            command,
+            columns,
+            rows,
+        } => {
             let fields: Vec<Field> = columns.iter().map(field).collect();
             backend::row_description(out, &fields);
             for row in rows {
@@ -144,17 +150,20 @@ fn write_output(out: &mut Vec<u8>, output: &Output) {
                 }
                 data.finish();
             }
-            backend::command_complete(out, &format!("SELECT {}", rows.len()));
+            backend::command_complete(out, &command_tag(command, rows.len()));
         }
-        // Postgres puts an oid, always 0 now, before INSERT's count.
-        Output::Count {
-            command: "INSERT",
-            count,
-        } => backend::command_complete(out, &format!("INSERT 0 {count}")),
         Output::Count { command, count } => {
-            backend::command_complete(out, &format!("{command} {count}"))
+            backend::command_complete(out, &command_tag(command, *count))
         }
         Output::Done(command) => backend::command_complete(out, command),
+    }
+}
+
+fn command_tag(command: &str, count: impl std::fmt::Display) -> String {
+    match command {
+        // Postgres puts an oid, always 0 now, before INSERT's count.
+        "INSERT" => format!("INSERT 0 {count}"),
+        command => format!("{command} {count}"),
     }
 }
 
@@ -164,6 +173,7 @@ fn field(column: &Column) -> Field {
         DataType::BigInt => (oid::INT8, 8, -1),
         DataType::Double => (oid::FLOAT8, 8, -1),
         DataType::Bool => (oid::BOOL, 1, -1),
+        DataType::Timestamptz => (oid::TIMESTAMPTZ, 8, -1),
         // A VARCHAR's modifier is its limit plus 4; some limits are too big.
         DataType::Varchar(max_len) => {
             let modifier = i32::try_from(max_len).ok().and_then(|n| n.checked_add(4));
@@ -191,6 +201,16 @@ fn status(session: &Session) -> wire::TransactionStatus {
 /// they can retry on a serialization failure, say.
 fn sqlstate(err: &Error) -> &'static str {
     let Error::Engine(err) = err;
+    // A bad timestamp literal fails while binding, other bad text when run.
+    if let EngineError::Planner(PlannerError::Value(value))
+    | EngineError::Execution(ExecutionError::Value(value)) = err
+    {
+        match value {
+            ValueError::InvalidTimestamp(_) => return "22007", // invalid_datetime_format
+            ValueError::TimestampOutOfRange(_) => return "22008", // datetime_field_overflow
+            _ => {}
+        }
+    }
     match err {
         EngineError::Parse(_) => "42601",                 // syntax_error
         EngineError::Planner(_) => "42000",               // syntax_error_or_access_rule_violation
@@ -242,6 +262,7 @@ fn schema(catalog: &Catalog) -> [Output; 2] {
     let text = |label: &str| Column::new(label, DataType::Varchar(u32::MAX), false);
     [
         Output::Rows {
+            command: "SELECT",
             columns: vec![
                 name("table"),
                 name("column"),
@@ -251,6 +272,7 @@ fn schema(catalog: &Catalog) -> [Output; 2] {
             rows: columns,
         },
         Output::Rows {
+            command: "SELECT",
             columns: vec![
                 name("index"),
                 name("table"),

@@ -43,10 +43,12 @@ impl Executor for CreateTableExecutor {
             self.done = true;
             let primary_key: Vec<&str> =
                 self.plan.primary_key().iter().map(String::as_str).collect();
-            self.ctx.catalog().create_table(
+            let identity: Vec<&str> = self.plan.identity().iter().map(String::as_str).collect();
+            self.ctx.catalog().create_table_with_identity(
                 self.plan.table_name(),
                 self.plan.table_schema().clone(),
                 &primary_key,
+                &identity,
             )?;
         }
         Ok(false)

@@ -97,6 +97,9 @@ pub enum PlannerError {
     #[error("subquery must return only one column, found {found}")]
     SubqueryColumns { found: usize },
 
+    #[error("identity column {column} must be INT or BIGINT, not {found}")]
+    IdentityType { column: String, found: DataType },
+
     /// Something the parser accepts but the binder or planner does not
     /// handle yet, such as a correlated subquery.
     #[error("{0} is not supported")]

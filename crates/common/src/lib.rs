@@ -8,6 +8,7 @@ pub mod hash;
 pub mod ids;
 pub mod rid;
 pub mod schema;
+pub mod timestamp;
 pub mod tuple;
 pub mod value;
 

@@ -35,6 +35,7 @@ pub mod oid {
     pub const TEXT: u32 = 25;
     pub const FLOAT8: u32 = 701;
     pub const VARCHAR: u32 = 1043;
+    pub const TIMESTAMPTZ: u32 = 1184;
 }
 
 /// Messages longer than this are refused before anything is allocated for

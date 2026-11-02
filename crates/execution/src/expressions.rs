@@ -14,6 +14,7 @@ mod constant;
 mod display;
 mod is_null;
 mod logic;
+mod next_value;
 mod string;
 #[cfg(test)]
 #[path = "../tests/util/expressions.rs"]
@@ -29,6 +30,7 @@ pub use constant::ConstantExpr;
 pub use display::ExprInput;
 pub use is_null::IsNullExpr;
 pub use logic::{LogicExpr, LogicOp};
+pub use next_value::NextValueExpr;
 pub use string::{StringExpr, StringOp};
 pub use unary::{UnaryExpr, UnaryOp};
 
@@ -80,6 +82,7 @@ pub enum AbstractExpr {
     StringExpr,
     ArrayExpr,
     CastExpr,
+    NextValueExpr,
 }
 
 /// What [`evaluate_in_place`] gives.
@@ -141,6 +144,7 @@ pub(crate) fn type_name(data_type: DataType) -> &'static str {
         DataType::Double => "DOUBLE",
         DataType::Bool => "BOOL",
         DataType::Varchar(_) => "VARCHAR",
+        DataType::Timestamptz => "TIMESTAMPTZ",
         DataType::Array => "ARRAY",
     }
 }

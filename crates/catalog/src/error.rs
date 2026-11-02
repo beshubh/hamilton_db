@@ -37,6 +37,9 @@ pub enum CatalogError {
     #[error("primary key column {0} must be NOT NULL")]
     NullablePrimaryKey(String),
 
+    #[error("identity column {0} must be a NOT NULL INT or BIGINT")]
+    InvalidIdentity(String),
+
     #[error("name {0:?} is empty or longer than {MAX_NAME_LEN} bytes")]
     InvalidName(String),
 

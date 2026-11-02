@@ -1,11 +1,13 @@
+use common::value::can_cast;
 use common::{Column, DataType, Schema, Tuple, Value, ValueError};
 
-use super::{AbstractExpr, Expr, UNNAMED_COLUMN, is_number, type_name};
+use super::{AbstractExpr, Expr, UNNAMED_COLUMN, type_name};
 use crate::Result;
 
-/// Converts a number to INT, BIGINT or DOUBLE, as [`Value::cast_number`]
-/// does: a DOUBLE is rounded to an integer, and a value that does not fit
-/// fails with [`ValueError::Overflow`]. NULL stays NULL.
+/// Converts a value to another type as [`Value::cast`] does: a number to
+/// INT, BIGINT or DOUBLE (a DOUBLE is rounded to an integer, and a value
+/// that does not fit fails with [`ValueError::Overflow`]), or VARCHAR text
+/// to TIMESTAMPTZ. NULL stays NULL.
 #[derive(Clone, Debug)]
 pub struct CastExpr {
     /// Always `[arg]`.
@@ -14,10 +16,10 @@ pub struct CastExpr {
 }
 
 impl CastExpr {
-    /// Fails unless `arg` and `to` are numeric types.
+    /// Fails unless [`can_cast`] allows the conversion.
     pub fn new(arg: AbstractExpr, to: DataType) -> Result<Self> {
         let ty = arg.return_type();
-        if !is_number(ty.data_type) || !is_number(to) {
+        if !can_cast(ty.data_type, to) {
             return Err(ValueError::InvalidOperands {
                 op: "CAST",
                 left: type_name(ty.data_type),
@@ -33,7 +35,7 @@ impl CastExpr {
     }
 
     fn cast(&self, value: Value) -> Result<Value> {
-        Ok(value.cast_number(self.return_type.data_type)?)
+        Ok(value.cast(self.return_type.data_type)?)
     }
 }
 
@@ -111,6 +113,27 @@ mod tests {
         );
         let round = cast(cast(column(1), DataType::Double), DataType::Int);
         assert_eq!(eval(&round, &ints(None, -3)).unwrap(), Value::Int(-3));
+    }
+
+    #[test]
+    fn parses_text_into_timestamps() {
+        let ts = cast(
+            constant(Value::from("2026-11-02 10:51:00+01"), DataType::Varchar(32)),
+            DataType::Timestamptz,
+        );
+        assert_eq!(ts.return_type().data_type, DataType::Timestamptz);
+        assert_eq!(
+            eval(&ts, &ints(None, 0)).unwrap().to_string(),
+            "2026-11-02 09:51:00+00"
+        );
+        let bad = cast(
+            constant(Value::from("later"), DataType::Varchar(32)),
+            DataType::Timestamptz,
+        );
+        assert!(matches!(
+            eval(&bad, &ints(None, 0)),
+            Err(ExecutionError::Value(ValueError::InvalidTimestamp(_)))
+        ));
     }
 
     #[test]

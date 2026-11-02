@@ -42,6 +42,13 @@ pub enum ValueError {
     #[error("division by zero")]
     DivisionByZero,
 
+    #[error("invalid input syntax for type timestamptz: \"{0}\"")]
+    InvalidTimestamp(String),
+
+    /// A timestamp outside the years 1 to 9999.
+    #[error("timestamp out of range: \"{0}\"")]
+    TimestampOutOfRange(String),
+
     /// A row has a different number of values than its schema has columns.
     #[error("expected {expected} values, found {found}")]
     ColumnCountMismatch { expected: usize, found: usize },

@@ -66,6 +66,7 @@ impl<'a> Planner<'a> {
                 create.schema.clone(),
                 create.primary_key.clone(),
             )
+            .with_identity(create.identity.clone())
             .into(),
             BoundStatement::CreateIndex(create) => {
                 CreateIndexPlan::new(&create.name, &create.table, create.columns.clone()).into()
@@ -169,7 +170,8 @@ impl<'a> Planner<'a> {
         Ok(Arc::new(plan.into()))
     }
 
-    /// `Insert(Values)`.
+    /// `Insert(Values)`, under a projection of the RETURNING items if there
+    /// are any.
     fn plan_insert(&self, insert: &BoundInsert) -> Result<AbstractPlanNode> {
         let rows = insert
             .rows
@@ -181,12 +183,21 @@ impl<'a> Planner<'a> {
             })
             .collect::<Result<_>>()?;
         let values = ValuesPlan::new(insert.table.schema.clone(), rows);
-        Ok(InsertPlan::new(
+        let plan = InsertPlan::new(
             insert.table.oid,
             &insert.table.name,
             Arc::new(values.into()),
-        )
-        .into())
+        );
+        if insert.returning.is_empty() {
+            return Ok(plan.into());
+        }
+        let plan = plan.with_returning(insert.table.schema.clone());
+        let exprs = insert
+            .returning
+            .iter()
+            .map(|item| plan_expr(&item.expr, Inputs::One))
+            .collect::<Result<_>>()?;
+        Ok(ProjectionPlan::new(insert.returning_schema(), exprs, Arc::new(plan.into())).into())
     }
 
     /// `Update(Filter(SeqScan))`, with a target expression for every column:

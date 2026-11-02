@@ -42,6 +42,7 @@ pub(crate) fn fixed_width(data_type: DataType) -> usize {
         DataType::Double => 8,
         DataType::Bool => 1,
         DataType::Varchar(_) => 4,
+        DataType::Timestamptz => 8,
         // Never holds a value: encoding a non-NULL ARRAY fails.
         DataType::Array => 0,
     }
@@ -220,6 +221,9 @@ fn encode(schema: &Schema, values: &[Value]) -> Result<Vec<u8>> {
             (DataType::Double, Value::Double(v)) => {
                 buf[at..at + 8].copy_from_slice(&v.to_le_bytes())
             }
+            (DataType::Timestamptz, Value::Timestamptz(v)) => {
+                buf[at..at + 8].copy_from_slice(&v.to_le_bytes())
+            }
             (DataType::Bool, Value::Bool(v)) => buf[at] = u8::from(*v),
             (DataType::Varchar(max), Value::Varchar(s)) => {
                 if s.len() > max as usize {
@@ -340,6 +344,7 @@ fn read_column<'a>(schema: &Schema, bytes: &'a [u8], idx: usize) -> Result<Value
         DataType::Int => ValueRef::Int(i32::from_le_bytes(read_array(bytes, at))),
         DataType::BigInt => ValueRef::BigInt(i64::from_le_bytes(read_array(bytes, at))),
         DataType::Double => ValueRef::Double(f64::from_le_bytes(read_array(bytes, at))),
+        DataType::Timestamptz => ValueRef::Timestamptz(i64::from_le_bytes(read_array(bytes, at))),
         DataType::Bool => match bytes[at] {
             0 => ValueRef::Bool(false),
             1 => ValueRef::Bool(true),
@@ -438,6 +443,22 @@ mod tests {
             Tuple::encode(&schema, &[Value::Int(1), Value::Double(1.0)]),
             Err(ValueError::TypeMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn round_trips_timestamps() {
+        let schema = Schema::new(vec![
+            Column::new("at", DataType::Timestamptz, true),
+            Column::new("id", DataType::Int, false),
+        ]);
+        for row in [
+            vec![Value::Timestamptz(1_793_616_660_123_456), Value::Int(1)],
+            vec![Value::Timestamptz(-1), Value::Int(2)],
+            vec![Value::Null, Value::Int(3)],
+        ] {
+            let tuple = Tuple::encode(&schema, &row).unwrap();
+            assert_eq!(tuple.decode(&schema).unwrap(), row);
+        }
     }
 
     #[test]
