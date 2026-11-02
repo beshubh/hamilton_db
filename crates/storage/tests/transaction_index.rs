@@ -1,13 +1,13 @@
 //! Index entries written through transactions, as `index_versions`
 //! describes: writes add entries and retire them, older readers still reach
 //! the versions they see, garbage collection removes retired entries no one
-//! needs, and a primary key is checked against rows rather than entries.
+//! needs, and a unique key is checked against rows rather than entries.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use common::{Column, DataType, Rid, Schema, Tuple, Value};
+use common::{Column, DataType, IndexKind, Rid, Schema, Tuple, Value};
 use storage::StorageError;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::concurrency::index_versions::IndexedTable;
@@ -23,6 +23,7 @@ use tempfile::TempDir;
 /// two indexes on `name`: `by_name` stores primary keys, `by_name_rid` rids.
 struct Db {
     _dir: TempDir,
+    bpm: Arc<BufferPoolManager>,
     tm: TransactionManager,
     table: Arc<IndexedTable>,
     pkey: Arc<Index>,
@@ -46,34 +47,48 @@ fn name_schema() -> Schema {
 }
 
 fn setup() -> Db {
+    setup_with(IndexKind::Plain)
+}
+
+/// `setup`, with both name indexes of kind `by_name`.
+fn setup_with(by_name: IndexKind) -> Db {
     let dir = TempDir::new().unwrap();
     let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
     let bpm = Arc::new(BufferPoolManager::new(16, dm));
-    let index = |name: &str, column, key_schema, is_primary_key, locator| {
-        let metadata = IndexMetadata::new(
-            name,
-            "t",
-            vec![column],
-            Arc::new(key_schema),
-            is_primary_key,
-            locator,
-        );
-        let index = BtreeIndex::new(metadata, bpm.new_page(), Arc::clone(&bpm)).unwrap();
-        Arc::new(Index::from(index))
-    };
-    let pkey = index("t_pkey", 0, id_schema(), true, LocatorKind::Rid);
-    let by_name = index("t_name", 1, name_schema(), false, LocatorKind::PrimaryKey);
-    let by_name_rid = index("t_name_rid", 1, name_schema(), false, LocatorKind::Rid);
+    let pkey = new_index(&bpm, "t_pkey", 0, IndexKind::PrimaryKey, LocatorKind::Rid);
+    let by_name = new_index(&bpm, "t_name", 1, by_name, LocatorKind::PrimaryKey);
+    let by_name_rid = new_index(
+        &bpm,
+        "t_name_rid",
+        1,
+        by_name.metadata().kind(),
+        LocatorKind::Rid,
+    );
     let heap = Arc::new(TableHeap::create(Arc::clone(&bpm)).unwrap());
     let table = Arc::new(IndexedTable::new(heap, schema(), Some(Arc::clone(&pkey))));
     Db {
         _dir: dir,
+        bpm,
         tm: TransactionManager::new(1),
         table,
         pkey,
         by_name,
         by_name_rid,
     }
+}
+
+/// An empty index on `column` of the table.
+fn new_index(
+    bpm: &Arc<BufferPoolManager>,
+    name: &str,
+    column: usize,
+    kind: IndexKind,
+    locator: LocatorKind,
+) -> Arc<Index> {
+    let key_schema = Schema::new(vec![schema().columns()[column].clone()]);
+    let metadata = IndexMetadata::new(name, "t", vec![column], Arc::new(key_schema), kind, locator);
+    let index = BtreeIndex::new(metadata, bpm.new_page(), Arc::clone(bpm)).unwrap();
+    Arc::new(Index::from(index))
 }
 
 fn row(id: i32, name: &str) -> Vec<Value> {
@@ -84,8 +99,8 @@ fn id_key(id: i32) -> Tuple {
     Tuple::encode(&id_schema(), &[Value::Int(id)]).unwrap()
 }
 
-fn name_key(name: &str) -> Tuple {
-    Tuple::encode(&name_schema(), &[Value::from(name)]).unwrap()
+fn name_key(name: impl Into<Value>) -> Tuple {
+    Tuple::encode(&name_schema(), &[name.into()]).unwrap()
 }
 
 /// An index entry: the index, the key and the locator.
@@ -95,14 +110,14 @@ impl Db {
     /// The entries of row `values` at `rid`, primary key first.
     fn entries(&self, values: &[Value], rid: Rid) -> Vec<Entry<'_>> {
         let (id, name) = match values {
-            [Value::Int(id), Value::Varchar(name)] => (*id, name.as_str()),
+            [Value::Int(id), name] => (*id, name.clone()),
             values => panic!("{values:?}"),
         };
         vec![
             (&self.pkey, id_key(id), RowLocator::Rid(rid)),
             (
                 &self.by_name,
-                name_key(name),
+                name_key(name.clone()),
                 RowLocator::PrimaryKey(id_key(id)),
             ),
             (&self.by_name_rid, name_key(name), RowLocator::Rid(rid)),
@@ -115,7 +130,7 @@ impl Db {
         let tuple = Tuple::encode(&schema(), values).unwrap();
         let rid = txn.insert(&self.table.heap, &schema(), &tuple)?;
         for (index, key, locator) in self.entries(values, rid) {
-            if !txn.insert_entry(&self.table, index, &key, &locator)? {
+            if !txn.insert_entry(&self.table, index, &key, &locator, rid)? {
                 return Ok(None);
             }
         }
@@ -142,7 +157,7 @@ impl Db {
                 continue;
             }
             txn.retire_entry(&self.table, index, &old_key, &old_locator)?;
-            if !txn.insert_entry(&self.table, index, &key, &locator)? {
+            if !txn.insert_entry(&self.table, index, &key, &locator, new_rid)? {
                 return Ok(None);
             }
         }
@@ -455,7 +470,10 @@ fn keys_can_shift_between_rows() {
                 if old_key != key || old_locator != locator {
                     txn.retire_entry(&db.table, index, &old_key, &old_locator)
                         .unwrap();
-                    assert!(txn.insert_entry(&db.table, index, &key, &locator).unwrap());
+                    assert!(
+                        txn.insert_entry(&db.table, index, &key, &locator, rid)
+                            .unwrap()
+                    );
                 }
             }
         }
@@ -566,7 +584,7 @@ fn an_ended_transaction_writes_no_entries() {
     db.tm.commit(&txn).unwrap();
     let locator = RowLocator::Rid(Rid::new(1, 0));
     assert!(
-        txn.insert_entry(&db.table, &db.pkey, &id_key(1), &locator)
+        txn.insert_entry(&db.table, &db.pkey, &id_key(1), &locator, Rid::new(1, 0))
             .is_err()
     );
     assert!(
@@ -574,4 +592,93 @@ fn an_ended_transaction_writes_no_entries() {
             .is_err()
     );
     assert_eq!(db.entry_count(), 0);
+}
+
+fn null_row(id: i32) -> Vec<Value> {
+    vec![Value::Int(id), Value::Null]
+}
+
+const UNIQUE: IndexKind = IndexKind::Unique {
+    nulls_distinct: true,
+};
+
+#[test]
+fn a_unique_key_the_inserter_sees_is_taken() {
+    let db = setup_with(UNIQUE);
+    db.run(|txn| db.insert(txn, &row(1, "a")).unwrap().unwrap());
+
+    let txn = db.tm.begin();
+    assert_eq!(db.insert(&txn, &row(2, "a")).unwrap(), None);
+    db.tm.abort(&txn).unwrap();
+    db.run(|txn| db.insert(txn, &row(2, "b")).unwrap().unwrap());
+}
+
+#[test]
+fn null_keys_never_conflict_unless_not_distinct() {
+    let db = setup_with(UNIQUE);
+    db.run(|txn| {
+        for id in 1..=3 {
+            db.insert(txn, &null_row(id)).unwrap().unwrap();
+        }
+    });
+
+    let db = setup_with(IndexKind::Unique {
+        nulls_distinct: false,
+    });
+    db.run(|txn| db.insert(txn, &null_row(1)).unwrap().unwrap());
+    let txn = db.tm.begin();
+    assert_eq!(db.insert(&txn, &null_row(2)).unwrap(), None);
+    db.tm.abort(&txn).unwrap();
+}
+
+/// The entry for the row's old primary key leads back to the row itself,
+/// which must not count as another row with the name.
+#[test]
+fn changing_the_primary_key_keeps_a_unique_key() {
+    let db = setup_with(UNIQUE);
+    let rid = db.run(|txn| db.insert(txn, &row(1, "a")).unwrap().unwrap());
+    db.run(|txn| db.update(txn, rid, &row(2, "a")).unwrap().unwrap());
+    db.run(|txn| assert_eq!(db.find_row(txn, &row(2, "a")), [row(2, "a")]));
+}
+
+#[test]
+fn a_unique_key_an_uncommitted_insert_holds_conflicts() {
+    let db = setup_with(UNIQUE);
+    let first = db.tm.begin();
+    let second = db.tm.begin();
+    db.insert(&first, &row(1, "a")).unwrap().unwrap();
+    let err = db.insert(&second, &row(2, "a")).unwrap_err();
+    assert!(matches!(err, StorageError::Conflict { .. }), "{err:?}");
+    db.tm.abort(&second).unwrap();
+
+    db.tm.abort(&first).unwrap();
+    db.run(|txn| db.insert(txn, &row(2, "a")).unwrap().unwrap());
+}
+
+/// `build_index` on a unique index: rows that share a key are reported, and
+/// a row whose writer hasn't committed is a conflict.
+#[test]
+fn building_a_unique_index_checks_the_rows() {
+    let db = setup();
+    let build = |name| {
+        let index = new_index(&db.bpm, name, 1, UNIQUE, LocatorKind::PrimaryKey);
+        let txn = db.tm.begin();
+        let built = txn.build_index(&db.table, &index);
+        db.tm.commit(&txn).unwrap();
+        built
+    };
+    db.run(|txn| {
+        db.insert(txn, &row(1, "a")).unwrap().unwrap();
+        db.insert(txn, &null_row(2)).unwrap().unwrap();
+        db.insert(txn, &null_row(3)).unwrap().unwrap();
+    });
+    assert_eq!(build("u1").unwrap(), None);
+
+    let writer = db.tm.begin();
+    db.insert(&writer, &row(4, "a")).unwrap().unwrap();
+    let err = build("u2").unwrap_err();
+    assert!(matches!(err, StorageError::Conflict { .. }), "{err:?}");
+
+    db.tm.commit(&writer).unwrap();
+    assert_eq!(build("u3").unwrap(), Some(name_key("a")));
 }

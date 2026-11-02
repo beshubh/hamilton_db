@@ -4,11 +4,14 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.db import connection
+from unittest import mock
+
+from django.db import IntegrityError, connection
 from django.test import TransactionTestCase, override_settings
 from django.urls import reverse
 from PIL import Image
 
+from .forms import UserForm
 from .models import Tweet, User
 
 MEDIA_ROOT = tempfile.mkdtemp(prefix="social-media-")
@@ -76,6 +79,22 @@ class SocialTests(TransactionTestCase):
         response = self.client.post(
             reverse("users"), {"username": "alice", "display_name": "Other", "bio": ""}
         )
+        self.assertContains(response, "That username is taken.")
+        self.assertEqual(User.objects.count(), 1)
+
+    def test_the_database_rejects_a_taken_username(self):
+        self.make_user("alice")
+        with self.assertRaises(IntegrityError):
+            self.make_user("alice")
+        self.assertEqual(User.objects.count(), 1)
+
+    def test_a_signup_that_loses_the_race_for_a_name_is_told_so(self):
+        # As if another signup took the name after the form checked it.
+        self.make_user("alice")
+        with mock.patch.object(UserForm, "validate_unique"):
+            response = self.client.post(
+                reverse("users"), {"username": "alice", "display_name": "Other", "bio": ""}
+            )
         self.assertContains(response, "That username is taken.")
         self.assertEqual(User.objects.count(), 1)
 

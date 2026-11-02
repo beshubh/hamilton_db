@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use catalog::Catalog;
-use common::{Tuple, Value};
+use common::{IndexKind, Tuple, Value};
 use execution::ExecutionError;
 use execution::execution_context::{self, ExecutionSettings};
 use planner::{Binder, EngineError, ExecutionEngine, Output, PlannerError};
@@ -136,19 +136,13 @@ fn create_table_with_primary_key_and_index() {
     let indexes = catalog.table_indexes("users");
     let summary: Vec<_> = indexes
         .iter()
-        .map(|index| {
-            (
-                index.name.as_str(),
-                index.key_columns.clone(),
-                index.is_primary_key,
-            )
-        })
+        .map(|index| (index.name.as_str(), index.key_columns.clone(), index.kind))
         .collect();
     assert_eq!(
         summary,
         [
-            ("users_pkey", vec![0], true),
-            ("users_name", vec![1], false)
+            ("users_pkey", vec![0], IndexKind::PrimaryKey),
+            ("users_name", vec![1], IndexKind::Plain)
         ]
     );
 }
@@ -194,6 +188,91 @@ fn primary_key_rejects_duplicates() {
         db.run("SELECT * FROM users"),
         [vec![Value::Int(1), Value::from("bo")]]
     );
+}
+
+#[test]
+fn unique_constraints_reject_duplicates() {
+    let db = Db::new();
+    db.run(
+        "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(16) UNIQUE, a INT, b INT, \
+         UNIQUE (a, b))",
+    );
+    assert_eq!(
+        db.run("INSERT INTO users VALUES (1, 'ann', 1, 1), (2, 'bo', 1, 2)"),
+        count(2)
+    );
+    assert_duplicate_key(
+        db.try_run("INSERT INTO users VALUES (3, 'ann', 2, 1)"),
+        "users_name_key",
+        "(name)=(ann)",
+    );
+    assert_duplicate_key(
+        db.try_run("INSERT INTO users VALUES (3, 'cy', 1, 2)"),
+        "users_a_b_key",
+        "(a, b)=(1, 2)",
+    );
+    assert_duplicate_key(
+        db.try_run("UPDATE users SET name = 'ann' WHERE id = 2"),
+        "users_name_key",
+        "(name)=(ann)",
+    );
+    // Changing the primary key, or a column outside the key, keeps it.
+    assert_eq!(db.run("UPDATE users SET id = id + 10"), count(2));
+    assert_eq!(db.run("UPDATE users SET a = a WHERE id = 11"), count(1));
+    // The rows swap keys: each is checked against the other's new version.
+    assert_eq!(db.run("UPDATE users SET b = 3 - b"), count(2));
+    assert_eq!(
+        db.run("SELECT id, b FROM users ORDER BY id"),
+        [
+            vec![Value::Int(11), Value::Int(2)],
+            vec![Value::Int(12), Value::Int(1)]
+        ]
+    );
+    // A deleted row's key can be used again.
+    db.run("DELETE FROM users WHERE id = 11");
+    assert_eq!(db.run("INSERT INTO users VALUES (1, 'ann', 1, 2)"), count(1));
+}
+
+#[test]
+fn null_keys_conflict_only_when_nulls_are_not_distinct() {
+    let db = Db::new();
+    db.run("CREATE TABLE t (a INT, b INT, UNIQUE (a, b))");
+    assert_eq!(
+        db.run("INSERT INTO t VALUES (1, NULL), (1, NULL), (NULL, NULL)"),
+        count(3)
+    );
+    db.run("CREATE TABLE u (a INT, b INT, UNIQUE NULLS NOT DISTINCT (a, b))");
+    assert_eq!(
+        db.run("INSERT INTO u VALUES (1, NULL), (2, NULL)"),
+        count(2)
+    );
+    assert_duplicate_key(
+        db.try_run("INSERT INTO u VALUES (1, NULL)"),
+        "u_a_b_key",
+        "(a, b)=(1, NULL)",
+    );
+}
+
+#[test]
+fn create_unique_index_checks_the_rows_already_there() {
+    let db = Db::new();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    db.run("INSERT INTO t VALUES (1, 1), (2, 1), (3, NULL), (4, NULL)");
+    assert_duplicate_key(
+        db.try_run("CREATE UNIQUE INDEX t_v ON t (v)"),
+        "t_v",
+        "(v)=(1)",
+    );
+    assert!(db.catalog().get_index("t_v").is_none());
+    assert!(
+        db.try_run("CREATE UNIQUE INDEX t_v ON t (v) NULLS NOT DISTINCT")
+            .is_err()
+    );
+
+    db.run("DELETE FROM t WHERE id = 2");
+    assert!(db.run("CREATE UNIQUE INDEX t_v ON t (v)").is_empty());
+    assert_duplicate_key(db.try_run("INSERT INTO t VALUES (5, 1)"), "t_v", "(v)=(1)");
+    assert_eq!(db.run("INSERT INTO t VALUES (5, NULL)"), count(1));
 }
 
 #[test]

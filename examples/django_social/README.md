@@ -61,11 +61,10 @@ each for a feature HamiltonDB lacks:
 | `SAVEPOINT` | `SAVEPOINT "s..._x1"` for nested `atomic()` | `uses_savepoints = False` |
 | `TRUNCATE` | `TRUNCATE "social_tweet", "social_user";` when the tests flush | `sql_flush` sends `DELETE FROM` per table |
 | `CREATE DATABASE` | `CREATE DATABASE "test_hamilton"` for tests | test database creation is skipped; tests get their own server |
+| Operator classes | `CREATE INDEX "social_user_username_..._like" ON "social_user" ("username" varchar_pattern_ops)` for a unique `varchar` | the schema editor skips the `_like` index |
 
 Because there are no savepoints, the tests use `TransactionTestCase`, not
-`TestCase`. There are no `UNIQUE` constraints either, so the user form
-checks that a username is free before saving; two concurrent signups can
-still both take it. Keep `USE_TZ = True`: the server reports its time zone
+`TestCase`. Keep `USE_TZ = True`: the server reports its time zone
 as UTC, and Django otherwise tries `SELECT set_config('TimeZone', ...)`.
 
 Every text column is a `CharField`, so a `varchar`;

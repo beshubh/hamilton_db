@@ -59,6 +59,16 @@ impl<'a> Binder<'a> {
         if self.catalog.get_table(&create.name).is_some() {
             return Err(PlannerError::TableExists(create.name.clone()));
         }
+        for key in &create.unique {
+            for (i, name) in key.columns.iter().enumerate() {
+                if key.columns[..i].contains(name) {
+                    return Err(PlannerError::DuplicateColumn(name.clone()));
+                }
+                if !create.columns.iter().any(|column| column.name == *name) {
+                    return Err(PlannerError::ColumnNotFound(name.clone()));
+                }
+            }
+        }
         let mut columns = create.columns.clone();
         for (i, name) in create.primary_key.iter().enumerate() {
             if create.primary_key[..i].contains(name) {
@@ -87,6 +97,7 @@ impl<'a> Binder<'a> {
             name: create.name.clone(),
             schema: Schema::new(columns),
             primary_key: create.primary_key.clone(),
+            unique: create.unique.clone(),
             identity: create.identity.clone(),
         }))
     }
@@ -111,6 +122,7 @@ impl<'a> Binder<'a> {
             name: create.name.clone(),
             table: table.name,
             columns: create.columns.clone(),
+            kind: create.kind,
         }))
     }
 

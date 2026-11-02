@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use btree_index::BtreeIndex;
-use common::{Rid, Schema, Tuple};
+use common::{IndexKind, Rid, Schema, Tuple};
 use enum_dispatch::enum_dispatch;
 
 use crate::error::Result;
@@ -57,7 +57,8 @@ pub enum LocatorKind {
 }
 
 /// What an index is on: its table, which of the table's columns make up the
-/// key, the key columns' own schema, and which `RowLocator` it stores.
+/// key, the key columns' own schema, whether rows may share a key, and which
+/// `RowLocator` it stores.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexMetadata {
     name: String,
@@ -66,7 +67,7 @@ pub struct IndexMetadata {
     key_attrs: Vec<usize>,
     /// The key columns as a schema of their own, for encoding keys.
     key_schema: Arc<Schema>,
-    is_primary_key: bool,
+    kind: IndexKind,
     locator: LocatorKind,
 }
 
@@ -77,7 +78,7 @@ impl IndexMetadata {
         table_name: impl Into<String>,
         key_attrs: Vec<usize>,
         key_schema: Arc<Schema>,
-        is_primary_key: bool,
+        kind: IndexKind,
         locator: LocatorKind,
     ) -> Self {
         debug_assert_eq!(
@@ -86,7 +87,7 @@ impl IndexMetadata {
             "one key attribute per key column"
         );
         debug_assert!(
-            !is_primary_key || locator == LocatorKind::Rid,
+            !kind.is_primary_key() || locator == LocatorKind::Rid,
             "a primary key index points with record ids"
         );
         Self {
@@ -94,7 +95,7 @@ impl IndexMetadata {
             table_name: table_name.into(),
             key_attrs,
             key_schema,
-            is_primary_key,
+            kind,
             locator,
         }
     }
@@ -117,8 +118,12 @@ impl IndexMetadata {
         &self.key_schema
     }
 
+    pub fn kind(&self) -> IndexKind {
+        self.kind
+    }
+
     pub fn is_primary_key(&self) -> bool {
-        self.is_primary_key
+        self.kind.is_primary_key()
     }
 
     /// Which `RowLocator` the index's entries store.
@@ -137,16 +142,22 @@ impl fmt::Display for IndexMetadata {
             write!(f, "{} {}", column.name, column.data_type)?;
         }
         write!(f, ")")?;
-        if self.is_primary_key {
-            write!(f, " PRIMARY KEY")?;
+        match self.kind {
+            IndexKind::Plain => Ok(()),
+            IndexKind::Unique {
+                nulls_distinct: true,
+            } => write!(f, " UNIQUE"),
+            IndexKind::Unique {
+                nulls_distinct: false,
+            } => write!(f, " UNIQUE NULLS NOT DISTINCT"),
+            IndexKind::PrimaryKey => write!(f, " PRIMARY KEY"),
         }
-        Ok(())
     }
 }
 
 /// An index from keys to rows. Keys are tuples in the index's key schema, as
 /// `Tuple::to_key` builds them. Any index may hold a key for many rows, a
-/// primary key index included: the index doesn't check uniqueness,
+/// unique one included: the index doesn't check uniqueness,
 /// `Transaction::insert_entry` does.
 ///
 /// Rows are given as `RowLocator`s of the kind `IndexMetadata::locator`

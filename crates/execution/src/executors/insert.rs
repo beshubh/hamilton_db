@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use common::{Rid, Schema, Tuple};
+use storage::index::IndexTrait;
 
 use super::{
     AbstractExecutor, Executor, count_row, duplicate_key, index_keys, locators, write_indexes,
@@ -13,8 +14,8 @@ use crate::plans::{InsertPlan, PlanNode};
 /// Inserts all of the child's rows, and their entries in each of the table's
 /// indexes, on the first call to `next`, and produces one row holding how
 /// many there were, or with RETURNING the inserted rows themselves. A row
-/// whose primary key is taken, by a row already in the table or one
-/// inserted before it, fails the statement.
+/// whose key in a unique index is taken, by a row already in the table or
+/// one inserted before it, fails the statement.
 pub struct InsertExecutor {
     ctx: Arc<ExecutionContext>,
     plan: InsertPlan,
@@ -78,8 +79,8 @@ impl Executor for InsertExecutor {
             let rid = txn.insert(&table.heap, &table.schema, tuple)?;
             let locators = locators(&indexes, &keys, rid);
             for ((index, key), locator) in indexes.iter().zip(&keys).zip(&locators) {
-                if !txn.insert_entry(&indexed, &index.index, key, locator)? {
-                    return Err(duplicate_key(index, key));
+                if !txn.insert_entry(&indexed, &index.index, key, locator, rid)? {
+                    return Err(duplicate_key(index.index.metadata(), key));
                 }
             }
         }

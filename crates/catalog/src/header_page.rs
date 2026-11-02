@@ -31,8 +31,9 @@ const MAGIC: u64 = u64::from_le_bytes(*b"HAMDBCAT");
 /// of being misread. 3: secondary indexes store the primary key, on tables
 /// that have one. 4: the header keeps the next transaction id. 5: primary
 /// key index entries hold the rid after the key. 6: columns record whether
-/// they are identity columns.
-const VERSION: u32 = 6;
+/// they are identity columns. 7: indexes record their kind, which says
+/// whether they are unique.
+const VERSION: u32 = 7;
 
 /// The Tid a new database's first transaction gets. 0 is `INVALID_TXN_ID`,
 /// the `ts` of rows written outside transactions.

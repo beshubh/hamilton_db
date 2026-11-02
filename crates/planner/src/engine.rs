@@ -28,6 +28,9 @@
 //!   visible yet, so no one can tell. In a block that can't be done: the
 //!   failed statement may have written rows, which only aborting the whole
 //!   transaction undoes, so the block fails and the client retries it.
+//!   CREATE TABLE is never retried, as the catalog isn't transactional.
+//!   CREATE INDEX records nothing until its build succeeds, so it can be:
+//!   a unique index waits out writers that haven't committed.
 //!
 //! [`ExecutionEngine::session`] opens another session on the same database.
 //! Sessions share one `TransactionManager`, so their transactions are
@@ -300,9 +303,8 @@ impl ExecutionEngine {
                 // conflict with them.
                 return result;
             }
-            // DDL isn't retried: the catalog isn't transactional.
             let other = match &result {
-                Err(err) if ddl.is_none() => conflicting_txn(err),
+                Err(err) if ddl != Some("CREATE TABLE") => conflicting_txn(err),
                 _ => None,
             };
             match other {

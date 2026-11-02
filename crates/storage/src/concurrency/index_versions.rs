@@ -25,15 +25,17 @@
 //! primary key entry goes in before its other entries: the check finds the
 //! rows behind a primary key through it.
 //!
-//! **Uniqueness.** A primary key index may hold a key for many rids: old
-//! versions of a row keep their entries after it moves, or after it is
-//! deleted and the key inserted again. `Transaction::insert_entry` adds the
-//! entry first and then looks at every other row the key leads to. A
-//! version there with the key, written by another transaction that is
-//! running or committed after this one, is a `Conflict`; failing that, the
-//! key is taken if the version this transaction sees has it. Adding before
-//! checking means that of two transactions inserting a key at once, at
-//! least one sees the other.
+//! **Uniqueness.** A unique index, a primary key included, may hold a key
+//! for many rows: old versions of a row keep their entries after it moves,
+//! or after it is deleted and the key inserted again.
+//! `Transaction::insert_entry` adds the entry first and then looks at every
+//! other row the key leads to. A version there with the key, written by
+//! another transaction that is running or committed after this one, is a
+//! `Conflict`; failing that, the key is taken if the version this
+//! transaction sees has it. Adding before checking means that of two
+//! transactions inserting a key at once, at least one sees the other. A key
+//! with a NULL column is never checked unless the index treats NULLs as not
+//! distinct ([`must_be_free`]).
 //!
 //! **Building an index.** CREATE INDEX fills the new index from its table
 //! (`Transaction::build_index`) while writes to the table wait (see the
@@ -45,11 +47,13 @@
 //! knew the index, so nothing would retire their entries. The build
 //! therefore retires every entry it adds. Garbage collection checks them
 //! once every transaction running when the build ended has ended, and
-//! keeps those still needed.
+//! keeps those still needed. A unique index is checked once it is full,
+//! and only when no other transaction has a write to the table in flight,
+//! so that each row has one version that counts: its head.
 
 use std::sync::Arc;
 
-use common::{Rid, Schema, Tuple};
+use common::{IndexKind, Rid, Schema, Tuple};
 
 use crate::error::Result;
 use crate::index::btree_index::KeySchemaComparator;
@@ -193,6 +197,30 @@ fn stable_versions(
         let head = versions.first().map(|(meta, _)| *meta);
         if table.heap.head_meta(rid)? == head {
             return Ok(versions);
+        }
+    }
+}
+
+/// Whether no other row may have `key` in `index`: the index is unique and,
+/// unless its NULLs are not distinct, no column of `key` is NULL.
+pub(crate) fn must_be_free(index: &Index, key: &Tuple) -> Result<bool> {
+    let metadata = index.metadata();
+    match metadata.kind() {
+        IndexKind::Plain => Ok(false),
+        IndexKind::PrimaryKey
+        | IndexKind::Unique {
+            nulls_distinct: false,
+        } => Ok(true),
+        IndexKind::Unique {
+            nulls_distinct: true,
+        } => {
+            let schema = metadata.key_schema();
+            for idx in 0..schema.len() {
+                if key.is_null(schema, idx)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }
     }
 }

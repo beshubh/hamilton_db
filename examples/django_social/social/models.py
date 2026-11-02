@@ -4,7 +4,9 @@ from django.utils import timezone
 
 
 class User(models.Model):
-    username = models.CharField(max_length=30)
+    username = models.CharField(
+        max_length=30, unique=True, error_messages={"unique": "That username is taken."}
+    )
     display_name = models.CharField(max_length=50)
     bio = models.CharField(max_length=160, blank=True)
 

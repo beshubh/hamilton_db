@@ -69,7 +69,7 @@ use std::sync::Arc;
 use catalog::{IndexInfo, TableInfo, TableWriteGuard};
 use common::{Rid, Schema, Tuple, Value};
 use enum_dispatch::enum_dispatch;
-use storage::index::{LocatorKind, RowLocator};
+use storage::index::{IndexMetadata, LocatorKind, RowLocator};
 
 use crate::error::{ExecutionError, Result};
 use crate::execution_context::ExecutionContext;
@@ -198,7 +198,7 @@ fn write_indexes<'a>(
 ) -> (TableWriteGuard<'a>, Vec<Arc<IndexInfo>>) {
     let guard = table.lock_writes();
     let mut indexes = ctx.catalog().table_indexes(&table.name);
-    indexes.sort_by_key(|index| !index.is_primary_key);
+    indexes.sort_by_key(|index| !index.kind.is_primary_key());
     (guard, indexes)
 }
 
@@ -213,7 +213,7 @@ fn index_keys(table: &TableInfo, indexes: &[Arc<IndexInfo>], tuple: &Tuple) -> R
 /// The `RowLocator` each of `indexes` (all of a table's indexes) stores for a
 /// row, given the row's key in each index and its rid.
 fn locators(indexes: &[Arc<IndexInfo>], keys: &[Tuple], rid: Rid) -> Vec<RowLocator> {
-    let primary_key = indexes.iter().position(|index| index.is_primary_key);
+    let primary_key = indexes.iter().position(|index| index.kind.is_primary_key());
     indexes
         .iter()
         .map(|index| match index.locator {
@@ -227,15 +227,15 @@ fn locators(indexes: &[Arc<IndexInfo>], keys: &[Tuple], rid: Rid) -> Vec<RowLoca
         .collect()
 }
 
-/// The error for `key` already being in the primary key `index`.
-fn duplicate_key(index: &IndexInfo, key: &Tuple) -> ExecutionError {
-    let columns = index.key_schema.columns().iter().map(|c| c.name.as_str());
-    let values = match key.decode(&index.key_schema) {
+/// The error for `key` already being in the unique `index`.
+fn duplicate_key(index: &IndexMetadata, key: &Tuple) -> ExecutionError {
+    let columns = index.key_schema().columns().iter().map(|c| c.name.as_str());
+    let values = match key.decode(index.key_schema()) {
         Ok(values) => values.iter().map(ToString::to_string).collect(),
         Err(_) => vec!["?".to_owned()],
     };
     ExecutionError::DuplicateKey {
-        index: index.name.clone(),
+        index: index.name().to_owned(),
         key: format!(
             "({})=({})",
             columns.collect::<Vec<_>>().join(", "),

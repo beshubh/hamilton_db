@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::sync::Arc;
 
-use common::{Column, DataType, Rid, Schema, Tuple, Value, ValueError};
+use common::{Column, DataType, IndexKind, Rid, Schema, Tuple, Value, ValueError};
 use storage::StorageError;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::disk::disk_manager::DiskManager;
@@ -83,7 +83,7 @@ fn new_index_is_empty() {
         "users",
         vec![0, 1],
         schema(),
-        false,
+        IndexKind::Plain,
         LocatorKind::Rid,
     );
     let index = BtreeIndex::new(metadata, header_page_id, bpm).unwrap();
@@ -138,7 +138,11 @@ fn index_with(
         "users",
         key_attrs,
         key_schema,
-        is_primary_key,
+        if is_primary_key {
+            IndexKind::PrimaryKey
+        } else {
+            IndexKind::Plain
+        },
         locator,
     );
     let index = BtreeIndex::new(metadata, header_page_id, bpm).unwrap();

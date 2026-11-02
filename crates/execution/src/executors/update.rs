@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use catalog::{IndexInfo, TableInfo};
 use common::{Rid, Schema, Tuple};
-use storage::index::RowLocator;
+use storage::index::{IndexTrait, RowLocator};
 
 use super::{
     AbstractExecutor, Executor, count_row, duplicate_key, index_keys, locators, write_indexes,
@@ -93,23 +93,24 @@ impl Executor for UpdateExecutor {
         let indexed = self.ctx.indexed_table(&table);
 
         let txn = self.ctx.txn();
-        // Each row's entries in `indexes`, before and after the update.
-        let mut moved: Vec<(Vec<Entry>, Vec<Entry>)> = Vec::with_capacity(found.len());
+        // Each row's entries in `indexes`, before and after the update, and
+        // its new rid.
+        let mut moved: Vec<(Vec<Entry>, Vec<Entry>, Rid)> = Vec::with_capacity(found.len());
         for (rid, old) in &found {
             let new = self.new_row(&table, old)?;
             let new_rid = txn.update(&table.heap, &table.schema, *rid, &new)?;
             let old_entries = entries(&table, &indexes, old, *rid)?;
             let new_entries = entries(&table, &indexes, &new, new_rid)?;
-            moved.push((old_entries, new_entries));
+            moved.push((old_entries, new_entries, new_rid));
         }
-        for (old_entries, new_entries) in &moved {
+        for (old_entries, new_entries, rid) in &moved {
             for ((index, old), new) in indexes.iter().zip(old_entries).zip(new_entries) {
                 if old == new {
                     continue;
                 }
                 txn.retire_entry(&indexed, &index.index, &old.0, &old.1)?;
-                if !txn.insert_entry(&indexed, &index.index, &new.0, &new.1)? {
-                    return Err(duplicate_key(index, &new.0));
+                if !txn.insert_entry(&indexed, &index.index, &new.0, &new.1, *rid)? {
+                    return Err(duplicate_key(index.index.metadata(), &new.0));
                 }
             }
         }

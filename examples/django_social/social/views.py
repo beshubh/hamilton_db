@@ -1,3 +1,4 @@
+from django.db import IntegrityError
 from django.db.models import Q
 from django.http import HttpResponseBadRequest
 from django.shortcuts import get_object_or_404, redirect, render
@@ -103,10 +104,17 @@ def profile(request, username):
 def users(request):
     form = UserForm(request.POST or None)
     if request.method == "POST" and form.is_valid():
-        user = form.save()
-        response = redirect(user)
-        response.set_signed_cookie(COOKIE, str(user.pk), salt=SALT, httponly=True, samesite="Lax")
-        return response
+        try:
+            user = form.save()
+        except IntegrityError:
+            # Another signup took the name after the form checked it.
+            form.add_error("username", User._meta.get_field("username").error_messages["unique"])
+        else:
+            response = redirect(user)
+            response.set_signed_cookie(
+                COOKIE, str(user.pk), salt=SALT, httponly=True, samesite="Lax"
+            )
+            return response
     return render(request, "social/users.html", {"form": form, "users": User.objects.all()})
 
 

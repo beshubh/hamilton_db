@@ -67,9 +67,12 @@ impl<'a> Planner<'a> {
                 create.primary_key.clone(),
             )
             .with_identity(create.identity.clone())
+            .with_unique(create.unique.clone())
             .into(),
             BoundStatement::CreateIndex(create) => {
-                CreateIndexPlan::new(&create.name, &create.table, create.columns.clone()).into()
+                CreateIndexPlan::new(&create.name, &create.table, create.columns.clone())
+                    .with_kind(create.kind)
+                    .into()
             }
             BoundStatement::Insert(insert) => self.plan_insert(insert)?,
             BoundStatement::Select(select) => self.plan_select(select)?,

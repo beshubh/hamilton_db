@@ -11,6 +11,7 @@ from django.db.backends.postgresql import (
     features,
     introspection,
     operations,
+    schema,
 )
 
 
@@ -53,7 +54,15 @@ class DatabaseCreation(creation.DatabaseCreation):
         pass
 
 
+class DatabaseSchemaEditor(schema.DatabaseSchemaEditor):
+    def _create_like_index_sql(self, model, field):
+        # No operator classes, so no varchar_pattern_ops index for LIKE on a
+        # unique or indexed varchar.
+        return None
+
+
 class DatabaseWrapper(base.DatabaseWrapper):
+    SchemaEditorClass = DatabaseSchemaEditor
     features_class = DatabaseFeatures
     introspection_class = DatabaseIntrospection
     ops_class = DatabaseOperations

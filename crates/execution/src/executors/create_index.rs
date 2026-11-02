@@ -1,14 +1,17 @@
 use std::sync::Arc;
 
 use common::{Rid, Schema, Tuple};
+use storage::index::IndexTrait;
 
-use super::Executor;
+use super::{Executor, duplicate_key};
+use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::plans::{CreateIndexPlan, PlanNode};
-use crate::{ExecutionError, Result};
 
 /// Creates the index on the first call to `next`, with an entry for every
-/// row already in the table (`Transaction::build_index`). Produces no rows.
+/// row already in the table (`Transaction::build_index`). A unique index
+/// fails, and is not created, if two of the rows share a key. Produces no
+/// rows.
 pub struct CreateIndexExecutor {
     ctx: Arc<ExecutionContext>,
     plan: CreateIndexPlan,
@@ -48,9 +51,13 @@ impl Executor for CreateIndexExecutor {
                 self.plan.index_name(),
                 self.plan.table_name(),
                 &key_columns,
+                self.plan.kind(),
                 |table, index| {
                     let table = self.ctx.indexed_table(table);
-                    Ok::<_, ExecutionError>(txn.build_index(&table, index)?)
+                    match txn.build_index(&table, index)? {
+                        Some(key) => Err(duplicate_key(index.metadata(), &key)),
+                        None => Ok(()),
+                    }
                 },
             )?;
         }
@@ -67,7 +74,7 @@ mod tests {
     use std::sync::Arc;
 
     use catalog::CatalogError;
-    use common::{DataType, Value};
+    use common::{DataType, IndexKind, Value};
 
     use super::super::test_util::{Db, constant, int, user, users_schema};
     use crate::ExecutionError;
@@ -86,7 +93,7 @@ mod tests {
         let index = db.catalog().get_index("users_name_id").unwrap();
         assert_eq!(index.table_oid, db.users.oid);
         assert_eq!(index.key_columns, [1, 0]);
-        assert!(!index.is_primary_key);
+        assert_eq!(index.kind, IndexKind::Plain);
     }
 
     #[test]

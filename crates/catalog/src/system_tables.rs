@@ -5,7 +5,7 @@
 //! columns        (table_oid INT, position INT, name VARCHAR, type_id INT,
 //!                 max_len INT, nullable BOOL, identity BOOL)
 //! indexes        (oid INT, name VARCHAR, table_oid INT, header_page_id INT,
-//!                 is_primary_key BOOL)
+//!                 kind INT)
 //! index_columns  (index_oid INT, position INT, column INT)
 //! ```
 //!
@@ -16,7 +16,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use common::{Column, DataType, PageId, Schema, Tuple, Value};
+use common::{Column, DataType, IndexKind, PageId, Schema, Tuple, Value};
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::table::table_heap::TableHeap;
 use storage::table::table_page::TupleMeta;
@@ -63,7 +63,7 @@ static INDEXES_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
         name_column("name"),
         int_column("table_oid"),
         int_column("header_page_id"),
-        Column::new("is_primary_key", DataType::Bool, false),
+        int_column("kind"),
     ])
 });
 
@@ -97,7 +97,7 @@ pub(crate) struct IndexRow {
     pub name: String,
     pub table_oid: TableOid,
     pub header_page_id: PageId,
-    pub is_primary_key: bool,
+    pub kind: IndexKind,
 }
 
 /// A row of `index_columns`: key column `position` of index `index_oid` is
@@ -174,7 +174,7 @@ impl SystemTables {
             Value::Varchar(row.name.clone()),
             oid_value(row.table_oid),
             Value::Int(row.header_page_id),
-            Value::Bool(row.is_primary_key),
+            Value::Int(encode_kind(row.kind)),
         ];
         insert(&self.indexes, &INDEXES_SCHEMA, &values)
     }
@@ -217,7 +217,7 @@ impl SystemTables {
                 name: as_string(&values[1])?,
                 table_oid: as_oid(&values[2])?,
                 header_page_id: as_int(&values[3])?,
-                is_primary_key: as_bool(&values[4])?,
+                kind: decode_kind(as_int(&values[4])?)?,
             })
         })
     }
@@ -274,6 +274,33 @@ fn decode_type(type_id: i32, max_len: i32) -> Result<DataType> {
         5 => DataType::Double,
         6 => DataType::Timestamptz,
         other => return Err(CatalogError::Corrupt(format!("unknown type id {other}"))),
+    })
+}
+
+fn encode_kind(kind: IndexKind) -> i32 {
+    match kind {
+        IndexKind::Plain => 0,
+        IndexKind::Unique {
+            nulls_distinct: true,
+        } => 1,
+        IndexKind::Unique {
+            nulls_distinct: false,
+        } => 2,
+        IndexKind::PrimaryKey => 3,
+    }
+}
+
+fn decode_kind(kind: i32) -> Result<IndexKind> {
+    Ok(match kind {
+        0 => IndexKind::Plain,
+        1 => IndexKind::Unique {
+            nulls_distinct: true,
+        },
+        2 => IndexKind::Unique {
+            nulls_distinct: false,
+        },
+        3 => IndexKind::PrimaryKey,
+        other => return Err(CatalogError::Corrupt(format!("unknown index kind {other}"))),
     })
 }
 
@@ -336,5 +363,22 @@ mod tests {
             assert_eq!(decode_type(type_id, max_len).unwrap(), data_type);
         }
         assert!(matches!(decode_type(9, 0), Err(CatalogError::Corrupt(_))));
+    }
+
+    #[test]
+    fn index_kinds_round_trip() {
+        for kind in [
+            IndexKind::Plain,
+            IndexKind::Unique {
+                nulls_distinct: true,
+            },
+            IndexKind::Unique {
+                nulls_distinct: false,
+            },
+            IndexKind::PrimaryKey,
+        ] {
+            assert_eq!(decode_kind(encode_kind(kind)).unwrap(), kind);
+        }
+        assert!(matches!(decode_kind(4), Err(CatalogError::Corrupt(_))));
     }
 }

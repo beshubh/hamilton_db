@@ -5,7 +5,7 @@ use std::io::{self, BufReader, Write};
 use std::net::TcpStream;
 
 use catalog::{Catalog, MAX_NAME_LEN};
-use common::{Column, DataType, Value, ValueError};
+use common::{Column, DataType, IndexKind, Value, ValueError};
 use execution::ExecutionError;
 use planner::{EngineError, Output, PlannerError, TransactionStatus};
 use storage::StorageError;
@@ -254,7 +254,7 @@ fn schema(catalog: &Catalog) -> [Output; 2] {
             indexes.push(vec![
                 Value::from(index.name.as_str()),
                 Value::from(table.name.as_str()),
-                Value::Bool(index.is_primary_key),
+                Value::from(kind_name(index.kind)),
                 Value::from(key.join(", ").as_str()),
             ]);
         }
@@ -273,13 +273,22 @@ fn schema(catalog: &Catalog) -> [Output; 2] {
         },
         Output::Rows {
             command: "SELECT",
-            columns: vec![
-                name("index"),
-                name("table"),
-                flag("primary_key"),
-                text("columns"),
-            ],
+            columns: vec![name("index"), name("table"), text("kind"), text("columns")],
             rows: indexes,
         },
     ]
+}
+
+/// An index's kind as `\d` shows it, empty for a plain index.
+fn kind_name(kind: IndexKind) -> &'static str {
+    match kind {
+        IndexKind::Plain => "",
+        IndexKind::Unique {
+            nulls_distinct: true,
+        } => "UNIQUE",
+        IndexKind::Unique {
+            nulls_distinct: false,
+        } => "UNIQUE NULLS NOT DISTINCT",
+        IndexKind::PrimaryKey => "PRIMARY KEY",
+    }
 }
