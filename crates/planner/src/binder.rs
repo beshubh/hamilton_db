@@ -12,7 +12,7 @@ mod scope;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use catalog::{Catalog, TableInfo};
+use catalog::{Catalog, RelationKind, TableInfo};
 use common::{DataType, Schema, Value, ValueError};
 use parser::{
     CreateIndex, CreateTable, Delete, Expr, FromItem, Insert, JoinKind, OrderByItem, Select,
@@ -127,7 +127,7 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_insert(&self, insert: &Insert) -> Result<BoundStatement> {
-        let info = self.table_info(&insert.table)?;
+        let info = self.table_to_change(&insert.table)?;
         let table = bound_table(&info, None);
         let columns = table.schema.columns();
 
@@ -174,8 +174,8 @@ impl<'a> Binder<'a> {
                             forbid_calls(&value, "VALUES")?;
                             assign(value, column)
                         }
-                        (None, Some(identity)) => Ok(BoundExpr {
-                            kind: BoundExprKind::NextIdentity(Arc::clone(identity)),
+                        (None, Some(sequence)) => Ok(BoundExpr {
+                            kind: BoundExprKind::NextIdentity(Arc::clone(sequence)),
                             return_type: column.clone(),
                         }),
                         (None, None) => null_for(column),
@@ -334,7 +334,8 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_update(&self, update: &Update) -> Result<BoundStatement> {
-        let table = self.bind_table(&update.table)?;
+        let info = self.table_to_change(&update.table.name)?;
+        let table = bound_table(&info, update.table.alias.as_deref());
         let mut scope = Scope::default();
         scope.push(&table.alias, table.schema.columns())?;
 
@@ -370,7 +371,8 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_delete(&self, delete: &Delete) -> Result<BoundStatement> {
-        let table = self.bind_table(&delete.table)?;
+        let info = self.table_to_change(&delete.table.name)?;
+        let table = bound_table(&info, delete.table.alias.as_deref());
         let mut scope = Scope::default();
         scope.push(&table.alias, table.schema.columns())?;
         let selection = delete
@@ -390,6 +392,15 @@ impl<'a> Binder<'a> {
         self.catalog
             .get_table(name)
             .ok_or_else(|| PlannerError::TableNotFound(name.to_owned()))
+    }
+
+    /// A table an INSERT, UPDATE or DELETE writes.
+    fn table_to_change(&self, name: &str) -> Result<Arc<TableInfo>> {
+        let info = self.table_info(name)?;
+        if info.kind == RelationKind::Sequence {
+            return Err(PlannerError::CannotChangeSequence(name.to_owned()));
+        }
+        Ok(info)
     }
 
     /// Binds one select item, expanding `*` and `t.*` into their columns.

@@ -1,31 +1,31 @@
 use std::sync::Arc;
 
-use catalog::Identity;
+use catalog::Sequence;
 use common::{Column, Schema, Tuple, Value};
 
 use super::{AbstractExpr, Expr};
 use crate::Result;
 
-/// The next value of an identity column, for a row an INSERT leaves the
-/// column out of. Each evaluation takes a new value, which fails with
-/// `Overflow` once it no longer fits the column's type.
+/// The next value of an identity column's sequence, for a row an INSERT
+/// leaves the column out of. Each evaluation takes a new value.
 #[derive(Clone, Debug)]
 pub struct NextValueExpr {
-    identity: Arc<Identity>,
+    sequence: Arc<Sequence>,
     return_type: Column,
 }
 
 impl NextValueExpr {
-    /// `return_type` is the identity column's: INT or BIGINT.
-    pub fn new(identity: Arc<Identity>, return_type: Column) -> Self {
+    /// `return_type` is the identity column's, INT or BIGINT, whose range
+    /// the sequence keeps to.
+    pub fn new(sequence: Arc<Sequence>, return_type: Column) -> Self {
         Self {
-            identity,
+            sequence,
             return_type,
         }
     }
 
     fn next(&self) -> Result<Value> {
-        let value = Value::BigInt(self.identity.next_value()?);
+        let value = Value::BigInt(self.sequence.next_value()?);
         Ok(value.cast_number(self.return_type.data_type)?)
     }
 }

@@ -8,7 +8,47 @@ Serves the database in FILE (default hamilton.db, created if missing) over
 the Postgres wire protocol until Ctrl-C or SIGTERM.
 
   --host HOST   address to listen on (default 127.0.0.1)
-  --port PORT   port to listen on (default 6942; 0 picks a free one)";
+  --port PORT   port to listen on (default 6942; 0 picks a free one)
+
+Set HAMILTON_LOG to error, warn, info, debug or trace to log to stderr.";
+
+/// Writes `log` records to stderr. Off unless HAMILTON_LOG is set, not
+/// RUST_LOG: a test runner that reads only the startup line would inherit a
+/// RUST_LOG exported for other tools, fill its stderr pipe and block us.
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!(
+                "hamilton-server: {} {}: {}",
+                record.level(),
+                record.target(),
+                record.args()
+            );
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_logging() -> anyhow::Result<()> {
+    let Ok(level) = std::env::var("HAMILTON_LOG") else {
+        return Ok(());
+    };
+    let level: log::LevelFilter = level.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "HAMILTON_LOG must be off, error, warn, info, debug or trace, not {level:?}"
+        )
+    })?;
+    log::set_logger(&StderrLogger).map_err(|err| anyhow::anyhow!("{err}"))?;
+    log::set_max_level(level);
+    Ok(())
+}
 
 struct Args {
     host: String,
@@ -48,6 +88,7 @@ fn parse_args() -> anyhow::Result<Args> {
 
 fn main() -> anyhow::Result<()> {
     let args = parse_args()?;
+    init_logging()?;
     let db = Database::open(&args.file).with_context(|| format!("opening {}", args.file))?;
     let server = Server::bind(db, (args.host.as_str(), args.port))
         .with_context(|| format!("listening on {}:{}", args.host, args.port))?;

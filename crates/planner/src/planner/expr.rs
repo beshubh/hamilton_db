@@ -50,8 +50,8 @@ pub(super) fn plan_expr(expr: &BoundExpr, inputs: Inputs) -> Result<AbstractExpr
         BoundExprKind::Constant(value) => {
             ConstantExpr::new(value.clone(), expr.return_type.clone()).into()
         }
-        BoundExprKind::NextIdentity(identity) => {
-            NextValueExpr::new(Arc::clone(identity), expr.return_type.clone()).into()
+        BoundExprKind::NextIdentity(sequence) => {
+            NextValueExpr::new(Arc::clone(sequence), expr.return_type.clone()).into()
         }
         BoundExprKind::Binary { op, left, right } => {
             plan_binary(*op, plan_expr(left, inputs)?, plan_expr(right, inputs)?)?

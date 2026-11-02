@@ -192,8 +192,13 @@ fn identity_timestamps_and_returning_over_the_wire() {
         error_code(&mut c, "SELECT 'not a time'::timestamptz"),
         "22007"
     );
+    // A value given explicitly doesn't move the sequence, as in Postgres.
+    query(
+        &mut c,
+        "INSERT INTO posts (id, text, created_at) VALUES (7, 'given', '2026-11-02')",
+    );
 
-    // The counter starts after the largest id on disk.
+    // The sequence carries on where it was, not after the largest id.
     let server = server.restart();
     let mut c = server.connect();
     assert_eq!(

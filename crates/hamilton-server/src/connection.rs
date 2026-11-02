@@ -4,7 +4,7 @@
 use std::io::{self, BufReader, Write};
 use std::net::TcpStream;
 
-use catalog::{Catalog, MAX_NAME_LEN};
+use catalog::{Catalog, CatalogError, MAX_NAME_LEN};
 use common::{Column, DataType, IndexKind, Value, ValueError};
 use execution::ExecutionError;
 use planner::{EngineError, Output, PlannerError, TransactionStatus};
@@ -225,7 +225,10 @@ fn sqlstate(err: &Error) -> &'static str {
                 "23505" // unique_violation
             }
             ExecutionError::Value(_) => "22000", // data_exception
-            _ => "XX000",                        // internal_error
+            ExecutionError::Catalog(CatalogError::SequenceExhausted { .. }) => {
+                "2200H" // sequence_generator_limit_exceeded
+            }
+            _ => "XX000", // internal_error
         },
     }
 }
@@ -290,5 +293,22 @@ fn kind_name(kind: IndexKind) -> &'static str {
             nulls_distinct: false,
         } => "UNIQUE NULLS NOT DISTINCT",
         IndexKind::PrimaryKey => "PRIMARY KEY",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SQL can't run an INT sequence up to its maximum cheaply without
+    /// setval, so this builds the error.
+    #[test]
+    fn an_exhausted_sequence_is_sequence_generator_limit_exceeded() {
+        let exhausted = CatalogError::SequenceExhausted {
+            name: "t_id_seq".into(),
+            max: i32::MAX.into(),
+        };
+        let err = Error::Engine(EngineError::Execution(ExecutionError::Catalog(exhausted)));
+        assert_eq!(sqlstate(&err), "2200H");
     }
 }

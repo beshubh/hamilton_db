@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 common = { path = "../common" }
 storage = { path = "../storage" }
+log = "0.4.34"
 parking_lot = "0.12.5"
 thiserror.workspace = true
 zerocopy = { version = "0.8.63", features = ["derive"] }

@@ -40,6 +40,13 @@ pub enum CatalogError {
     #[error("identity column {0} must be a NOT NULL INT or BIGINT")]
     InvalidIdentity(String),
 
+    /// CREATE INDEX on a sequence.
+    #[error("{0} is not a table")]
+    NotATable(String),
+
+    #[error("nextval: reached maximum value of sequence {name} ({max})")]
+    SequenceExhausted { name: String, max: i64 },
+
     #[error("name {0:?} is empty or longer than {MAX_NAME_LEN} bytes")]
     InvalidName(String),
 

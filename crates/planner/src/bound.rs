@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use catalog::{Identity, TableOid};
+use catalog::{Sequence, TableOid};
 use common::{Column, IndexKind, Schema, UniqueKey, Value};
 use parser::{BinaryOp, JoinKind, UnaryOp};
 
@@ -249,9 +249,9 @@ pub enum BoundExprKind {
         idx: usize,
     },
     Constant(Value),
-    /// The next value of an identity column, for an INSERT that leaves the
-    /// column out. Each evaluation takes a new one.
-    NextIdentity(Arc<Identity>),
+    /// The next value of an identity column's sequence, for an INSERT that
+    /// leaves the column out. Each evaluation takes a new one.
+    NextIdentity(Arc<Sequence>),
     /// Arithmetic on integers, a comparison, AND or OR. The operand types
     /// have been checked.
     Binary {

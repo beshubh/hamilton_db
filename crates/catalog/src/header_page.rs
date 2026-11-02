@@ -32,8 +32,9 @@ const MAGIC: u64 = u64::from_le_bytes(*b"HAMDBCAT");
 /// that have one. 4: the header keeps the next transaction id. 5: primary
 /// key index entries hold the rid after the key. 6: columns record whether
 /// they are identity columns. 7: indexes record their kind, which says
-/// whether they are unique.
-const VERSION: u32 = 7;
+/// whether they are unique. 8: sequences are relations, and identity columns
+/// record theirs.
+const VERSION: u32 = 8;
 
 /// The Tid a new database's first transaction gets. 0 is `INVALID_TXN_ID`,
 /// the `ts` of rows written outside transactions.

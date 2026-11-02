@@ -54,6 +54,8 @@ There is no WAL. While the server runs, dirty pages reach disk when evicted and 
 
 A crash is not. Commits since the last checkpoint are lost, and a crash during one leaves some pages written and others not. Any locked tuple that reached disk keeps the uncommitted bit and an older Tid, so every later reader and writer fails on it with `Conflict`. Nothing clears these when the database opens.
 
+Sequence rows ([`sequence.rs`](../../crates/catalog/src/sequence.rs)) are changed in place outside any transaction, at `ts` 0, so a crash loses their latest changes too. That alone would hand out ids already on disk again: a sequence's page is hot and is written mostly at checkpoints, while the table pages holding its ids are written whenever they are evicted. So `nextval` writes the row to disk 32 values ahead before handing them out, and again on its first call after a checkpoint or eviction writes the page as it is (the page is clean then). A crash skips up to 32 values instead. This stands in for the WAL record Postgres writes. With no fsync it survives a process crash, not a power loss.
+
 ## Known gaps
 
 - **Phantoms.** Read timestamps guard tuples that exist. A row inserted by an older transaction that a newer one's scan should have seen is not caught, so schedules with inserts are not serializable.
