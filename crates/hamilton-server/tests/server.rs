@@ -321,6 +321,45 @@ fn a_unique_key_taken_by_an_open_block_is_waited_for() {
     server.stop();
 }
 
+/// CREATE UNIQUE INDEX waits for a block holding a duplicate it hasn't
+/// committed: the index fails if the block commits, and is created if it
+/// rolls back.
+#[test]
+fn create_unique_index_waits_for_an_uncommitted_duplicate() {
+    let server = Running::start();
+    let (mut a, mut b) = (server.connect(), server.connect());
+    query(&mut a, "CREATE TABLE t (v INT)");
+    query(&mut a, "INSERT INTO t VALUES (1)");
+    assert_eq!(
+        create_while_held(&mut a, &mut b, "COMMIT").as_deref(),
+        Some("23505")
+    );
+    query(&mut a, "DELETE FROM t");
+    query(&mut a, "INSERT INTO t VALUES (1)");
+    assert_eq!(create_while_held(&mut a, &mut b, "ROLLBACK"), None);
+    assert_eq!(error_code(&mut a, "INSERT INTO t VALUES (1)"), "23505");
+    server.stop();
+}
+
+/// Has `b` create a unique index on `t (v)` while `a` holds an uncommitted
+/// duplicate of `v = 1`, which `a` then ends with `end`. Returns the SQLSTATE
+/// `b` got, if any.
+fn create_while_held(a: &mut Client, b: &mut Client, end: &str) -> Option<String> {
+    query(a, "BEGIN; INSERT INTO t VALUES (1)");
+    thread::scope(|s| {
+        let creator = s.spawn(|| b.simple_query("CREATE UNIQUE INDEX t_v ON t (v)"));
+        thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!creator.is_finished(), "CREATE UNIQUE INDEX didn't wait");
+        query(a, end);
+        creator
+            .join()
+            .unwrap()
+            .unwrap()
+            .error
+            .map(|error| error.code)
+    })
+}
+
 #[test]
 fn concurrent_increments_over_connections_all_count() {
     const CONNECTIONS: usize = 4;

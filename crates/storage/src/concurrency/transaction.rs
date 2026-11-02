@@ -40,7 +40,7 @@ use crate::concurrency::index_versions::{self, IndexedTable, TableEntry};
 use crate::concurrency::read_ts::ReadTimestamps;
 use crate::concurrency::watermark::Watermark;
 use crate::error::{Result, StorageError};
-use crate::index::{Index, IndexTrait, RowLocator};
+use crate::index::{Index, IndexTrait, LocatorKind, RowLocator};
 use crate::table::table_heap::TableHeap;
 use crate::table::table_iterator::{TableIterator, TableRow};
 use crate::table::table_page::TupleMeta;
@@ -521,43 +521,66 @@ impl Transaction {
         key: &Tuple,
         rid: Rid,
     ) -> Result<bool> {
-        let schema = &table.schema;
         let mut holders = Vec::new();
         index.scan_key(key, &mut holders)?;
+        if index.metadata().locator() == LocatorKind::Rid {
+            for locator in &holders {
+                let other = locator.as_rid().expect("checked the locator kind");
+                if other != rid && self.has_key_at(table, index, key, other)? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
         let mut others = Vec::new();
         for locator in &holders {
-            others.extend(table.rids(locator)?);
+            table.rids_into(locator, &mut others)?;
         }
         others.sort_unstable();
         others.dedup();
         // Not `locator`: an entry storing another primary key can lead back
         // to `rid`, when this transaction changed the row's primary key.
-        for other in others.into_iter().filter(|&other| other != rid) {
-            let versions = table
-                .heap
-                .versions_since(other, self.tid, schema, &self.undo)?;
-            for (meta, version) in versions {
-                let by_another = meta.ts > self.tid && meta.ts != self.write_ts();
-                if by_another
-                    && !meta.is_deleted
-                    && index_versions::has_key(index, schema, &version, key)?
-                {
-                    return Err(StorageError::Conflict {
-                        rid: other,
-                        other: meta.ts & !TXN_UNCOMMITTED_BIT,
-                    });
-                }
-            }
-            let visible = table
-                .heap
-                .get_at(other, self.tid, schema, &self.undo, self.reads())?;
-            if let Some((_, version)) = visible
-                && index_versions::has_key(index, schema, &version, key)?
-            {
+        for other in others {
+            if other != rid && self.has_key_at(table, index, key, other)? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// Whether the row at `other` has `key` in `index` as this transaction
+    /// sees it, for `key_is_free`. Fails with `Conflict` if another
+    /// transaction's newer or uncommitted version there has it.
+    fn has_key_at(
+        &self,
+        table: &IndexedTable,
+        index: &Index,
+        key: &Tuple,
+        other: Rid,
+    ) -> Result<bool> {
+        let schema = &table.schema;
+        let versions = table
+            .heap
+            .versions_since(other, self.tid, schema, &self.undo)?;
+        for (meta, version) in versions {
+            let by_another = meta.ts > self.tid && meta.ts != self.write_ts();
+            if by_another
+                && !meta.is_deleted
+                && index_versions::has_key(index, schema, &version, key)?
+            {
+                return Err(StorageError::Conflict {
+                    rid: other,
+                    other: meta.ts & !TXN_UNCOMMITTED_BIT,
+                });
+            }
+        }
+        let visible = table
+            .heap
+            .get_at(other, self.tid, schema, &self.undo, self.reads())?;
+        Ok(match visible {
+            Some((_, version)) => index_versions::has_key(index, schema, &version, key)?,
+            None => false,
+        })
     }
 
     fn record_write(&self, heap: &Arc<TableHeap>, schema: &Schema, rid: Rid) {

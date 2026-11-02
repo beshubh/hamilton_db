@@ -28,9 +28,11 @@
 //!   visible yet, so no one can tell. In a block that can't be done: the
 //!   failed statement may have written rows, which only aborting the whole
 //!   transaction undoes, so the block fails and the client retries it.
-//!   CREATE TABLE is never retried, as the catalog isn't transactional.
-//!   CREATE INDEX records nothing until its build succeeds, so it can be:
-//!   a unique index waits out writers that haven't committed.
+//!   CREATE TABLE is never retried, as the catalog isn't transactional
+//!   (see `retryable`). CREATE INDEX is: a failed build records nothing,
+//!   and a unique index's conflicts come before it adds an entry, so the
+//!   catalog frees each attempt's empty tree. It waits out writers that
+//!   haven't committed.
 //!
 //! [`ExecutionEngine::session`] opens another session on the same database.
 //! Sessions share one `TransactionManager`, so their transactions are
@@ -304,7 +306,7 @@ impl ExecutionEngine {
                 return result;
             }
             let other = match &result {
-                Err(err) if ddl != Some("CREATE TABLE") => conflicting_txn(err),
+                Err(err) if retryable(bound) => conflicting_txn(err),
                 _ => None,
             };
             match other {
@@ -422,6 +424,22 @@ impl ExecutionEngine {
 impl Drop for ExecutionEngine {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+/// Whether `bound`, run outside a block, may run again after a `Conflict`.
+/// Every statement must answer: running one again must not repeat
+/// anything the failed attempt left in the catalog.
+fn retryable(bound: &BoundStatement) -> bool {
+    match bound {
+        BoundStatement::CreateTable(_) => false,
+        BoundStatement::CreateIndex(_)
+        | BoundStatement::Insert(_)
+        | BoundStatement::Select(_)
+        | BoundStatement::Update(_)
+        | BoundStatement::Delete(_)
+        | BoundStatement::Explain(_) => true,
+        BoundStatement::Transaction(_) => unreachable!("transaction commands are not run here"),
     }
 }
 

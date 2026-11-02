@@ -1214,8 +1214,8 @@ mod tests {
     #[test]
     fn create_table_with_unique_constraints() {
         let stmt = parse_one(
-            "CREATE TABLE t (id INT PRIMARY KEY UNIQUE, a INT NOT NULL UNIQUE, b INT, \
-             UNIQUE (b, a), UNIQUE NULLS NOT DISTINCT (b), UNIQUE NULLS DISTINCT (a))",
+            "CREATE TABLE t (id INT PRIMARY KEY, a INT NOT NULL UNIQUE, b INT, \
+             UNIQUE (b, a), UNIQUE NULLS NOT DISTINCT (b), UNIQUE NULLS DISTINCT (a, b))",
         )
         .unwrap();
         let Statement::CreateTable(create) = stmt else {
@@ -1231,11 +1231,10 @@ mod tests {
         assert_eq!(
             create.unique,
             [
-                key(&["id"], true),
                 key(&["a"], true),
                 key(&["b", "a"], true),
                 key(&["b"], false),
-                key(&["a"], true),
+                key(&["a", "b"], true),
             ]
         );
     }

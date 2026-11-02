@@ -230,7 +230,25 @@ fn unique_constraints_reject_duplicates() {
     );
     // A deleted row's key can be used again.
     db.run("DELETE FROM users WHERE id = 11");
-    assert_eq!(db.run("INSERT INTO users VALUES (1, 'ann', 1, 2)"), count(1));
+    assert_eq!(
+        db.run("INSERT INTO users VALUES (1, 'ann', 1, 2)"),
+        count(1)
+    );
+}
+
+#[test]
+fn constraints_copying_the_primary_key_or_each_other_add_no_index() {
+    let db = Db::new();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY UNIQUE, a INT, UNIQUE (a), UNIQUE (a))");
+    let indexes = db.catalog().table_indexes("t");
+    let names: Vec<_> = indexes.iter().map(|index| index.name.as_str()).collect();
+    assert_eq!(names, ["t_pkey", "t_a_key"]);
+    db.run("INSERT INTO t VALUES (1, 1)");
+    assert_duplicate_key(
+        db.try_run("INSERT INTO t VALUES (2, 1)"),
+        "t_a_key",
+        "(a)=(1)",
+    );
 }
 
 #[test]

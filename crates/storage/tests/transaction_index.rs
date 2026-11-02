@@ -107,6 +107,13 @@ fn name_key(name: impl Into<Value>) -> Tuple {
 type Entry<'a> = (&'a Arc<Index>, Tuple, RowLocator);
 
 impl Db {
+    /// Builds a new unique index on `name` in `txn`, returning what
+    /// `build_index` returned and the index.
+    fn build_unique(&self, txn: &Transaction) -> (storage::Result<Option<Tuple>>, Arc<Index>) {
+        let index = new_index(&self.bpm, "t_name_key", 1, UNIQUE, LocatorKind::PrimaryKey);
+        (txn.build_index(&self.table, &index), index)
+    }
+
     /// The entries of row `values` at `rid`, primary key first.
     fn entries(&self, values: &[Value], rid: Rid) -> Vec<Entry<'_>> {
         let (id, name) = match values {
@@ -655,30 +662,65 @@ fn a_unique_key_an_uncommitted_insert_holds_conflicts() {
     db.run(|txn| db.insert(txn, &row(2, "a")).unwrap().unwrap());
 }
 
-/// `build_index` on a unique index: rows that share a key are reported, and
-/// a row whose writer hasn't committed is a conflict.
+/// `build_index` on a unique index reports a key two rows share, and
+/// checks no key with a NULL.
 #[test]
-fn building_a_unique_index_checks_the_rows() {
+fn building_a_unique_index_finds_shared_keys() {
     let db = setup();
-    let build = |name| {
-        let index = new_index(&db.bpm, name, 1, UNIQUE, LocatorKind::PrimaryKey);
-        let txn = db.tm.begin();
-        let built = txn.build_index(&db.table, &index);
-        db.tm.commit(&txn).unwrap();
-        built
-    };
     db.run(|txn| {
         db.insert(txn, &row(1, "a")).unwrap().unwrap();
         db.insert(txn, &null_row(2)).unwrap().unwrap();
         db.insert(txn, &null_row(3)).unwrap().unwrap();
     });
-    assert_eq!(build("u1").unwrap(), None);
+    assert_eq!(db.run(|txn| db.build_unique(txn).0.unwrap()), None);
+    db.run(|txn| db.insert(txn, &row(4, "a")).unwrap().unwrap());
+    assert_eq!(
+        db.run(|txn| db.build_unique(txn).0.unwrap()),
+        Some(name_key("a"))
+    );
+}
 
+/// Whether a row's key counts isn't known while its writer runs, so the
+/// build conflicts, before adding a single entry.
+#[test]
+fn building_a_unique_index_conflicts_with_an_uncommitted_head() {
+    let db = setup();
+    db.run(|txn| db.insert(txn, &row(1, "a")).unwrap().unwrap());
+    let rid = db.run(|txn| db.insert(txn, &row(2, "b")).unwrap().unwrap());
     let writer = db.tm.begin();
-    db.insert(&writer, &row(4, "a")).unwrap().unwrap();
-    let err = build("u2").unwrap_err();
-    assert!(matches!(err, StorageError::Conflict { .. }), "{err:?}");
+    let builder = db.tm.begin();
+    // Not a duplicate: any write in flight conflicts.
+    db.update(&writer, rid, &row(2, "c")).unwrap().unwrap();
 
+    for txn in [&builder, &db.tm.begin()] {
+        let (built, index) = db.build_unique(txn);
+        let err = built.unwrap_err();
+        assert!(
+            matches!(err, StorageError::Conflict { other, .. } if other == writer.tid()),
+            "{err:?}"
+        );
+        let Index::BtreeIndex(btree) = &*index;
+        assert!(btree.tree().is_empty().unwrap());
+        db.tm.abort(txn).unwrap();
+    }
     db.tm.commit(&writer).unwrap();
-    assert_eq!(build("u3").unwrap(), Some(name_key("a")));
+    assert_eq!(db.run(|txn| db.build_unique(txn).0.unwrap()), None);
+}
+
+/// A head committed after the builder began is a version the builder can't
+/// see, so it conflicts too.
+#[test]
+fn building_a_unique_index_conflicts_with_a_newer_commit() {
+    let db = setup();
+    let builder = db.tm.begin();
+    let newer = db.run(|txn| {
+        db.insert(txn, &row(1, "a")).unwrap().unwrap();
+        txn.tid()
+    });
+    let err = db.build_unique(&builder).0.unwrap_err();
+    assert!(
+        matches!(err, StorageError::Conflict { other, .. } if other == newer),
+        "{err:?}"
+    );
+    db.tm.abort(&builder).unwrap();
 }
