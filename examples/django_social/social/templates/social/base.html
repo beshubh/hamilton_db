@@ -1,0 +1,36 @@
+{% load static %}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Chirp{% endblock %} · on HamiltonDB</title>
+  <link rel="stylesheet" href="{% static 'social/style.css' %}">
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="{% url 'timeline' %}">Chirp</a>
+    <nav>
+      <a href="{% url 'timeline' %}">Home</a>
+      <a href="{% url 'compose' %}">Compose</a>
+      <a href="{% url 'users' %}">Users</a>
+      {% if acting_user %}<a href="{{ acting_user.get_absolute_url }}">Profile</a>{% endif %}
+    </nav>
+    <form class="switcher" method="post" action="{% url 'switch_user' %}">
+      {% csrf_token %}
+      <input type="hidden" name="next" value="{{ request.get_full_path }}">
+      <label>Acting as
+        <select name="user">
+          <option value="">nobody</option>
+          {% for u in all_users %}
+            <option value="{{ u.pk }}"{% if acting_user and u.pk == acting_user.pk %} selected{% endif %}>@{{ u.username }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button type="submit">Switch</button>
+    </form>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

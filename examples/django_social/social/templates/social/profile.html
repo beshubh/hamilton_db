@@ -1,0 +1,14 @@
+{% extends "social/base.html" %}
+{% block title %}@{{ profile.username }}{% endblock %}
+{% block content %}
+  <section class="profile">
+    <h1>{{ profile.display_name }}</h1>
+    <div class="handle">@{{ profile.username }}</div>
+    {% if profile.bio %}<p>{{ profile.bio }}</p>{% endif %}
+  </section>
+  {% for tweet in tweets %}
+    {% include "social/_tweet.html" %}
+  {% empty %}
+    <p class="hint">@{{ profile.username }} hasn't posted yet.</p>
+  {% endfor %}
+{% endblock %}
