@@ -37,7 +37,7 @@ pub const SCHEMA: &[&str] = &[
      category VARCHAR(32), brand VARCHAR(32), price DOUBLE PRECISION, stock INT)",
     "CREATE INDEX idx_products_name ON products (name)",
     "CREATE TABLE orders (id BIGINT PRIMARY KEY, item VARCHAR(64), qty INT, \
-     create_at INT, updated_at INT)",
+     create_at BIGINT, updated_at BIGINT)",
     "CREATE INDEX idx_orders_item ON orders (item, qty)",
 ];
 
