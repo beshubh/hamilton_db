@@ -27,6 +27,7 @@ mod seq_scan;
 mod sort;
 mod topn;
 mod topn_per_group;
+mod truncate;
 mod update;
 mod values;
 mod window;
@@ -48,6 +49,7 @@ pub use seq_scan::SeqScanPlan;
 pub use sort::{OrderBy, SortPlan};
 pub use topn::TopNPlan;
 pub use topn_per_group::TopNPerGroupPlan;
+pub use truncate::TruncatePlan;
 pub use update::UpdatePlan;
 pub use values::ValuesPlan;
 pub use window::{WindowColumn, WindowFunction, WindowFunctionKind, WindowPlan};
@@ -84,6 +86,7 @@ pub enum AbstractPlanNode {
     InsertPlan,
     UpdatePlan,
     DeletePlan,
+    TruncatePlan,
     FilterPlan,
     ProjectionPlan,
     NestedLoopJoinPlan,

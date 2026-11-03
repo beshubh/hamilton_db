@@ -4,6 +4,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
 from unittest import mock
 
 from django.db import IntegrityError, connection
@@ -50,6 +51,14 @@ class SocialTests(TransactionTestCase):
         self.assertEqual(types[("social_tweet", "created_at")], "TIMESTAMPTZ")
         for (table, column), type_ in types.items():
             self.assertNotIn("TEXT", type_, f"{table}.{column}")
+
+    def test_flush_restarts_ids(self):
+        self.make_user("alice")
+        self.make_user("bob")
+        # TRUNCATE "social_tweet", "social_user" RESTART IDENTITY;
+        call_command("flush", interactive=False, inhibit_post_migrate=True, verbosity=0)
+        self.assertFalse(User.objects.exists())
+        self.assertEqual(self.make_user("carol").pk, 1)
 
     def test_ids_and_timestamps_round_trip(self):
         alice = self.make_user("alice")

@@ -15,6 +15,7 @@ pub enum Statement {
     Select(Box<Select>),
     Update(Update),
     Delete(Delete),
+    Truncate(Truncate),
     /// `EXPLAIN stmt`: the plan of a SELECT, INSERT, UPDATE or DELETE,
     /// without running it.
     Explain(Box<Statement>),
@@ -96,6 +97,16 @@ pub struct Update {
 pub struct Delete {
     pub table: TableRef,
     pub selection: Option<Expr>,
+}
+
+/// `TRUNCATE [TABLE] table, ... [RESTART IDENTITY | CONTINUE IDENTITY]
+/// [CASCADE | RESTRICT]`. With no foreign keys, CASCADE and RESTRICT do the
+/// same.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Truncate {
+    /// In the order written, repeats included.
+    pub tables: Vec<String>,
+    pub restart_identity: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

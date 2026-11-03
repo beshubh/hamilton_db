@@ -29,6 +29,7 @@
 //! `table_page`).
 
 use std::collections::{HashMap, HashSet};
+use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -48,18 +49,23 @@ use crate::table::undo_log::UndoLog;
 
 /// What an ended transaction leaves for garbage collection: the tuples it
 /// left deleted and the index entries it retired. `built` holds the entries
-/// it added building an index, which wait for every transaction running
-/// when it ended rather than for its Tid (see `index_versions`).
+/// it added building an index, and `deferred` the work `after_readers`
+/// queued; both wait for every transaction running when it ended rather
+/// than for its Tid (see `index_versions`).
 #[derive(Default)]
 pub(crate) struct Garbage {
     pub tuples: Vec<(Arc<TableHeap>, Rid)>,
     pub entries: Vec<TableEntry>,
     pub built: Vec<TableEntry>,
+    pub deferred: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 impl Garbage {
     pub fn is_empty(&self) -> bool {
-        self.tuples.is_empty() && self.entries.is_empty() && self.built.is_empty()
+        self.tuples.is_empty()
+            && self.entries.is_empty()
+            && self.built.is_empty()
+            && self.deferred.is_empty()
     }
 
     /// Moves everything in `other` into this.
@@ -67,6 +73,7 @@ impl Garbage {
         self.tuples.append(&mut other.tuples);
         self.entries.append(&mut other.entries);
         self.built.append(&mut other.built);
+        self.deferred.append(&mut other.deferred);
     }
 }
 
@@ -107,7 +114,13 @@ pub struct Transaction {
     retired: Mutex<Vec<TableEntry>>,
     /// The index entries `build_index` added.
     built: Mutex<Vec<TableEntry>>,
+    /// See `on_end`.
+    on_end: Mutex<Vec<EndHook>>,
+    /// See `after_readers`.
+    after_readers: Mutex<Vec<EndHook>>,
 }
+
+type EndHook = Box<dyn FnOnce(TransactionState) + Send>;
 
 /// The tuples a transaction wrote in one table, keyed by the table's first
 /// page. The schema is kept because rollback decodes the deltas.
@@ -144,6 +157,8 @@ impl Transaction {
             index_writes: Mutex::new(Vec::new()),
             retired: Mutex::new(Vec::new()),
             built: Mutex::new(Vec::new()),
+            on_end: Mutex::new(Vec::new()),
+            after_readers: Mutex::new(Vec::new()),
         }
     }
 
@@ -153,6 +168,30 @@ impl Transaction {
 
     pub fn state(&self) -> TransactionState {
         *self.state.read()
+    }
+
+    /// Runs `hook` with the outcome once the transaction's writes are
+    /// committed or rolled back, newest hook first, for a change made
+    /// outside the heap, such as a sequence restart. If ending the writes
+    /// fails partway, hooks are told `Aborted`, so that outcome must be the
+    /// safe one. A hook runs with the state locked and must not use the
+    /// transaction.
+    pub fn on_end(&self, hook: impl FnOnce(TransactionState) + Send + 'static) -> Result<()> {
+        let _state = self.running()?;
+        self.on_end.lock().push(Box::new(hook));
+        Ok(())
+    }
+
+    /// Runs `work` with the outcome during garbage collection, once every
+    /// transaction running when this one ended has ended, and after the
+    /// garbage any of them left: for freeing pages that they may still read.
+    pub fn after_readers(
+        &self,
+        work: impl FnOnce(TransactionState) + Send + 'static,
+    ) -> Result<()> {
+        let _state = self.running()?;
+        self.after_readers.lock().push(Box::new(work));
+        Ok(())
     }
 
     /// Inserts `tuple`, locked until the transaction ends, and returns its
@@ -378,6 +417,24 @@ impl Transaction {
             return Err(StorageError::TransactionNotRunning(self.tid));
         }
         let mut garbage = Garbage::default();
+        let ended = self.end_writes(outcome, &mut garbage);
+        let told = if ended.is_ok() {
+            outcome
+        } else {
+            TransactionState::Aborted
+        };
+        let hooks = mem::take(&mut *self.on_end.lock());
+        hooks.into_iter().rev().for_each(|hook| hook(told));
+        ended?;
+        garbage.deferred = mem::take(&mut *self.after_readers.lock())
+            .into_iter()
+            .map(|work| Box::new(move || work(outcome)) as Box<dyn FnOnce() + Send>)
+            .collect();
+        *state = outcome;
+        Ok(garbage)
+    }
+
+    fn end_writes(&self, outcome: TransactionState, garbage: &mut Garbage) -> Result<()> {
         let mut index_writes = self.index_writes.lock();
         let mut retired = self.retired.lock();
         garbage.built.append(&mut self.built.lock());
@@ -414,8 +471,7 @@ impl Transaction {
             }
         }
         write_set.clear();
-        *state = outcome;
-        Ok(garbage)
+        Ok(())
     }
 
     pub(crate) fn undo_log(&self) -> &Arc<UndoLog> {

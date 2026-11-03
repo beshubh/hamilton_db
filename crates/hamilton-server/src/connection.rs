@@ -219,7 +219,9 @@ fn sqlstate(err: &Error) -> &'static str {
         EngineError::NoTransaction => "25P01",            // no_active_sql_transaction
         EngineError::NotInTransactionBlock(_) => "25001", // active_sql_transaction
         EngineError::Execution(err) => match err {
-            ExecutionError::Storage(StorageError::Conflict { .. }) => "40001", // serialization_failure
+            ExecutionError::Storage(StorageError::Conflict { .. })
+            | ExecutionError::Catalog(CatalogError::ChangedSince { .. }) => "40001", // serialization_failure
+            ExecutionError::Catalog(CatalogError::LockConflict { .. }) => "55P03", // lock_not_available
             ExecutionError::DuplicateKey { .. }
             | ExecutionError::Storage(StorageError::DuplicateKey) => {
                 "23505" // unique_violation

@@ -4,13 +4,11 @@ Each override works around one gap; the README lists them with the SQL that
 fails without it.
 """
 
-from django.db import NotSupportedError
 from django.db.backends.postgresql import (
     base,
     creation,
     features,
     introspection,
-    operations,
     schema,
 )
 
@@ -36,14 +34,6 @@ class DatabaseIntrospection(introspection.DatabaseIntrospection):
         return [introspection.TableInfo(name, "t", None) for name in names]
 
 
-class DatabaseOperations(operations.DatabaseOperations):
-    def sql_flush(self, style, tables, *, reset_sequences=False, allow_cascade=False):
-        # No TRUNCATE. Without foreign keys there is nothing to cascade to.
-        if reset_sequences:
-            raise NotSupportedError("HamiltonDB can't restart identity columns")
-        return [f"DELETE FROM {self.quote_name(table)};" for table in tables]
-
-
 class DatabaseCreation(creation.DatabaseCreation):
     # A server serves one database and has no CREATE DATABASE, so tests use
     # the configured one, which must be a fresh server (see the test runner).
@@ -65,5 +55,4 @@ class DatabaseWrapper(base.DatabaseWrapper):
     SchemaEditorClass = DatabaseSchemaEditor
     features_class = DatabaseFeatures
     introspection_class = DatabaseIntrospection
-    ops_class = DatabaseOperations
     creation_class = DatabaseCreation

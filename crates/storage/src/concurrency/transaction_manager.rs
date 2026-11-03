@@ -50,6 +50,10 @@ struct Shared {
     /// What each ended transaction left, by Tid, until the watermark passes
     /// it.
     garbage: Mutex<BTreeMap<TxnId, Garbage>>,
+    /// Passes collect garbage holding this shared, and run deferred work
+    /// holding it exclusively, so that work such as freeing pages waits for
+    /// another pass still collecting garbage on them.
+    deferring: RwLock<()>,
     passes: Mutex<Passes>,
     /// Wakes the collector when a pass is requested or it should stop.
     wake: Condvar,
@@ -77,6 +81,7 @@ impl TransactionManager {
             read_ts: Arc::new(ReadTimestamps::new()),
             entry_lock: Arc::new(RwLock::new(())),
             garbage: Mutex::new(BTreeMap::new()),
+            deferring: RwLock::new(()),
             passes: Mutex::new(Passes::default()),
             wake: Condvar::new(),
             finished: Condvar::new(),
@@ -194,11 +199,13 @@ impl TransactionManager {
         );
         let mut garbage = txn.finish(outcome)?;
         // Queued before the Tid ends, so the watermark cannot pass it first.
-        // An index build's entries wait for the newest Tid begun so far, so
-        // every transaction running now ends first (see `index_versions`).
+        // An index build's entries, and deferred work, wait for the newest
+        // Tid begun so far, so every transaction running now ends first (see
+        // `index_versions`).
         // Another transaction may queue at that Tid too, so queues merge.
         let built = Garbage {
             built: mem::take(&mut garbage.built),
+            deferred: mem::take(&mut garbage.deferred),
             ..Garbage::default()
         };
         let newest = self.shared.watermark.next() - 1;
@@ -259,6 +266,9 @@ impl Shared {
 
     /// One pass. See `TransactionManager::garbage_collect`.
     fn garbage_collect(&self) -> Result<()> {
+        // Taken before `dead`, so a pass that took older garbage is still
+        // counted when another takes newer deferred work.
+        let collecting = self.deferring.read();
         let watermark = self.watermark.get();
         self.undo.collect(watermark);
         self.read_ts.collect(watermark);
@@ -268,7 +278,9 @@ impl Shared {
             std::mem::replace(&mut *garbage, kept)
         };
         let mut first_error = None;
-        for garbage in dead.into_values() {
+        let mut deferred = Vec::new();
+        for mut garbage in dead.into_values() {
+            deferred.append(&mut garbage.deferred);
             for (heap, rid) in garbage.tuples {
                 match heap.reclaim(rid, watermark) {
                     Ok(true) => self.read_ts.remove(rid),
@@ -289,6 +301,11 @@ impl Shared {
                     first_error.get_or_insert(e);
                 }
             }
+        }
+        drop(collecting);
+        if !deferred.is_empty() {
+            let _deferring = self.deferring.write();
+            deferred.into_iter().for_each(|work| work());
         }
         first_error.map_or(Ok(()), Err)
     }

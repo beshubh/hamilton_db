@@ -160,6 +160,26 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
         Ok(BtreeHeaderPage::new(guard.get_data())?.root_page_id())
     }
 
+    /// Every page of the tree, header first.
+    pub fn page_ids(&self) -> Result<Vec<PageId>> {
+        let mut pages = vec![self.header_page_id];
+        let root = self.get_root_page_id()?;
+        let mut stack = if root == INVALID_PAGE_ID {
+            Vec::new()
+        } else {
+            vec![root]
+        };
+        while let Some(page_id) = stack.pop() {
+            pages.push(page_id);
+            let guard = self.bpm.checked_read_page(page_id, AccessType::Index)?;
+            if page_type(guard.get_data()) == Ok(PageType::BTreeInternal) {
+                let page = InternalPage::new(guard.get_data())?;
+                stack.extend((0..page.size()).map(|i| page.value_at(i)));
+            }
+        }
+        Ok(pages)
+    }
+
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.get_root_page_id()? == INVALID_PAGE_ID)
     }
