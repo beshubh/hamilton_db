@@ -10,12 +10,13 @@ mod expr;
 mod scope;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use catalog::Catalog;
-use common::{Schema, Value, ValueError};
+use catalog::{Catalog, RelationKind, TableInfo};
+use common::{DataType, Schema, Value, ValueError};
 use parser::{
     CreateIndex, CreateTable, Delete, Expr, FromItem, Insert, JoinKind, OrderByItem, Select,
-    SelectItem, Statement, TableRef, Update,
+    SelectItem, Statement, TableRef, Truncate, Update,
 };
 
 use self::aggregate::Rewriter;
@@ -24,7 +25,7 @@ use self::scope::Scope;
 use crate::bound::{
     BoundCreateIndex, BoundCreateTable, BoundDelete, BoundExpr, BoundExprKind, BoundFrom,
     BoundInsert, BoundOrderBy, BoundSelect, BoundSelectItem, BoundStatement, BoundTable,
-    BoundUpdate, TransactionCommand,
+    BoundTruncate, BoundUpdate, TransactionCommand,
 };
 use crate::error::{PlannerError, Result};
 
@@ -45,6 +46,7 @@ impl<'a> Binder<'a> {
             Statement::Select(select) => self.bind_select(select, None).map(BoundStatement::Select),
             Statement::Update(update) => self.bind_update(update),
             Statement::Delete(delete) => self.bind_delete(delete),
+            Statement::Truncate(truncate) => self.bind_truncate(truncate),
             Statement::Explain(stmt) => Ok(BoundStatement::Explain(Box::new(self.bind(stmt)?))),
             Statement::Begin => Ok(BoundStatement::Transaction(TransactionCommand::Begin)),
             Statement::Commit => Ok(BoundStatement::Transaction(TransactionCommand::Commit)),
@@ -53,10 +55,20 @@ impl<'a> Binder<'a> {
     }
 
     /// The catalog checks the column names when the table is created.
-    /// Primary key columns are made NOT NULL, as in Postgres.
+    /// Primary key and identity columns are made NOT NULL, as in Postgres.
     fn bind_create_table(&self, create: &CreateTable) -> Result<BoundStatement> {
         if self.catalog.get_table(&create.name).is_some() {
             return Err(PlannerError::TableExists(create.name.clone()));
+        }
+        for key in &create.unique {
+            for (i, name) in key.columns.iter().enumerate() {
+                if key.columns[..i].contains(name) {
+                    return Err(PlannerError::DuplicateColumn(name.clone()));
+                }
+                if !create.columns.iter().any(|column| column.name == *name) {
+                    return Err(PlannerError::ColumnNotFound(name.clone()));
+                }
+            }
         }
         let mut columns = create.columns.clone();
         for (i, name) in create.primary_key.iter().enumerate() {
@@ -69,10 +81,25 @@ impl<'a> Binder<'a> {
                 .ok_or_else(|| PlannerError::ColumnNotFound(name.clone()))?;
             column.nullable = false;
         }
+        for name in &create.identity {
+            let column = columns
+                .iter_mut()
+                .find(|column| column.name == *name)
+                .ok_or_else(|| PlannerError::ColumnNotFound(name.clone()))?;
+            if !matches!(column.data_type, DataType::Int | DataType::BigInt) {
+                return Err(PlannerError::IdentityType {
+                    column: name.clone(),
+                    found: column.data_type,
+                });
+            }
+            column.nullable = false;
+        }
         Ok(BoundStatement::CreateTable(BoundCreateTable {
             name: create.name.clone(),
             schema: Schema::new(columns),
             primary_key: create.primary_key.clone(),
+            unique: create.unique.clone(),
+            identity: create.identity.clone(),
         }))
     }
 
@@ -96,14 +123,13 @@ impl<'a> Binder<'a> {
             name: create.name.clone(),
             table: table.name,
             columns: create.columns.clone(),
+            kind: create.kind,
         }))
     }
 
     fn bind_insert(&self, insert: &Insert) -> Result<BoundStatement> {
-        let table = self.bind_table(&TableRef {
-            name: insert.table.clone(),
-            alias: None,
-        })?;
+        let info = self.table_to_change(&insert.table)?;
+        let table = bound_table(&info, None);
         let columns = table.schema.columns();
 
         // For each table column, its position in a VALUES row, if listed.
@@ -127,7 +153,7 @@ impl<'a> Binder<'a> {
         };
 
         // VALUES can't refer to any table.
-        let scope = Scope::default();
+        let no_table = Scope::default();
         let rows = insert
             .rows
             .iter()
@@ -142,19 +168,38 @@ impl<'a> Binder<'a> {
                 columns
                     .iter()
                     .zip(&position)
-                    .map(|(column, pos)| match pos {
-                        Some(pos) => {
-                            let value = self.bind_expr(&row[*pos], &scope)?;
+                    .enumerate()
+                    .map(|(idx, (column, pos))| match (pos, info.identity(idx)) {
+                        (Some(pos), _) => {
+                            let value = self.bind_expr(&row[*pos], &no_table)?;
                             forbid_calls(&value, "VALUES")?;
                             assign(value, column)
                         }
-                        None => null_for(column),
+                        (None, Some(sequence)) => Ok(BoundExpr {
+                            kind: BoundExprKind::NextIdentity(Arc::clone(sequence)),
+                            return_type: column.clone(),
+                        }),
+                        (None, None) => null_for(column),
                     })
                     .collect()
             })
             .collect::<Result<_>>()?;
 
-        Ok(BoundStatement::Insert(BoundInsert { table, rows }))
+        let mut scope = Scope::default();
+        scope.push(&table.alias, table.schema.columns())?;
+        let mut returning = Vec::new();
+        for item in &insert.returning {
+            self.bind_select_item(item, &scope, &mut returning)?;
+        }
+        for item in &returning {
+            forbid_calls(&item.expr, "RETURNING")?;
+        }
+
+        Ok(BoundStatement::Insert(BoundInsert {
+            table,
+            rows,
+            returning,
+        }))
     }
 
     /// Binds a SELECT, which is a subquery of the query `outer` is the
@@ -290,7 +335,8 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_update(&self, update: &Update) -> Result<BoundStatement> {
-        let table = self.bind_table(&update.table)?;
+        let info = self.table_to_change(&update.table.name)?;
+        let table = bound_table(&info, update.table.alias.as_deref());
         let mut scope = Scope::default();
         scope.push(&table.alias, table.schema.columns())?;
 
@@ -326,7 +372,8 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_delete(&self, delete: &Delete) -> Result<BoundStatement> {
-        let table = self.bind_table(&delete.table)?;
+        let info = self.table_to_change(&delete.table.name)?;
+        let table = bound_table(&info, delete.table.alias.as_deref());
         let mut scope = Scope::default();
         scope.push(&table.alias, table.schema.columns())?;
         let selection = delete
@@ -337,17 +384,39 @@ impl<'a> Binder<'a> {
         Ok(BoundStatement::Delete(BoundDelete { table, selection }))
     }
 
+    /// A table named twice is truncated once, as in Postgres.
+    fn bind_truncate(&self, truncate: &Truncate) -> Result<BoundStatement> {
+        let mut tables: Vec<BoundTable> = Vec::with_capacity(truncate.tables.len());
+        for name in &truncate.tables {
+            let info = self.table_to_change(name)?;
+            if !tables.iter().any(|table| table.oid == info.oid) {
+                tables.push(bound_table(&info, None));
+            }
+        }
+        Ok(BoundStatement::Truncate(BoundTruncate {
+            tables,
+            restart_identity: truncate.restart_identity,
+        }))
+    }
+
     fn bind_table(&self, table: &TableRef) -> Result<BoundTable> {
-        let info = self
-            .catalog
-            .get_table(&table.name)
-            .ok_or_else(|| PlannerError::TableNotFound(table.name.clone()))?;
-        Ok(BoundTable {
-            oid: info.oid,
-            name: info.name.clone(),
-            alias: table.alias.clone().unwrap_or_else(|| info.name.clone()),
-            schema: info.schema.clone(),
-        })
+        let info = self.table_info(&table.name)?;
+        Ok(bound_table(&info, table.alias.as_deref()))
+    }
+
+    fn table_info(&self, name: &str) -> Result<Arc<TableInfo>> {
+        self.catalog
+            .get_table(name)
+            .ok_or_else(|| PlannerError::TableNotFound(name.to_owned()))
+    }
+
+    /// A table an INSERT, UPDATE, DELETE or TRUNCATE writes.
+    fn table_to_change(&self, name: &str) -> Result<Arc<TableInfo>> {
+        let info = self.table_info(name)?;
+        if info.kind == RelationKind::Sequence {
+            return Err(PlannerError::CannotChangeSequence(name.to_owned()));
+        }
+        Ok(info)
     }
 
     /// Binds one select item, expanding `*` and `t.*` into their columns.
@@ -417,6 +486,15 @@ impl<'a> Binder<'a> {
             expr,
             desc: item.desc,
         })
+    }
+}
+
+fn bound_table(info: &TableInfo, alias: Option<&str>) -> BoundTable {
+    BoundTable {
+        oid: info.oid,
+        name: info.name.clone(),
+        alias: alias.unwrap_or(&info.name).to_owned(),
+        schema: info.schema.clone(),
     }
 }
 

@@ -1,6 +1,8 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use common::{Rid, Schema, Tuple};
+use storage::index::IndexTrait;
 
 use super::{
     AbstractExecutor, Executor, count_row, duplicate_key, index_keys, locators, write_indexes,
@@ -11,8 +13,9 @@ use crate::plans::{InsertPlan, PlanNode};
 
 /// Inserts all of the child's rows, and their entries in each of the table's
 /// indexes, on the first call to `next`, and produces one row holding how
-/// many there were. A row whose primary key is taken, by a row already in
-/// the table or one inserted before it, fails the statement.
+/// many there were, or with RETURNING the inserted rows themselves. A row
+/// whose key in a unique index is taken, by a row already in the table or
+/// one inserted before it, fails the statement.
 pub struct InsertExecutor {
     ctx: Arc<ExecutionContext>,
     plan: InsertPlan,
@@ -20,6 +23,8 @@ pub struct InsertExecutor {
     child_tuples: Vec<Tuple>,
     child_rids: Vec<Rid>,
     done: bool,
+    /// With RETURNING, the inserted rows not produced yet.
+    returned: VecDeque<Tuple>,
 }
 
 impl InsertExecutor {
@@ -31,6 +36,7 @@ impl InsertExecutor {
             child_tuples: Vec::new(),
             child_rids: Vec::new(),
             done: false,
+            returned: VecDeque::new(),
         }
     }
 }
@@ -38,6 +44,7 @@ impl InsertExecutor {
 impl Executor for InsertExecutor {
     fn init(&mut self) -> Result<()> {
         self.done = false;
+        self.returned.clear();
         self.child.init()
     }
 
@@ -50,7 +57,9 @@ impl Executor for InsertExecutor {
         tuples.clear();
         rids.clear();
         if self.done {
-            return Ok(false);
+            let n = batch_size.min(self.returned.len());
+            tuples.extend(self.returned.drain(..n));
+            return Ok(!tuples.is_empty());
         }
         self.done = true;
         let table = self.ctx.table(self.plan.table_oid())?;
@@ -70,13 +79,17 @@ impl Executor for InsertExecutor {
             let rid = txn.insert(&table.heap, &table.schema, tuple)?;
             let locators = locators(&indexes, &keys, rid);
             for ((index, key), locator) in indexes.iter().zip(&keys).zip(&locators) {
-                if !txn.insert_entry(&indexed, &index.index, key, locator)? {
-                    return Err(duplicate_key(index, key));
+                if !txn.insert_entry(&indexed, &index.index, key, locator, rid)? {
+                    return Err(duplicate_key(index.index.metadata(), key));
                 }
             }
         }
-        tuples.push(count_row(self.plan.get_output_schema(), rows.len())?);
-        Ok(true)
+        if !self.plan.returning() {
+            tuples.push(count_row(self.plan.get_output_schema(), rows.len())?);
+            return Ok(true);
+        }
+        self.returned = rows.into();
+        self.next(tuples, rids, batch_size)
     }
 
     fn get_output_schema(&self) -> &Schema {

@@ -63,6 +63,7 @@ pub fn hash_value_ref(value: ValueRef<'_>, seed: u64) -> u64 {
         ValueRef::Double(v) => hash_double(v, seed),
         ValueRef::Bool(v) => hash_bool(v, seed),
         ValueRef::Varchar(v) => hash_varchar(v, seed),
+        ValueRef::Timestamptz(v) => hash_bigint(v, seed),
         ValueRef::Array(values) => hash_values(values, seed),
     }
 }

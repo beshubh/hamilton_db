@@ -28,6 +28,13 @@
 //!   visible yet, so no one can tell. In a block that can't be done: the
 //!   failed statement may have written rows, which only aborting the whole
 //!   transaction undoes, so the block fails and the client retries it.
+//!   A statement that can't get a table lock (`LockConflict`) is retried
+//!   the same way, once the holder ends.
+//!   CREATE TABLE is never retried, as the catalog isn't transactional
+//!   (see `retryable`). CREATE INDEX is: a failed build records nothing,
+//!   and a unique index's conflicts come before it adds an entry, so the
+//!   catalog frees each attempt's empty tree. It waits out writers that
+//!   haven't committed.
 //!
 //! [`ExecutionEngine::session`] opens another session on the same database.
 //! Sessions share one `TransactionManager`, so their transactions are
@@ -43,11 +50,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use catalog::Catalog;
+use catalog::{Catalog, CatalogError};
 use common::{Column, TxnId, Value};
 use execution::ExecutionError;
 use execution::execution_context::{ExecutionContext, ExecutionSettings};
-use execution::executors::{Executor, create_executor};
+use execution::executors::{Executor, create_executor, lock_tables};
 use execution::plans::AbstractPlanNode;
 use parser::{ParseError, Statement};
 use storage::StorageError;
@@ -72,8 +79,10 @@ pub const DEFAULT_CONFLICT_TIMEOUT: Duration = Duration::from_secs(2);
 /// What a statement produced.
 #[derive(Debug, PartialEq)]
 pub enum Output {
-    /// The rows of a SELECT or EXPLAIN.
+    /// The rows of a SELECT or EXPLAIN, whose `command` is `SELECT`, or of
+    /// an INSERT ... RETURNING, whose `command` is `INSERT`.
     Rows {
+        command: &'static str,
         columns: Vec<Column>,
         rows: Vec<Vec<Value>>,
     },
@@ -260,7 +269,11 @@ impl ExecutionEngine {
             }
             (_, State::Idle) => Err(EngineError::NoTransaction),
             (TransactionCommand::Commit, State::InBlock(txn)) => {
-                self.commit(&txn)?;
+                if let Err(err) = self.commit(&txn) {
+                    // The commit's error is the one to report.
+                    let _ = self.txn_manager.abort(&txn);
+                    return Err(err);
+                }
                 Ok(Output::Done("COMMIT"))
             }
             (TransactionCommand::Rollback, State::InBlock(txn)) => {
@@ -298,13 +311,12 @@ impl ExecutionEngine {
                 // conflict with them.
                 return result;
             }
-            // DDL isn't retried: the catalog isn't transactional.
-            let other = match &result {
-                Err(err) if ddl.is_none() => conflicting_txn(err),
+            let conflict = match &result {
+                Err(err) if retryable(bound) => conflict(err),
                 _ => None,
             };
-            match other {
-                Some(other) if self.wait_to_retry(txn.tid(), other, attempt, deadline) => {
+            match conflict {
+                Some(conflict) if self.wait_to_retry(txn.tid(), conflict, attempt, deadline) => {
                     attempt += 1;
                 }
                 _ => return result,
@@ -312,14 +324,27 @@ impl ExecutionEngine {
         }
     }
 
-    /// Waits until a statement whose transaction `tid` conflicted with
-    /// transaction `other` is worth running again in a new one. Returns
-    /// `false` once `deadline` has passed.
-    fn wait_to_retry(&self, tid: TxnId, other: TxnId, attempt: u32, deadline: Instant) -> bool {
+    /// Waits until a statement whose transaction `tid` hit `conflict` is
+    /// worth running again in a new one. Returns `false` once `deadline` has
+    /// passed.
+    fn wait_to_retry(
+        &self,
+        tid: TxnId,
+        conflict: Conflict,
+        attempt: u32,
+        deadline: Instant,
+    ) -> bool {
         // An older transaction holds a row the statement needs, or wrote one
         // it must see, and only its end changes that. A newer one is still
-        // older than the retry's Tid, which gets past it at once.
-        if other < tid && !self.txn_manager.wait_for_end(other, deadline) {
+        // older than the retry's Tid, which gets past it at once. A table
+        // lock is held until its holder ends, however new.
+        let wait_for = match conflict {
+            Conflict::Row(other) => Some(other).filter(|&other| other < tid),
+            Conflict::Lock(other) => Some(other),
+        };
+        if let Some(other) = wait_for
+            && !self.txn_manager.wait_for_end(other, deadline)
+        {
             return false;
         }
         // Conflicting again means others keep getting in first.
@@ -330,8 +355,13 @@ impl ExecutionEngine {
         Instant::now() < deadline
     }
 
-    /// Records the next Tid in the catalog header, then commits `txn`.
+    /// Readies the catalog changes `txn` made, records the next Tid in the
+    /// catalog header, then commits `txn`. If this fails, `txn` is still
+    /// running and must be aborted.
     fn commit(&self, txn: &Transaction) -> Result<()> {
+        self.catalog
+            .prepare_commit(txn)
+            .map_err(ExecutionError::from)?;
         self.catalog
             .set_next_tid(self.txn_manager.next_tid())
             .map_err(ExecutionError::from)?;
@@ -351,6 +381,7 @@ impl ExecutionEngine {
             Arc::clone(txn),
             self.settings,
         ));
+        lock_tables(&self.catalog, txn, plan)?;
         let mut executor = create_executor(&ctx, plan)?;
         executor.init()?;
         let (mut tuples, mut rids) = (Vec::new(), Vec::new());
@@ -364,18 +395,25 @@ impl ExecutionEngine {
                 );
             }
         }
-        let command = match bound {
+        let (command, returns_rows) = match bound {
             BoundStatement::CreateTable(_) => return Ok(Output::Done("CREATE TABLE")),
             BoundStatement::CreateIndex(_) => return Ok(Output::Done("CREATE INDEX")),
-            BoundStatement::Select(_) | BoundStatement::Explain(_) => {
-                let columns = executor.get_output_schema().columns().to_vec();
-                return Ok(Output::Rows { columns, rows });
-            }
-            BoundStatement::Insert(_) => "INSERT",
-            BoundStatement::Update(_) => "UPDATE",
-            BoundStatement::Delete(_) => "DELETE",
+            BoundStatement::Select(_) | BoundStatement::Explain(_) => ("SELECT", true),
+            BoundStatement::Insert(insert) => ("INSERT", !insert.returning.is_empty()),
+            BoundStatement::Update(_) => ("UPDATE", false),
+            BoundStatement::Delete(_) => ("DELETE", false),
+            // Postgres reports no count.
+            BoundStatement::Truncate(_) => return Ok(Output::Done("TRUNCATE TABLE")),
             BoundStatement::Transaction(_) => unreachable!("transaction commands are not planned"),
         };
+        if returns_rows {
+            let columns = executor.get_output_schema().columns().to_vec();
+            return Ok(Output::Rows {
+                command,
+                columns,
+                rows,
+            });
+        }
         match rows.as_slice() {
             [row] => match row.as_slice() {
                 [Value::BigInt(count)] => Ok(Output::Count {
@@ -416,12 +454,47 @@ impl Drop for ExecutionEngine {
     }
 }
 
-/// The transaction `err` conflicted with, if it is a storage `Conflict`.
-fn conflicting_txn(err: &EngineError) -> Option<TxnId> {
+/// Whether `bound`, run outside a block, may run again after a `Conflict`.
+/// Every statement must answer: running one again must not repeat
+/// anything the failed attempt left in the catalog.
+fn retryable(bound: &BoundStatement) -> bool {
+    match bound {
+        BoundStatement::CreateTable(_) => false,
+        BoundStatement::CreateIndex(_)
+        | BoundStatement::Insert(_)
+        | BoundStatement::Select(_)
+        | BoundStatement::Update(_)
+        | BoundStatement::Delete(_)
+        | BoundStatement::Truncate(_)
+        | BoundStatement::Explain(_) => true,
+        BoundStatement::Transaction(_) => unreachable!("transaction commands are not run here"),
+    }
+}
+
+/// What a statement that failed with `err` should wait out before running
+/// again, if anything.
+#[derive(Clone, Copy)]
+enum Conflict {
+    /// A transaction holding or having written a row.
+    Row(TxnId),
+    /// A transaction holding a table lock.
+    Lock(TxnId),
+}
+
+fn conflict(err: &EngineError) -> Option<Conflict> {
     match err {
         EngineError::Execution(ExecutionError::Storage(StorageError::Conflict {
             other, ..
-        })) => Some(*other),
+        })) => Some(Conflict::Row(*other)),
+        EngineError::Execution(ExecutionError::Catalog(CatalogError::LockConflict {
+            other,
+            ..
+        })) => Some(Conflict::Lock(*other)),
+        // Ended already, and older than the retry.
+        EngineError::Execution(ExecutionError::Catalog(CatalogError::ChangedSince {
+            other,
+            ..
+        })) => Some(Conflict::Row(*other)),
         _ => None,
     }
 }

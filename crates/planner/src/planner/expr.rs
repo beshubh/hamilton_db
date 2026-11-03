@@ -4,11 +4,13 @@
 //! the execution expressions check when built, so building one fails only
 //! if the two disagree.
 
+use std::sync::Arc;
+
 use execution::ExecutionError;
 use execution::expressions::{
     AbstractExpr, ArithmeticExpr, ArithmeticOp, ArrayExpr, CastExpr, ColumnValueExpr,
-    ComparisonExpr, ComparisonOp, ConstantExpr, IsNullExpr, LogicExpr, LogicOp, StringExpr,
-    StringOp, UnaryExpr, UnaryOp,
+    ComparisonExpr, ComparisonOp, ConstantExpr, IsNullExpr, LogicExpr, LogicOp, NextValueExpr,
+    StringExpr, StringOp, UnaryExpr, UnaryOp,
 };
 use parser::BinaryOp;
 
@@ -47,6 +49,9 @@ pub(super) fn plan_expr(expr: &BoundExpr, inputs: Inputs) -> Result<AbstractExpr
         }
         BoundExprKind::Constant(value) => {
             ConstantExpr::new(value.clone(), expr.return_type.clone()).into()
+        }
+        BoundExprKind::NextIdentity(sequence) => {
+            NextValueExpr::new(Arc::clone(sequence), expr.return_type.clone()).into()
         }
         BoundExprKind::Binary { op, left, right } => {
             plan_binary(*op, plan_expr(left, inputs)?, plan_expr(right, inputs)?)?

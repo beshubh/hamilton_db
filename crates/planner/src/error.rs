@@ -97,6 +97,14 @@ pub enum PlannerError {
     #[error("subquery must return only one column, found {found}")]
     SubqueryColumns { found: usize },
 
+    #[error("identity column {column} must be INT or BIGINT, not {found}")]
+    IdentityType { column: String, found: DataType },
+
+    /// INSERT, UPDATE or DELETE on a sequence, whose row only `nextval`
+    /// changes.
+    #[error("cannot change sequence {0}")]
+    CannotChangeSequence(String),
+
     /// Something the parser accepts but the binder or planner does not
     /// handle yet, such as a correlated subquery.
     #[error("{0} is not supported")]

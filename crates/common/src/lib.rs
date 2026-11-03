@@ -6,8 +6,10 @@ pub mod config;
 pub mod error;
 pub mod hash;
 pub mod ids;
+pub mod index_kind;
 pub mod rid;
 pub mod schema;
+pub mod timestamp;
 pub mod tuple;
 pub mod value;
 
@@ -15,6 +17,7 @@ pub use error::{Result, ValueError};
 pub use ids::{
     FrameId, INVALID_LSN, INVALID_PAGE_ID, INVALID_TXN_ID, Lsn, PageId, TXN_UNCOMMITTED_BIT, TxnId,
 };
+pub use index_kind::{IndexKind, UniqueKey};
 pub use rid::{Rid, SlotId};
 pub use schema::{Column, Schema};
 pub use tuple::{ColumnReader, Tuple, TupleJoiner, TupleProjector, TupleWriter};

@@ -1,4 +1,4 @@
-use common::ValueError;
+use common::{TxnId, ValueError};
 use storage::StorageError;
 use thiserror::Error;
 
@@ -36,6 +36,25 @@ pub enum CatalogError {
 
     #[error("primary key column {0} must be NOT NULL")]
     NullablePrimaryKey(String),
+
+    #[error("identity column {0} must be a NOT NULL INT or BIGINT")]
+    InvalidIdentity(String),
+
+    /// CREATE INDEX on a sequence.
+    #[error("{0} is not a table")]
+    NotATable(String),
+
+    /// Another transaction holds a lock that conflicts.
+    #[error("could not obtain lock on relation \"{table}\"")]
+    LockConflict { table: String, other: TxnId },
+
+    /// A newer transaction truncated the table, removing rows this one
+    /// would see, or used it, so this one can't truncate it.
+    #[error("could not serialize access to relation \"{table}\" due to a newer transaction")]
+    ChangedSince { table: String, other: TxnId },
+
+    #[error("nextval: reached maximum value of sequence {name} ({max})")]
+    SequenceExhausted { name: String, max: i64 },
 
     #[error("name {0:?} is empty or longer than {MAX_NAME_LEN} bytes")]
     InvalidName(String),

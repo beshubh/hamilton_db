@@ -1,0 +1,19 @@
+{% extends "social/base.html" %}
+{% block title %}{{ tweet.author.display_name }}{% endblock %}
+{% block content %}
+  <h1>Thread</h1>
+  {% for parent in ancestors %}
+    {% include "social/_tweet.html" with tweet=parent hide_parent=True %}
+  {% endfor %}
+  {% include "social/_tweet.html" with highlight=True hide_parent=True %}
+  {% if acting_user %}
+    {% url 'reply' tweet.pk as action %}
+    {% include "social/_compose_form.html" with action=action button="Reply" %}
+  {% endif %}
+  <h2>{{ replies|length }} repl{{ replies|length|pluralize:"y,ies" }}</h2>
+  <div class="replies">
+    {% for reply, depth in replies %}
+      {% include "social/_tweet.html" with tweet=reply depth=depth hide_parent=True %}
+    {% endfor %}
+  </div>
+{% endblock %}

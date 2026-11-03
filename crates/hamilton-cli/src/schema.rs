@@ -32,7 +32,8 @@ pub struct Column {
 #[derive(Debug, PartialEq)]
 pub struct Index {
     pub name: String,
-    pub primary_key: bool,
+    /// `PRIMARY KEY`, `UNIQUE`, `UNIQUE NULLS NOT DISTINCT`, or empty.
+    pub kind: String,
     /// The key columns, joined by `", "`.
     pub columns: String,
 }
@@ -71,7 +72,7 @@ impl Schema {
             });
         }
         for row in indexes {
-            let [name, table, primary_key, columns] = cells(row)?;
+            let [name, table, kind, columns] = cells(row)?;
             let table = schema
                 .tables
                 .iter_mut()
@@ -79,7 +80,7 @@ impl Schema {
                 .ok_or_else(|| bad(format!("index {name} is on unknown table {table}")))?;
             table.indexes.push(Index {
                 name: name.to_owned(),
-                primary_key: primary_key == "t",
+                kind: kind.to_owned(),
                 columns: columns.to_owned(),
             });
         }

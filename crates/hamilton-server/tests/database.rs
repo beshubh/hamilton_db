@@ -48,6 +48,7 @@ fn runs_statements() {
     assert_eq!(
         output,
         Output::Rows {
+            command: "SELECT",
             columns: vec![
                 Column::new("name", DataType::Varchar(8), true),
                 Column::new("ten", DataType::Int, false),

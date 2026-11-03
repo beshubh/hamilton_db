@@ -122,6 +122,8 @@ impl fmt::Display for ExprDisplay<'_> {
                     expr.return_type().data_type
                 )
             }
+            // It stands in for the column's default.
+            AbstractExpr::NextValueExpr(_) => f.write_str("DEFAULT"),
         }
     }
 }
@@ -130,6 +132,7 @@ impl fmt::Display for ExprDisplay<'_> {
 fn write_literal(value: &Value, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match value {
         Value::Varchar(s) => write!(f, "'{}'", s.replace('\'', "''")),
+        Value::Timestamptz(_) => write!(f, "'{value}'::TIMESTAMPTZ"),
         Value::Array(values) => {
             f.write_str("ARRAY[")?;
             for (idx, value) in values.iter().enumerate() {

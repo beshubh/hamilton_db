@@ -9,6 +9,7 @@ catalog = { path = "../catalog" }
 common = { path = "../common" }
 ctrlc = { version = "3.5.2", features = ["termination"] }
 execution = { path = "../execution" }
+log = "0.4.34"
 planner = { path = "../planner" }
 storage = { path = "../storage" }
 wire = { path = "../wire" }

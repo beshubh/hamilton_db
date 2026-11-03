@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use common::Schema;
+use common::{IndexKind, Schema};
 
 use super::{AbstractPlanNode, PlanNode, expect_children};
 
@@ -13,6 +13,8 @@ pub struct CreateIndexPlan {
     table_name: String,
     /// The key columns, in key order.
     key_columns: Vec<String>,
+    /// Plain or unique, never a primary key.
+    kind: IndexKind,
 }
 
 impl CreateIndexPlan {
@@ -26,7 +28,13 @@ impl CreateIndexPlan {
             index_name: index_name.into(),
             table_name: table_name.into(),
             key_columns,
+            kind: IndexKind::Plain,
         }
+    }
+
+    pub fn with_kind(mut self, kind: IndexKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     pub fn index_name(&self) -> &str {
@@ -39,6 +47,10 @@ impl CreateIndexPlan {
 
     pub fn key_columns(&self) -> &[String] {
         &self.key_columns
+    }
+
+    pub fn kind(&self) -> IndexKind {
+        self.kind
     }
 }
 

@@ -1,0 +1,19 @@
+{% extends "social/base.html" %}
+{% block title %}{% if reply_to %}Reply{% elif quoted %}Quote{% else %}Compose{% endif %}{% endblock %}
+{% block content %}
+  {% if reply_to %}
+    <h1>Reply</h1>
+    {% include "social/_tweet.html" with tweet=reply_to %}
+    {% url 'reply' reply_to.pk as action %}
+    {% include "social/_compose_form.html" with action=action button="Reply" %}
+  {% elif quoted %}
+    <h1>Quote</h1>
+    {% url 'quote' quoted.pk as action %}
+    {% include "social/_compose_form.html" with action=action button="Quote" %}
+    {% include "social/_quoted.html" %}
+  {% else %}
+    <h1>Compose</h1>
+    {% url 'compose' as action %}
+    {% include "social/_compose_form.html" with action=action %}
+  {% endif %}
+{% endblock %}

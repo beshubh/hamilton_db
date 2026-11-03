@@ -90,6 +90,7 @@ fn shape(plan: &AbstractPlanNode) -> String {
         AbstractPlanNode::InsertPlan(_) => "Insert",
         AbstractPlanNode::UpdatePlan(_) => "Update",
         AbstractPlanNode::DeletePlan(_) => "Delete",
+        AbstractPlanNode::TruncatePlan(_) => "Truncate",
         AbstractPlanNode::FilterPlan(_) => "Filter",
         AbstractPlanNode::ProjectionPlan(_) => "Projection",
         AbstractPlanNode::NestedLoopJoinPlan(_) => "NestedLoopJoin",
@@ -300,6 +301,15 @@ fn delete_without_where_scans_everything() {
     assert_eq!(
         shape(&db.plan("DELETE FROM users WHERE id > 3")),
         "Delete(Filter(SeqScan users))"
+    );
+}
+
+#[test]
+fn truncate_is_one_node() {
+    let db = Db::new();
+    assert_eq!(
+        shape(&db.optimized("TRUNCATE orders, users, orders")),
+        "Truncate"
     );
 }
 

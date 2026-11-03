@@ -1,5 +1,6 @@
 """A minimal Postgres wire protocol client: startup, then simple queries.
 Enough to talk to hamilton-server over several connections at once."""
+import select
 import socket
 import struct
 from dataclasses import dataclass
@@ -40,8 +41,19 @@ class Connection:
         """Runs `sql` and returns a result for each statement that ran, and
         last the error that stopped the rest, if one did. BOOL values come
         back as `true` and `false`, as the CLI prints them."""
+        self.send(sql)
+        return self.results()
+
+    def send(self, sql: str):
+        """Sends `sql` without waiting for its results; `results` reads them."""
         body = sql.encode() + b"\0"
         self.sock.sendall(b"Q" + struct.pack("!i", len(body) + 4) + body)
+
+    def results(self, timeout: float | None = None) -> list[Rows | Command | Error] | None:
+        """The results of the query sent last, as `query` returns them, or
+        None if they haven't started arriving within `timeout` seconds."""
+        if timeout is not None and not select.select([self.sock], [], [], timeout)[0]:
+            return None
         return self._until_ready()
 
     def close(self):

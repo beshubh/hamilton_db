@@ -24,13 +24,16 @@ The executors must keep two orders ([`executors.rs`](../../crates/execution/src/
 
 An entry can outlive the version it was added for. It may lead to a row whose visible version has another key, or to no visible row. A reader must fetch through `Transaction::row_at` and check the key again, as `IndexScanExecutor` and `NestedIndexJoinExecutor` do. A new executor that reads through an index has to do the same.
 
-## Primary key uniqueness
+## Uniqueness
 
-The tree doesn't enforce it: a key may sit at several rids, because old versions keep their entries after a row moves, or after it is deleted and the key inserted again. `insert_entry` adds the entry first, then looks at the other rows the key leads to:
+Primary keys and UNIQUE indexes are checked the same way. The tree doesn't enforce it: a key may sit at several rids, because old versions keep their entries after a row moves, or after it is deleted and the key inserted again. `insert_entry` adds the entry first, then looks at the other rows the key leads to:
 - a version with the key, written by another transaction that is running or committed after this one: `Conflict`;
 - otherwise, a visible version with the key: duplicate key.
 
-Adding before checking means that when two transactions insert the same key at once, at least one of them sees the other.
+Adding before checking means that when two transactions insert the same key at once, at least one of them sees the other. A conflict never waits in storage; outside a block the engine waits for the other transaction and retries, so a concurrent duplicate ends as a duplicate key, as in Postgres ([mvto.md](mvto.md#rules)).
+
+- "Other rows" means other rids, not other locators. In an index that stores the primary key, an entry for the row's old primary key leads back to the row itself after `SET id = ...`.
+- A key with a NULL column is never checked, unless the index is `NULLS NOT DISTINCT` (`must_be_free` in [`index_versions.rs`](../../crates/storage/src/concurrency/index_versions.rs)).
 
 ## CREATE INDEX
 
@@ -38,3 +41,4 @@ Adding before checking means that when two transactions insert the same key at o
 - The build adds an entry for every version visible at or above the watermark, locked versions included, not just the newest. An older transaction that is still open may use the index in its next statement.
 - Some of those versions are later rolled back or replaced by writers that never knew about the index, so nothing would retire their entries. The build retires every entry it adds instead. Garbage collection checks them once every transaction running when the build ended has ended.
 - A crash during a build wastes the index's pages. The index was never recorded, so it doesn't come back.
+- A unique index's build first fails with `Conflict` if another transaction has an uncommitted or newer version of any row in the table, and CREATE INDEX retries once that transaction ends. Then every head is committed before the build and no write can land during it, so a row's head is the one version that counts: after the fill, two heads with the same key are a duplicate, and the index is not recorded.

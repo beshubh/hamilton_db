@@ -1,0 +1,5 @@
+<a class="quoted" href="{{ quoted.get_absolute_url }}">
+  <span class="who"><strong>{{ quoted.author.display_name }}</strong> <span class="handle">@{{ quoted.author.username }}</span></span>
+  <span class="text">{{ quoted.text }}</span>
+  {% if quoted.image %}<img src="{{ quoted.image.url }}" alt="">{% endif %}
+</a>

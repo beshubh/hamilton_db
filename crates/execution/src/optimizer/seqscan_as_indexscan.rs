@@ -147,7 +147,8 @@ fn key_value(value: &Value, column: &Column) -> Option<Value> {
         (DataType::Int, Value::Int(_))
         | (DataType::BigInt, Value::BigInt(_))
         | (DataType::Double, Value::Double(_))
-        | (DataType::Bool, Value::Bool(_)) => Some(value.clone()),
+        | (DataType::Bool, Value::Bool(_))
+        | (DataType::Timestamptz, Value::Timestamptz(_)) => Some(value.clone()),
         (DataType::Varchar(max), Value::Varchar(s)) if s.len() <= max as usize => {
             Some(value.clone())
         }

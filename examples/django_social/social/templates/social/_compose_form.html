@@ -1,0 +1,11 @@
+<form class="compose" method="post" enctype="multipart/form-data" action="{{ action }}">
+  {% csrf_token %}
+  {{ form.non_field_errors }}
+  {{ form.text.errors }}
+  {{ form.text }}
+  {{ form.image.errors }}
+  <div class="row">
+    <label class="file">Image {{ form.image }}</label>
+    <button type="submit">{{ button|default:"Post" }}</button>
+  </div>
+</form>

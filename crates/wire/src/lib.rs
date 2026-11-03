@@ -23,8 +23,9 @@ pub const PROTOCOL_VERSION: i32 = 3 << 16;
 /// two row sets, in table name order:
 ///
 /// - `table, column, type, nullable`: one row per column, in column order.
-/// - `index, table, primary_key, columns`: one row per index, in creation
-///   order, `columns` being its key columns joined by `", "`.
+/// - `index, table, kind, columns`: one row per index, in creation order,
+///   `kind` being `PRIMARY KEY`, `UNIQUE`, `UNIQUE NULLS NOT DISTINCT` or
+///   empty, and `columns` its key columns joined by `", "`.
 pub const SCHEMA_REQUEST: &str = "\\schema";
 
 /// The type oids a row description uses, Postgres's own.
@@ -35,6 +36,7 @@ pub mod oid {
     pub const TEXT: u32 = 25;
     pub const FLOAT8: u32 = 701;
     pub const VARCHAR: u32 = 1043;
+    pub const TIMESTAMPTZ: u32 = 1184;
 }
 
 /// Messages longer than this are refused before anything is allocated for

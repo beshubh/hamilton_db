@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use catalog::Catalog;
-use common::{Tuple, Value};
+use common::{IndexKind, Tuple, Value};
 use execution::ExecutionError;
 use execution::execution_context::{self, ExecutionSettings};
 use planner::{Binder, EngineError, ExecutionEngine, Output, PlannerError};
@@ -136,19 +136,13 @@ fn create_table_with_primary_key_and_index() {
     let indexes = catalog.table_indexes("users");
     let summary: Vec<_> = indexes
         .iter()
-        .map(|index| {
-            (
-                index.name.as_str(),
-                index.key_columns.clone(),
-                index.is_primary_key,
-            )
-        })
+        .map(|index| (index.name.as_str(), index.key_columns.clone(), index.kind))
         .collect();
     assert_eq!(
         summary,
         [
-            ("users_pkey", vec![0], true),
-            ("users_name", vec![1], false)
+            ("users_pkey", vec![0], IndexKind::PrimaryKey),
+            ("users_name", vec![1], IndexKind::Plain)
         ]
     );
 }
@@ -197,6 +191,109 @@ fn primary_key_rejects_duplicates() {
 }
 
 #[test]
+fn unique_constraints_reject_duplicates() {
+    let db = Db::new();
+    db.run(
+        "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(16) UNIQUE, a INT, b INT, \
+         UNIQUE (a, b))",
+    );
+    assert_eq!(
+        db.run("INSERT INTO users VALUES (1, 'ann', 1, 1), (2, 'bo', 1, 2)"),
+        count(2)
+    );
+    assert_duplicate_key(
+        db.try_run("INSERT INTO users VALUES (3, 'ann', 2, 1)"),
+        "users_name_key",
+        "(name)=(ann)",
+    );
+    assert_duplicate_key(
+        db.try_run("INSERT INTO users VALUES (3, 'cy', 1, 2)"),
+        "users_a_b_key",
+        "(a, b)=(1, 2)",
+    );
+    assert_duplicate_key(
+        db.try_run("UPDATE users SET name = 'ann' WHERE id = 2"),
+        "users_name_key",
+        "(name)=(ann)",
+    );
+    // Changing the primary key, or a column outside the key, keeps it.
+    assert_eq!(db.run("UPDATE users SET id = id + 10"), count(2));
+    assert_eq!(db.run("UPDATE users SET a = a WHERE id = 11"), count(1));
+    // The rows swap keys: each is checked against the other's new version.
+    assert_eq!(db.run("UPDATE users SET b = 3 - b"), count(2));
+    assert_eq!(
+        db.run("SELECT id, b FROM users ORDER BY id"),
+        [
+            vec![Value::Int(11), Value::Int(2)],
+            vec![Value::Int(12), Value::Int(1)]
+        ]
+    );
+    // A deleted row's key can be used again.
+    db.run("DELETE FROM users WHERE id = 11");
+    assert_eq!(
+        db.run("INSERT INTO users VALUES (1, 'ann', 1, 2)"),
+        count(1)
+    );
+}
+
+#[test]
+fn constraints_copying_the_primary_key_or_each_other_add_no_index() {
+    let db = Db::new();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY UNIQUE, a INT, UNIQUE (a), UNIQUE (a))");
+    let indexes = db.catalog().table_indexes("t");
+    let names: Vec<_> = indexes.iter().map(|index| index.name.as_str()).collect();
+    assert_eq!(names, ["t_pkey", "t_a_key"]);
+    db.run("INSERT INTO t VALUES (1, 1)");
+    assert_duplicate_key(
+        db.try_run("INSERT INTO t VALUES (2, 1)"),
+        "t_a_key",
+        "(a)=(1)",
+    );
+}
+
+#[test]
+fn null_keys_conflict_only_when_nulls_are_not_distinct() {
+    let db = Db::new();
+    db.run("CREATE TABLE t (a INT, b INT, UNIQUE (a, b))");
+    assert_eq!(
+        db.run("INSERT INTO t VALUES (1, NULL), (1, NULL), (NULL, NULL)"),
+        count(3)
+    );
+    db.run("CREATE TABLE u (a INT, b INT, UNIQUE NULLS NOT DISTINCT (a, b))");
+    assert_eq!(
+        db.run("INSERT INTO u VALUES (1, NULL), (2, NULL)"),
+        count(2)
+    );
+    assert_duplicate_key(
+        db.try_run("INSERT INTO u VALUES (1, NULL)"),
+        "u_a_b_key",
+        "(a, b)=(1, NULL)",
+    );
+}
+
+#[test]
+fn create_unique_index_checks_the_rows_already_there() {
+    let db = Db::new();
+    db.run("CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    db.run("INSERT INTO t VALUES (1, 1), (2, 1), (3, NULL), (4, NULL)");
+    assert_duplicate_key(
+        db.try_run("CREATE UNIQUE INDEX t_v ON t (v)"),
+        "t_v",
+        "(v)=(1)",
+    );
+    assert!(db.catalog().get_index("t_v").is_none());
+    assert!(
+        db.try_run("CREATE UNIQUE INDEX t_v ON t (v) NULLS NOT DISTINCT")
+            .is_err()
+    );
+
+    db.run("DELETE FROM t WHERE id = 2");
+    assert!(db.run("CREATE UNIQUE INDEX t_v ON t (v)").is_empty());
+    assert_duplicate_key(db.try_run("INSERT INTO t VALUES (5, 1)"), "t_v", "(v)=(1)");
+    assert_eq!(db.run("INSERT INTO t VALUES (5, NULL)"), count(1));
+}
+
+#[test]
 fn composite_primary_key_rejects_duplicates_of_the_whole_key() {
     let db = Db::new();
     db.run("CREATE TABLE t (a INT, b VARCHAR(8), PRIMARY KEY (a, b))");
@@ -230,6 +327,154 @@ fn doubles_are_stored_compared_and_computed() {
     assert!(matches!(
         db.try_run("SELECT x / 0 FROM m WHERE id = 1"),
         Err(ExecutionError::Value(common::ValueError::DivisionByZero))
+    ));
+}
+
+#[test]
+fn timestamps_are_stored_compared_and_sorted() {
+    let db = Db::new();
+    db.run("CREATE TABLE posts (id INT PRIMARY KEY, at TIMESTAMP WITH TIME ZONE NOT NULL)");
+    db.run(
+        "INSERT INTO posts VALUES (1, '2026-11-02T10:51:00.5+00:00'::timestamptz), \
+         (2, '2026-11-02 12:00:00+01'), (3, CAST('2026-11-01' AS TIMESTAMPTZ))",
+    );
+    let shown = |rows: Vec<Vec<Value>>| -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|row| row.iter().map(ToString::to_string).collect())
+            .collect()
+    };
+    assert_eq!(
+        shown(db.run("SELECT id, at FROM posts ORDER BY at DESC")),
+        [
+            ["2", "2026-11-02 11:00:00+00"],
+            ["1", "2026-11-02 10:51:00.5+00"],
+            ["3", "2026-11-01 00:00:00+00"],
+        ]
+    );
+    let after = "SELECT id FROM posts WHERE at >= '2026-11-02 10:51:00.5' ORDER BY id";
+    assert_eq!(db.run(after), [[int(1)], [int(2)]]);
+    assert_eq!(
+        shown(db.run("SELECT min(at), max(at) FROM posts")),
+        [["2026-11-01 00:00:00+00", "2026-11-02 11:00:00+00"]]
+    );
+    db.run("CREATE INDEX posts_at ON posts (at)");
+    assert_eq!(db.run(after), [[int(1)], [int(2)]]);
+}
+
+#[test]
+fn identity_columns_fill_in_left_out_values() {
+    let db = Db::new();
+    db.run(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY, \
+         n INT GENERATED BY DEFAULT AS IDENTITY, name VARCHAR(8))",
+    );
+    db.run("INSERT INTO t (name) VALUES ('a'), ('b')");
+    // A value given is kept, and the counter doesn't move.
+    db.run("INSERT INTO t (id, name) VALUES (10, 'c')");
+    db.run("INSERT INTO t (name) VALUES ('d')");
+    assert_eq!(
+        db.run("SELECT id, n, name FROM t ORDER BY name"),
+        [
+            vec![Value::BigInt(1), int(1), text("a")],
+            vec![Value::BigInt(2), int(2), text("b")],
+            vec![Value::BigInt(10), int(3), text("c")],
+            vec![Value::BigInt(3), int(4), text("d")],
+        ]
+    );
+    let null = db
+        .engine
+        .borrow_mut()
+        .execute_sql("INSERT INTO t (id, name) VALUES (NULL, 'e')")
+        .unwrap_err();
+    assert!(matches!(
+        null,
+        EngineError::Planner(PlannerError::Value(common::ValueError::NullNotAllowed(_)))
+    ));
+}
+
+#[test]
+fn identity_columns_take_their_values_from_a_sequence() {
+    let db = Db::new();
+    db.run("CREATE TABLE t (id INT GENERATED BY DEFAULT AS IDENTITY, name VARCHAR(8))");
+    db.run("INSERT INTO t (name) VALUES ('a'), ('b')");
+    assert_eq!(
+        db.run("SELECT * FROM t_id_seq"),
+        [[Value::BigInt(2), int(31), Value::Bool(true)]]
+    );
+    // nextval isn't undone: a rolled-back INSERT leaves a gap.
+    db.run("BEGIN");
+    db.run("INSERT INTO t (name) VALUES ('c')");
+    db.run("ROLLBACK");
+    db.run("INSERT INTO t (name) VALUES ('d')");
+    assert_eq!(
+        db.run("SELECT id FROM t ORDER BY id"),
+        [[int(1)], [int(2)], [int(4)]]
+    );
+
+    for sql in [
+        "INSERT INTO t_id_seq VALUES (1, 0, FALSE)",
+        "UPDATE t_id_seq SET log_cnt = 0",
+        "DELETE FROM t_id_seq",
+    ] {
+        let err = db.engine.borrow_mut().execute_sql(sql).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Planner(PlannerError::CannotChangeSequence(name)) if name == "t_id_seq"),
+            "{sql}: {err}"
+        );
+    }
+    assert!(matches!(
+        db.try_run("CREATE INDEX i ON t_id_seq (last_value)"),
+        Err(ExecutionError::Catalog(catalog::CatalogError::NotATable(_)))
+    ));
+}
+
+#[test]
+fn insert_returning_produces_the_inserted_rows() {
+    let db = Db::new();
+    db.run(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY, name VARCHAR(8))",
+    );
+    // As Django inserts a row.
+    assert_eq!(
+        db.run("INSERT INTO \"t\" (\"name\") VALUES ('a') RETURNING \"t\".\"id\""),
+        [[Value::BigInt(1)]]
+    );
+    // More rows than a batch.
+    assert_eq!(
+        db.run(
+            "INSERT INTO t (name) VALUES ('b'), ('c'), ('d'), ('e'), (NULL) \
+             RETURNING id * 10 AS ten, *"
+        ),
+        [
+            vec![Value::BigInt(20), Value::BigInt(2), text("b")],
+            vec![Value::BigInt(30), Value::BigInt(3), text("c")],
+            vec![Value::BigInt(40), Value::BigInt(4), text("d")],
+            vec![Value::BigInt(50), Value::BigInt(5), text("e")],
+            vec![Value::BigInt(60), Value::BigInt(6), Value::Null],
+        ]
+    );
+    assert_eq!(db.run("SELECT count(*) FROM t"), count(6));
+    let mut engine = db.engine.borrow_mut();
+    let [output] = engine
+        .execute_sql("INSERT INTO t (name) VALUES ('f') RETURNING name")
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert!(matches!(
+        output,
+        Output::Rows {
+            command: "INSERT",
+            ..
+        }
+    ));
+    let aggregate = engine
+        .execute_sql("INSERT INTO t (name) VALUES ('g') RETURNING count(*)")
+        .unwrap_err();
+    assert!(matches!(
+        aggregate,
+        EngineError::Planner(PlannerError::AggregateNotAllowed {
+            clause: "RETURNING"
+        })
     ));
 }
 

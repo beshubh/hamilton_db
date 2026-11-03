@@ -1,0 +1,18 @@
+{% extends "social/base.html" %}
+{% block title %}Users{% endblock %}
+{% block content %}
+  <h1>Users</h1>
+  <ul class="users">
+    {% for u in users %}
+      <li><a href="{{ u.get_absolute_url }}"><strong>{{ u.display_name }}</strong> <span class="handle">@{{ u.username }}</span></a>{% if u.bio %} — {{ u.bio }}{% endif %}</li>
+    {% empty %}
+      <li class="hint">Nobody here yet.</li>
+    {% endfor %}
+  </ul>
+  <h2>New user</h2>
+  <form class="user-form" method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button type="submit">Create and act as</button>
+  </form>
+{% endblock %}

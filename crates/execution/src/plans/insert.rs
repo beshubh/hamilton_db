@@ -9,8 +9,9 @@ use super::{AbstractPlanNode, PlanNode, dml_output_schema, expect_children};
 /// already in table column order and of the columns' types.
 #[derive(Clone, Debug)]
 pub struct InsertPlan {
-    /// See [`dml_output_schema`].
+    /// See [`dml_output_schema`], or the table's schema with RETURNING.
     output_schema: Schema,
+    returning: bool,
     /// Always `[child]`.
     children: Vec<Arc<AbstractPlanNode>>,
     table_oid: TableOid,
@@ -25,10 +26,23 @@ impl InsertPlan {
     ) -> Self {
         Self {
             output_schema: dml_output_schema(),
+            returning: false,
             children: vec![child],
             table_oid,
             table_name: table_name.into(),
         }
+    }
+
+    /// Produces each inserted row, of `table_schema`, instead of the count,
+    /// for a projection of the RETURNING items above.
+    pub fn with_returning(mut self, table_schema: Schema) -> Self {
+        self.output_schema = table_schema;
+        self.returning = true;
+        self
+    }
+
+    pub fn returning(&self) -> bool {
+        self.returning
     }
 
     pub fn table_oid(&self) -> TableOid {

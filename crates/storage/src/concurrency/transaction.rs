@@ -29,6 +29,7 @@
 //! `table_page`).
 
 use std::collections::{HashMap, HashSet};
+use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -41,7 +42,7 @@ use crate::concurrency::index_versions::{self, IndexedTable, TableEntry};
 use crate::concurrency::read_ts::ReadTimestamps;
 use crate::concurrency::watermark::Watermark;
 use crate::error::{Result, StorageError};
-use crate::index::{Index, IndexTrait, RowLocator};
+use crate::index::{Index, IndexTrait, LocatorKind, RowLocator};
 use crate::table::table_heap::TableHeap;
 use crate::table::table_iterator::{TableIterator, TableRow};
 use crate::table::table_page::TupleMeta;
@@ -49,18 +50,23 @@ use crate::table::undo_log::UndoLog;
 
 /// What an ended transaction leaves for garbage collection: the tuples it
 /// left deleted and the index entries it retired. `built` holds the entries
-/// it added building an index, which wait for every transaction running
-/// when it ended rather than for its Tid (see `index_versions`).
+/// it added building an index, and `deferred` the work `after_readers`
+/// queued; both wait for every transaction running when it ended rather
+/// than for its Tid (see `index_versions`).
 #[derive(Default)]
 pub(crate) struct Garbage {
     pub tuples: Vec<(Arc<TableHeap>, Rid)>,
     pub entries: Vec<TableEntry>,
     pub built: Vec<TableEntry>,
+    pub deferred: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 impl Garbage {
     pub fn is_empty(&self) -> bool {
-        self.tuples.is_empty() && self.entries.is_empty() && self.built.is_empty()
+        self.tuples.is_empty()
+            && self.entries.is_empty()
+            && self.built.is_empty()
+            && self.deferred.is_empty()
     }
 
     /// Moves everything in `other` into this.
@@ -68,6 +74,7 @@ impl Garbage {
         self.tuples.append(&mut other.tuples);
         self.entries.append(&mut other.entries);
         self.built.append(&mut other.built);
+        self.deferred.append(&mut other.deferred);
     }
 }
 
@@ -108,7 +115,13 @@ pub struct Transaction {
     retired: Mutex<Vec<TableEntry>>,
     /// The index entries `build_index` added.
     built: Mutex<Vec<TableEntry>>,
+    /// See `on_end`.
+    on_end: Mutex<Vec<EndHook>>,
+    /// See `after_readers`.
+    after_readers: Mutex<Vec<EndHook>>,
 }
+
+type EndHook = Box<dyn FnOnce(TransactionState) + Send>;
 
 /// The tuples a transaction wrote in one table, keyed by the table's first
 /// page. The schema is kept because rollback decodes the deltas.
@@ -145,6 +158,8 @@ impl Transaction {
             index_writes: Mutex::new(Vec::new()),
             retired: Mutex::new(Vec::new()),
             built: Mutex::new(Vec::new()),
+            on_end: Mutex::new(Vec::new()),
+            after_readers: Mutex::new(Vec::new()),
         }
     }
 
@@ -154,6 +169,30 @@ impl Transaction {
 
     pub fn state(&self) -> TransactionState {
         *self.state.read()
+    }
+
+    /// Runs `hook` with the outcome once the transaction's writes are
+    /// committed or rolled back, newest hook first, for a change made
+    /// outside the heap, such as a sequence restart. If ending the writes
+    /// fails partway, hooks are told `Aborted`, so that outcome must be the
+    /// safe one. A hook runs with the state locked and must not use the
+    /// transaction.
+    pub fn on_end(&self, hook: impl FnOnce(TransactionState) + Send + 'static) -> Result<()> {
+        let _state = self.running()?;
+        self.on_end.lock().push(Box::new(hook));
+        Ok(())
+    }
+
+    /// Runs `work` with the outcome during garbage collection, once every
+    /// transaction running when this one ended has ended, and after the
+    /// garbage any of them left: for freeing pages that they may still read.
+    pub fn after_readers(
+        &self,
+        work: impl FnOnce(TransactionState) + Send + 'static,
+    ) -> Result<()> {
+        let _state = self.running()?;
+        self.after_readers.lock().push(Box::new(work));
+        Ok(())
     }
 
     /// Inserts `tuple`, locked until the transaction ends, and returns its
@@ -199,31 +238,31 @@ impl Transaction {
     }
 
     /// Makes sure `index`, one of `table`'s, holds `key` for the row at
-    /// `locator`, which this transaction has just written. Abort removes the
-    /// entry if this added it.
+    /// `locator`, which this transaction has just written at `rid`. Abort
+    /// removes the entry if this added it.
     ///
-    /// In a primary key index the key must also be free, as
-    /// `index_versions` describes: returns `false`, adding nothing, if the
-    /// row this transaction sees at another rid has it, and fails with
-    /// `Conflict` if another transaction's newer or uncommitted version
-    /// does. Add a row's primary key entry before its other entries.
+    /// In a unique index the key must also be free, as `index_versions`
+    /// describes: returns `false`, adding nothing, if the row this
+    /// transaction sees at another rid has it, and fails with `Conflict` if
+    /// another transaction's newer or uncommitted version does. Add a row's
+    /// primary key entry before its other entries.
     pub fn insert_entry(
         &self,
         table: &Arc<IndexedTable>,
         index: &Arc<Index>,
         key: &Tuple,
         locator: &RowLocator,
+        rid: Rid,
     ) -> Result<bool> {
         let _running = self.running()?;
         let added = {
             let _entries = self.entry_lock.read();
             index.insert_entry(key, locator)?
         };
-        let free = if index.metadata().is_primary_key() {
-            let rid = locator.as_rid().expect("the primary key index stores rids");
-            self.key_is_free(table, index, key, rid)
-        } else {
-            Ok(true)
+        let free = match index_versions::must_be_free(index, key) {
+            Ok(true) => self.key_is_free(table, index, key, rid),
+            Ok(false) => Ok(true),
+            Err(e) => Err(e),
         };
         if matches!(free, Ok(false)) {
             if added {
@@ -269,10 +308,25 @@ impl Transaction {
     /// the entries of every row: one for each version a reader at or above
     /// the watermark might see. Writes to the table must wait until the index
     /// is in the catalog. Each entry is retired as it is added; see
-    /// `index_versions` for why. Rows are not read as this transaction sees
-    /// them, so nothing is recorded and no read fails with `Conflict`.
-    pub fn build_index(&self, table: &Arc<IndexedTable>, index: &Arc<Index>) -> Result<()> {
+    /// `index_versions` for why. The fill doesn't read rows as this
+    /// transaction sees them, so it records no reads and fails with no
+    /// `Conflict`.
+    ///
+    /// A unique index is checked too: returns a key that two rows have, if
+    /// there is one, and the index must not be recorded. It fails with
+    /// `Conflict` before adding anything if another transaction has written
+    /// a row of the table and not committed, or committed after this one:
+    /// whether that row keeps its key isn't known yet.
+    pub fn build_index(
+        &self,
+        table: &Arc<IndexedTable>,
+        index: &Arc<Index>,
+    ) -> Result<Option<Tuple>> {
         let _running = self.running()?;
+        let unique = index.metadata().kind().is_unique();
+        if unique {
+            self.check_heads_committed(table)?;
+        }
         let watermark = self.watermark.get();
         let mut rows = table.heap.iter()?;
         while let Some(heads) = rows.next_batch_with_deleted()? {
@@ -294,7 +348,10 @@ impl Transaction {
                 }
             }
         }
-        Ok(())
+        if unique {
+            return self.duplicate_key(table, index);
+        }
+        Ok(None)
     }
 
     /// The version of the tuple at `rid` this transaction sees, or `None` if
@@ -361,6 +418,24 @@ impl Transaction {
             return Err(StorageError::TransactionNotRunning(self.tid));
         }
         let mut garbage = Garbage::default();
+        let ended = self.end_writes(outcome, &mut garbage);
+        let told = if ended.is_ok() {
+            outcome
+        } else {
+            TransactionState::Aborted
+        };
+        let hooks = mem::take(&mut *self.on_end.lock());
+        hooks.into_iter().rev().for_each(|hook| hook(told));
+        ended?;
+        garbage.deferred = mem::take(&mut *self.after_readers.lock())
+            .into_iter()
+            .map(|work| Box::new(move || work(outcome)) as Box<dyn FnOnce() + Send>)
+            .collect();
+        *state = outcome;
+        Ok(garbage)
+    }
+
+    fn end_writes(&self, outcome: TransactionState, garbage: &mut Garbage) -> Result<()> {
         let mut index_writes = self.index_writes.lock();
         let mut retired = self.retired.lock();
         garbage.built.append(&mut self.built.lock());
@@ -397,8 +472,7 @@ impl Transaction {
             }
         }
         write_set.clear();
-        *state = outcome;
-        Ok(garbage)
+        Ok(())
     }
 
     pub(crate) fn undo_log(&self) -> &Arc<UndoLog> {
@@ -447,9 +521,55 @@ impl Transaction {
         Ok(rid)
     }
 
-    /// Whether `key`, which this transaction has just added to the primary
-    /// key `index` for its row at `rid`, is free: no other row the key leads
-    /// to has it. See `index_versions` for the rule. The caller holds
+    /// Fails with `Conflict` if the head of any row of `table` was written
+    /// by a transaction that hasn't committed, or committed after this one.
+    /// The caller holds `running`.
+    fn check_heads_committed(&self, table: &IndexedTable) -> Result<()> {
+        let mut rows = table.heap.iter()?;
+        while let Some(heads) = rows.next_batch_with_deleted()? {
+            for (meta, head) in heads {
+                // Locked heads have the uncommitted bit set, so are above too.
+                if meta.ts > self.tid {
+                    return Err(StorageError::Conflict {
+                        rid: head.rid().expect("rows read from a page carry their rid"),
+                        other: meta.ts & !TXN_UNCOMMITTED_BIT,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A key that two rows have in `index`, a unique index of `table` that
+    /// `build_index` has just filled. Every head is committed before this
+    /// transaction (`check_heads_committed`), and writes wait for the build,
+    /// so each row's head is the version that counts. The caller holds
+    /// `running`.
+    fn duplicate_key(&self, table: &IndexedTable, index: &Index) -> Result<Option<Tuple>> {
+        let metadata = index.metadata();
+        let mut rows = table.heap.iter()?;
+        while let Some(heads) = rows.next_batch_with_deleted()? {
+            for (meta, head) in heads {
+                let rid = head.rid().expect("rows read from a page carry their rid");
+                debug_assert!(meta.ts <= self.tid, "a write landed during the build");
+                if meta.is_deleted {
+                    continue;
+                }
+                let key =
+                    head.to_key(&table.schema, metadata.key_schema(), metadata.key_attrs())?;
+                if index_versions::must_be_free(index, &key)?
+                    && !self.key_is_free(table, index, &key, rid)?
+                {
+                    return Ok(Some(key));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether `key`, which this transaction has just added to the unique
+    /// `index` for its row at `rid`, is free: no other row the key leads to
+    /// has it. See `index_versions` for the rule. The caller holds
     /// `running`.
     fn key_is_free(
         &self,
@@ -458,39 +578,71 @@ impl Transaction {
         key: &Tuple,
         rid: Rid,
     ) -> Result<bool> {
-        let schema = &table.schema;
         let mut holders = Vec::new();
         index.scan_key(key, &mut holders)?;
-        let others = holders
-            .iter()
-            .map(|locator| locator.as_rid().expect("the primary key index stores rids"))
-            .filter(|&other| other != rid);
-        for other in others {
-            let versions = table
-                .heap
-                .versions_since(other, self.tid, schema, &self.undo)?;
-            for (meta, version) in versions {
-                let by_another = meta.ts > self.tid && meta.ts != self.write_ts();
-                if by_another
-                    && !meta.is_deleted
-                    && index_versions::has_key(index, schema, &version, key)?
-                {
-                    return Err(StorageError::Conflict {
-                        rid: other,
-                        other: meta.ts & !TXN_UNCOMMITTED_BIT,
-                    });
+        if index.metadata().locator() == LocatorKind::Rid {
+            for locator in &holders {
+                let other = locator.as_rid().expect("checked the locator kind");
+                if other != rid && self.has_key_at(table, index, key, other)? {
+                    return Ok(false);
                 }
             }
-            let visible = table
-                .heap
-                .get_at(other, self.tid, schema, &self.undo, self.reads())?;
-            if let Some((_, version)) = visible
-                && index_versions::has_key(index, schema, &version, key)?
-            {
+            return Ok(true);
+        }
+        // The rows behind each primary key, all in one buffer: a row found
+        // twice, after its primary key changed, is only checked twice.
+        let primary_key = table.primary_key_index();
+        let mut found = Vec::new();
+        for locator in &holders {
+            let RowLocator::PrimaryKey(pk) = locator else {
+                unreachable!("checked the locator kind");
+            };
+            primary_key.scan_key(pk, &mut found)?;
+        }
+        for locator in &found {
+            let other = locator.as_rid().expect("the primary key index stores rids");
+            // By rid: a holder storing another primary key can lead back to
+            // `rid`, when this transaction changed the row's primary key.
+            if other != rid && self.has_key_at(table, index, key, other)? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// Whether the row at `other` has `key` in `index` as this transaction
+    /// sees it, for `key_is_free`. Fails with `Conflict` if another
+    /// transaction's newer or uncommitted version there has it.
+    fn has_key_at(
+        &self,
+        table: &IndexedTable,
+        index: &Index,
+        key: &Tuple,
+        other: Rid,
+    ) -> Result<bool> {
+        let schema = &table.schema;
+        let versions = table
+            .heap
+            .versions_since(other, self.tid, schema, &self.undo)?;
+        for (meta, version) in versions {
+            let by_another = meta.ts > self.tid && meta.ts != self.write_ts();
+            if by_another
+                && !meta.is_deleted
+                && index_versions::has_key(index, schema, &version, key)?
+            {
+                return Err(StorageError::Conflict {
+                    rid: other,
+                    other: meta.ts & !TXN_UNCOMMITTED_BIT,
+                });
+            }
+        }
+        let visible = table
+            .heap
+            .get_at(other, self.tid, schema, &self.undo, self.reads())?;
+        Ok(match visible {
+            Some((_, version)) => index_versions::has_key(index, schema, &version, key)?,
+            None => false,
+        })
     }
 
     fn record_write(&self, heap: &Arc<TableHeap>, schema: &Schema, rid: Rid) {

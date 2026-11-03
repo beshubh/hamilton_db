@@ -19,6 +19,7 @@ use std::fmt::{self, Write as _};
 use std::hash::{Hash, Hasher};
 
 use crate::error::{Result, ValueError};
+use crate::timestamp;
 
 /// The declared type of a column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -32,6 +33,8 @@ pub enum DataType {
     Bool,
     /// UTF-8 string of at most this many bytes.
     Varchar(u32),
+    /// An instant, to the microsecond; see [`crate::timestamp`].
+    Timestamptz,
     /// A list of values, built by expressions. It has no element type and
     /// cannot be stored in a tuple.
     Array,
@@ -47,6 +50,7 @@ impl DataType {
             DataType::Double => "DOUBLE",
             DataType::Bool => "BOOL",
             DataType::Varchar(_) => "VARCHAR",
+            DataType::Timestamptz => "TIMESTAMPTZ",
             DataType::Array => "ARRAY",
         }
     }
@@ -60,6 +64,7 @@ impl fmt::Display for DataType {
             DataType::Double => f.write_str("DOUBLE"),
             DataType::Bool => f.write_str("BOOL"),
             DataType::Varchar(max_len) => write!(f, "VARCHAR({max_len})"),
+            DataType::Timestamptz => f.write_str("TIMESTAMPTZ"),
             DataType::Array => f.write_str("ARRAY"),
         }
     }
@@ -75,7 +80,21 @@ pub enum Value {
     Double(f64),
     Bool(bool),
     Varchar(String),
+    /// Microseconds since 1970-01-01 00:00:00 UTC.
+    Timestamptz(i64),
     Array(Vec<Value>),
+}
+
+/// Whether [`Value::cast`] converts values of type `from` to `to`.
+pub fn can_cast(from: DataType, to: DataType) -> bool {
+    let is_number = |t| matches!(t, DataType::Int | DataType::BigInt | DataType::Double);
+    (is_number(from) && is_number(to))
+        || matches!(
+            (from, to),
+            (DataType::Varchar(_), DataType::Timestamptz)
+                | (DataType::Bool, DataType::Bool)
+                | (DataType::Timestamptz, DataType::Timestamptz)
+        )
 }
 
 /// A [`Value`] that borrows its string or array, from a tuple's bytes or
@@ -89,6 +108,7 @@ pub enum ValueRef<'a> {
     Double(f64),
     Bool(bool),
     Varchar(&'a str),
+    Timestamptz(i64),
     Array(&'a [Value]),
 }
 
@@ -231,6 +251,7 @@ impl<'a> ValueRef<'a> {
             ValueRef::Double(_) => "DOUBLE",
             ValueRef::Bool(_) => "BOOL",
             ValueRef::Varchar(_) => "VARCHAR",
+            ValueRef::Timestamptz(_) => "TIMESTAMPTZ",
             ValueRef::Array(_) => "ARRAY",
         }
     }
@@ -238,7 +259,7 @@ impl<'a> ValueRef<'a> {
     /// Orders two values, or returns `None` if either is NULL.
     ///
     /// Numbers compare by value across types, strings compare bytewise,
-    /// and `false < true`.
+    /// timestamps by instant, and `false < true`.
     #[inline]
     pub fn compare(self, other: ValueRef<'_>) -> Result<Option<Ordering>> {
         match (self, other) {
@@ -247,6 +268,7 @@ impl<'a> ValueRef<'a> {
             (ValueRef::BigInt(l), ValueRef::BigInt(r)) => Ok(Some(l.cmp(&r))),
             (ValueRef::Bool(l), ValueRef::Bool(r)) => Ok(Some(l.cmp(&r))),
             (ValueRef::Varchar(l), ValueRef::Varchar(r)) => Ok(Some(l.cmp(r))),
+            (ValueRef::Timestamptz(l), ValueRef::Timestamptz(r)) => Ok(Some(l.cmp(&r))),
             _ => match (self.as_number(), other.as_number()) {
                 (Some(l), Some(r)) => Ok(Some(l.compare(r))),
                 _ => Err(ValueError::Incomparable {
@@ -280,6 +302,7 @@ impl<'a> ValueRef<'a> {
             ValueRef::Double(v) => Value::Double(v),
             ValueRef::Bool(v) => Value::Bool(v),
             ValueRef::Varchar(v) => Value::Varchar(v.to_owned()),
+            ValueRef::Timestamptz(v) => Value::Timestamptz(v),
             ValueRef::Array(values) => Value::Array(values.to_vec()),
         }
     }
@@ -308,6 +331,7 @@ impl Value {
             Value::Double(v) => ValueRef::Double(*v),
             Value::Bool(v) => ValueRef::Bool(*v),
             Value::Varchar(v) => ValueRef::Varchar(v),
+            Value::Timestamptz(v) => ValueRef::Timestamptz(*v),
             Value::Array(values) => ValueRef::Array(values),
         }
     }
@@ -457,6 +481,22 @@ impl Value {
         })
     }
 
+    /// Converts to `to` as an explicit `CAST` does, for the pairs
+    /// [`can_cast`] allows: numbers as [`Value::cast_number`] converts them,
+    /// and VARCHAR text to TIMESTAMPTZ. NULL stays NULL.
+    pub fn cast(&self, to: DataType) -> Result<Value> {
+        match (self, to) {
+            (Value::Null, _) => Ok(Value::Null),
+            (Value::Varchar(text), DataType::Timestamptz) => {
+                timestamp::parse(text).map(Value::Timestamptz)
+            }
+            (Value::Bool(_), DataType::Bool) | (Value::Timestamptz(_), DataType::Timestamptz) => {
+                Ok(self.clone())
+            }
+            _ => self.cast_number(to),
+        }
+    }
+
     fn as_number(&self) -> Option<Number> {
         self.as_value_ref().as_number()
     }
@@ -528,6 +568,7 @@ impl PartialEq for Value {
             (Value::Double(l), Value::Double(r)) => l.to_bits() == r.to_bits(),
             (Value::Bool(l), Value::Bool(r)) => l == r,
             (Value::Varchar(l), Value::Varchar(r)) => l == r,
+            (Value::Timestamptz(l), Value::Timestamptz(r)) => l == r,
             (Value::Array(l), Value::Array(r)) => l == r,
             _ => false,
         }
@@ -547,6 +588,7 @@ impl Hash for Value {
             Value::Double(v) => v.to_bits().hash(state),
             Value::Bool(v) => v.hash(state),
             Value::Varchar(v) => v.hash(state),
+            Value::Timestamptz(v) => v.hash(state),
             Value::Array(values) => values.hash(state),
         }
     }
@@ -640,6 +682,7 @@ impl fmt::Display for Value {
             Value::Double(v) => format_double(*v, f),
             Value::Bool(v) => write!(f, "{v}"),
             Value::Varchar(v) => f.write_str(v),
+            Value::Timestamptz(v) => timestamp::format(*v, f),
             Value::Array(values) => {
                 f.write_str("{")?;
                 for (i, v) in values.iter().enumerate() {
@@ -878,6 +921,35 @@ mod tests {
         );
         assert!(v("1").cast_number(DataType::Int).is_err());
         assert!(v(1).cast_number(DataType::Bool).is_err());
+    }
+
+    #[test]
+    fn casts_text_to_timestamps() {
+        let ts = v("2026-11-02 10:51:00+00")
+            .cast(DataType::Timestamptz)
+            .unwrap();
+        assert_eq!(ts.to_string(), "2026-11-02 10:51:00+00");
+        assert_eq!(ts.cast(DataType::Timestamptz), Ok(ts.clone()));
+        assert_eq!(NULL.cast(DataType::Timestamptz), Ok(NULL));
+        assert_eq!(v(7).cast(DataType::BigInt), Ok(v(7_i64)));
+        assert!(matches!(
+            v("soon").cast(DataType::Timestamptz),
+            Err(ValueError::InvalidTimestamp(_))
+        ));
+        assert!(ts.cast(DataType::BigInt).is_err());
+        assert!(can_cast(DataType::Varchar(8), DataType::Timestamptz));
+        assert!(!can_cast(DataType::Timestamptz, DataType::BigInt));
+        assert!(!can_cast(DataType::Varchar(8), DataType::Int));
+    }
+
+    #[test]
+    fn compares_timestamps_by_instant() {
+        let earlier = Value::Timestamptz(-5);
+        let later = Value::Timestamptz(7);
+        assert_eq!(earlier.compare(&later), Ok(Some(Ordering::Less)));
+        assert_eq!(later.cmp_eq(&Value::Timestamptz(7)), Ok(v(true)));
+        assert!(earlier.compare(&v(-5_i64)).is_err());
+        assert_eq!(DataType::Timestamptz.to_string(), "TIMESTAMPTZ");
     }
 
     #[test]

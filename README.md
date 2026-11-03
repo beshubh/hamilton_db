@@ -26,7 +26,8 @@ inside.
   queries, and an expression engine. The parser handles `CREATE TABLE`
   (with a `PRIMARY KEY`), `CREATE INDEX`, `INSERT`, `SELECT`, `UPDATE` and
   `DELETE`; executors are next.
-- **Types**: `INT`, `BIGINT`, `BOOL` and `VARCHAR(n)`.
+- **Types**: `INT`, `BIGINT`, `DOUBLE PRECISION`, `BOOL`, `VARCHAR(n)` and
+  `TIMESTAMPTZ`.
 
 ## Layout
 

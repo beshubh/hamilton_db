@@ -157,6 +157,7 @@ name = "catalog"
 version = "0.1.0"
 dependencies = [
  "common",
+ "log",
  "parking_lot",
  "storage",
  "tempfile",
@@ -536,6 +537,7 @@ dependencies = [
  "common",
  "ctrlc",
  "execution",
+ "log",
  "planner",
  "proptest",
  "rand",

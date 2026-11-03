@@ -1,0 +1,16 @@
+<article class="tweet{% if highlight %} highlight{% endif %}" id="t{{ tweet.pk }}"{% if depth %} style="margin-left: {% widthratio depth 1 24 %}px"{% endif %}>
+  <div class="who">
+    <a href="{{ tweet.author.get_absolute_url }}"><strong>{{ tweet.author.display_name }}</strong> <span class="handle">@{{ tweet.author.username }}</span></a>
+    · <a class="when" href="{{ tweet.get_absolute_url }}">{{ tweet.created_at|date:"M j, H:i" }}</a>
+  </div>
+  {% if tweet.reply_to and not hide_parent %}
+    <div class="context">Replying to <a href="{{ tweet.reply_to.get_absolute_url }}">@{{ tweet.reply_to.author.username }}</a></div>
+  {% endif %}
+  <p class="text">{{ tweet.text|linebreaksbr }}</p>
+  {% if tweet.image %}<img class="media" src="{{ tweet.image.url }}" alt="">{% endif %}
+  {% if tweet.quote_of %}{% include "social/_quoted.html" with quoted=tweet.quote_of %}{% endif %}
+  <div class="actions">
+    <a href="{{ tweet.get_absolute_url }}">Reply</a>
+    <a href="{% url 'quote' tweet.pk %}">Quote</a>
+  </div>
+</article>

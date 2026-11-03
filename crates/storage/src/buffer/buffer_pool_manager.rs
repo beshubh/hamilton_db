@@ -184,6 +184,12 @@ impl BufferPoolManager {
         }
     }
 
+    /// Syncs the db file and saves which pages it holds, so that pages
+    /// written so far are found on reopening (`DiskManager::checkpoint`).
+    pub fn sync_disk(&self) -> Result<()> {
+        self.disk_manager.checkpoint()
+    }
+
     /// Number of frames in the pool.
     pub fn size(&self) -> usize {
         self.num_frames

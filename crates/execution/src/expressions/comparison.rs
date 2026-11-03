@@ -65,7 +65,9 @@ impl ComparisonExpr {
         let (l, r) = (left.return_type(), right.return_type());
         match (l.data_type, r.data_type) {
             (l, r) if is_number(l) && is_number(r) => {}
-            (DataType::Bool, DataType::Bool) | (DataType::Varchar(_), DataType::Varchar(_)) => {}
+            (DataType::Bool, DataType::Bool)
+            | (DataType::Varchar(_), DataType::Varchar(_))
+            | (DataType::Timestamptz, DataType::Timestamptz) => {}
             _ => {
                 return Err(ValueError::InvalidOperands {
                     op: op.symbol(),

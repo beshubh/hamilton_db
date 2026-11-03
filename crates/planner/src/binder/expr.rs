@@ -6,7 +6,11 @@
 //! - `+ - * /` and unary `-` take numbers (INT, BIGINT, DOUBLE), and `%`
 //!   integers. INT with INT is INT; any DOUBLE makes the result DOUBLE, and
 //!   otherwise any BIGINT makes it BIGINT.
-//! - Comparisons take two numbers, two BOOLs or two VARCHARs.
+//! - Comparisons take two numbers, two BOOLs, two VARCHARs or two
+//!   TIMESTAMPTZs. A string literal compared with or stored into a
+//!   TIMESTAMPTZ is read as one, as Postgres reads an untyped literal.
+//! - `CAST(x AS t)` and `x::t` convert between numbers and from VARCHAR to
+//!   TIMESTAMPTZ (see [`can_cast`]). A literal is converted while binding.
 //! - AND, OR and NOT take BOOLs.
 //! - The result can be NULL if any operand can, except for IS [NOT] NULL.
 //! - `count` takes anything, `sum` and `avg` numbers, and `min` and `max`
@@ -18,6 +22,7 @@
 //! asks for (the other operand, BOOL under AND, the column it is stored
 //! in) and is INT where nothing does, as in `SELECT NULL`.
 
+use common::value::can_cast;
 use common::{Column, DataType, Value, ValueError};
 use parser::{BinaryOp, Expr, UnaryOp, WindowSpec};
 
@@ -74,6 +79,7 @@ impl Binder<'_> {
                     None => bind_function(name, args, *star),
                 }
             }
+            Expr::Cast { expr, data_type } => bind_cast(self.bind_expr(expr, scope)?, *data_type),
             Expr::Array(elements) => Ok(BoundExpr {
                 kind: BoundExprKind::Array(
                     elements
@@ -279,8 +285,12 @@ pub(super) fn assign(mut expr: BoundExpr, column: &Column) -> Result<BoundExpr> 
         | (DataType::BigInt, DataType::BigInt)
         | (DataType::Double, DataType::Double)
         | (DataType::Bool, DataType::Bool)
-        | (DataType::Varchar(_), DataType::Varchar(_)) => Ok(expr),
+        | (DataType::Varchar(_), DataType::Varchar(_))
+        | (DataType::Timestamptz, DataType::Timestamptz) => Ok(expr),
         (from, to) if is_number(from) && is_number(to) => cast_number(expr, to),
+        (DataType::Varchar(_), DataType::Timestamptz) if is_constant(&expr) => {
+            bind_cast(expr, DataType::Timestamptz)
+        }
         _ => Err(ValueError::TypeMismatch {
             column: column.name.clone(),
             expected: column.data_type,
@@ -309,6 +319,40 @@ fn cast_number(expr: BoundExpr, to: DataType) -> Result<BoundExpr> {
     })
 }
 
+/// `CAST(expr AS to)`. A NULL literal just takes the type.
+fn bind_cast(mut expr: BoundExpr, to: DataType) -> Result<BoundExpr> {
+    type_null(&mut expr, to);
+    let from = expr.return_type.data_type;
+    if from == to {
+        return Ok(expr);
+    }
+    if !can_cast(from, to) {
+        return Err(ValueError::InvalidOperands {
+            op: "CAST",
+            left: from.type_name(),
+            right: to.type_name(),
+        }
+        .into());
+    }
+    if let BoundExprKind::Constant(value) = &expr.kind {
+        return Ok(constant(value.cast(to)?));
+    }
+    let nullable = expr.return_type.nullable;
+    Ok(BoundExpr {
+        kind: BoundExprKind::Cast(Box::new(expr)),
+        return_type: unnamed(to, nullable),
+    })
+}
+
+/// Reads a string literal compared with a TIMESTAMPTZ as a timestamp.
+fn type_text_literal(expr: &mut BoundExpr, other: DataType) -> Result<()> {
+    let text = matches!(expr.return_type.data_type, DataType::Varchar(_));
+    if other == DataType::Timestamptz && text && is_constant(expr) {
+        *expr = bind_cast(expr.clone(), DataType::Timestamptz)?;
+    }
+    Ok(())
+}
+
 fn bind_binary(op: BinaryOp, mut left: BoundExpr, mut right: BoundExpr) -> Result<BoundExpr> {
     let operand_type = match op {
         BinaryOp::And | BinaryOp::Or => Some(DataType::Bool),
@@ -324,6 +368,8 @@ fn bind_binary(op: BinaryOp, mut left: BoundExpr, mut right: BoundExpr) -> Resul
             let (l, r) = (left.return_type.data_type, right.return_type.data_type);
             type_null(&mut left, r);
             type_null(&mut right, l);
+            type_text_literal(&mut left, r)?;
+            type_text_literal(&mut right, l)?;
         }
     }
 
@@ -399,7 +445,9 @@ fn comparable(l: DataType, r: DataType) -> bool {
     (is_number(l) && is_number(r))
         || matches!(
             (l, r),
-            (DataType::Bool, DataType::Bool) | (DataType::Varchar(_), DataType::Varchar(_))
+            (DataType::Bool, DataType::Bool)
+                | (DataType::Varchar(_), DataType::Varchar(_))
+                | (DataType::Timestamptz, DataType::Timestamptz)
         )
 }
 
@@ -533,6 +581,7 @@ fn constant(value: Value) -> BoundExpr {
         Value::Double(_) => DataType::Double,
         Value::Bool(_) => DataType::Bool,
         Value::Varchar(s) => DataType::Varchar(u32::try_from(s.len()).unwrap_or(u32::MAX)),
+        Value::Timestamptz(_) => DataType::Timestamptz,
         Value::Array(_) => DataType::Array,
     };
     let nullable = value.is_null();
@@ -540,6 +589,10 @@ fn constant(value: Value) -> BoundExpr {
         kind: BoundExprKind::Constant(value),
         return_type: unnamed(data_type, nullable),
     }
+}
+
+fn is_constant(expr: &BoundExpr) -> bool {
+    matches!(expr.kind, BoundExprKind::Constant(_))
 }
 
 fn is_null_literal(expr: &BoundExpr) -> bool {

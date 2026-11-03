@@ -1,0 +1,16 @@
+{% extends "social/base.html" %}
+{% block title %}Home{% endblock %}
+{% block content %}
+  <h1>Home</h1>
+  {% if acting_user %}
+    {% url 'compose' as action %}
+    {% include "social/_compose_form.html" with action=action %}
+  {% else %}
+    <p class="hint"><a href="{% url 'users' %}">Create a user</a> or pick one above to post.</p>
+  {% endif %}
+  {% for tweet in tweets %}
+    {% include "social/_tweet.html" %}
+  {% empty %}
+    <p class="hint">No tweets yet.</p>
+  {% endfor %}
+{% endblock %}

@@ -28,8 +28,8 @@ use execution::optimizer::Optimizer;
 use execution::plans::{
     AbstractPlanNode, Aggregate, AggregationPlan, CreateIndexPlan, CreateTablePlan, DeletePlan,
     ExplainPlan, FilterPlan, HashJoinPlan, InsertPlan, JoinType, LimitPlan, OrderBy, PlanNode,
-    ProjectionPlan, SeqScanPlan, SortPlan, UpdatePlan, ValuesPlan, WindowColumn, WindowFunction,
-    WindowFunctionKind, WindowPlan,
+    ProjectionPlan, SeqScanPlan, SortPlan, TruncatePlan, UpdatePlan, ValuesPlan, WindowColumn,
+    WindowFunction, WindowFunctionKind, WindowPlan,
 };
 use parser::{BinaryOp, JoinKind};
 
@@ -66,14 +66,23 @@ impl<'a> Planner<'a> {
                 create.schema.clone(),
                 create.primary_key.clone(),
             )
+            .with_identity(create.identity.clone())
+            .with_unique(create.unique.clone())
             .into(),
             BoundStatement::CreateIndex(create) => {
-                CreateIndexPlan::new(&create.name, &create.table, create.columns.clone()).into()
+                CreateIndexPlan::new(&create.name, &create.table, create.columns.clone())
+                    .with_kind(create.kind)
+                    .into()
             }
             BoundStatement::Insert(insert) => self.plan_insert(insert)?,
             BoundStatement::Select(select) => self.plan_select(select)?,
             BoundStatement::Update(update) => self.plan_update(update)?,
             BoundStatement::Delete(delete) => self.plan_delete(delete)?,
+            BoundStatement::Truncate(truncate) => TruncatePlan::new(
+                truncate.tables.iter().map(|table| table.oid).collect(),
+                truncate.restart_identity,
+            )
+            .into(),
             BoundStatement::Explain(stmt) => {
                 ExplainPlan::new(Arc::new(self.plan_unoptimized(stmt)?)).into()
             }
@@ -169,7 +178,8 @@ impl<'a> Planner<'a> {
         Ok(Arc::new(plan.into()))
     }
 
-    /// `Insert(Values)`.
+    /// `Insert(Values)`, under a projection of the RETURNING items if there
+    /// are any.
     fn plan_insert(&self, insert: &BoundInsert) -> Result<AbstractPlanNode> {
         let rows = insert
             .rows
@@ -181,12 +191,21 @@ impl<'a> Planner<'a> {
             })
             .collect::<Result<_>>()?;
         let values = ValuesPlan::new(insert.table.schema.clone(), rows);
-        Ok(InsertPlan::new(
+        let plan = InsertPlan::new(
             insert.table.oid,
             &insert.table.name,
             Arc::new(values.into()),
-        )
-        .into())
+        );
+        if insert.returning.is_empty() {
+            return Ok(plan.into());
+        }
+        let plan = plan.with_returning(insert.table.schema.clone());
+        let exprs = insert
+            .returning
+            .iter()
+            .map(|item| plan_expr(&item.expr, Inputs::One))
+            .collect::<Result<_>>()?;
+        Ok(ProjectionPlan::new(insert.returning_schema(), exprs, Arc::new(plan.into())).into())
     }
 
     /// `Update(Filter(SeqScan))`, with a target expression for every column:

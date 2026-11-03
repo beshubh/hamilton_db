@@ -279,10 +279,10 @@ impl Session {
             text.push_str(&format!("\n{}", self.heading("Indexes")));
         }
         for index in &table.indexes {
-            let kind = if index.primary_key {
-                "PRIMARY KEY "
+            let kind = if index.kind.is_empty() {
+                String::new()
             } else {
-                ""
+                format!("{} ", index.kind)
             };
             text.push_str(&format!("\n  {} {kind}({})", index.name, index.columns));
         }
@@ -401,7 +401,7 @@ mod tests {
             &server,
             &[
                 "\\d",
-                "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(16));",
+                "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(16) UNIQUE);",
                 "CREATE INDEX users_name ON users (name);",
                 "\\d",
                 "\\d users",
@@ -413,9 +413,9 @@ mod tests {
         assert_eq!(
             blocks[3],
             [
-                " table | columns |        indexes",
-                "-------+---------+------------------------",
-                " users |       2 | users_pkey, users_name",
+                " table | columns |                indexes",
+                "-------+---------+----------------------------------------",
+                " users |       2 | users_pkey, users_name_key, users_name",
             ]
             .join("\n")
         );
@@ -429,6 +429,7 @@ mod tests {
                 " name   | VARCHAR(16) | yes",
                 "Indexes",
                 "  users_pkey PRIMARY KEY (id)",
+                "  users_name_key UNIQUE (name)",
                 "  users_name (name)",
             ]
             .join("\n")

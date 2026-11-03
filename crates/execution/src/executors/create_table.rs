@@ -7,8 +7,8 @@ use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::plans::{CreateTablePlan, PlanNode};
 
-/// Creates the table, and its primary key index, on the first call to
-/// `next`. Produces no rows.
+/// Creates the table, with its primary key and unique indexes, on the first
+/// call to `next`. Produces no rows.
 pub struct CreateTableExecutor {
     ctx: Arc<ExecutionContext>,
     plan: CreateTablePlan,
@@ -43,10 +43,13 @@ impl Executor for CreateTableExecutor {
             self.done = true;
             let primary_key: Vec<&str> =
                 self.plan.primary_key().iter().map(String::as_str).collect();
-            self.ctx.catalog().create_table(
+            let identity: Vec<&str> = self.plan.identity().iter().map(String::as_str).collect();
+            self.ctx.catalog().create_table_with_constraints(
                 self.plan.table_name(),
                 self.plan.table_schema().clone(),
                 &primary_key,
+                &identity,
+                self.plan.unique(),
             )?;
         }
         Ok(false)
@@ -60,6 +63,7 @@ impl Executor for CreateTableExecutor {
 #[cfg(test)]
 mod tests {
     use catalog::CatalogError;
+    use common::IndexKind;
 
     use super::super::test_util::{Db, users_schema};
     use crate::ExecutionError;
@@ -83,7 +87,7 @@ mod tests {
         db.run(plan.into()).unwrap();
         let [pkey] = db.catalog().table_indexes("t").try_into().unwrap();
         assert_eq!(pkey.name, "t_pkey");
-        assert!(pkey.is_primary_key);
+        assert_eq!(pkey.kind, IndexKind::PrimaryKey);
         assert_eq!(pkey.key_columns, [0]);
     }
 
