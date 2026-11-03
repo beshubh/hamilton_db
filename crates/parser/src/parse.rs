@@ -22,28 +22,68 @@ use sqlparser::ast::{
     TableWithJoins, TimezoneInfo, TruncateIdentityOption, UnaryOperator, UniqueConstraint,
     WindowType,
 };
-use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::ast::{
     self, BinaryOp, CreateIndex, CreateTable, Delete, FromItem, Insert, JoinKind, OrderByItem,
     Select, Statement, TableRef, Truncate, UnaryOp, Update, WindowSpec,
 };
+use crate::dialect::HamiltonDialect;
 use crate::error::{ParseError, Result};
 
 /// Parses one or more `;`-separated statements.
 pub fn parse(sql: &str) -> Result<Vec<Statement>> {
-    Parser::parse_sql(&PostgreSqlDialect {}, sql)?
-        .iter()
-        .map(convert_statement)
+    Parser::parse_sql(&HamiltonDialect::default(), sql)?
+        .into_iter()
+        .map(|mut stmt| {
+            // An INSERT's rows render alike on both sides of its canonical
+            // check, so it is checked without them, rather than render
+            // every row twice, and they are converted on their own.
+            let Some(rows) = take_insert_rows(&mut stmt) else {
+                return convert_statement(&stmt);
+            };
+            let sql::Statement::Insert(insert) = &stmt else {
+                unreachable!("only an INSERT has rows to take")
+            };
+            match convert_insert(&stmt, insert, Some(&rows)) {
+                Ok(insert) => Ok(insert),
+                // Errors show the statement, so they get its rows back.
+                Err(_) => {
+                    put_insert_rows(&mut stmt, rows);
+                    convert_statement(&stmt)
+                }
+            }
+        })
         .collect()
+}
+
+/// The rows of an `INSERT ... VALUES`, leaving it without any, or `None`
+/// for any other statement.
+fn take_insert_rows(stmt: &mut sql::Statement) -> Option<Vec<sql::Parens<Vec<Expr>>>> {
+    let sql::Statement::Insert(insert) = stmt else {
+        return None;
+    };
+    let SetExpr::Values(values) = insert.source.as_mut()?.body.as_mut() else {
+        return None;
+    };
+    Some(std::mem::take(&mut values.rows))
+}
+
+/// Gives the INSERT `take_insert_rows` took `rows` from back its rows.
+fn put_insert_rows(stmt: &mut sql::Statement, rows: Vec<sql::Parens<Vec<Expr>>>) {
+    if let sql::Statement::Insert(insert) = stmt
+        && let Some(source) = insert.source.as_mut()
+        && let SetExpr::Values(values) = source.body.as_mut()
+    {
+        values.rows = rows;
+    }
 }
 
 fn convert_statement(stmt: &sql::Statement) -> Result<Statement> {
     match stmt {
         sql::Statement::CreateTable(create) => convert_create_table(stmt, create),
         sql::Statement::CreateIndex(create) => convert_create_index(stmt, create),
-        sql::Statement::Insert(insert) => convert_insert(stmt, insert),
+        sql::Statement::Insert(insert) => convert_insert(stmt, insert, None),
         sql::Statement::Query(query) => {
             convert_query(query).map(|select| Statement::Select(Box::new(select)))
         }
@@ -392,7 +432,12 @@ fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
     }
 }
 
-fn convert_insert(stmt: &sql::Statement, insert: &sql::Insert) -> Result<Statement> {
+/// `taken_rows` are the rows `take_insert_rows` took from `insert`, if it did.
+fn convert_insert(
+    stmt: &sql::Statement,
+    insert: &sql::Insert,
+    taken_rows: Option<&[sql::Parens<Vec<Expr>>]>,
+) -> Result<Statement> {
     let TableObject::TableName(table) = &insert.table else {
         return Err(unsupported(stmt));
     };
@@ -419,11 +464,15 @@ fn convert_insert(stmt: &sql::Statement, insert: &sql::Insert) -> Result<Stateme
         "INSERT INTO <table> [(<column>, ...)] VALUES (...), ... [RETURNING <items>]",
     )?;
 
-    let rows = values
-        .rows
-        .iter()
-        .map(|row| row.content.iter().map(convert_expr).collect())
-        .collect::<Result<_>>()?;
+    let source_rows = taken_rows.unwrap_or(&values.rows);
+    let mut rows = Vec::with_capacity(source_rows.len());
+    for row in source_rows {
+        let mut exprs = Vec::with_capacity(row.content.len());
+        for expr in &row.content {
+            exprs.push(convert_expr(expr)?);
+        }
+        rows.push(exprs);
+    }
     Ok(Statement::Insert(Insert {
         table: object_name(table)?,
         columns: insert
@@ -999,13 +1048,30 @@ fn unsupported_expr(expr: &Expr) -> ParseError {
 /// Rejects `stmt` unless it renders exactly as `canonical`, i.e. it has no
 /// clauses beyond the ones the caller extracted.
 fn ensure_canonical(stmt: &impl std::fmt::Display, canonical: &str, supported: &str) -> Result<()> {
-    if stmt.to_string() == canonical {
+    if renders_as(stmt, canonical) {
         Ok(())
     } else {
         Err(ParseError::Unsupported(format!(
             "`{stmt}` (only `{supported}`)"
         )))
     }
+}
+
+/// Whether `value` renders as `expected`, compared as it renders rather than
+/// rendered whole first: an INSERT renders every row it inserts.
+fn renders_as(value: &impl std::fmt::Display, expected: &str) -> bool {
+    struct Compare<'a> {
+        rest: &'a str,
+    }
+    impl std::fmt::Write for Compare<'_> {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.rest = self.rest.strip_prefix(s).ok_or(std::fmt::Error)?;
+            Ok(())
+        }
+    }
+    let mut compare = Compare { rest: expected };
+    std::fmt::Write::write_fmt(&mut compare, format_args!("{value}")).is_ok()
+        && compare.rest.is_empty()
 }
 
 fn unsupported(stmt: &sql::Statement) -> ParseError {

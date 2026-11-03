@@ -8,6 +8,7 @@ use crate::{
         page_header::{stamp_checksum, verify_checksum},
     },
 };
+use common::hash::IntKeys;
 use common::{FrameId, INVALID_PAGE_ID, PageId};
 use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, Mutex, MutexGuard, RawRwLock, RwLock};
 use std::{
@@ -125,7 +126,7 @@ impl FrameHeader {
 /// memory. Only touched while holding the buffer pool latch.
 #[derive(Default)]
 pub(crate) struct BufferPoolManagerState {
-    page_table: HashMap<PageId, FrameId>,
+    page_table: HashMap<PageId, FrameId, IntKeys>,
     free_frames: VecDeque<FrameId>,
 }
 
@@ -152,6 +153,11 @@ pub struct BufferPoolManager {
     latch: BpmLatch,
     replacer: Arc<ArcReplacer>,
     disk_scheduler: Arc<DiskScheduler>,
+    /// Asked directly whether a page was ever written. One that was not
+    /// reads as zeros and has nothing on disk to free, so neither needs a
+    /// trip through the scheduler. Writes are waited for with the page in
+    /// the page table, so none is in flight for a page being loaded or
+    /// deleted.
     disk_manager: Arc<DiskManager>,
 }
 
@@ -163,7 +169,7 @@ impl BufferPoolManager {
             .map(|i| Arc::new(FrameHeader::new(i as FrameId)))
             .collect();
         let state = BufferPoolManagerState {
-            page_table: HashMap::new(),
+            page_table: HashMap::default(),
             free_frames: (0..num_frames as FrameId).collect(),
         };
         let next_page_id = disk_manager.next_page_id();
@@ -211,6 +217,9 @@ impl BufferPoolManager {
                 frame.reset();
                 state.free_frames.push_back(frame_id);
             }
+        }
+        if !self.disk_manager.has_page(page_id) {
+            return Ok(());
         }
         self.disk_scheduler.deallocate_page(page_id).wait()
     }
@@ -433,8 +442,7 @@ impl BufferPoolManager {
                 let frame = self.frame(frame_id);
                 if frame.page_id() == Some(page_id) {
                     frame.pin();
-                    self.replacer.record_access(frame_id, page_id, access_type);
-                    self.replacer.set_evictable(frame_id, false);
+                    self.replacer.record_pin(frame_id, page_id, access_type);
                     return Ok(Arc::clone(frame));
                 }
                 // A load that failed; its loader has not removed it yet.
@@ -517,12 +525,16 @@ impl BufferPoolManager {
         frame.set_page_id(Some(page_id));
         frame.pin();
         state.page_table.insert(page_id, frame_id);
-        self.replacer.record_access(frame_id, page_id, access_type);
-        self.replacer.set_evictable(frame_id, false);
+        self.replacer.record_pin(frame_id, page_id, access_type);
         // Nobody else had the frame pinned, so the latch is free.
         let mut data = frame.get_data_mut();
         drop(state);
 
+        if !self.disk_manager.has_page(page_id) {
+            data.fill(0);
+            drop(data);
+            return Ok(frame);
+        }
         let read = self
             .disk_scheduler
             .read_page(page_id)

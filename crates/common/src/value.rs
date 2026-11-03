@@ -15,7 +15,7 @@
 //! comparison is [`Value::compare`] and the `cmp_*` methods.
 
 use std::cmp::Ordering;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::hash::{Hash, Hasher};
 
 use crate::error::{Result, ValueError};
@@ -110,6 +110,25 @@ pub enum ValueRef<'a> {
     Varchar(&'a str),
     Timestamptz(i64),
     Array(&'a [Value]),
+}
+
+/// Whether `l == r`, comparing short slices, as most strings in rows are,
+/// with a few word loads rather than a call to `memcmp`.
+#[inline]
+pub(crate) fn bytes_equal(l: &[u8], r: &[u8]) -> bool {
+    let len = l.len();
+    if len != r.len() {
+        return false;
+    }
+    let word = |bytes: &[u8], at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    let half = |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    match len {
+        0 => true,
+        1..=3 => l[0] == r[0] && l[len / 2] == r[len / 2] && l[len - 1] == r[len - 1],
+        4..=8 => half(l, 0) == half(r, 0) && half(l, len - 4) == half(r, len - 4),
+        9..=16 => word(l, 0) == word(r, 0) && word(l, len - 8) == word(r, len - 8),
+        _ => l == r,
+    }
 }
 
 /// 2^63, the smallest double above every `i64`. Every double in
@@ -241,9 +260,12 @@ impl<'a> ValueRef<'a> {
     ///
     /// Numbers compare by value across types, strings compare bytewise,
     /// timestamps by instant, and `false < true`.
+    #[inline]
     pub fn compare(self, other: ValueRef<'_>) -> Result<Option<Ordering>> {
         match (self, other) {
             (ValueRef::Null, _) | (_, ValueRef::Null) => Ok(None),
+            (ValueRef::Int(l), ValueRef::Int(r)) => Ok(Some(l.cmp(&r))),
+            (ValueRef::BigInt(l), ValueRef::BigInt(r)) => Ok(Some(l.cmp(&r))),
             (ValueRef::Bool(l), ValueRef::Bool(r)) => Ok(Some(l.cmp(&r))),
             (ValueRef::Varchar(l), ValueRef::Varchar(r)) => Ok(Some(l.cmp(r))),
             (ValueRef::Timestamptz(l), ValueRef::Timestamptz(r)) => Ok(Some(l.cmp(&r))),
@@ -255,6 +277,20 @@ impl<'a> ValueRef<'a> {
                 }),
             },
         }
+    }
+
+    /// SQL `=` of two values: `None` if either is NULL. Answers what
+    /// [`compare`](Self::compare) would, quicker for the types keys mostly
+    /// have.
+    #[inline]
+    pub fn equals(self, other: ValueRef<'_>) -> Result<Option<bool>> {
+        Ok(Some(match (self, other) {
+            (ValueRef::Null, _) | (_, ValueRef::Null) => return Ok(None),
+            (ValueRef::Varchar(l), ValueRef::Varchar(r)) => bytes_equal(l.as_bytes(), r.as_bytes()),
+            (ValueRef::Int(l), ValueRef::Int(r)) => l == r,
+            (ValueRef::BigInt(l), ValueRef::BigInt(r)) => l == r,
+            _ => return Ok(self.compare(other)?.map(Ordering::is_eq)),
+        }))
     }
 
     /// A [`Value`] holding a copy of this one.
@@ -567,17 +603,73 @@ fn format_double(v: f64, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     if v.is_infinite() {
         return f.write_str(if v > 0.0 { "Infinity" } else { "-Infinity" });
     }
+    // The fewest digits of a double in this range have an exponent in
+    // -4..15, and of any other double one outside it.
+    let magnitude = v.abs();
+    let mut text = StackText::new();
+    if magnitude == 0.0 || (1e-4..1e15).contains(&magnitude) {
+        if write!(text, "{v}").is_ok() {
+            return f.write_str(text.as_str());
+        }
+        return write!(f, "{v}");
+    }
     // `{:e}` gives the fewest digits, as `1.5e-7`.
-    let scientific = format!("{v:e}");
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .expect("a finite double formats with an exponent");
-    let exponent: i32 = exponent.parse().expect("the exponent is an integer");
-    if (-4..15).contains(&exponent) {
-        write!(f, "{v}")
-    } else {
-        let sign = if exponent < 0 { '-' } else { '+' };
-        write!(f, "{mantissa}e{sign}{:02}", exponent.abs())
+    let scientific = match write!(text, "{v:e}") {
+        Ok(()) => text.as_str(),
+        Err(_) => return write!(f, "{}", format_scientific(&format!("{v:e}"))),
+    };
+    let mut out = StackText::new();
+    match write!(out, "{}", format_scientific(scientific)) {
+        Ok(()) => f.write_str(out.as_str()),
+        Err(_) => write!(f, "{}", format_scientific(scientific)),
+    }
+}
+
+/// `{:e}` output, such as `1.5e-7`, with a sign and at least two digits in
+/// its exponent, as `1.5e-07`.
+fn format_scientific(scientific: &str) -> impl fmt::Display + '_ {
+    struct Scientific<'a>(&'a str);
+    impl fmt::Display for Scientific<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let (mantissa, exponent) = self
+                .0
+                .split_once('e')
+                .expect("a finite double formats with an exponent");
+            let exponent: i32 = exponent.parse().expect("the exponent is an integer");
+            let sign = if exponent < 0 { '-' } else { '+' };
+            write!(f, "{mantissa}e{sign}{:02}", exponent.abs())
+        }
+    }
+    Scientific(scientific)
+}
+
+/// Text formatted on the stack, so that a value can be written to a
+/// formatter in one piece without allocating. Fails once it is full.
+struct StackText {
+    bytes: [u8; 48],
+    len: usize,
+}
+
+impl StackText {
+    fn new() -> Self {
+        Self {
+            bytes: [0; 48],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("only strings are written")
+    }
+}
+
+impl fmt::Write for StackText {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len + s.len();
+        let dst = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+        dst.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
     }
 }
 

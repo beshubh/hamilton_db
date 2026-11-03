@@ -5,8 +5,11 @@ use common::{Rid, Schema, Tuple};
 use super::Executor;
 use crate::Result;
 use crate::execution_context::ExecutionContext;
-use crate::expressions::Expr;
+use crate::expressions::{Expr, evaluate_in_place};
 use crate::plans::{PlanNode, ValuesPlan};
+
+/// What a row's buffer starts with, enough for most rows' strings too.
+const ROW_CAPACITY: usize = 128;
 
 /// Produces the plan's rows, evaluating their expressions, which read no
 /// input.
@@ -37,12 +40,24 @@ impl Executor for ValuesExecutor {
         tuples.clear();
         rids.clear();
         let (input, input_schema) = (Tuple::default(), Schema::default());
+        let schema = self.plan.get_output_schema();
         for row in self.plan.rows().iter().skip(self.next_row).take(batch_size) {
-            let values = row
-                .iter()
-                .map(|expr| expr.evaluate(&input, &input_schema))
-                .collect::<Result<Vec<_>>>()?;
-            tuples.push(Tuple::encode(self.plan.get_output_schema(), &values)?);
+            if row.len() != schema.len() {
+                let values = row
+                    .iter()
+                    .map(|expr| expr.evaluate(&input, &input_schema))
+                    .collect::<Result<Vec<_>>>()?;
+                tuples.push(Tuple::encode(schema, &values)?);
+            } else {
+                // Constants are encoded where they are, without copying.
+                let mut tuple = Tuple::from_bytes(Vec::with_capacity(ROW_CAPACITY));
+                let mut writer = tuple.writer(schema);
+                for expr in row {
+                    writer.push(evaluate_in_place(expr, &input, &input_schema)?.as_value_ref())?;
+                }
+                writer.finish()?;
+                tuples.push(tuple);
+            }
             self.next_row += 1;
         }
         Ok(!tuples.is_empty())

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use common::{Rid, Schema, Tuple};
 
-use super::{AbstractExecutor, Executor, passes};
+use super::{AbstractExecutor, Executor, RowPredicate};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
 use crate::plans::{FilterPlan, PlanNode};
@@ -13,6 +13,8 @@ pub struct FilterExecutor {
     child: Box<AbstractExecutor>,
     child_tuples: Vec<Tuple>,
     child_rids: Vec<Rid>,
+    /// The plan's predicate, made ready to test rows.
+    predicate: RowPredicate,
 }
 
 impl FilterExecutor {
@@ -21,11 +23,13 @@ impl FilterExecutor {
         plan: FilterPlan,
         child: Box<AbstractExecutor>,
     ) -> Self {
+        let predicate = RowPredicate::new(plan.predicate(), child.get_output_schema());
         Self {
             plan,
             child,
             child_tuples: Vec::new(),
             child_rids: Vec::new(),
+            predicate,
         }
     }
 }
@@ -43,23 +47,31 @@ impl Executor for FilterExecutor {
         rids: &mut Vec<Rid>,
         batch_size: usize,
     ) -> Result<bool> {
-        tuples.clear();
         rids.clear();
-        while tuples.is_empty() {
+        let mut n = 0;
+        while n == 0 {
             let more = self
                 .child
                 .next(&mut self.child_tuples, &mut self.child_rids, batch_size)?;
             if !more {
+                tuples.clear();
                 return Ok(false);
             }
             let schema = self.child.get_output_schema();
-            for tuple in self.child_tuples.drain(..) {
-                if passes(self.plan.predicate(), &tuple, schema)? {
+            for tuple in &mut self.child_tuples {
+                if self.predicate.passes(tuple, schema)? {
                     rids.extend(tuple.rid());
-                    tuples.push(tuple);
+                    // Trading buffers with the caller's batch keeps both
+                    // batches' buffers in use rather than freeing them.
+                    if n == tuples.len() {
+                        tuples.push(Tuple::default());
+                    }
+                    std::mem::swap(&mut tuples[n], tuple);
+                    n += 1;
                 }
             }
         }
+        tuples.truncate(n);
         Ok(true)
     }
 

@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use std::sync::Arc;
 
-use common::{INVALID_PAGE_ID, PageId, Rid, Schema, SlotId, Tuple};
+use common::{INVALID_PAGE_ID, PageId, Rid, Schema, SlotId, TXN_UNCOMMITTED_BIT, Tuple};
 
 use crate::buffer::arc_replacer::AccessType;
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
@@ -98,28 +98,122 @@ impl TableIterator {
         undo: &UndoLog,
         read_ts: Option<&ReadTimestamps>,
     ) -> Result<Option<Vec<TableRow>>> {
-        let record_reads = |heads: &[TableRow]| {
-            for (meta, tuple) in heads {
-                undo_log::check_read(row_rid(tuple), meta, ts)?;
-            }
-            if let Some(read_ts) = read_ts {
-                read_ts.record_page(heads.iter().map(|(_, tuple)| row_rid(tuple)), ts);
-            }
-            Ok(())
-        };
-        while let Some(heads) = self.next_page(|_| true, record_reads)? {
-            let mut rows = Vec::with_capacity(heads.len());
-            for head in heads {
-                let rid = row_rid(&head.1);
-                if let Some(row) = undo_log::version_at(rid, head, ts, schema, undo)? {
-                    rows.push(row);
+        let mut rows = Vec::new();
+        Ok(self
+            .next_batch_at_into(ts, schema, undo, read_ts, &mut rows)?
+            .then_some(rows))
+    }
+
+    /// [`next_batch_at`](Self::next_batch_at) into `rows`, replacing what it
+    /// holds and writing over its tuples' buffers rather than allocating new
+    /// ones. Returns `false`, leaving it empty, once the scan is done.
+    pub fn next_batch_at_into(
+        &mut self,
+        ts: u64,
+        schema: &Schema,
+        undo: &UndoLog,
+        read_ts: Option<&ReadTimestamps>,
+        rows: &mut Vec<TableRow>,
+    ) -> Result<bool> {
+        while self.next_page_id != INVALID_PAGE_ID {
+            let page_id = self.next_page_id;
+            let (heads, resolve) = self.copy_page_at(page_id, ts, read_ts, rows)?;
+            if !resolve {
+                rows.truncate(heads);
+                if heads > 0 {
+                    return Ok(true);
                 }
+                continue;
             }
-            if !rows.is_empty() {
-                return Ok(Some(rows));
+            // Resolve the versions with the page released, moving the rows
+            // visible at `ts` to the front.
+            let mut visible = 0;
+            for i in 0..heads {
+                let (meta, tuple) = &rows[i];
+                let row = if meta.ts & TXN_UNCOMMITTED_BIT == 0 && meta.ts <= ts {
+                    // Committed by `ts`: the head is the version, as
+                    // `version_at` would find.
+                    if meta.is_deleted {
+                        continue;
+                    }
+                    None
+                } else {
+                    let rid = row_rid(tuple);
+                    let head = std::mem::take(&mut rows[i]);
+                    match undo_log::version_at(rid, head, ts, schema, undo)? {
+                        Some(row) => Some(row),
+                        None => continue,
+                    }
+                };
+                if let Some(row) = row {
+                    rows[i] = row;
+                }
+                rows.swap(visible, i);
+                visible += 1;
+            }
+            rows.truncate(visible);
+            if visible > 0 {
+                return Ok(true);
             }
         }
-        Ok(None)
+        rows.clear();
+        Ok(false)
+    }
+
+    /// Copies the rows of page `page_id` before the scan's end into the
+    /// front of `rows`, reusing its tuples' buffers, and returns how many,
+    /// and whether any needs its version at `ts` found: one not committed by
+    /// then. Rows a commit by then deleted have no version at `ts`, and are
+    /// left out. Under the page's guard, checks each head can be read at
+    /// `ts` and records the reads in `read_ts`, as `TableHeap::get_at` does,
+    /// then moves the scan on to the next page.
+    fn copy_page_at(
+        &mut self,
+        page_id: PageId,
+        ts: u64,
+        read_ts: Option<&ReadTimestamps>,
+        rows: &mut Vec<TableRow>,
+    ) -> Result<(usize, bool)> {
+        let guard = self.bpm.checked_read_page(page_id, AccessType::Scan)?;
+        let page = TablePage::new(guard.get_data())?;
+        let is_last = page_id == self.last_page_id;
+        let end = if is_last {
+            self.last_slot_count
+        } else {
+            SlotId::MAX
+        };
+        let mut heads = 0;
+        let mut resolve = false;
+        for (slot, meta, payload) in page.iter().take_while(|&(slot, _, _)| slot < end) {
+            let rid = Rid::new(page_id, slot);
+            undo_log::check_read(rid, &meta, ts)?;
+            let committed = meta.ts & TXN_UNCOMMITTED_BIT == 0 && meta.ts <= ts;
+            if committed && meta.is_deleted {
+                continue;
+            }
+            resolve |= !committed;
+            if heads == rows.len() {
+                rows.push(TableRow::default());
+            }
+            let (row_meta, tuple) = &mut rows[heads];
+            *row_meta = meta;
+            tuple.set_bytes(payload);
+            tuple.set_rid(rid);
+            heads += 1;
+        }
+        if let Some(read_ts) = read_ts {
+            let rids = page
+                .iter()
+                .take_while(|&(slot, _, _)| slot < end)
+                .map(|(slot, _, _)| Rid::new(page_id, slot));
+            read_ts.record_page(rids, ts);
+        }
+        self.next_page_id = if is_last {
+            INVALID_PAGE_ID
+        } else {
+            page.next_page_id()
+        };
+        Ok((heads, resolve))
     }
 
     /// Copies the rows of the next page that `keep` accepts, and passes them

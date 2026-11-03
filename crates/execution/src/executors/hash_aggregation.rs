@@ -2,15 +2,18 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use common::hash::{hash_values, partition_index};
-use common::{Column, DataType, INVALID_PAGE_ID, Rid, Schema, Tuple, Value};
+use common::hash::{HashedKeys, ValuesHasher, hash_values, partition_index};
+use common::{
+    Column, ColumnReader, DataType, INVALID_PAGE_ID, Rid, Schema, Tuple, Value, ValueError,
+    ValueRef,
+};
 use storage::page::PAGE_SIZE;
 
 use super::intermediate_result::{IntermediatePages, IntermediateResult};
 use super::{AbstractExecutor, Executor};
 use crate::Result;
 use crate::execution_context::ExecutionContext;
-use crate::expressions::Expr;
+use crate::expressions::{AbstractExpr, Evaluated, Expr, column_reader, evaluate_with};
 use crate::plans::{Aggregate, AggregationPlan, PlanNode};
 
 /// How many rows `init` asks the child for at a time. Each batch is folded
@@ -75,7 +78,7 @@ pub struct HashAggregationExecutor {
     /// aggregate's running value (see [`RunningValue::to_values`]).
     group_schema: Schema,
     /// The groups being aggregated, by the hash of their group-by values.
-    table: HashMap<u64, Vec<Group>>,
+    table: HashMap<u64, Vec<Group>, HashedKeys>,
     /// The bytes the table's groups take; see the type's docs.
     table_bytes: usize,
     /// Partitions not aggregated yet, each with the seed to hash its groups
@@ -85,6 +88,12 @@ pub struct HashAggregationExecutor {
     pages: IntermediatePages,
     /// Output rows not returned by `next` yet.
     output: VecDeque<Tuple>,
+    /// A hasher with seed 0 and nothing added yet, made once.
+    empty_hasher: ValuesHasher,
+    /// A reader for each group-by that is a column of the child's rows.
+    group_readers: Vec<Option<ColumnReader>>,
+    /// A reader for each aggregate whose argument is a column.
+    arg_readers: Vec<Option<ColumnReader>>,
 }
 
 /// Groups whose group-by values hash alike.
@@ -144,6 +153,64 @@ impl RunningValue {
                 count,
             },
         })
+    }
+
+    /// Adds `tuple`, a row of `schema`, to this running value of
+    /// `aggregate`: what merging [`of_row`](Self::of_row) gives, without
+    /// copying the row's value unless it becomes the MIN or MAX.
+    /// `reader` reads the aggregate's argument, if it is a column.
+    #[inline]
+    fn add_row(
+        &mut self,
+        aggregate: &Aggregate,
+        reader: Option<ColumnReader>,
+        tuple: &Tuple,
+        schema: &Schema,
+    ) -> Result<()> {
+        let arg = match aggregate.arg() {
+            Some(expr) => evaluate_with(reader, expr, tuple, schema)?,
+            None => Evaluated::InPlace(ValueRef::Null),
+        };
+        let arg = arg.as_value_ref();
+        match self {
+            RunningValue::Count(count) => {
+                if matches!(aggregate, Aggregate::CountStar) || !arg.is_null() {
+                    *count += 1;
+                }
+            }
+            RunningValue::Sum(sum) => match (&mut *sum, arg) {
+                // Integers sum as a BIGINT, so the cast and `+` come to this.
+                (Value::BigInt(sum), ValueRef::Int(value)) => {
+                    *sum = sum
+                        .checked_add(i64::from(value))
+                        .ok_or(ValueError::Overflow)?;
+                }
+                (Value::BigInt(sum), ValueRef::BigInt(value)) => {
+                    *sum = sum.checked_add(value).ok_or(ValueError::Overflow)?;
+                }
+                (_, ValueRef::Null) => {}
+                _ => {
+                    let value = arg.to_value().cast_number(sum_type(aggregate))?;
+                    *sum = add(sum, &value)?;
+                }
+            },
+            RunningValue::Min(min) => {
+                if replaces_with(arg, min, Ordering::Less)? {
+                    *min = arg.to_value();
+                }
+            }
+            RunningValue::Max(max) => {
+                if replaces_with(arg, max, Ordering::Greater)? {
+                    *max = arg.to_value();
+                }
+            }
+            RunningValue::Avg { sum, count } => {
+                let value = arg.to_value().cast_number(sum_type(aggregate))?;
+                *sum = add(sum, &value)?;
+                *count += i64::from(!arg.is_null());
+            }
+        }
+        Ok(())
     }
 
     /// Adds `other`'s rows, of the same group and aggregate, to this.
@@ -253,26 +320,53 @@ fn add(sum: &Value, value: &Value) -> Result<Value> {
 /// Whether `candidate` should replace `current` as a MIN (`Less`) or MAX
 /// (`Greater`). NULLs are skipped.
 fn replaces(candidate: &Value, current: &Value, wins: Ordering) -> Result<bool> {
+    replaces_with(candidate.as_value_ref(), current, wins)
+}
+
+/// [`replaces`] for a candidate read in place.
+fn replaces_with(candidate: ValueRef<'_>, current: &Value, wins: Ordering) -> Result<bool> {
     if candidate.is_null() {
         return Ok(false);
     }
-    Ok(current.is_null() || candidate.compare(current)? == Some(wins))
+    Ok(current.is_null() || candidate.compare(current.as_value_ref())? == Some(wins))
 }
 
 /// Whether two rows have the same group-by values. Unlike `=`, NULL
 /// matches NULL: GROUP BY puts all NULLs in one group.
 fn same_group(left: &[Value], right: &[Value]) -> Result<bool> {
     for (l, r) in left.iter().zip(right) {
-        let equal = match (l.is_null(), r.is_null()) {
-            (true, true) => true,
-            (false, false) => l.compare(r)? == Some(Ordering::Equal),
-            _ => false,
-        };
-        if !equal {
+        if !same_key(l.as_value_ref(), r.as_value_ref())? {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// [`same_group`] of `keys` and the values of `group_bys` on `tuple`, a row
+/// of `schema`, read in place.
+fn row_in_group(
+    keys: &[Value],
+    group_bys: &[AbstractExpr],
+    readers: &[Option<ColumnReader>],
+    tuple: &Tuple,
+    schema: &Schema,
+) -> Result<bool> {
+    for ((key, expr), &reader) in keys.iter().zip(group_bys).zip(readers) {
+        let value = evaluate_with(reader, expr, tuple, schema)?;
+        if !same_key(key.as_value_ref(), value.as_value_ref())? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether two group-by values put rows in the same group.
+fn same_key(left: ValueRef<'_>, right: ValueRef<'_>) -> Result<bool> {
+    Ok(match (left.is_null(), right.is_null()) {
+        (true, true) => true,
+        (false, false) => left.equals(right)? == Some(true),
+        _ => false,
+    })
 }
 
 impl HashAggregationExecutor {
@@ -287,16 +381,34 @@ impl HashAggregationExecutor {
             .map(|expr| expr.return_type().clone());
         let value_columns = plan.aggregates().iter().flat_map(RunningValue::columns);
         let group_schema = Schema::new(group_columns.chain(value_columns).collect());
+        let child_schema = child.get_output_schema();
+        let group_readers = plan
+            .group_bys()
+            .iter()
+            .map(|expr| column_reader(expr, child_schema))
+            .collect();
+        let arg_readers = plan
+            .aggregates()
+            .iter()
+            .map(|aggregate| {
+                aggregate
+                    .arg()
+                    .and_then(|arg| column_reader(arg, child_schema))
+            })
+            .collect();
         Self {
+            group_readers,
+            arg_readers,
             pages: IntermediatePages::new(Arc::clone(&ctx)),
             exec_ctx: ctx,
             plan,
             child,
             group_schema,
-            table: HashMap::new(),
+            table: HashMap::default(),
             table_bytes: 0,
             pending: Vec::new(),
             output: VecDeque::new(),
+            empty_hasher: ValuesHasher::new(0),
         }
     }
 
@@ -354,12 +466,57 @@ impl HashAggregationExecutor {
         let mut spilled = None;
         let (mut tuples, mut rids) = (Vec::new(), Vec::new());
         while self.child.next(&mut tuples, &mut rids, CHILD_BATCH_SIZE)? {
+            if self.plan.group_bys().is_empty()
+                && let Some(group) = self.table.values_mut().flatten().next()
+            {
+                // Without group-bys there is one group, which never spills.
+                let schema = self.child.get_output_schema();
+                let aggregates = self.plan.aggregates().iter().zip(&self.arg_readers);
+                for tuple in &tuples {
+                    for (value, (aggregate, &reader)) in
+                        group.values.iter_mut().zip(aggregates.clone())
+                    {
+                        value.add_row(aggregate, reader, tuple, schema)?;
+                    }
+                }
+                continue;
+            }
             for tuple in &tuples {
+                if spilled.is_none() && self.add_to_its_group(tuple)? {
+                    continue;
+                }
                 let group = self.group_of_row(tuple)?;
                 self.add_group(group, 0, &mut spilled)?;
             }
         }
         self.finish_input(spilled, 0)
+    }
+
+    /// Adds `tuple`, a row of the child, to its group if the hash table has
+    /// it, as [`add_group`](Self::add_group) with seed 0 would. Returns
+    /// whether it did. Reads the group-by values in place, so a row of a
+    /// group already in the table copies nothing.
+    fn add_to_its_group(&mut self, tuple: &Tuple) -> Result<bool> {
+        let schema = self.child.get_output_schema();
+        let group_bys = self.plan.group_bys();
+        let readers = &self.group_readers;
+        let mut hasher = self.empty_hasher;
+        for (expr, &reader) in group_bys.iter().zip(readers) {
+            hasher.add(evaluate_with(reader, expr, tuple, schema)?.as_value_ref());
+        }
+        let Some(bucket) = self.table.get_mut(&hasher.finish()) else {
+            return Ok(false);
+        };
+        for group in bucket.iter_mut() {
+            if row_in_group(&group.keys, group_bys, readers, tuple, schema)? {
+                let aggregates = self.plan.aggregates().iter().zip(&self.arg_readers);
+                for (value, (aggregate, &reader)) in group.values.iter_mut().zip(aggregates) {
+                    value.add_row(aggregate, reader, tuple, schema)?;
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Reads `partition` to the end, freeing its pages, and aggregates its
