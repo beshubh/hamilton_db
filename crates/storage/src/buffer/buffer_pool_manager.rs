@@ -152,6 +152,7 @@ pub struct BufferPoolManager {
     latch: BpmLatch,
     replacer: Arc<ArcReplacer>,
     disk_scheduler: Arc<DiskScheduler>,
+    disk_manager: Arc<DiskManager>,
 }
 
 impl BufferPoolManager {
@@ -172,8 +173,15 @@ impl BufferPoolManager {
             frames,
             latch: Arc::new(Mutex::new(state)),
             replacer: Arc::new(ArcReplacer::new(num_frames)),
-            disk_scheduler: Arc::new(DiskScheduler::new(disk_manager)),
+            disk_scheduler: Arc::new(DiskScheduler::new(Arc::clone(&disk_manager))),
+            disk_manager,
         }
+    }
+
+    /// Syncs the db file and saves which pages it holds, so that pages
+    /// written so far are found on reopening (`DiskManager::checkpoint`).
+    pub fn sync_disk(&self) -> Result<()> {
+        self.disk_manager.checkpoint()
     }
 
     /// Number of frames in the pool.

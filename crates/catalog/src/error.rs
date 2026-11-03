@@ -1,4 +1,4 @@
-use common::ValueError;
+use common::{TxnId, ValueError};
 use storage::StorageError;
 use thiserror::Error;
 
@@ -43,6 +43,15 @@ pub enum CatalogError {
     /// CREATE INDEX on a sequence.
     #[error("{0} is not a table")]
     NotATable(String),
+
+    /// Another transaction holds a lock that conflicts.
+    #[error("could not obtain lock on relation \"{table}\"")]
+    LockConflict { table: String, other: TxnId },
+
+    /// A newer transaction truncated the table, removing rows this one
+    /// would see, or used it, so this one can't truncate it.
+    #[error("could not serialize access to relation \"{table}\" due to a newer transaction")]
+    ChangedSince { table: String, other: TxnId },
 
     #[error("nextval: reached maximum value of sequence {name} ({max})")]
     SequenceExhausted { name: String, max: i64 },

@@ -43,6 +43,7 @@ mod sort;
 #[cfg(test)]
 #[path = "../tests/util/executors.rs"]
 pub(crate) mod test_util;
+mod truncate;
 mod update;
 mod values;
 
@@ -61,20 +62,22 @@ pub use nested_loop_join::NestedLoopJoinExecutor;
 pub use projection::ProjectionExecutor;
 pub use seq_scan::SeqScanExecutor;
 pub use sort::SortExecutor;
+pub use truncate::TruncateExecutor;
 pub use update::UpdateExecutor;
 pub use values::ValuesExecutor;
 
 use std::sync::Arc;
 
-use catalog::{IndexInfo, TableInfo, TableWriteGuard};
+use catalog::{Catalog, IndexInfo, LockMode, TableInfo, TableWriteGuard};
 use common::{Rid, Schema, Tuple, Value};
 use enum_dispatch::enum_dispatch;
+use storage::concurrency::transaction::Transaction;
 use storage::index::{IndexMetadata, LocatorKind, RowLocator};
 
 use crate::error::{ExecutionError, Result};
 use crate::execution_context::ExecutionContext;
 use crate::expressions::{AbstractExpr, Expr};
-use crate::plans::AbstractPlanNode;
+use crate::plans::{AbstractPlanNode, PlanNode};
 
 #[enum_dispatch]
 pub trait Executor {
@@ -107,6 +110,7 @@ pub enum AbstractExecutor {
     InsertExecutor,
     UpdateExecutor,
     DeleteExecutor,
+    TruncateExecutor,
     FilterExecutor,
     ProjectionExecutor,
     SortExecutor,
@@ -149,6 +153,9 @@ pub fn create_executor(
         AbstractPlanNode::DeletePlan(plan) => {
             DeleteExecutor::new(Arc::clone(ctx), plan.clone(), child(plan.child())?).into()
         }
+        AbstractPlanNode::TruncatePlan(plan) => {
+            TruncateExecutor::new(Arc::clone(ctx), plan.clone()).into()
+        }
         AbstractPlanNode::FilterPlan(plan) => {
             FilterExecutor::new(Arc::clone(ctx), plan.clone(), child(plan.child())?).into()
         }
@@ -185,6 +192,49 @@ pub fn create_executor(
         }
     };
     Ok(executor)
+}
+
+/// Locks the tables `plan` uses for `txn`, before any of its executors
+/// run, so that an INSERT that can't get its lock takes no identity value.
+/// EXPLAIN runs nothing, so locks nothing.
+pub fn lock_tables(catalog: &Catalog, txn: &Transaction, plan: &AbstractPlanNode) -> Result<()> {
+    let lock = |oid, mode| catalog.lock_table(txn, oid, mode);
+    match plan {
+        AbstractPlanNode::ExplainPlan(_) | AbstractPlanNode::CreateTablePlan(_) => return Ok(()),
+        AbstractPlanNode::SeqScanPlan(plan) => lock(plan.table_oid(), LockMode::AccessShare)?,
+        AbstractPlanNode::IndexScanPlan(plan) => lock(plan.table_oid(), LockMode::AccessShare)?,
+        AbstractPlanNode::NestedIndexJoinPlan(plan) => {
+            lock(plan.inner_table_oid(), LockMode::AccessShare)?;
+        }
+        AbstractPlanNode::InsertPlan(plan) => lock(plan.table_oid(), LockMode::RowExclusive)?,
+        AbstractPlanNode::UpdatePlan(plan) => lock(plan.table_oid(), LockMode::RowExclusive)?,
+        AbstractPlanNode::DeletePlan(plan) => lock(plan.table_oid(), LockMode::RowExclusive)?,
+        AbstractPlanNode::CreateIndexPlan(plan) => {
+            if let Some(table) = catalog.get_table(plan.table_name()) {
+                lock(table.oid, LockMode::RowExclusive)?;
+            }
+        }
+        AbstractPlanNode::TruncatePlan(plan) => {
+            for &oid in plan.tables() {
+                lock(oid, LockMode::AccessExclusive)?;
+            }
+        }
+        // These read only their children's rows.
+        AbstractPlanNode::ValuesPlan(_)
+        | AbstractPlanNode::FilterPlan(_)
+        | AbstractPlanNode::ProjectionPlan(_)
+        | AbstractPlanNode::NestedLoopJoinPlan(_)
+        | AbstractPlanNode::HashJoinPlan(_)
+        | AbstractPlanNode::AggregationPlan(_)
+        | AbstractPlanNode::WindowPlan(_)
+        | AbstractPlanNode::SortPlan(_)
+        | AbstractPlanNode::LimitPlan(_)
+        | AbstractPlanNode::TopNPlan(_)
+        | AbstractPlanNode::TopNPerGroupPlan(_) => {}
+    }
+    plan.get_children()
+        .iter()
+        .try_for_each(|child| lock_tables(catalog, txn, child))
 }
 
 /// The indexes of `table` that INSERT, UPDATE and DELETE write, primary key

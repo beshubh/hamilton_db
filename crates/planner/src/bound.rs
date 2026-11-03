@@ -34,6 +34,7 @@ pub enum BoundStatement {
     Select(BoundSelect),
     Update(BoundUpdate),
     Delete(BoundDelete),
+    Truncate(BoundTruncate),
     Explain(Box<BoundStatement>),
     /// BEGIN, COMMIT or ROLLBACK. These change the session's transaction
     /// state rather than data, so they are run by the `ExecutionEngine`
@@ -177,6 +178,13 @@ pub struct BoundUpdate {
 pub struct BoundDelete {
     pub table: BoundTable,
     pub selection: Option<BoundExpr>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundTruncate {
+    /// Each table once, in the order first written.
+    pub tables: Vec<BoundTable>,
+    pub restart_identity: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

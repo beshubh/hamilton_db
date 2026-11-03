@@ -17,7 +17,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use common::{Column, DataType, IndexKind, PageId, Schema, Tuple, Value};
+use common::{Column, DataType, IndexKind, PageId, Rid, Schema, Tuple, Value};
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::table::table_heap::TableHeap;
 use storage::table::table_page::TupleMeta;
@@ -193,6 +193,26 @@ impl SystemTables {
         insert(&self.index_columns, &INDEX_COLUMNS_SCHEMA, &values)
     }
 
+    /// Points the `tables` row of `oid` at a new first page.
+    pub fn set_first_page_id(&self, oid: TableOid, page_id: PageId) -> Result<()> {
+        set_page_id(&self.tables, &TABLES_SCHEMA, oid, 2, page_id)
+    }
+
+    /// Points the `indexes` row of `oid` at a new header page.
+    pub fn set_header_page_id(&self, oid: IndexOid, page_id: PageId) -> Result<()> {
+        set_page_id(&self.indexes, &INDEXES_SCHEMA, oid, 3, page_id)
+    }
+
+    /// The page holding the `tables` row of `oid`.
+    pub fn table_row_page(&self, oid: TableOid) -> Result<PageId> {
+        Ok(find_row(&self.tables, &TABLES_SCHEMA, oid)?.0.page_id)
+    }
+
+    /// The page holding the `indexes` row of `oid`.
+    pub fn index_row_page(&self, oid: IndexOid) -> Result<PageId> {
+        Ok(find_row(&self.indexes, &INDEXES_SCHEMA, oid)?.0.page_id)
+    }
+
     pub fn scan_tables(&self) -> Result<Vec<TableRow>> {
         scan(&self.tables, &TABLES_SCHEMA, |values| {
             Ok(TableRow {
@@ -240,6 +260,36 @@ impl SystemTables {
             })
         })
     }
+}
+
+/// Sets column `column`, a page id, of the row whose first column is `oid`.
+/// The row keeps its size, so it is changed in place.
+fn set_page_id(
+    heap: &TableHeap,
+    schema: &Schema,
+    oid: u32,
+    column: usize,
+    page_id: PageId,
+) -> Result<()> {
+    let (rid, meta, mut values) = find_row(heap, schema, oid)?;
+    values[column] = Value::Int(page_id);
+    heap.update_in_place(rid, &meta, &Tuple::encode(schema, &values)?)?;
+    Ok(())
+}
+
+/// The row whose first column is `oid`.
+fn find_row(heap: &TableHeap, schema: &Schema, oid: u32) -> Result<(Rid, TupleMeta, Vec<Value>)> {
+    for row in heap.iter()? {
+        let (meta, tuple) = row?;
+        let values = tuple.decode(schema)?;
+        if as_oid(&values[0])? == oid {
+            let rid = tuple.rid().expect("the heap's rows carry their rid");
+            return Ok((rid, meta, values));
+        }
+    }
+    Err(CatalogError::Corrupt(format!(
+        "no catalog row for oid {oid}"
+    )))
 }
 
 fn insert(heap: &TableHeap, schema: &Schema, values: &[Value]) -> Result<()> {

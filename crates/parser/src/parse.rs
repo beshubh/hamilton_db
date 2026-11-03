@@ -19,14 +19,15 @@ use sqlparser::ast::{
     JoinConstraint, JoinOperator, KeyOrIndexDisplay, LimitClause, NullsDistinctOption, ObjectName,
     ObjectNamePart, OrderByKind, OrderByOptions, OrderBySort, PrimaryKeyConstraint, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, TableConstraint, TableFactor, TableObject,
-    TableWithJoins, TimezoneInfo, UnaryOperator, UniqueConstraint, WindowType,
+    TableWithJoins, TimezoneInfo, TruncateIdentityOption, UnaryOperator, UniqueConstraint,
+    WindowType,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::ast::{
     self, BinaryOp, CreateIndex, CreateTable, Delete, FromItem, Insert, JoinKind, OrderByItem,
-    Select, Statement, TableRef, UnaryOp, Update, WindowSpec,
+    Select, Statement, TableRef, Truncate, UnaryOp, Update, WindowSpec,
 };
 use crate::error::{ParseError, Result};
 
@@ -48,6 +49,7 @@ fn convert_statement(stmt: &sql::Statement) -> Result<Statement> {
         }
         sql::Statement::Update(update) => convert_update(stmt, update),
         sql::Statement::Delete(delete) => convert_delete(stmt, delete),
+        sql::Statement::Truncate(truncate) => convert_truncate(stmt, truncate),
         sql::Statement::Explain { statement, .. } => convert_explain(stmt, statement),
         sql::Statement::StartTransaction { .. } => convert_begin(stmt),
         // Matched by field, not by rendering: the AST drops `TRANSACTION`
@@ -732,6 +734,36 @@ fn convert_delete(stmt: &sql::Statement, delete: &sql::Delete) -> Result<Stateme
     Ok(Statement::Delete(Delete {
         table: convert_table_factor(&table.relation)?,
         selection: delete.selection.as_ref().map(convert_expr).transpose()?,
+    }))
+}
+
+fn convert_truncate(stmt: &sql::Statement, truncate: &sql::Truncate) -> Result<Statement> {
+    let mut canonical = format!(
+        "TRUNCATE {}{}",
+        if truncate.table { "TABLE " } else { "" },
+        join(truncate.table_names.iter().map(|target| &target.name))
+    );
+    match truncate.identity {
+        Some(TruncateIdentityOption::Restart) => canonical += " RESTART IDENTITY",
+        Some(TruncateIdentityOption::Continue) => canonical += " CONTINUE IDENTITY",
+        None => {}
+    }
+    if let Some(cascade) = &truncate.cascade {
+        canonical += &format!(" {cascade}");
+    }
+    ensure_canonical(
+        stmt,
+        &canonical,
+        "TRUNCATE [TABLE] <table>, ... [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE | RESTRICT]",
+    )?;
+
+    Ok(Statement::Truncate(Truncate {
+        tables: truncate
+            .table_names
+            .iter()
+            .map(|target| object_name(&target.name))
+            .collect::<Result<_>>()?,
+        restart_identity: truncate.identity == Some(TruncateIdentityOption::Restart),
     }))
 }
 
@@ -1858,6 +1890,36 @@ mod tests {
                 }),
             })
         );
+    }
+
+    #[test]
+    fn truncate() {
+        let truncate = |tables: &[&str], restart_identity| {
+            Statement::Truncate(Truncate {
+                tables: tables.iter().map(|&t| t.into()).collect(),
+                restart_identity,
+            })
+        };
+        assert_eq!(parse_one("TRUNCATE t").unwrap(), truncate(&["t"], false));
+        assert_eq!(
+            parse_one(r#"TRUNCATE TABLE "Tweet", u, t"#).unwrap(),
+            truncate(&["Tweet", "u", "t"], false)
+        );
+        assert_eq!(
+            parse_one(r#"TRUNCATE "a", "b" RESTART IDENTITY CASCADE"#).unwrap(),
+            truncate(&["a", "b"], true)
+        );
+        assert_eq!(
+            parse_one("TRUNCATE t CONTINUE IDENTITY RESTRICT").unwrap(),
+            truncate(&["t"], false)
+        );
+    }
+
+    #[test]
+    fn truncate_rejects_unsupported_parts() {
+        assert_unsupported("TRUNCATE ONLY t");
+        assert_unsupported("TRUNCATE t *");
+        assert_unsupported("TRUNCATE s.t");
     }
 
     #[test]

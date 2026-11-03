@@ -28,8 +28,8 @@ use execution::optimizer::Optimizer;
 use execution::plans::{
     AbstractPlanNode, Aggregate, AggregationPlan, CreateIndexPlan, CreateTablePlan, DeletePlan,
     ExplainPlan, FilterPlan, HashJoinPlan, InsertPlan, JoinType, LimitPlan, OrderBy, PlanNode,
-    ProjectionPlan, SeqScanPlan, SortPlan, UpdatePlan, ValuesPlan, WindowColumn, WindowFunction,
-    WindowFunctionKind, WindowPlan,
+    ProjectionPlan, SeqScanPlan, SortPlan, TruncatePlan, UpdatePlan, ValuesPlan, WindowColumn,
+    WindowFunction, WindowFunctionKind, WindowPlan,
 };
 use parser::{BinaryOp, JoinKind};
 
@@ -78,6 +78,11 @@ impl<'a> Planner<'a> {
             BoundStatement::Select(select) => self.plan_select(select)?,
             BoundStatement::Update(update) => self.plan_update(update)?,
             BoundStatement::Delete(delete) => self.plan_delete(delete)?,
+            BoundStatement::Truncate(truncate) => TruncatePlan::new(
+                truncate.tables.iter().map(|table| table.oid).collect(),
+                truncate.restart_identity,
+            )
+            .into(),
             BoundStatement::Explain(stmt) => {
                 ExplainPlan::new(Arc::new(self.plan_unoptimized(stmt)?)).into()
             }

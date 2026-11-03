@@ -81,6 +81,18 @@ impl TableHeap {
         self.first_page_id
     }
 
+    /// Every page of the heap, in list order.
+    pub fn page_ids(&self) -> Result<Vec<PageId>> {
+        let mut pages = Vec::new();
+        let mut page_id = self.first_page_id;
+        while page_id != INVALID_PAGE_ID {
+            pages.push(page_id);
+            let guard = self.bpm.checked_read_page(page_id, AccessType::Scan)?;
+            page_id = TablePage::new(guard.get_data())?.next_page_id();
+        }
+        Ok(pages)
+    }
+
     /// Appends a tuple to the last page, starting a new page when that one is
     /// full, and returns where it went.
     pub fn insert(&self, meta: &TupleMeta, tuple: &Tuple) -> Result<Rid> {

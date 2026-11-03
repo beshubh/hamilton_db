@@ -59,7 +59,6 @@ each for a feature HamiltonDB lacks:
 | DDL in a transaction block | `BEGIN; CREATE TABLE ...` for every migration | `can_rollback_ddl = False` |
 | Foreign keys, `ALTER TABLE` | `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... DEFERRABLE INITIALLY DEFERRED` | `supports_foreign_keys = False` (no referential integrity) |
 | `SAVEPOINT` | `SAVEPOINT "s..._x1"` for nested `atomic()` | `uses_savepoints = False` |
-| `TRUNCATE` | `TRUNCATE "social_tweet", "social_user";` when the tests flush | `sql_flush` sends `DELETE FROM` per table |
 | `CREATE DATABASE` | `CREATE DATABASE "test_hamilton"` for tests | test database creation is skipped; tests get their own server |
 | Operator classes | `CREATE INDEX "social_user_username_..._like" ON "social_user" ("username" varchar_pattern_ops)` for a unique `varchar` | the schema editor skips the `_like` index |
 

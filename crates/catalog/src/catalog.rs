@@ -1,18 +1,21 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{Column, DataType, IndexKind, PageId, Schema, TxnId, UniqueKey, ValueError};
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use storage::StorageError;
 use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
+use storage::concurrency::transaction::{Transaction, TransactionState};
 use storage::index::btree_index::BtreeIndex;
 use storage::index::{Index, IndexMetadata, LocatorKind};
 use storage::table::table_heap::TableHeap;
 
 use crate::error::{CatalogError, Result};
 use crate::header_page::{CATALOG_PAGE_ID, SystemTableRoots, read_next_tid, write_next_tid};
+use crate::locks::{LockMode, TableLocks};
 use crate::sequence::{self, Sequence};
 use crate::system_tables::{ColumnRow, IndexColumnRow, IndexRow, SystemTables, TableRow};
 
@@ -51,6 +54,8 @@ pub struct TableInfo {
     identity: Vec<(usize, Arc<Sequence>)>,
     /// See `lock_writes`.
     writes: RwLock<()>,
+    /// See `Catalog::lock_table`.
+    locks: TableLocks,
 }
 
 impl TableInfo {
@@ -70,12 +75,32 @@ impl TableInfo {
             kind,
             identity,
             writes: RwLock::new(()),
+            locks: TableLocks::default(),
+        }
+    }
+
+    /// This table on `heap` instead, sharing its locks.
+    fn on_heap(&self, heap: Arc<TableHeap>) -> Self {
+        Self {
+            oid: self.oid,
+            name: self.name.clone(),
+            schema: self.schema.clone(),
+            heap,
+            kind: self.kind,
+            identity: self.identity.clone(),
+            writes: RwLock::new(()),
+            locks: self.locks.clone(),
         }
     }
 
     /// First page of the table's heap.
     pub fn first_page_id(&self) -> PageId {
         self.heap.first_page_id()
+    }
+
+    /// The sequences of the identity columns, in column order.
+    pub fn sequences(&self) -> impl Iterator<Item = &Arc<Sequence>> {
+        self.identity.iter().map(|(_, sequence)| sequence)
     }
 
     /// The sequence of column `column`, if it is an identity column.
@@ -161,6 +186,16 @@ pub struct Catalog {
     /// Creates hold the write lock from the name check until the new entry is
     /// in memory, so DDL is serialized.
     state: RwLock<CatalogState>,
+    /// Each running transaction's truncates, for `prepare_commit`.
+    truncates: Mutex<HashMap<TxnId, Truncates>>,
+}
+
+#[derive(Default)]
+struct Truncates {
+    tables: Vec<TableOid>,
+    /// Set once `prepare_commit` starts pointing the catalog rows at the
+    /// new pages, which an abort must then point back.
+    prepared: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -231,6 +266,7 @@ impl Catalog {
             bpm,
             system,
             state: RwLock::new(CatalogState::default()),
+            truncates: Mutex::default(),
         })
     }
 
@@ -372,6 +408,7 @@ impl Catalog {
             bpm,
             system,
             state: RwLock::new(state),
+            truncates: Mutex::default(),
         })
     }
 
@@ -763,6 +800,196 @@ impl Catalog {
         Ok(info)
     }
 
+    /// Locks table `oid` in `mode` until `txn` ends, failing at once if
+    /// another transaction holds a conflicting lock (`LockConflict`), or if a
+    /// newer one truncated the table or, for `AccessExclusive`, used it at
+    /// all (`ChangedSince`): MVTO orders it before them. A table that doesn't
+    /// exist is left for the statement to report.
+    pub fn lock_table(&self, txn: &Transaction, oid: TableOid, mode: LockMode) -> Result<()> {
+        match self.get_table_by_oid(oid) {
+            Some(table) => table.locks.lock(txn, &table.name, mode),
+            None => Ok(()),
+        }
+    }
+
+    /// Empties table `oid` for `txn`, which holds it in `AccessExclusive`, by
+    /// giving it a new heap and new, empty indexes; with `restart_identity`,
+    /// its sequences start over too. No transaction but `txn` can use the
+    /// table until it ends, and none older can afterwards, so the old pages
+    /// have no other readers.
+    ///
+    /// An abort puts the old heap and indexes back. A commit must be
+    /// prepared (`prepare_commit`), and then writes the catalog rows
+    /// pointing at the new pages. The replaced pages are freed once garbage
+    /// collection is done with them.
+    pub fn truncate(
+        self: &Arc<Self>,
+        txn: &Transaction,
+        oid: TableOid,
+        restart_identity: bool,
+    ) -> Result<()> {
+        let mut state = self.state.write();
+        let old = state
+            .tables
+            .get(&oid)
+            .cloned()
+            .ok_or_else(|| CatalogError::TableNotFound(oid.to_string()))?;
+        let old_indexes = indexes_of(&state, oid);
+        let new = Arc::new(old.on_heap(Arc::new(TableHeap::create(Arc::clone(&self.bpm))?)));
+        let mut new_indexes = Vec::with_capacity(old_indexes.len());
+        for index in &old_indexes {
+            let header_page_id = self.bpm.new_page();
+            let metadata = index_metadata(
+                &new,
+                &index.name,
+                index.kind,
+                &index.key_columns,
+                &index.key_schema,
+                index.locator,
+            );
+            new_indexes.push(Arc::new(IndexInfo {
+                oid: index.oid,
+                name: index.name.clone(),
+                table_oid: oid,
+                table_name: index.table_name.clone(),
+                key_columns: index.key_columns.clone(),
+                key_schema: index.key_schema.clone(),
+                header_page_id,
+                kind: index.kind,
+                locator: index.locator,
+                index: open_index(&self.bpm, metadata, header_page_id)?,
+            }));
+        }
+
+        let tid = txn.tid();
+        let prepared = {
+            let mut truncates = self.truncates.lock();
+            let truncates = truncates.entry(tid).or_default();
+            if !truncates.tables.contains(&oid) {
+                truncates.tables.push(oid);
+            }
+            Arc::clone(&truncates.prepared)
+        };
+        let durable = Arc::new(AtomicBool::new(false));
+        let catalog = Arc::clone(self);
+        let (replaced, replaced_indexes) = (Arc::clone(&old), old_indexes.clone());
+        let written = Arc::clone(&durable);
+        txn.on_end(move |outcome| {
+            catalog.truncates.lock().remove(&tid);
+            let prepared = prepared.load(Ordering::Acquire);
+            if outcome == TransactionState::Committed {
+                // Only a commit that bypassed the engine isn't prepared.
+                let result = match prepared {
+                    true => catalog.write_rows(oid),
+                    false => catalog
+                        .prepare_tables(&[oid], &AtomicBool::new(false))
+                        .and_then(|()| catalog.write_rows(oid)),
+                };
+                match result {
+                    Ok(()) => written.store(true, Ordering::Release),
+                    Err(e) => log::error!("writing the truncate of {}: {e}", replaced.name),
+                }
+                replaced.locks.truncated(tid);
+            } else {
+                if prepared && let Err(e) = catalog.point_rows(&replaced, &replaced_indexes) {
+                    log::error!("rolling back the truncate of {}: {e}", replaced.name);
+                }
+                let mut state = catalog.state.write();
+                state.tables.insert(oid, Arc::clone(&replaced));
+                for index in replaced_indexes {
+                    state.indexes.insert(index.oid, index);
+                }
+            }
+            let durable = written.load(Ordering::Acquire);
+            replaced.sequences().for_each(|s| s.end_restart(durable));
+        })?;
+        let bpm = Arc::clone(&self.bpm);
+        let unused = (Arc::clone(&new), new_indexes.clone());
+        txn.after_readers(move |outcome| {
+            let (table, indexes) = match outcome {
+                TransactionState::Committed if durable.load(Ordering::Acquire) => {
+                    (old, old_indexes)
+                }
+                // Still in the catalog on disk.
+                TransactionState::Committed => return,
+                _ => unused,
+            };
+            free_pages(&bpm, &table, &indexes);
+        })?;
+
+        if restart_identity {
+            new.sequences().for_each(|s| s.restart());
+        }
+        state.tables.insert(oid, new);
+        for index in new_indexes {
+            state.indexes.insert(index.oid, index);
+        }
+        Ok(())
+    }
+
+    /// Readies `txn`'s truncates to commit, before the commit: checkpoints,
+    /// writing every page and the disk's list of them, so that everything
+    /// the catalog points at is on disk and every page holding a catalog row
+    /// has a place there. Then points the catalog rows at the new pages in
+    /// memory, for the commit to write. If this fails, `txn` must abort.
+    // TODO(wal): a commit record would replace these writes.
+    pub fn prepare_commit(&self, txn: &Transaction) -> Result<()> {
+        let (tables, prepared) = match self.truncates.lock().get(&txn.tid()) {
+            Some(truncates) => (truncates.tables.clone(), Arc::clone(&truncates.prepared)),
+            None => return Ok(()),
+        };
+        self.prepare_tables(&tables, &prepared)
+    }
+
+    fn prepare_tables(&self, tables: &[TableOid], prepared: &AtomicBool) -> Result<()> {
+        self.bpm.flush_all_pages()?;
+        self.bpm.sync_disk()?;
+        prepared.store(true, Ordering::Release);
+        for &oid in tables {
+            let (table, indexes) = {
+                let state = self.state.read();
+                (Arc::clone(&state.tables[&oid]), indexes_of(&state, oid))
+            };
+            self.point_rows(&table, &indexes)?;
+        }
+        Ok(())
+    }
+
+    /// Points the catalog rows of `table` and `indexes` at their pages.
+    fn point_rows(&self, table: &TableInfo, indexes: &[Arc<IndexInfo>]) -> Result<()> {
+        self.system
+            .set_first_page_id(table.oid, table.first_page_id())?;
+        for index in indexes {
+            self.system
+                .set_header_page_id(index.oid, index.header_page_id)?;
+        }
+        Ok(())
+    }
+
+    /// Writes table `oid`'s heap and indexes again, now that the commit has
+    /// stamped the rows `txn` added, then the pages holding its catalog
+    /// rows, and the header that makes those stamps committed on reopening.
+    /// All of them have had places on disk since `prepare_commit`.
+    fn write_rows(&self, oid: TableOid) -> Result<()> {
+        let (table, indexes) = {
+            let state = self.state.read();
+            (Arc::clone(&state.tables[&oid]), indexes_of(&state, oid))
+        };
+        let mut pages = table.heap.page_ids()?;
+        for index in &indexes {
+            pages.extend(tree(index).page_ids()?);
+        }
+        pages.push(self.system.table_row_page(oid)?);
+        for index in &indexes {
+            pages.push(self.system.index_row_page(index.oid)?);
+        }
+        pages.push(CATALOG_PAGE_ID);
+        for page_id in pages {
+            self.bpm.flush_page(page_id)?;
+        }
+        Ok(())
+    }
+
     pub fn get_index(&self, name: &str) -> Option<Arc<IndexInfo>> {
         let state = self.state.read();
         state.indexes.get(state.index_names.get(name)?).cloned()
@@ -791,6 +1018,52 @@ impl Catalog {
             .flatten()
             .map(|oid| Arc::clone(&state.indexes[oid]))
             .collect()
+    }
+}
+
+fn indexes_of(state: &CatalogState, oid: TableOid) -> Vec<Arc<IndexInfo>> {
+    state
+        .table_indexes
+        .get(&oid)
+        .into_iter()
+        .flatten()
+        .map(|index| Arc::clone(&state.indexes[index]))
+        .collect()
+}
+
+fn tree(
+    index: &IndexInfo,
+) -> &storage::index::btree::Btree<storage::index::btree_index::EntryComparator> {
+    let Index::BtreeIndex(btree) = &*index.index;
+    btree.tree()
+}
+
+/// Frees the pages of a heap and its indexes that nothing points to any
+/// more. Freeing is only to save space, so failures are logged.
+fn free_pages(bpm: &BufferPoolManager, table: &TableInfo, indexes: &[Arc<IndexInfo>]) {
+    let mut pages = match table.heap.page_ids() {
+        Ok(pages) => pages,
+        Err(e) => return log::error!("freeing the old heap of {}: {e}", table.name),
+    };
+    for index in indexes {
+        match tree(index).page_ids() {
+            Ok(tree) => pages.extend(tree),
+            Err(e) => log::error!("freeing the old index {}: {e}", index.name),
+        }
+    }
+    for page_id in pages {
+        // A checkpoint may pin the page for a moment. Past that, something
+        // still uses it, so it is left allocated.
+        for attempt in 0.. {
+            match bpm.delete_page(page_id) {
+                Err(StorageError::PagePinned(_)) if attempt < 1000 => std::thread::yield_now(),
+                Err(e) => {
+                    log::error!("freeing page {page_id}: {e}");
+                    break;
+                }
+                Ok(()) => break,
+            }
+        }
     }
 }
 

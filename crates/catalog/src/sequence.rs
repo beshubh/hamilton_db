@@ -17,11 +17,20 @@
 //! rolled-back INSERT leaves a gap. Values reach disk before they are handed
 //! out (`log_ahead`), so a crash skips up to LOG_VALS values rather than
 //! handing any out again.
+//!
+//! `TRUNCATE ... RESTART IDENTITY` (`restart`) belongs to a transaction. It
+//! must not reach disk before the truncate does, or a crash would bring
+//! back rows whose ids the sequence hands out again. So until the
+//! transaction ends, the restarted sequence counts in memory and the row
+//! keeps its old value. The truncate's commit puts the restarted value in
+//! the row once the empty table is on disk; anything else only ever moves
+//! the row forward.
 
 use std::fmt;
 use std::sync::{Arc, LazyLock};
 
 use common::{Column, DataType, PageId, Schema, SlotId, Tuple};
+use parking_lot::Mutex;
 use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::page::page_guard::WritePageGuard;
@@ -95,6 +104,10 @@ pub struct Sequence {
     bpm: Arc<BufferPoolManager>,
     page_id: PageId,
     max: i64,
+    /// The value a restart whose transaction hasn't ended handed out last,
+    /// or 0 for none, as values start at 1. `nextval` takes values from it
+    /// rather than from the row.
+    restart: Mutex<Option<i64>>,
 }
 
 impl Sequence {
@@ -113,37 +126,28 @@ impl Sequence {
             bpm,
             page_id,
             max,
+            restart: Mutex::new(None),
         }
     }
 
     /// Hands out the next value, as Postgres's `nextval` does with the
     /// default options: INCREMENT 1, CACHE 1, NO CYCLE.
     pub fn next_value(&self) -> Result<i64> {
+        // Held throughout, so a restart can't end between the check and the
+        // row change.
+        let mut restart = self.restart.lock();
+        if let Some(last) = restart.as_mut() {
+            *last = self.after(*last)?;
+            return Ok(*last);
+        }
         let mut guard = self
             .bpm
             .checked_write_page(self.page_id, AccessType::Lookup)?;
-        // Read without `get_data_mut`, which dirties the page even if this
-        // call then fails.
-        let (meta, mut row) = {
-            let page = TablePage::new(guard.get_data())?;
-            let (meta, payload) = page.get(SLOT)?;
-            let row = SequenceRow::read_from_bytes(payload).map_err(|_| self.corrupt())?;
-            (meta, row)
-        };
-        if row.null_bitmap != 0 || row.is_called > 1 {
-            return Err(self.corrupt());
-        }
+        let (meta, mut row) = self.read(&guard)?;
 
         let is_called = row.is_called == 1;
         let value = if is_called {
-            row.last_value
-                .get()
-                .checked_add(1)
-                .filter(|&value| value <= self.max)
-                .ok_or_else(|| CatalogError::SequenceExhausted {
-                    name: self.name.clone(),
-                    max: self.max,
-                })?
+            self.after(row.last_value.get())?
         } else {
             row.last_value.get()
         };
@@ -164,6 +168,71 @@ impl Sequence {
         row.is_called = 1;
         TablePage::new(guard.get_data_mut())?.update(SLOT, &meta, row.as_bytes())?;
         Ok(value)
+    }
+
+    /// Makes the next value 1 again, until `end_restart`. The caller holds
+    /// the table locked, so only its transaction takes values meanwhile.
+    pub(crate) fn restart(&self) {
+        *self.restart.lock() = Some(0);
+    }
+
+    /// Puts the pending restart, if there is one, in the row: as it is if
+    /// the truncate is `durable`, else only if that moves the row forward,
+    /// so a rolled-back restart leaves a gap of the values it handed out.
+    pub(crate) fn end_restart(&self, durable: bool) {
+        let mut restart = self.restart.lock();
+        let Some(last) = restart.take() else {
+            return;
+        };
+        // A later `nextval` logs ahead from here.
+        let row = SequenceRow {
+            null_bitmap: 0,
+            last_value: last.max(1).into(),
+            log_cnt: 0.into(),
+            is_called: u8::from(last > 0),
+        };
+        let next = |row: &SequenceRow| i128::from(row.last_value.get()) + i128::from(row.is_called);
+        if let Err(e) = self.replace_if(&row, |now| durable || next(now) < next(&row)) {
+            log::error!("ending the restart of {}: {e}", self.name);
+        }
+    }
+
+    /// The value after `last`, if the sequence hasn't reached its maximum.
+    fn after(&self, last: i64) -> Result<i64> {
+        last.checked_add(1)
+            .filter(|&value| value <= self.max)
+            .ok_or_else(|| CatalogError::SequenceExhausted {
+                name: self.name.clone(),
+                max: self.max,
+            })
+    }
+
+    /// Writes `row` over the current row if `replace(current)`.
+    fn replace_if(
+        &self,
+        row: &SequenceRow,
+        replace: impl FnOnce(&SequenceRow) -> bool,
+    ) -> Result<()> {
+        let mut guard = self
+            .bpm
+            .checked_write_page(self.page_id, AccessType::Lookup)?;
+        let (meta, current) = self.read(&guard)?;
+        if replace(&current) {
+            TablePage::new(guard.get_data_mut())?.update(SLOT, &meta, row.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Reads the row without `get_data_mut`, which dirties the page even if
+    /// the caller then fails.
+    fn read(&self, guard: &WritePageGuard) -> Result<(TupleMeta, SequenceRow)> {
+        let page = TablePage::new(guard.get_data())?;
+        let (meta, payload) = page.get(SLOT)?;
+        let row = SequenceRow::read_from_bytes(payload).map_err(|_| self.corrupt())?;
+        if row.null_bitmap != 0 || row.is_called > 1 {
+            return Err(self.corrupt());
+        }
+        Ok((meta, row))
     }
 
     /// Writes the row to disk as if every value through `last_value` had
@@ -215,7 +284,7 @@ impl fmt::Debug for Sequence {
             .field("name", &self.name)
             .field("page_id", &self.page_id)
             .field("max", &self.max)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
