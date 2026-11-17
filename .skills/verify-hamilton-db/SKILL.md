@@ -80,7 +80,7 @@ hdb repl shot repl-select
 hdb repl stop
 ```
 
-For regressions rather than a targeted proof, the repo's own suites start their own servers and need no `hdb up`: `cargo nextest run -p <crate>`, `uv run sqltest/run.py transactions`, `uv run sqltest/run.py index_storage`.
+For regressions rather than a targeted proof, the repo's own suites start their own servers and need no `hdb up`: `cargo nextest run -p <crate>`, `uv run sqltest/run.py transactions`, `uv run sqltest/run.py index_storage`, and for crashes `uv run sqltest/run.py recovery`.
 
 ## Evidence
 

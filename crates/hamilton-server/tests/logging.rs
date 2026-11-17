@@ -2,10 +2,20 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 use tempfile::TempDir;
 use wire::Client;
+
+/// Kills and reaps the server on drop, so a panicking test leaves none running.
+struct Killed(Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 /// Runs the server binary with HAMILTON_LOG set to `log`, or unset, inserts
 /// a row that takes its id from a sequence, and returns what the server
@@ -21,8 +31,8 @@ fn stderr_after_an_insert(log: Option<&str>) -> String {
     if let Some(log) = log {
         command.env("HAMILTON_LOG", log);
     }
-    let mut server = command.spawn().unwrap();
-    let mut stderr = BufReader::new(server.stderr.take().unwrap());
+    let mut server = Killed(command.spawn().unwrap());
+    let mut stderr = BufReader::new(server.0.stderr.take().unwrap());
     let mut startup = String::new();
     while !startup.contains("listening on") {
         startup.clear();
@@ -42,8 +52,7 @@ fn stderr_after_an_insert(log: Option<&str>) -> String {
         assert_eq!(client.simple_query(sql).unwrap().error, None, "{sql}");
     }
     drop(client);
-    server.kill().unwrap();
-    server.wait().unwrap();
+    drop(server);
     let mut rest = String::new();
     stderr.read_to_string(&mut rest).unwrap();
     rest

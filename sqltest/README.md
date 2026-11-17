@@ -8,13 +8,14 @@ uv run sqltest/run.py                          # every suite
 uv run sqltest/run.py transactions             # one suite
 uv run sqltest/run.py -k "lost update"         # cases whose name contains the text
 uv run sqltest/run.py index_storage --runs 50  # more timed runs per query (default 20)
+uv run sqltest/run.py recovery --seed 7        # crash scenarios with other choices (default 1)
 ```
 
-It exits non-zero if any case fails. Each suite is a SQL file of cases,
-each starting with `-- case: <name>`, and a Python module that runs them.
-`cli.py` starts a server on a free port for a suite or case and drives the
-CLI; `pgwire.py` is a small wire protocol client for opening several
-connections at once.
+It exits non-zero if any case fails. `transactions` and `index_storage` are
+each a SQL file of cases, each starting with `-- case: <name>`, and a Python
+module that runs them. `recovery` is Python only. `cli.py` starts a server
+on a free port for a suite or case and drives the CLI; `pgwire.py` is a
+small wire protocol client for opening several connections at once.
 
 ## transactions
 
@@ -31,6 +32,18 @@ SELECT balance FROM accounts WHERE id = 1;   -- => 100
 
 Each case runs on a fresh server and database with the tables at the top
 of the file. `transactions.py` has the format.
+
+## recovery
+
+`recovery.py` kills the server with SIGKILL while several clients write,
+starts it again on the same files, and checks what survived. Its scenarios
+are its cases, each described by its docstring there, and `-k` picks them by
+name.
+
+It runs a debug build, so every mtr also checks its own redo. A COMMIT sent
+with no reply may survive or not, but never in part. `--seed` fixes each
+client's choices and the kill delays, not how the clients interleave. A
+failure prints the seed, and keeps the database files and server logs.
 
 ## index_storage
 
@@ -61,4 +74,5 @@ target/release/hamilton-server /tmp/sqltest.db &
 kill %1
 ```
 
-Delete `/tmp/sqltest.{db,meta,log}` before running it again.
+Delete `/tmp/sqltest.db`, `/tmp/sqltest.meta` and `/tmp/sqltest.log.*`
+before running it again.

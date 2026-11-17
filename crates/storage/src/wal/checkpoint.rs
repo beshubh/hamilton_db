@@ -210,24 +210,21 @@ fn take(bpm: &BufferPoolManager, last_start: &mut Lsn) -> Result<Checkpoint> {
 /// How often `Checkpointer` looks at the log.
 const POLL: Duration = Duration::from_secs(1);
 
-/// The log growth that triggers a checkpoint before its interval is up.
-const LOG_GROWTH: u64 = crate::wal::SEGMENT_SIZE;
-
 /// A thread that takes a fuzzy checkpoint every interval, or sooner once
-/// the log has grown by `LOG_GROWTH`, until dropped.
+/// the log has grown by `log_growth` bytes, until dropped.
 pub(crate) struct Checkpointer {
     stop: Arc<(Mutex<bool>, Condvar)>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Checkpointer {
-    pub(crate) fn start(bpm: Arc<BufferPoolManager>, interval: Duration) -> Self {
+    pub(crate) fn start(bpm: Arc<BufferPoolManager>, interval: Duration, log_growth: u64) -> Self {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let thread = {
             let stop = Arc::clone(&stop);
             thread::Builder::new()
                 .name("checkpoint".into())
-                .spawn(move || run(&bpm, interval, &stop))
+                .spawn(move || run(&bpm, interval, log_growth, &stop))
                 .expect("failed to start the checkpoint thread")
         };
         Self {
@@ -237,7 +234,12 @@ impl Checkpointer {
     }
 }
 
-fn run(bpm: &BufferPoolManager, interval: Duration, stop: &(Mutex<bool>, Condvar)) {
+fn run(
+    bpm: &BufferPoolManager,
+    interval: Duration,
+    log_growth: u64,
+    stop: &(Mutex<bool>, Condvar),
+) {
     let (mut last_time, mut last_end) = (Instant::now(), bpm.log().end());
     loop {
         {
@@ -250,7 +252,7 @@ fn run(bpm: &BufferPoolManager, interval: Duration, stop: &(Mutex<bool>, Condvar
             }
         }
         let end = bpm.log().end();
-        let due = last_time.elapsed() >= interval || end - last_end >= LOG_GROWTH;
+        let due = last_time.elapsed() >= interval || end - last_end >= log_growth;
         let idle = end == last_end && bpm.dirty_pages().is_empty();
         if !due || idle {
             continue;

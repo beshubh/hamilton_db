@@ -49,5 +49,6 @@ Most code changes do not need an internal documentation change. Agents can read 
 # Verification
 ---
 - Before you push, run `cargo nextest run -p <crate>`, to test the changes in the crate where you made a change.
-- if you have made changes on sql or index storage or transactions, run `uv run sqltest/run.py <transaction>` for testing transaction invariants and `uv run sqltest/run.py index_storage` for testing index storage invariants.
+- if you have made changes on sql or index storage or transactions, run `uv run sqltest/run.py transactions` for testing transaction invariants and `uv run sqltest/run.py index_storage` for testing index storage invariants.
+- if you have made changes on the log, recovery, checkpoints or anything that writes pages, run `uv run sqltest/run.py recovery` for testing crash recovery invariants.
 

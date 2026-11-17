@@ -13,7 +13,7 @@ A database is files next to each other: `<name>.db`, `<name>.meta`, and the log'
 
 ## How to get to it (user POV)
 
-- `hamilton-server [--host HOST] [--port PORT] [FILE]`, stopped with Ctrl-C or SIGTERM.
+- `hamilton-server [--host HOST] [--port PORT] [--pool-size FRAMES] [--log-segment-size BYTES] [FILE]`, stopped with Ctrl-C or SIGTERM.
 - Starting it again on the same `FILE`.
 
 ## Driving it with hdb
@@ -50,10 +50,11 @@ Preconditions:
 
 - **Crash.** Run `hdb sql persist-precrash` with `INSERT INTO ps_notes (body) VALUES ('doomed'); SELECT count(*) FROM ps_notes;`, then `hdb crash`, `hdb start`, and `hdb sql persist-postcrash` with `SELECT * FROM ps_notes ORDER BY id;`. The server must start and answer with every committed row, `doomed` included.
 
-- **Log stays bounded.** Keep inserts going for a few minutes (a single-row insert logs about 700 bytes) and run `ls -l /tmp/hamilton-verify/$HDB_RUN/data` every few seconds. Segment numbers keep rising, each segment stops at about 64 MiB, and the oldest ones disappear once a checkpoint runs (every 30 s, or after 64 MiB of log), so only a handful are ever listed. After `hdb crash` and `hdb start`, one segment is left.
+- **Log stays bounded.** Keep inserts going for a few minutes (a single-row insert logs about 700 bytes) and run `ls -l /tmp/hamilton-verify/$HDB_RUN/data` every few seconds. Segment numbers keep rising, each segment stops at about 64 MiB, and the oldest ones disappear once a checkpoint runs (every 30 s, or once the log has grown by a segment), so only a handful are ever listed. After `hdb crash` and `hdb start`, every segment from before the crash is gone but the last; the sweep that ends the open may have started more after it. `uv run sqltest/run.py recovery -k checkpoints` shows the same in about 10 s, on a server it starts with `--log-segment-size 262144`.
 
 ## Gotchas
 
+- With `HAMILTON_LOG=info`, every open logs `recovered in … ms` and then `swept … dead tuples and … index entries`. After a clean restart the sweep finds 0 and 0, unless a CREATE TABLE or CREATE INDEX failed since the last open.
 - Opening the files after `hdb crash` replays the log, so every statement that returned before the kill is there. A statement still running at the kill is not, and neither is anything from a transaction block left open: recovery rolls those back, so no row stays locked. Don't swap `crash` for `restart` to prove durability.
 - The port changes on every start. Anything holding the old port (an open `hdb repl` tab, a `psql` in another pane) is dead after a restart.
 - `hdb restart` doesn't rebuild. To test that a new build reads an old database, `hdb stop && hdb up`.

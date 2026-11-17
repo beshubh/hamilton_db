@@ -9,6 +9,7 @@
     uv run sqltest/run.py transactions             # some suites
     uv run sqltest/run.py -k "lost update"         # cases whose name contains the text
     uv run sqltest/run.py index_storage --runs 50  # more timed runs per query
+    uv run sqltest/run.py recovery --seed 7        # crash scenarios with other choices
 
 Builds the CLI first. Exits non-zero if any case fails.
 """
@@ -17,10 +18,12 @@ import sys
 
 import cli
 import index_storage
+import recovery
 import transactions
 
 SUITES = {
     "index_storage": index_storage,
+    "recovery": recovery,
     "transactions": transactions,
 }
 
@@ -34,6 +37,7 @@ def main():
     parser.add_argument("-k", metavar="TEXT", help="run only cases whose name contains TEXT")
     parser.add_argument("--runs", type=int, default=20, help="timed runs per query (index_storage)")
     parser.add_argument("--warmup", type=int, default=5, help="untimed runs first (index_storage)")
+    parser.add_argument("--seed", type=int, default=1, help="seed for the clients' choices (recovery)")
     args = parser.parse_args()
     if unknown := [s for s in args.suites if s not in SUITES]:
         parser.error(f"unknown suite {unknown[0]!r}; choose from {', '.join(SUITES)}")

@@ -32,8 +32,8 @@ pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The size `open` lets a log segment grow to before starting the next.
 /// Starting a segment costs two syncs on the flush that needs it, and
-/// removing one costs a directory sync, so a segment is as large as the log
-/// growth that triggers a checkpoint, which then removes about one.
+/// removing one costs a directory sync, so the same log growth triggers a
+/// checkpoint, which then removes about one.
 pub const SEGMENT_SIZE: u64 = 64 << 20;
 
 /// An open database: its buffer pool, and the thread that takes its
@@ -68,9 +68,10 @@ pub fn open(path: impl AsRef<Path>, pool_size: usize) -> Result<Storage> {
     )
 }
 
-/// `open` on the files of `fs`, taking a fuzzy checkpoint every
-/// `checkpoint_interval`, or never, and starting a log segment once the
-/// last holds `segment_size` bytes.
+/// `open` on the files of `fs`, starting a log segment once the last holds
+/// `segment_size` bytes, and taking a fuzzy checkpoint every
+/// `checkpoint_interval`, or sooner once the log grows by `segment_size`.
+/// With no interval it takes none.
 pub fn open_with(
     fs: Arc<dyn Fs>,
     path: impl AsRef<Path>,
@@ -85,8 +86,8 @@ pub fn open_with(
     let log = Log::open(fs, path.with_extension("log"), segment_size)?;
     let bpm = Arc::new(BufferPoolManager::new(pool_size, disk, log));
     recovery::recover(&bpm)?;
-    let checkpointer =
-        checkpoint_interval.map(|interval| Checkpointer::start(Arc::clone(&bpm), interval));
+    let checkpointer = checkpoint_interval
+        .map(|interval| Checkpointer::start(Arc::clone(&bpm), interval, segment_size));
     Ok(Storage { bpm, checkpointer })
 }
 

@@ -61,9 +61,10 @@ HamiltonDB doesn't have; use `hamilton-cli` for those.
 
 ### Databases
 
-A database is a file, with a `.meta` and a `.log` file next to it. Give the
-server a path to serve another one; it creates the files if they don't
-exist, though not the directory they go in:
+A database is a file, with a `.meta` file and the log's segments
+(`.log.00000001` and up) next to it. Give the server a path to serve another
+one; it creates the files if they don't exist, though not the directory they
+go in:
 
 ```sh
 cargo run -p hamilton-server -- data/shop.db
@@ -81,12 +82,12 @@ cargo run -p hamilton-cli -- -p 6943   # analytics.db
 
 Only one process can have a database open; a second server on the same file
 fails with "already open in another process". To start a database over,
-stop its server and delete all three files. Deleting only the `.db` leaves a
+stop its server and delete all its files. Deleting only the `.db` leaves a
 stale `.meta`, and opening then fails with "page 0 is not a catalog header
 page".
 
 ```sh
-rm shop.db shop.meta shop.log
+rm shop.db shop.meta shop.log.*
 ```
 
 To time join queries against a local Postgres on the same data (flags are

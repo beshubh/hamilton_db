@@ -12,6 +12,8 @@ use catalog::{Catalog, SWEEP_BATCH};
 use planner::{EngineError, ExecutionEngine, Output, TransactionStatus};
 use storage::Storage;
 use storage::buffer::buffer_pool_manager::DEFAULT_POOL_SIZE;
+use storage::disk::fs::OsFs;
+use storage::wal::{CHECKPOINT_INTERVAL, SEGMENT_SIZE};
 
 pub struct Database {
     storage: Storage,
@@ -28,7 +30,26 @@ impl Database {
     /// `.meta` file and log segments sit next to it. Fails if another
     /// process has it open.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let storage = storage::open(path, DEFAULT_POOL_SIZE)?;
+        Self::open_with(path, DEFAULT_POOL_SIZE, SEGMENT_SIZE)
+    }
+
+    /// `open` with `pool_size` frames in the buffer pool, starting a log
+    /// segment, and taking a checkpoint, each time the log grows by
+    /// `log_segment_size` bytes.
+    pub fn open_with(
+        path: impl AsRef<Path>,
+        pool_size: usize,
+        log_segment_size: u64,
+    ) -> Result<Self> {
+        let started = Instant::now();
+        let storage = storage::open_with(
+            Arc::new(OsFs),
+            path,
+            pool_size,
+            Some(CHECKPOINT_INTERVAL),
+            log_segment_size,
+        )?;
+        log::info!("recovered in {} ms", started.elapsed().as_millis());
         let catalog = Arc::new(Catalog::open(Arc::clone(&storage.bpm))?);
         let root = ExecutionEngine::new(Arc::clone(&catalog));
         let started = Instant::now();
