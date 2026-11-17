@@ -54,12 +54,10 @@ One collector thread in [`TransactionManager`](../../crates/storage/src/concurre
 
 ## Restart and crashes
 
-Opening a database replays the log, so after a crash the pages hold every change that the log kept, including every acknowledged commit ([Recovery](recovery.md)). The log does not hold what MVTO keeps in memory. A restart, clean or not, loses the undo log, the read timestamps, and the watermark. That does no harm:
+Opening a database replays the log, finishes the commits a crash cut off between their stamps, and undoes the transactions it cut off before they committed, so no tuple stays locked ([Recovery](recovery.md#recovery-finishes-the-transactions-a-crash-cut-off)). A commit survives a crash once `TransactionManager::commit` returns, and a reader never sees one that a crash can lose. The log does not hold what MVTO keeps in memory. A restart, clean or not, loses the undo log, the read timestamps, and the watermark. That does no harm:
 
-- The new Tid counter starts from the catalog header, which is above every `ts` on disk. New readers therefore see the committed versions as committed.
+- The new Tid counter starts from the catalog header, which is above every Tid in the log. New readers therefore see the committed versions as committed.
 - No reader is older than the versions on disk, so no reader walks an undo chain. Stale `undo_ptr`s are still on disk. `older_record` rejects them, because it requires the record's `rid` and `writer_ts` to match.
-
-A crash does leave the locks of the transactions it cut off. A locked tuple keeps the uncommitted bit and an older Tid, so every later reader and writer fails on that tuple with `Conflict`. Nothing clears these locks when the database opens.
 
 `nextval` changes a sequence row in place, outside any transaction, at `ts` 0. It writes the row to disk 32 values ahead before it hands those values out ([`sequence.rs`](../../crates/catalog/src/sequence.rs)). The write syncs the log through that change first, so after a crash the sequence skips up to 32 values and never repeats one.
 
@@ -88,5 +86,4 @@ A crash before the log holds the catalog rows' new page ids finds the old table,
 
 - **Phantoms.** Read timestamps guard tuples that exist. If an older transaction inserts a row that a newer transaction's scan should have seen, nothing detects it. Schedules with inserts are therefore not serializable.
 - **The catalog is not transactional.** CREATE TABLE and CREATE INDEX are rejected inside a block.
-- **A commit or abort that fails partway** leaves the transaction running, with some tuples finished and the rest locked.
-- **Crash recovery restores pages, not transactions.** See [Transactions are not recovered](recovery.md#transactions-are-not-recovered).
+- **A crash during a TRUNCATE's commit** can leave the table on its new heap: step 2 logs the catalog rows outside the transaction.

@@ -7,6 +7,7 @@ use storage::StorageError;
 use storage::index::btree_index::{BtreeIndex, KeySchemaComparator};
 use storage::index::{Index, IndexMetadata, IndexTrait, LocatorKind, RowLocator};
 use storage::page::btree_page::KeyComparator;
+use storage::wal::Logged;
 use tempfile::TempDir;
 
 fn schema() -> Arc<Schema> {
@@ -177,7 +178,9 @@ impl IndexFixture {
 
     fn insert(&self, row: &Tuple, locator: RowLocator) {
         assert!(
-            self.index.insert_entry(&self.key(row), &locator).unwrap(),
+            self.index
+                .insert_entry(&self.key(row), &locator, Logged::System)
+                .unwrap(),
             "{locator:?}"
         );
     }
@@ -230,8 +233,16 @@ fn rid(n: i32) -> RowLocator {
 fn insert_then_scan_key() {
     let f = name_age_index();
     let (alice, bob) = (row(1, Some(30), "alice"), row(2, Some(25), "bob"));
-    assert!(f.index.insert_entry(&f.key(&alice), &rid(1)).unwrap());
-    assert!(f.index.insert_entry(&f.key(&bob), &rid(2)).unwrap());
+    assert!(
+        f.index
+            .insert_entry(&f.key(&alice), &rid(1), Logged::System)
+            .unwrap()
+    );
+    assert!(
+        f.index
+            .insert_entry(&f.key(&bob), &rid(2), Logged::System)
+            .unwrap()
+    );
 
     assert_eq!(f.lookup(&alice), [rid(1)]);
     assert_eq!(f.lookup(&bob), [rid(2)]);
@@ -244,8 +255,8 @@ fn insert_then_scan_key() {
 fn insert_of_existing_entry_changes_nothing() {
     let f = name_age_index();
     let key = f.key(&row(1, Some(30), "alice"));
-    assert!(f.index.insert_entry(&key, &rid(1)).unwrap());
-    assert!(!f.index.insert_entry(&key, &rid(1)).unwrap());
+    assert!(f.index.insert_entry(&key, &rid(1), Logged::System).unwrap());
+    assert!(!f.index.insert_entry(&key, &rid(1), Logged::System).unwrap());
     assert_eq!(f.lookup(&row(1, Some(30), "alice")), [rid(1)]);
     assert_eq!(f.entries().len(), 1);
 }
@@ -301,7 +312,11 @@ fn keys_are_ordered_by_the_key_schema() {
         row(5, Some(7), ""),
     ];
     for (i, r) in rows.iter().enumerate() {
-        assert!(f.index.insert_entry(&f.key(r), &rid(i as i32)).unwrap());
+        assert!(
+            f.index
+                .insert_entry(&f.key(r), &rid(i as i32), Logged::System)
+                .unwrap()
+        );
     }
     let s = |v: &str| Value::from(v);
     assert_eq!(
@@ -324,7 +339,11 @@ fn many_long_keys_split_and_merge() {
     let name = |n: i32| format!("{n:05}{}", "x".repeat((n as usize * 37) % 700));
     let rows: Vec<Tuple> = (0..2000).map(|n| row(n, Some(n % 50), &name(n))).collect();
     for (n, r) in rows.iter().enumerate() {
-        assert!(f.index.insert_entry(&f.key(r), &rid(n as i32)).unwrap());
+        assert!(
+            f.index
+                .insert_entry(&f.key(r), &rid(n as i32), Logged::System)
+                .unwrap()
+        );
     }
     for (n, r) in rows.iter().enumerate() {
         assert_eq!(f.lookup(r), [rid(n as i32)], "row {n}");
@@ -355,7 +374,10 @@ fn many_long_keys_split_and_merge() {
 fn key_over_max_size_is_rejected() {
     let f = name_age_index();
     let long = row(1, Some(1), &"x".repeat(BtreeIndex::MAX_KEY_SIZE));
-    let err = f.index.insert_entry(&f.key(&long), &rid(1)).unwrap_err();
+    let err = f
+        .index
+        .insert_entry(&f.key(&long), &rid(1), Logged::System)
+        .unwrap_err();
     assert!(
         matches!(err, StorageError::KeyTooLarge { max, .. } if max == BtreeIndex::MAX_KEY_SIZE)
     );
@@ -414,9 +436,9 @@ fn primary_key_entries_end_in_their_record_id() {
 fn primary_key_holds_a_key_for_many_rids() {
     let f = age_pk_index();
     let key = f.key(&row(1, Some(30), ""));
-    assert!(f.index.insert_entry(&key, &rid(1)).unwrap());
-    assert!(f.index.insert_entry(&key, &rid(2)).unwrap());
-    assert!(!f.index.insert_entry(&key, &rid(1)).unwrap());
+    assert!(f.index.insert_entry(&key, &rid(1), Logged::System).unwrap());
+    assert!(f.index.insert_entry(&key, &rid(2), Logged::System).unwrap());
+    assert!(!f.index.insert_entry(&key, &rid(1), Logged::System).unwrap());
     assert_eq!(f.lookup(&row(0, Some(30), "")), [rid(1), rid(2)]);
     assert!(f.index.delete_entry(&key, &rid(1)).unwrap());
     assert_eq!(f.lookup(&row(0, Some(30), "")), [rid(2)]);
@@ -429,7 +451,7 @@ fn primary_key_delete_frees_the_key() {
     f.insert(&row(1, Some(30), ""), rid(1));
     f.index.delete_entry(&key, &rid(1)).unwrap();
     assert!(f.lookup(&row(0, Some(30), "")).is_empty());
-    assert!(f.index.insert_entry(&key, &rid(2)).unwrap());
+    assert!(f.index.insert_entry(&key, &rid(2), Logged::System).unwrap());
     assert_eq!(f.lookup(&row(0, Some(30), "")), [rid(2)]);
 }
 
@@ -468,7 +490,11 @@ fn primary_key_of_max_size() {
         None,
         &"x".repeat(BtreeIndex::MAX_KEY_SIZE - empty_len + 1),
     );
-    assert!(f.index.insert_entry(&f.key(&too_long), &rid(2)).is_err());
+    assert!(
+        f.index
+            .insert_entry(&f.key(&too_long), &rid(2), Logged::System)
+            .is_err()
+    );
 }
 
 #[test]
@@ -866,10 +892,10 @@ fn rows_with_the_same_key_are_all_found_in_primary_key_byte_order() {
 fn pk_insert_of_existing_entry_changes_nothing() {
     let f = pk_age_index();
     let key = f.key(&row(1, Some(30), ""));
-    assert!(f.index.insert_entry(&key, &pk(1)).unwrap());
-    assert!(!f.index.insert_entry(&key, &pk(1)).unwrap());
+    assert!(f.index.insert_entry(&key, &pk(1), Logged::System).unwrap());
+    assert!(!f.index.insert_entry(&key, &pk(1), Logged::System).unwrap());
     // Another row with the same key is a different entry.
-    assert!(f.index.insert_entry(&key, &pk(2)).unwrap());
+    assert!(f.index.insert_entry(&key, &pk(2), Logged::System).unwrap());
     assert_eq!(f.lookup(&row(0, Some(30), "")), pks(&[1, 2]));
 }
 
@@ -974,7 +1000,7 @@ fn key_too_large_counting_the_primary_key_is_rejected() {
 
     let err = f
         .index
-        .insert_entry(&f.key(&too_long), &long_pk)
+        .insert_entry(&f.key(&too_long), &long_pk, Logged::System)
         .unwrap_err();
     assert!(
         matches!(err, StorageError::KeyTooLarge { size, max: m } if size == max + 1 && m == max),

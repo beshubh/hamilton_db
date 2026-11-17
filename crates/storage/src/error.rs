@@ -62,6 +62,11 @@ pub enum StorageError {
     #[error("expected a {expected:?} page, found page type {found}")]
     UnexpectedPageType { expected: PageType, found: u32 },
 
+    /// The B+ tree with this header page was built to order its keys
+    /// another way than the comparator it is opened with.
+    #[error("B+ tree {0} orders its keys another way")]
+    BtreeMismatch(PageId),
+
     /// The page does not have room for the tuple right now.
     #[error("page is full")]
     PageFull,

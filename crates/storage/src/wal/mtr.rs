@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::ops::Range;
 
-use common::{INVALID_LSN, INVALID_TXN_ID, Lsn, PageId};
+use common::{INVALID_LSN, INVALID_TXN_ID, Lsn, PageId, Rid, TxnId};
 use smallvec::SmallVec;
 
 use crate::buffer::arc_replacer::AccessType;
@@ -12,28 +12,56 @@ use crate::error::{Result, StorageError};
 use crate::page::page_guard::WritePageGuard;
 use crate::page::page_header::set_page_lsn;
 use crate::page::{PAGE_SIZE, TEMP_PAGE_BASE};
+use crate::table::table_page::TablePage;
+use crate::wal::fatal;
 use crate::wal::op::{Ops, PageOp};
-use crate::wal::record::{Kind, PageChangesWriter, RecordBuf};
+use crate::wal::record::{Before, Kind, PageChangesWriter, RecordBuf, Undo};
+use crate::wal::txn_log::TxnLog;
 
 /// Who a change belongs to, which decides the kind of record that logs it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Logged {
+#[derive(Clone, Copy)]
+pub enum Logged<'a> {
     /// No transaction: redo-only.
     System,
+    /// A running transaction. Its record says how to undo the change: for a
+    /// heap op, `MtrPage::apply` reads that from the page; a B+ tree insert
+    /// sets it with `Mtr::undo_index_insert`.
+    Txn(&'a TxnLog),
+    /// The undo of one of the transaction's changes; the next of its
+    /// records to undo is `undo_next`. Only `wal::undo` logs these.
+    Clr { txn: &'a TxnLog, undo_next: Lsn },
+    /// Work the transaction does once its `Commit` is durable. Redo-only.
+    Completion(&'a TxnLog),
 }
 
-impl Logged {
-    fn kind(self) -> Kind {
+impl Logged<'_> {
+    fn kind(&self) -> Kind {
         match self {
             Self::System => Kind::System,
+            Self::Txn(_) => Kind::Update,
+            Self::Clr { .. } => Kind::Clr,
+            Self::Completion(_) => Kind::Completion,
         }
+    }
+
+    fn txn(&self) -> Option<&TxnLog> {
+        match *self {
+            Self::System => None,
+            Self::Txn(txn) | Self::Clr { txn, .. } | Self::Completion(txn) => Some(txn),
+        }
+    }
+
+    fn tid(&self) -> TxnId {
+        self.txn().map_or(INVALID_TXN_ID, TxnLog::tid)
     }
 }
 
 thread_local! {
     static RECORD: RefCell<RecordBuf> = RefCell::new(RecordBuf::new());
-    /// The ops buffer of the last mtr, kept so the next allocates nothing.
+    /// The ops and undo buffers of the last mtr, kept so the next allocates
+    /// nothing.
     static OPS: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static UNDO: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -55,7 +83,7 @@ thread_local! {
 /// a dirty page never needs the page's copy on disk.
 pub struct Mtr<'a> {
     bpm: &'a BufferPoolManager,
-    by: Logged,
+    by: Logged<'a>,
     state: RefCell<State>,
 }
 
@@ -66,6 +94,10 @@ struct State {
     frees: SmallVec<[PageId; 2]>,
     /// The encoded ops of every page, which `Logging::Ops` points into.
     ops: Vec<u8>,
+    /// The encoded undo of a transaction's change: one per mtr.
+    undo: Vec<u8>,
+    /// Log a record even if nothing changed.
+    always: bool,
 }
 
 struct Changed {
@@ -89,14 +121,29 @@ enum Logging {
 }
 
 impl<'a> Mtr<'a> {
-    pub(crate) fn new(bpm: &'a BufferPoolManager, by: Logged) -> Self {
+    pub(crate) fn new(bpm: &'a BufferPoolManager, by: Logged<'a>) -> Self {
         Self {
             bpm,
             by,
             state: RefCell::new(State {
                 ops: OPS.take(),
+                undo: UNDO.take(),
                 ..State::default()
             }),
+        }
+    }
+
+    /// For a transaction's mtr, logs that its change is undone by removing
+    /// `entry` from the B+ tree whose header page is `header`. Other mtrs
+    /// log no undo, so this does nothing for them.
+    pub(crate) fn undo_index_insert(&self, header: PageId, entry: &[u8]) {
+        if let Logged::Txn(_) = self.by {
+            let mut state = self.state.borrow_mut();
+            assert!(
+                state.undo.is_empty(),
+                "a transaction's mtr undoes one change"
+            );
+            Undo::IndexEntry { header, entry }.encode(&mut state.undo);
         }
     }
 
@@ -150,18 +197,32 @@ impl<'a> Mtr<'a> {
         self.finish()
     }
 
+    /// `commit`, logging a record even if the mtr changed nothing: for a
+    /// compensation whose undo found nothing left to change.
+    pub(crate) fn commit_always(mut self) -> Lsn {
+        self.state.get_mut().always = true;
+        self.finish()
+            .expect("an mtr that always logs logged nothing")
+    }
+
     fn finish(&mut self) -> Option<Lsn> {
         let State {
             mut changed,
             frees,
             mut ops,
+            mut undo,
+            always,
         } = std::mem::take(self.state.get_mut());
-        let lsn =
-            (!changed.is_empty() || !frees.is_empty()).then(|| self.append(&changed, &frees, &ops));
-        // `commit` runs this twice, the second time with no buffer to keep.
+        let lsn = (!changed.is_empty() || !frees.is_empty() || always)
+            .then(|| self.append(&changed, &frees, &ops, &undo));
+        // `commit` runs this twice, the second time with no buffers to keep.
         if ops.capacity() > 0 {
             ops.clear();
             OPS.set(ops);
+        }
+        if undo.capacity() > 0 {
+            undo.clear();
+            UNDO.set(undo);
         }
         let lsn = lsn?;
         for page in &mut changed {
@@ -191,12 +252,24 @@ impl<'a> Mtr<'a> {
     }
 
     /// Logs every changed page that is not freed, as its ops or an image,
-    /// and the frees.
-    fn append(&self, changed: &[Changed], frees: &[PageId], ops: &[u8]) -> Lsn {
+    /// and the frees, after the undo or the compensated record its kind
+    /// carries.
+    fn append(&self, changed: &[Changed], frees: &[PageId], ops: &[u8], undo: &[u8]) -> Lsn {
         #[cfg(debug_assertions)]
         check_redo(changed, ops);
         let mut record = RECORD.take();
-        record.begin(self.by.kind(), INVALID_TXN_ID);
+        record.begin(self.by.kind(), self.by.tid());
+        match self.by {
+            Logged::Txn(txn) if undo.is_empty() => fatal(format_args!(
+                "transaction {} changed a page with nothing to undo it",
+                txn.tid()
+            )),
+            Logged::Txn(_) => record.body().extend_from_slice(undo),
+            Logged::Clr { undo_next, .. } => {
+                record.body().extend_from_slice(&undo_next.to_le_bytes())
+            }
+            Logged::System | Logged::Completion(_) => {}
+        }
         let mut pages = PageChangesWriter::new(record.body());
         for page in changed {
             let page_id = page.guard.page_id();
@@ -221,15 +294,14 @@ impl<'a> Mtr<'a> {
             if !frees.is_empty() {
                 self.bpm.checkpoints().free_logged(lsn);
             }
-            INVALID_LSN
         });
         RECORD.set(record);
-        appended.unwrap_or_else(|e| {
-            // Unwinding would release latches on pages the log never got, and
-            // the server catches panics, so they could reach disk.
-            eprintln!("hamilton: cannot log a page change: {e}");
-            std::process::abort()
-        })
+        if let Some(txn) = self.by.txn() {
+            txn.note_logged();
+        }
+        // Unwinding would release latches on pages the log never got, and the
+        // server catches panics, so they could reach disk.
+        appended.unwrap_or_else(|e| fatal(format_args!("cannot log a page change: {e}")))
     }
 }
 
@@ -312,17 +384,28 @@ impl MtrPage<'_> {
     }
 
     /// Makes `op` on the page and logs it as itself, a few bytes instead of
-    /// the page. Fails as `op.apply` does, changing nothing.
+    /// the page. A transaction's insert, tuple or meta change also logs the
+    /// slot as it was, to undo it. Fails as `op.apply` does, changing
+    /// nothing.
     pub fn apply(&mut self, op: PageOp<'_>) -> Result<()> {
         #[cfg(debug_assertions)]
         let before = self
             .logging
             .is_none()
             .then(|| Box::new(crate::page::PageBuf(*self.data())));
-        self.guard
+        let undo_len = self.mtr.state.borrow().undo.len();
+        if let Logged::Txn(_) = self.mtr.by {
+            self.log_undo(&op)?;
+        }
+        let applied = self
+            .guard
             .as_mut()
             .expect("guard is held until drop")
-            .change_for_mtr(|data| op.apply(data))?;
+            .change_for_mtr(|data| op.apply(data));
+        if let Err(e) = applied {
+            self.mtr.state.borrow_mut().undo.truncate(undo_len);
+            return Err(e);
+        }
         let logging = self.logging.get_or_insert_with(|| Logging::Ops {
             runs: SmallVec::new(),
             #[cfg(debug_assertions)]
@@ -337,6 +420,39 @@ impl MtrPage<'_> {
                 _ => runs.push(start..ops.len()),
             }
         }
+        Ok(())
+    }
+
+    /// Encodes the undo of a heap row op, read from the page before `op`
+    /// changes it. Other ops need none.
+    fn log_undo(&self, op: &PageOp<'_>) -> Result<()> {
+        let (slot, keep_len) = match *op {
+            PageOp::HeapInsert { slot, payload, .. }
+            | PageOp::HeapSetTuple { slot, payload, .. } => (slot, Some(payload.len())),
+            PageOp::HeapSetMeta { slot, .. } => (slot, None),
+            _ => return Ok(()),
+        };
+        let page = TablePage::new(self.data())?;
+        let before = match *op {
+            PageOp::HeapInsert { .. } => Before::Inserted,
+            PageOp::HeapSetTuple { .. } => {
+                let (meta, payload) = page.get(slot)?;
+                Before::Tuple { meta, payload }
+            }
+            _ => Before::Meta(page.get(slot)?.0),
+        };
+        let mut state = self.mtr.state.borrow_mut();
+        assert!(
+            state.undo.is_empty(),
+            "a transaction's mtr undoes one change"
+        );
+        let rid = Rid::new(self.page_id(), slot);
+        Undo::Heap {
+            rid,
+            keep_len,
+            before,
+        }
+        .encode(&mut state.undo);
         Ok(())
     }
 

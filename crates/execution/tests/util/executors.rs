@@ -52,12 +52,13 @@ impl Db {
         let disk = Arc::clone(bpm.disk_manager());
         let catalog = Arc::new(Catalog::open(Arc::clone(&bpm)).unwrap());
         let users = catalog.create_table("users", users_schema(), &[]).unwrap();
+        let tm = TransactionManager::new(Arc::clone(&bpm), 1);
         Self {
             _dir: dir,
             disk,
             bpm,
             catalog,
-            tm: TransactionManager::new(1),
+            tm,
             settings: ExecutionSettings::default(),
             open: Mutex::new(Vec::new()),
             users,

@@ -1,6 +1,6 @@
 # Recovery
 
-A durable page reaches disk only after the log records that changed it are durable, so a crash loses nothing that the log kept. Opening a database (`storage::open` in [`wal.rs`](../../crates/storage/src/wal.rs)) replays the log into the pages before anything reads them. The design is ARIES with steal and no-force. It has no undo yet, so transactions are not recovered, as a later section explains.
+A durable page reaches disk only after the log records that changed it are durable, so a crash loses nothing that the log kept. Opening a database (`storage::open` in [`wal.rs`](../../crates/storage/src/wal.rs)) replays the log into the pages, then finishes the transactions a crash cut off, before anything reads them. The design is ARIES with steal and no-force.
 
 ## One mtr writes one record
 
@@ -48,7 +48,7 @@ A batch goes whole into one segment, and a new segment starts only once every re
 
 ## The `.meta` file is the checkpoint
 
-The log has no checkpoint records. A checkpoint saves its record in the `.meta` file, next to the page directory. The record holds where analysis starts, where redo starts, the next page id, and the dirty pages. One atomic rename publishes the record and the directory together, so recovery always starts from a directory that matches its checkpoint. Only [`checkpoint.rs`](../../crates/storage/src/wal/checkpoint.rs) reads the record.
+The log has no checkpoint records. A checkpoint saves its record in the `.meta` file, next to the page directory. The record holds where analysis starts, where redo starts, the next page id, the dirty pages, and the transactions that have records but no `End`. One atomic rename publishes the record and the directory together, so recovery always starts from a directory that matches its checkpoint. Only [`checkpoint.rs`](../../crates/storage/src/wal/checkpoint.rs) reads the record.
 
 A saved directory never maps a page to bytes that another page wrote:
 
@@ -61,8 +61,8 @@ A saved directory never maps a page to bytes that another page wrote:
 The thread that `storage::open` starts takes a fuzzy checkpoint every 30 seconds, or after 64 MiB of log, while transactions keep running. Each step depends on the ones before it:
 
 1. Write the pages first changed before the previous checkpoint began. Redo then reads about two checkpoint intervals of log.
-2. Read the end of the log. Analysis starts there.
-3. Scan the frames for dirty pages, note the oldest free that is logged but not applied yet, and only then copy the directory. A first write adds the page's slot to the directory before its frame is marked clean, so a page that the scan finds clean is in the copy, and a page still dirty gets redone from the record at its `rec_lsn`. An mtr applies its frees after it appends its record, so the copy may still list a freed page. Redo starts no later than that free and replays it.
+2. Holding off appends, read the end of the log, where analysis starts, copy the active transaction table, scan the frames for dirty pages, and note the oldest free that is logged but not applied yet.
+3. Copy the directory. A first write adds the page's slot to the directory before its frame is marked clean, so a page that the scan finds clean is in the copy, and a page still dirty gets redone from the record at its `rec_lsn`. An mtr applies its frees after it appends its record, so the copy may still list a freed page. Redo starts no later than that free and replays it.
 4. Sync the log, then the db file. Every free in the copy is now logged, and every write that the dirty page table leaves out is durable.
 5. Save the `.meta`, then release the slots that the copy no longer lists.
 6. Remove the log segments that the saved checkpoint no longer needs.
@@ -71,9 +71,9 @@ A sharp checkpoint (`BufferPoolManager::checkpoint`) writes every dirty page fir
 
 ## Checkpoints remove the log they no longer need
 
-After each `.meta` rename, the checkpoint removes every segment whose records all come before `Checkpoint::log_needed_from`, the oldest record that recovery from that checkpoint reads ([`checkpoint.rs`](../../crates/storage/src/wal/checkpoint.rs)). Today that is the earlier of the checkpoint's start and its redo start. Undo will add the first record of the oldest running transaction.
+After each `.meta` rename, the checkpoint removes every segment whose records all come before `Checkpoint::log_needed_from`, the oldest record that recovery from that checkpoint reads ([`checkpoint.rs`](../../crates/storage/src/wal/checkpoint.rs)): the earliest of the checkpoint's start, its redo start, and the first record of each transaction in its table, which recovery may have to finish or undo. A transaction left open therefore keeps every segment from its first record on.
 
-The bound must never move back from one checkpoint to the next, or a new checkpoint would need log that an older one removed. It holds today because `rec_lsn` and pending frees are recorded under the log's lock. A dirty page or pending free older than the previous checkpoint's start was therefore already in that checkpoint, and pulled its bound down as far. A transaction table must be copied under the same lock for the same reason. A checkpoint whose bound is below the log's first LSN fails, and the saved `.meta` stays.
+The bound must never move back from one checkpoint to the next, or a new checkpoint would need log that an older one removed. It holds because `rec_lsn`, pending frees and the transaction table all change only under the log's lock, and the checkpoint copies them under it. A dirty page, pending free or transaction older than the previous checkpoint's start was therefore already in that checkpoint, and pulled its bound down as far. A checkpoint whose bound is below the log's first LSN fails, and the saved `.meta` stays.
 
 Segments go oldest first, and each removal is durable before the next starts, so a crash never leaves a gap in the numbers. A crash after the rename and before a removal leaves old segments behind, and the next checkpoint removes them. The segment being written is never removed, so after recovery the log is one segment, which may still hold records from before recovery's checkpoint. Nothing reads them.
 
@@ -81,28 +81,58 @@ Segments go oldest first, and each removal is durable before the next starts, so
 
 Redo replays every free from the checkpoint's redo start, not only those after a page's first record. Replaying a free twice does no harm, because page ids are never reused. The next page id is raised past every page the log names. An id that was handed out but never logged can be handed out again after a crash, since nothing durable names it.
 
-Recovery appends nothing to the log, so a crash anywhere in it leaves files that recover the same pages. It ends with a sharp checkpoint. A log that lacks a record the checkpoint needs makes the open fail. A `.meta` with no checkpoint belongs to a database whose first open never finished, so records in the log next to it are left from other files, and recovery skips them.
+Redo appends nothing to the log. Finishing transactions after redo does, so a crash in the middle of it leaves records that the next recovery redoes, and that recovery goes on where they stop. Recovery ends with a sharp checkpoint. A log that lacks a record the checkpoint needs makes the open fail. A `.meta` with no checkpoint belongs to a database whose first open never finished, so records in the log next to it are left from other files, and recovery skips them.
 
-## Redo reads a page from disk only for ops
+## Redo never reads a page from disk
 
-Analysis adds a page that the checkpoint does not list at the page's first record after the checkpoint began, and that record can be ops. The checkpoint reads the log's end before it scans the frames, so a page can take an op and be written in between, and the scan then finds the page clean. Redo makes such ops on the page's copy on disk, unless the copy's LSN shows that it has them already.
+The checkpoint scans the frames while appends are held off, at the moment it reads the log's end. A page it finds clean takes its next change after that moment, and a change to a clean page logs all of it. So the first record that redo applies to every page replaces the page, and redo never trusts a page's copy on disk, which may be torn, stale, or another page's bytes. Redo fails the open with `CorruptLog` if a page's first record does not replace it ([`recovery.rs`](../../crates/storage/src/wal/recovery.rs)). Scanning the frames outside the lock would let a page take an op and be written in between, and then redo would have to read that page and trust its checksum.
 
-Any write of the page that a crash can tear came after a record that replaces the whole page, and redo reaches that record. So when the copy fails its checksum, or reads as zeros, redo skips the page's records until one replaces it ([`recovery.rs`](../../crates/storage/src/wal/recovery.rs)). A page that still cannot be read when redo ends fails the open with `CorruptLog`.
+## Undo is in each change's record
 
-## Commits sync the log
+A transaction's change is logged as an `Update` record that says how to take it back ([`record.rs`](../../crates/storage/src/wal/record.rs)). Recovery runs before the catalog can be read, so undo needs nothing the catalog knows:
 
-The engine syncs the log after a commit stamps its tuples, so a commit survives a crash once the client hears of it ([`engine.rs`](../../crates/planner/src/engine.rs)). A reader can see the stamps before the sync ends. The engine also records the next Tid in the catalog header before each statement that can write. A crash that keeps any of a transaction's writes therefore keeps a next Tid above that transaction's Tid.
+- A heap change is undone by slot, to the tuple's meta and bytes from before it. The mtr reads them from the page when the transaction's op is made (`MtrPage::apply`), so callers never build undo. The transaction holds the tuple's lock until it ends, so nothing else changes the slot. A shrinking locked update keeps the tuple's length, so undoing a change never makes a tuple longer, and it always fits back in place ([Version storage](version-storage.md)).
+- An index insert is undone by removing its entry by key, since splits move entries between pages. The B+ tree header records how the tree orders its keys, as its comparator describes them (`KeyComparator::describe`), so undo opens the tree from its header alone. Opening a tree with a comparator that orders keys another way fails with `BtreeMismatch`.
+- The `Update` of a heap insert or tuple change also holds the payload length that its commit keeps, which is shorter than the tuple when the update padded it. Recovery stamps from it, as it cannot decode the tuple without a schema.
 
-## Transactions are not recovered
+Writes that no transaction undoes are logged as `System` records: garbage collection, index builds, catalog rows, sequences, and an index entry that a unique check takes back at once.
 
-No log record names a transaction, so recovery replays page changes without knowing whose they are:
+## Undo logs a compensation for each change
 
-- A transaction that was running at the crash keeps its locked tuples. Every later reader and writer fails on them with `Conflict`. A commit that the crash cut off between its stamps leaves its other tuples locked in the same way.
-- A crash during a TRUNCATE's commit can leave the table on its new heap.
-- The undo log, the read timestamps, and the watermark restart empty, as [Restart and crashes in MVTO](mvto.md#restart-and-crashes) describes.
+Runtime abort and recovery undo a transaction the same way ([`undo.rs`](../../crates/storage/src/wal/undo.rs)). They walk its records from the newest through `prev_lsn`, and undo each `Update` in an mtr that logs a `Clr` naming the record before it (`undo_next`). A `Clr` is never undone: a walk that meets one jumps to its `undo_next`. So undo that a crash cuts off goes on after the last change it compensated, and never undoes a change twice. That matters once undo has given a row back: another transaction may write the row and commit, and undoing it again would overwrite that commit. An undo that finds nothing to change, such as an index entry already gone, still logs its `Clr`.
+
+A runtime abort logs `Abort`, then the compensations, then `End`. It reads the transaction's records back from the log, so every abort exercises the code recovery uses.
+
+Two orderings keep this safe, and nothing checks them:
+
+- A row's heap write is logged before its index entries. Undo runs newest first, so it removes the entries before the `Clr` that gives the row back. In the other order, a later transaction could add the same key and locator, commit, and then a resumed undo would remove that entry.
+- `End` is logged before the transaction's garbage is queued, so garbage collection marks a slot dead only after the `End` of the transaction that wrote it. Otherwise recovery could try to stamp a dead slot and fail the open.
+
+A `Transaction` dropped while running, which debug builds refuse, never logs `End`. Its first record then holds back log removal until the next restart.
+
+## Commit logs `Commit` before the stamps
+
+A transaction that wrote anything commits by logging `Commit` and waiting for it to be durable (group commit). Only then does it stamp its tuples, one `Completion` record per page in page order, run its `on_end` hooks, and log `End` without waiting. A stamp makes a version visible, so a reader never sees a commit that a crash can lose. A reader that meets a tuple during the sync gets `Conflict`, as for any locked tuple. A transaction that wrote nothing logs nothing.
+
+Once `Commit` is logged, the transaction has committed. A failure after it, or during undo, stops the process instead of returning: the caller would otherwise abort a durable commit, or leave a half-undone transaction running. Recovery finishes either from the log.
+
+CREATE TABLE, CREATE INDEX and TRUNCATE write catalog rows outside any transaction's records, so the catalog syncs the log after them.
+
+## Recovery finishes the transactions a crash cut off
+
+Analysis starts from the checkpoint's transaction table and follows the log, with the same rules that keep the log's own table ([`txn_log.rs`](../../crates/storage/src/wal/txn_log.rs)), and checks that each record's `prev_lsn` is its transaction's previous record. After redo:
+
+- A transaction whose `Commit` is in the log but whose `End` is not gets the rest of its stamps: every tuple its `Update`s name that it still holds. Then its `End`.
+- Every other transaction in the table is undone, the newest record of any of them first, and gets its `End`.
+
+No tuple stays locked. The next Tid comes from the catalog header, which each statement that can write raises before its first record, so it is above every Tid in the log. The undo log, the read timestamps, and the watermark restart empty, as [Restart and crashes in MVTO](mvto.md#restart-and-crashes) describes. Tuples that recovery's undo leaves deleted, and the garbage of transactions that ended before the crash, stay until a cleanup reclaims them.
+
+A crash during a TRUNCATE's commit can still leave the table on its new heap: TRUNCATE points the catalog rows at the new heap outside the transaction's records.
 
 ## The log decides what a crash test expects
 
 [`recovery.rs`](../../crates/storage/tests/recovery.rs) runs a workload on [`CrashFs`](../../crates/storage/tests/util/crash_fs.rs), which records every write, sync, rename, and removal. The test then recovers the files that a crash after each of those events would leave, with none, all, or a random part of the unsynced writes lost or torn. Every page must equal what the records that survived leave, which is its last image with the ops logged after it made on it. The workload changes raw pages, table pages, and leaves, and the test checks that the log holds both forms. `CrashFs` keeps every segment a checkpoint removed, and the oracle reads those too, so a page whose last record left the log is still checked against it. A new redo form needs a matching change to that oracle.
+
+[`txn_recovery.rs`](../../crates/storage/tests/txn_recovery.rs) does the same with transactions that commit, abort, and are left open. The rows after recovery must be exactly what the transactions whose `Commit` is in the log wrote, and each commit acknowledged before the crash must be among them. No tuple may stay locked, and every row must have its index entries. Undo is idempotent, so a crash test alone does not show a missing `Clr`. A concurrent test writes a row that a rollback gave back, and checks that a crash during the rollback keeps that commit.
 
 A crash sweep must also start from a recovered database, because recovery leaves states a first crash never meets: pages last logged before the log's first segment, and free slots rebuilt from the `.meta`.

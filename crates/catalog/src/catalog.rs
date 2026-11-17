@@ -273,7 +273,7 @@ impl Catalog {
         })
     }
 
-    pub fn bpm(&self) -> &BufferPoolManager {
+    pub fn bpm(&self) -> &Arc<BufferPoolManager> {
         &self.bpm
     }
 
@@ -625,6 +625,8 @@ impl Catalog {
             let index = self.new_index(&state, &index_name, &info, index.key, index.kind)?;
             self.add_index(&mut state, &info, index)?;
         }
+        // No transaction's commit covers these records.
+        self.bpm.log().flush_all()?;
         Ok(info)
     }
 
@@ -707,7 +709,10 @@ impl Catalog {
         let mut state = self.state.write();
         // Another create may have taken the name meanwhile.
         check_index_name_free(&state, name)?;
-        Ok(self.add_index(&mut state, &table, index)?)
+        let index = self.add_index(&mut state, &table, index)?;
+        // No transaction's commit covers the build's records.
+        self.bpm.log().flush_all().map_err(CatalogError::from)?;
+        Ok(index)
     }
 
     /// Opens the B+ tree of a new index named `name` on the `key` columns of
@@ -902,6 +907,14 @@ impl Catalog {
             }
             let durable = written.load(Ordering::Acquire);
             replaced.sequences().for_each(|s| s.end_restart(durable));
+            if durable && let Err(e) = catalog.bpm.log().flush_all() {
+                // Readers may already see the new heap.
+                eprintln!(
+                    "hamilton: cannot sync the truncate of {}: {e}",
+                    replaced.name
+                );
+                std::process::abort();
+            }
         })?;
         let bpm = Arc::clone(&self.bpm);
         let unused = (Arc::clone(&new), new_indexes.clone());
@@ -1856,7 +1869,10 @@ mod tests {
             Value::Bool(true),
         ];
         let tuple = Tuple::encode(&users(), &row).unwrap();
-        table.heap.insert(&TupleMeta::new(0), &tuple).unwrap();
+        table
+            .heap
+            .insert(Logged::System, &TupleMeta::new(0), &tuple)
+            .unwrap();
         let sequence_oid = table.identity(0).unwrap().oid;
         drop(table);
 
@@ -2064,7 +2080,10 @@ mod tests {
             &[1.into(), "ada".into(), Value::BigInt(10), true.into()],
         )
         .unwrap();
-        users_info.heap.insert(&TupleMeta::new(1), &row).unwrap();
+        users_info
+            .heap
+            .insert(Logged::System, &TupleMeta::new(1), &row)
+            .unwrap();
 
         let (users_oid, users_first_page) = (users_info.oid, users_info.first_page_id());
         let empty_oid = empty.oid;

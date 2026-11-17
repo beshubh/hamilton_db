@@ -23,10 +23,10 @@ fn record(buf: &mut RecordBuf, kind: Kind, tid: u64, body: &[u8]) {
     buf.finish();
 }
 
-fn append(log: &Log, kind: Kind, tid: u64, prev: Lsn, body: &[u8]) -> Lsn {
+fn append(log: &Log, kind: Kind, tid: u64, body: &[u8]) -> Lsn {
     let mut buf = RecordBuf::new();
     record(&mut buf, kind, tid, body);
-    log.append(&buf, |_| prev).unwrap()
+    log.append(&buf, |_| {}).unwrap()
 }
 
 /// Every durable record, as (lsn, prev_lsn, tid, kind, body).
@@ -70,7 +70,7 @@ fn segment_names(dir: &TempDir) -> Vec<String> {
 fn append_flushed(log: &Log, n: u64) -> Vec<Lsn> {
     (0..n)
         .map(|i| {
-            let lsn = append(log, Kind::System, i, INVALID_LSN, &[i as u8; 200]);
+            let lsn = append(log, Kind::System, i, &[i as u8; 200]);
             log.flush_to(lsn).unwrap();
             lsn
         })
@@ -104,8 +104,8 @@ fn a_new_log_is_empty() {
 #[test]
 fn lsns_are_byte_positions() {
     let (_dir, log) = setup();
-    let a = append(&log, Kind::Update, 1, INVALID_LSN, b"abc");
-    let b = append(&log, Kind::Commit, 1, a, b"");
+    let a = append(&log, Kind::Update, 1, b"abc");
+    let b = append(&log, Kind::Commit, 1, b"");
     assert_eq!(a, FIRST_LSN);
     assert_eq!(b, a + (HEADER_SIZE + 3) as Lsn);
     assert_eq!(log.end(), b + HEADER_SIZE as Lsn);
@@ -114,7 +114,7 @@ fn lsns_are_byte_positions() {
 #[test]
 fn records_are_read_back_from_memory_and_from_the_file() {
     let (_dir, log) = setup();
-    let a = append(&log, Kind::Update, 7, INVALID_LSN, b"first");
+    let a = append(&log, Kind::Update, 7, b"first");
     let mut buf = Vec::new();
     let r = log.read(a, &mut buf).unwrap();
     assert_eq!(
@@ -123,7 +123,7 @@ fn records_are_read_back_from_memory_and_from_the_file() {
     );
 
     log.flush_to(a).unwrap();
-    let b = append(&log, Kind::Clr, 7, a, b"second");
+    let b = append(&log, Kind::Clr, 7, b"second");
     let r = log.read(a, &mut buf).unwrap();
     assert_eq!(r.body, b"first");
     let r = log.read(b, &mut buf).unwrap();
@@ -134,7 +134,7 @@ fn records_are_read_back_from_memory_and_from_the_file() {
 #[test]
 fn reading_where_no_record_starts_fails() {
     let (_dir, log) = setup();
-    let a = append(&log, Kind::Update, 1, INVALID_LSN, b"payload");
+    let a = append(&log, Kind::Update, 1, b"payload");
     log.flush_all().unwrap();
     let mut buf = Vec::new();
     assert!(matches!(
@@ -148,30 +148,37 @@ fn reading_where_no_record_starts_fails() {
 }
 
 #[test]
-fn link_runs_with_the_lsn_and_sets_prev_lsn() {
+fn each_record_links_to_its_transactions_last() {
     let (_dir, log) = setup();
     let mut buf = RecordBuf::new();
-    let mut last = INVALID_LSN;
-    for i in 0..3u8 {
-        record(&mut buf, Kind::Update, 9, &[i]);
-        let lsn = log
-            .append(&buf, |lsn| std::mem::replace(&mut last, lsn))
-            .unwrap();
-        assert_eq!(lsn, last);
+    let mut seen = Vec::new();
+    for (kind, tid) in [
+        (Kind::Update, 9),
+        (Kind::System, 0),
+        (Kind::Update, 4),
+        (Kind::Update, 9),
+        (Kind::Commit, 9),
+        (Kind::End, 9),
+        (Kind::Update, 9),
+    ] {
+        record(&mut buf, kind, tid, b"");
+        let lsn = log.append(&buf, |lsn| seen.push(lsn)).unwrap();
+        assert_eq!(seen.last(), Some(&lsn), "on_append runs with the LSN");
     }
     log.flush_all().unwrap();
-    let records = scan_all(&log);
-    assert_eq!(records[0].1, INVALID_LSN);
-    assert_eq!(records[1].1, records[0].0);
-    assert_eq!(records[2].1, records[1].0);
+    let prevs: Vec<_> = scan_all(&log).iter().map(|r| r.1).collect();
+    let none = INVALID_LSN;
+    assert_eq!(prevs, [none, none, none, seen[0], seen[3], seen[4], none]);
+    assert_eq!(log.last_lsn(9), Some(seen[6]));
+    assert_eq!(log.last_lsn(4), Some(seen[2]));
 }
 
 #[test]
 fn only_durable_records_survive_reopening() {
     let (dir, log) = setup();
-    let a = append(&log, Kind::Update, 1, INVALID_LSN, b"kept");
+    let a = append(&log, Kind::Update, 1, b"kept");
     log.flush_to(a).unwrap();
-    append(&log, Kind::Update, 1, a, b"lost");
+    append(&log, Kind::Update, 1, b"lost");
     drop(log);
 
     let log = open(&dir, ONE_SEGMENT).unwrap();
@@ -184,9 +191,9 @@ fn only_durable_records_survive_reopening() {
 #[test]
 fn one_sync_covers_every_record_before_it() {
     let (_dir, log) = setup();
-    let first = append(&log, Kind::Update, 1, INVALID_LSN, b"a");
+    let first = append(&log, Kind::Update, 1, b"a");
     for _ in 0..9 {
-        append(&log, Kind::Update, 1, INVALID_LSN, b"b");
+        append(&log, Kind::Update, 1, b"b");
     }
     log.flush_to(first).unwrap();
     assert_eq!(log.num_syncs(), 1);
@@ -198,7 +205,7 @@ fn one_sync_covers_every_record_before_it() {
 #[test]
 fn flushing_the_invalid_lsn_does_nothing() {
     let (_dir, log) = setup();
-    append(&log, Kind::Update, 1, INVALID_LSN, b"a");
+    append(&log, Kind::Update, 1, b"a");
     log.flush_to(INVALID_LSN).unwrap();
     assert_eq!(log.num_syncs(), 0);
 }
@@ -208,7 +215,7 @@ fn a_full_tail_is_flushed_by_the_append_that_overflows_it() {
     let (dir, log) = setup();
     let body = vec![0xab; 64 << 10];
     let lsns: Vec<_> = (0..40)
-        .map(|i| append(&log, Kind::System, i, INVALID_LSN, &body))
+        .map(|i| append(&log, Kind::System, i, &body))
         .collect();
     assert!(log.durable_end() > FIRST_LSN, "nothing was flushed");
     let mut buf = Vec::new();
@@ -224,9 +231,9 @@ fn a_full_tail_is_flushed_by_the_append_that_overflows_it() {
 #[test]
 fn a_record_larger_than_the_tail_still_goes_in() {
     let (_dir, log) = setup();
-    append(&log, Kind::System, 1, INVALID_LSN, b"small");
+    append(&log, Kind::System, 1, b"small");
     let body = vec![7u8; 3 << 20];
-    let big = append(&log, Kind::System, 2, INVALID_LSN, &body);
+    let big = append(&log, Kind::System, 2, &body);
     log.flush_all().unwrap();
     let mut buf = Vec::new();
     assert_eq!(log.read(big, &mut buf).unwrap().body.len(), 3 << 20);
@@ -236,9 +243,9 @@ fn a_record_larger_than_the_tail_still_goes_in() {
 #[test]
 fn a_torn_record_ends_the_log_and_is_cut_off() {
     let (dir, log) = setup();
-    let a = append(&log, Kind::Update, 1, INVALID_LSN, b"one");
-    let b = append(&log, Kind::Update, 1, a, b"two");
-    let c = append(&log, Kind::Commit, 1, b, b"three");
+    append(&log, Kind::Update, 1, b"one");
+    append(&log, Kind::Update, 1, b"two");
+    let c = append(&log, Kind::Commit, 1, b"three");
     log.flush_all().unwrap();
     drop(log);
 
@@ -254,7 +261,7 @@ fn a_torn_record_ends_the_log_and_is_cut_off() {
     assert_eq!(log.end(), c);
     assert_eq!(file_len(&path), c);
 
-    let d = append(&log, Kind::Abort, 1, b, b"");
+    let d = append(&log, Kind::Abort, 1, b"");
     assert_eq!(d, c);
     log.flush_all().unwrap();
     drop(log);
@@ -266,9 +273,9 @@ fn a_torn_record_ends_the_log_and_is_cut_off() {
 #[test]
 fn a_record_that_fails_its_checksum_ends_the_log() {
     let (dir, log) = setup();
-    let a = append(&log, Kind::Update, 1, INVALID_LSN, b"one");
-    let b = append(&log, Kind::Update, 1, a, b"two");
-    append(&log, Kind::Update, 1, b, b"three");
+    append(&log, Kind::Update, 1, b"one");
+    let b = append(&log, Kind::Update, 1, b"two");
+    append(&log, Kind::Update, 1, b"three");
     log.flush_all().unwrap();
     drop(log);
 
@@ -291,7 +298,7 @@ fn a_record_that_fails_its_checksum_ends_the_log() {
 #[test]
 fn a_record_copied_to_another_position_is_not_a_record() {
     let (dir, log) = setup();
-    let a = append(&log, Kind::Update, 1, INVALID_LSN, b"one");
+    let a = append(&log, Kind::Update, 1, b"one");
     log.flush_all().unwrap();
     let end = log.end();
     drop(log);
@@ -316,7 +323,7 @@ fn a_record_copied_to_another_position_is_not_a_record() {
 #[test]
 fn an_intact_record_of_an_unknown_kind_is_an_error() {
     let (dir, log) = setup();
-    let a = append(&log, Kind::Update, 1, INVALID_LSN, b"one");
+    let a = append(&log, Kind::Update, 1, b"one");
     log.flush_all().unwrap();
     drop(log);
 
@@ -369,13 +376,12 @@ fn concurrent_appenders_and_flushers_lose_nothing() {
             let log = Arc::clone(&log);
             thread::spawn(move || {
                 let mut buf = RecordBuf::new();
-                let mut prev = INVALID_LSN;
                 for i in 0..200u64 {
                     record(&mut buf, Kind::Update, t + 1, &i.to_le_bytes());
-                    prev = log.append(&buf, |_| prev).unwrap();
+                    let lsn = log.append(&buf, |_| {}).unwrap();
                     if i % 10 == 9 {
-                        log.flush_to(prev).unwrap();
-                        assert!(log.durable_end() > prev);
+                        log.flush_to(lsn).unwrap();
+                        assert!(log.durable_end() > lsn);
                     }
                 }
             })
@@ -435,7 +441,7 @@ fn a_full_segment_is_followed_by_a_new_one_and_reads_cross_them() {
     assert_eq!(log.end(), end);
     let tids: Vec<u64> = scan_all(&log).into_iter().map(|r| r.2).collect();
     assert_eq!(tids, (0..20).collect::<Vec<_>>());
-    let next = append(&log, Kind::Commit, 99, INVALID_LSN, b"");
+    let next = append(&log, Kind::Commit, 99, b"");
     assert_eq!(next, end);
 }
 

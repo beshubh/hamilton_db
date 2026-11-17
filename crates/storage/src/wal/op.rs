@@ -6,7 +6,7 @@
 //! HeapInit      1 |
 //! HeapSetNext   2 | next i32
 //! HeapInsert    3 | slot u16 | meta | len u16 | payload
-//! HeapSetTuple  4 | slot u16 | meta | len u16 | payload
+//! HeapSetTuple  4 | slot u16 | meta | len u16 | payload | padded_to u16
 //! HeapSetMeta   5 | slot u16 | meta
 //! HeapStamp     6 | slot u16 | keep_len u16
 //! HeapMarkDead  7 | slot u16
@@ -45,11 +45,13 @@ pub enum PageOp<'a> {
         meta: TupleMeta,
         payload: &'a [u8],
     },
-    /// Replaces the tuple in `slot`, as `TablePage::update` does.
+    /// Replaces the tuple in `slot` with `payload` and zeros after it up to
+    /// `padded_to` bytes, as `TablePage::update` does.
     HeapSetTuple {
         slot: SlotId,
         meta: TupleMeta,
         payload: &'a [u8],
+        padded_to: usize,
     },
     HeapSetMeta {
         slot: SlotId,
@@ -116,7 +118,8 @@ impl<'a> PageOp<'a> {
                 slot,
                 meta,
                 payload,
-            } => TablePage::new(data)?.update(slot, &meta, payload),
+                padded_to,
+            } => TablePage::new(data)?.update(slot, &meta, payload, padded_to),
             Self::HeapSetMeta { slot, meta } => TablePage::new(data)?.update_meta(slot, &meta),
             Self::HeapStamp { slot, keep_len } => TablePage::new(data)?.stamp(slot, keep_len),
             Self::HeapMarkDead { slot } => TablePage::new(data)?.mark_dead(slot),
@@ -149,22 +152,25 @@ impl<'a> PageOp<'a> {
                 slot,
                 meta,
                 payload,
-            }
-            | Self::HeapSetTuple {
-                slot,
-                meta,
-                payload,
             } => {
-                let tag = if matches!(self, Self::HeapInsert { .. }) {
-                    HEAP_INSERT
-                } else {
-                    HEAP_SET_TUPLE
-                };
-                buf.push(tag);
+                buf.push(HEAP_INSERT);
                 buf.extend_from_slice(&slot.to_le_bytes());
                 encode_meta(buf, &meta);
                 buf.extend_from_slice(&u16_of(payload.len()).to_le_bytes());
                 buf.extend_from_slice(payload);
+            }
+            Self::HeapSetTuple {
+                slot,
+                meta,
+                payload,
+                padded_to,
+            } => {
+                buf.push(HEAP_SET_TUPLE);
+                buf.extend_from_slice(&slot.to_le_bytes());
+                encode_meta(buf, &meta);
+                buf.extend_from_slice(&u16_of(payload.len()).to_le_bytes());
+                buf.extend_from_slice(payload);
+                buf.extend_from_slice(&u16_of(padded_to).to_le_bytes());
             }
             Self::HeapSetMeta { slot, meta } => {
                 buf.push(HEAP_SET_META);
@@ -221,10 +227,15 @@ impl<'a> PageOp<'a> {
                         payload,
                     }
                 } else {
+                    let padded_to = r.u16()?.into();
+                    if padded_to < payload.len() {
+                        return Err(corrupt(format!("tuple padded to {padded_to} of {len}")));
+                    }
                     Self::HeapSetTuple {
                         slot,
                         meta,
                         payload,
+                        padded_to,
                     }
                 }
             }
@@ -301,7 +312,7 @@ impl<'a> Ops<'a> {
     }
 }
 
-fn encode_meta(buf: &mut Vec<u8>, meta: &TupleMeta) {
+pub(crate) fn encode_meta(buf: &mut Vec<u8>, meta: &TupleMeta) {
     buf.extend_from_slice(&meta.ts.to_le_bytes());
     buf.extend_from_slice(&meta.undo_ptr.to_le_bytes());
     let mut flags = 0;
@@ -314,10 +325,10 @@ fn encode_meta(buf: &mut Vec<u8>, meta: &TupleMeta) {
     buf.push(flags);
 }
 
-struct Reader<'a>(&'a [u8]);
+pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 
 impl<'a> Reader<'a> {
-    fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {
+    pub(crate) fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {
         let (head, rest) = self
             .0
             .split_at_checked(n)
@@ -326,23 +337,23 @@ impl<'a> Reader<'a> {
         Ok(head)
     }
 
-    fn u8(&mut self) -> Result<u8> {
+    pub(crate) fn u8(&mut self) -> Result<u8> {
         Ok(self.bytes(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16> {
+    pub(crate) fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_le_bytes(self.bytes(2)?.try_into().unwrap()))
     }
 
-    fn i32(&mut self) -> Result<i32> {
+    pub(crate) fn i32(&mut self) -> Result<i32> {
         Ok(i32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
     }
 
-    fn u64(&mut self) -> Result<u64> {
+    pub(crate) fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
     }
 
-    fn meta(&mut self) -> Result<TupleMeta> {
+    pub(crate) fn meta(&mut self) -> Result<TupleMeta> {
         let (ts, undo_ptr, flags) = (self.u64()?, self.u64()?, self.u8()?);
         Ok(TupleMeta {
             ts,

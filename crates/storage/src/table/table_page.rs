@@ -335,7 +335,7 @@ impl<B: DerefMut<Target = [u8; PAGE_SIZE]>> TablePage<B> {
             h.slot_count += 1;
             h.free_lower += SLOT_SIZE as u16;
         }
-        let offset = self.write_tuple(meta, payload);
+        let offset = self.write_tuple(meta, payload, payload.len());
         *self.slot_mut(slot) = Slot {
             offset: offset.into(),
             len: (tuple_len as u16).into(),
@@ -354,21 +354,30 @@ impl<B: DerefMut<Target = [u8; PAGE_SIZE]>> TablePage<B> {
         Ok(())
     }
 
-    /// Replaces the tuple in `slot`; its slot, and so its `Rid`, stays the
-    /// same. A tuple that no longer fits in place moves within the page,
-    /// compacting it if needed. Updates may use the room the insert limit
-    /// leaves free. Fails with `PageFull` if the page cannot hold the new
-    /// version at all.
-    pub fn update(&mut self, slot: SlotId, meta: &TupleMeta, payload: &[u8]) -> Result<()> {
-        self.check_update(slot, payload.len())?;
+    /// Replaces the tuple in `slot` with `payload` followed by zeros up to
+    /// `padded_to` bytes; its slot, and so its `Rid`, stays the same. A
+    /// tuple that no longer fits in place moves within the page, compacting
+    /// it if needed. Updates may use the room the insert limit leaves free.
+    /// Fails with `PageFull` if the page cannot hold the new version at all.
+    pub fn update(
+        &mut self,
+        slot: SlotId,
+        meta: &TupleMeta,
+        payload: &[u8],
+        padded_to: usize,
+    ) -> Result<()> {
+        debug_assert!(padded_to >= payload.len(), "padding shorter than payload");
+        self.check_update(slot, padded_to)?;
         let s = self.slot(slot);
         let (offset, old_len) = (s.offset.get(), s.len.get() as usize);
-        let new_len = TUPLE_HEADER_SIZE + payload.len();
+        let new_len = TUPLE_HEADER_SIZE + padded_to;
 
         if new_len <= old_len {
             let tuple = &mut self.data[offset as usize..][..new_len];
             TupleHeader::from(meta).write_to_prefix(tuple).unwrap();
-            tuple[TUPLE_HEADER_SIZE..].copy_from_slice(payload);
+            let (data, padding) = tuple[TUPLE_HEADER_SIZE..].split_at_mut(payload.len());
+            data.copy_from_slice(payload);
+            padding.fill(0);
             self.slot_mut(slot).len = (new_len as u16).into();
             self.header_mut().hole_bytes += (old_len - new_len) as u16;
             return Ok(());
@@ -380,7 +389,7 @@ impl<B: DerefMut<Target = [u8; PAGE_SIZE]>> TablePage<B> {
         if self.contiguous_free() < new_len {
             self.compact();
         }
-        let offset = self.write_tuple(meta, payload);
+        let offset = self.write_tuple(meta, payload, padded_to);
         let s = self.slot_mut(slot);
         s.offset = offset.into();
         s.len = (new_len as u16).into();
@@ -435,16 +444,19 @@ impl<B: DerefMut<Target = [u8; PAGE_SIZE]>> TablePage<B> {
         Ok(())
     }
 
-    /// Writes a tuple just below `free_upper`, which must have room for it,
-    /// and returns its offset.
-    fn write_tuple(&mut self, meta: &TupleMeta, payload: &[u8]) -> u16 {
-        let len = TUPLE_HEADER_SIZE + payload.len();
+    /// Writes a tuple of `payload` padded with zeros to `padded_to` bytes
+    /// just below `free_upper`, which must have room for it, and returns its
+    /// offset.
+    fn write_tuple(&mut self, meta: &TupleMeta, payload: &[u8], padded_to: usize) -> u16 {
+        let len = TUPLE_HEADER_SIZE + padded_to;
         let h = self.header_mut();
         h.free_upper -= len as u16;
         let offset = h.free_upper.get();
         let tuple = &mut self.data[offset as usize..][..len];
         TupleHeader::from(meta).write_to_prefix(tuple).unwrap();
-        tuple[TUPLE_HEADER_SIZE..].copy_from_slice(payload);
+        let (data, padding) = tuple[TUPLE_HEADER_SIZE..].split_at_mut(payload.len());
+        data.copy_from_slice(payload);
+        padding.fill(0);
         offset
     }
 
@@ -615,7 +627,7 @@ mod tests {
 
         let too_big = vec![1u8; MAX_PAYLOAD_SIZE + 1];
         assert!(matches!(
-            page.update(slot, &TupleMeta::new(2), &too_big),
+            page.update(slot, &TupleMeta::new(2), &too_big, too_big.len()),
             Err(StorageError::TupleTooLarge { .. })
         ));
     }
@@ -628,10 +640,22 @@ mod tests {
         let other = page.insert(&TupleMeta::new(1), b"neighbour").unwrap();
         let free = page.free_space();
 
-        page.update(slot, &TupleMeta::new(2), b"short").unwrap();
+        page.update(slot, &TupleMeta::new(2), b"short", 5).unwrap();
         assert_eq!(page.get(slot).unwrap(), (TupleMeta::new(2), &b"short"[..]));
         assert_eq!(page.get(other).unwrap().1, b"neighbour");
         assert_eq!(page.free_space(), free + 5);
+    }
+
+    #[test]
+    fn padded_update_keeps_the_length_with_zeros() {
+        let mut buf = empty();
+        let mut page = TablePage::new(&mut *buf).unwrap();
+        let slot = page.insert(&TupleMeta::new(1), b"long value").unwrap();
+        page.update(slot, &TupleMeta::new(2), b"short", 10).unwrap();
+        assert_eq!(page.get(slot).unwrap().1, b"short\0\0\0\0\0");
+        page.update(slot, &TupleMeta::new(3), b"grown past it", 20)
+            .unwrap();
+        assert_eq!(page.get(slot).unwrap().1, b"grown past it\0\0\0\0\0\0\0");
     }
 
     #[test]
@@ -640,7 +664,8 @@ mod tests {
         let mut page = TablePage::new(&mut *buf).unwrap();
         let a = page.insert(&TupleMeta::new(1), b"aaaa").unwrap();
         let b = page.insert(&TupleMeta::new(1), b"bbbb").unwrap();
-        page.update(a, &TupleMeta::new(2), b"aaaaaaaaaaaa").unwrap();
+        page.update(a, &TupleMeta::new(2), b"aaaaaaaaaaaa", 12)
+            .unwrap();
         assert_eq!(
             page.get(a).unwrap(),
             (TupleMeta::new(2), &b"aaaaaaaaaaaa"[..])
@@ -659,7 +684,8 @@ mod tests {
         }
         // Past the insert limit, but updates can still grow into the headroom.
         let bigger = [4u8; 300];
-        page.update(slots[0], &TupleMeta::new(2), &bigger).unwrap();
+        page.update(slots[0], &TupleMeta::new(2), &bigger, bigger.len())
+            .unwrap();
         assert_eq!(page.get(slots[0]).unwrap().1, &bigger[..]);
         assert!(PAGE_SIZE - page.free_space() > INSERT_LIMIT);
     }
@@ -678,13 +704,14 @@ mod tests {
         }
         // Shrink every other tuple: lots of free bytes, none contiguous enough.
         for &slot in slots.iter().step_by(2) {
-            page.update(slot, &TupleMeta::new(99), &payload[..10])
+            page.update(slot, &TupleMeta::new(99), &payload[..10], 10)
                 .unwrap();
         }
         let target = slots[1];
         let grown = [0xabu8; 1200];
         assert!(page.contiguous_free() < TUPLE_HEADER_SIZE + grown.len());
-        page.update(target, &TupleMeta::new(100), &grown).unwrap();
+        page.update(target, &TupleMeta::new(100), &grown, grown.len())
+            .unwrap();
 
         assert_eq!(page.get(target).unwrap(), (TupleMeta::new(100), &grown[..]));
         for (i, &slot) in slots.iter().enumerate() {
@@ -710,7 +737,7 @@ mod tests {
         let _c = page.insert(&TupleMeta::new(1), &payload).unwrap();
         let grown = [6u8; 2100];
         assert!(matches!(
-            page.update(a, &TupleMeta::new(2), &grown),
+            page.update(a, &TupleMeta::new(2), &grown, grown.len()),
             Err(StorageError::PageFull)
         ));
         assert_eq!(page.get(a).unwrap(), (TupleMeta::new(1), &payload[..]));

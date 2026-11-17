@@ -41,9 +41,9 @@
 //! ordered against each other by Tid as MVTO requires.
 //!
 //! Every statement that can write first records the next Tid in the catalog
-//! header, so that a restarted session never starts below a `ts` on disk,
-//! committed or locked (see `storage::concurrency::watermark`). Every commit
-//! syncs the log before it returns.
+//! header, so that a restarted session never starts below a Tid in the log
+//! (see `storage::concurrency::watermark`). A commit that wrote rows returns
+//! once its `Commit` record is durable.
 
 use std::mem;
 use std::sync::Arc;
@@ -153,9 +153,10 @@ impl ExecutionEngine {
     /// gets the Tid the catalog header recorded.
     pub fn new(catalog: Arc<Catalog>) -> Result<Self> {
         let next_tid = catalog.next_tid().map_err(ExecutionError::from)?;
+        let txn_manager = TransactionManager::new(Arc::clone(catalog.bpm()), next_tid);
         Ok(Self {
             catalog,
-            txn_manager: Arc::new(TransactionManager::new(next_tid)),
+            txn_manager: Arc::new(txn_manager),
             settings: ExecutionSettings::default(),
             batch_size: DEFAULT_BATCH_SIZE,
             conflict_timeout: DEFAULT_CONFLICT_TIMEOUT,
@@ -355,20 +356,14 @@ impl ExecutionEngine {
         Instant::now() < deadline
     }
 
-    /// Readies the catalog changes `txn` made, commits `txn`, then syncs the
-    /// log, so the commit survives a crash once this returns. If this fails
-    /// before the commit, `txn` is still running and must be aborted.
+    /// Readies the catalog changes `txn` made, then commits `txn`, which
+    /// survives a crash once this returns. If this fails, `txn` is still
+    /// running and must be aborted.
     fn commit(&self, txn: &Transaction) -> Result<()> {
         self.catalog
             .prepare_commit(txn)
             .map_err(ExecutionError::from)?;
         self.txn_manager.commit(txn).map_err(ExecutionError::from)?;
-        // TODO(wal): a commit record synced before the stamps replaces this.
-        if let Err(e) = self.catalog.bpm().log().flush_all() {
-            // Others may already read the commit, so it cannot be aborted.
-            eprintln!("hamilton: cannot sync a commit: {e}");
-            std::process::abort();
-        }
         Ok(())
     }
 

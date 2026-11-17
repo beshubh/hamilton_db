@@ -394,6 +394,7 @@ impl Workload {
             .map(|(slot, meta, bytes)| (slot, meta, bytes.len()))
             .collect();
         payload.resize(1 + self.below(200), self.below(256) as u8);
+        let padded_to = payload.len() + self.below(4);
         let meta = self.meta();
         if live.is_empty() || choice.is_multiple_of(6) {
             return Some(PageOp::HeapInsert {
@@ -408,6 +409,7 @@ impl Workload {
                 slot,
                 meta,
                 payload,
+                padded_to,
             },
             2 => PageOp::HeapSetMeta { slot, meta },
             3 if old.ts & TXN_UNCOMMITTED_BIT != 0 => PageOp::HeapStamp {

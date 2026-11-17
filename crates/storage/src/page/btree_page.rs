@@ -54,6 +54,11 @@ const _: () = assert!(PAGE_SIZE <= u16::MAX as usize);
 /// even if their bytes differ.
 pub trait KeyComparator {
     fn compare(&self, a: &[u8], b: &[u8]) -> Ordering;
+
+    /// Appends to `out` what a tree's header records about this order, so
+    /// the tree can be opened again with a comparator that orders the same
+    /// way, and refused with one that does not. Nothing, by default.
+    fn describe(&self, _out: &mut Vec<u8>) {}
 }
 
 /// Orders keys by their bytes, as `memcmp` does, so a shorter key sorts

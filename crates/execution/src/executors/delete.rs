@@ -67,7 +67,7 @@ impl Executor for DeleteExecutor {
         let indexed = self.ctx.indexed_table(&table);
         let txn = self.ctx.txn();
         for (rid, tuple) in &found {
-            txn.delete(&table.heap, &table.schema, *rid)?;
+            txn.delete(&table.heap, *rid)?;
             let keys = index_keys(&table, &indexes, tuple)?;
             let locators = locators(&indexes, &keys, *rid);
             for ((index, key), locator) in indexes.iter().zip(&keys).zip(&locators) {

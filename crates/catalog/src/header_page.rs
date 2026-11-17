@@ -33,8 +33,8 @@ const MAGIC: u64 = u64::from_le_bytes(*b"HAMDBCAT");
 /// key index entries hold the rid after the key. 6: columns record whether
 /// they are identity columns. 7: indexes record their kind, which says
 /// whether they are unique. 8: sequences are relations, and identity columns
-/// record theirs.
-const VERSION: u32 = 8;
+/// record theirs. 9: B+ tree headers record how their keys are ordered.
+const VERSION: u32 = 9;
 
 /// The Tid a new database's first transaction gets. 0 is `INVALID_TXN_ID`,
 /// the `ts` of rows written outside transactions.

@@ -24,11 +24,11 @@ fn setup(num_frames: usize) -> Db {
     let bpm = storage::open(dir.path().join("test.db"), num_frames)
         .unwrap()
         .bpm;
-    let heap = Arc::new(TableHeap::create(bpm).unwrap());
+    let heap = Arc::new(TableHeap::create(Arc::clone(&bpm)).unwrap());
     Db {
         _dir: dir,
         heap,
-        tm: TransactionManager::new(1),
+        tm: TransactionManager::new(bpm, 1),
     }
 }
 
@@ -209,7 +209,7 @@ fn a_transaction_can_write_what_it_read() {
     assert_eq!(db.read_ts(x), Some(txn.tid()));
     db.write(&txn, x, &row(1, 90)).unwrap();
     assert_eq!(db.read(&txn, x).unwrap(), Some(row(1, 90)));
-    txn.delete(&db.heap, &schema(), x).unwrap();
+    txn.delete(&db.heap, x).unwrap();
     db.tm.commit(&txn).unwrap();
     db.end_all(&[&_hold]);
 }
@@ -309,7 +309,7 @@ fn a_get_that_finds_nothing_is_recorded() {
     let deleter = db.tm.begin();
     let writer = db.tm.begin();
     let reader = db.tm.begin();
-    deleter.delete(&db.heap, &schema(), x).unwrap();
+    deleter.delete(&db.heap, x).unwrap();
     db.tm.commit(&deleter).unwrap();
 
     assert_eq!(db.read(&reader, x).unwrap(), None);
@@ -379,9 +379,12 @@ fn concurrent_transfers_are_serializable() {
             s.spawn(move || {
                 let mut rng = Rng(t * 7919 + 1);
                 for _ in 0..TRANSFERS {
+                    // Chosen once, so an audit that conflicts is retried as
+                    // an audit rather than turning into a transfer.
+                    let is_audit = rng.below(10) == 0;
                     loop {
                         let txn = db.tm.begin();
-                        let result = if rng.below(10) == 0 {
+                        let result = if is_audit {
                             audit(db, &txn).map(|sum| {
                                 assert_eq!(sum, TOTAL, "transaction {} saw", txn.tid());
                                 scans.fetch_add(1, Ordering::Relaxed);

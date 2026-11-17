@@ -21,6 +21,7 @@ use common::{Column, DataType, IndexKind, PageId, Rid, Schema, Tuple, Value};
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::table::table_heap::TableHeap;
 use storage::table::table_page::TupleMeta;
+use storage::wal::Logged;
 
 use crate::catalog::{IndexOid, MAX_NAME_LEN, RelationKind, TableOid};
 use crate::error::{CatalogError, Result};
@@ -294,7 +295,7 @@ fn find_row(heap: &TableHeap, schema: &Schema, oid: u32) -> Result<(Rid, TupleMe
 
 fn insert(heap: &TableHeap, schema: &Schema, values: &[Value]) -> Result<()> {
     let tuple = Tuple::encode(schema, values)?;
-    heap.insert(&TupleMeta::new(CATALOG_TS), &tuple)?;
+    heap.insert(Logged::System, &TupleMeta::new(CATALOG_TS), &tuple)?;
     Ok(())
 }
 

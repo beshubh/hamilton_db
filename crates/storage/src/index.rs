@@ -6,6 +6,7 @@ use common::{IndexKind, Rid, Schema, Tuple};
 use enum_dispatch::enum_dispatch;
 
 use crate::error::Result;
+use crate::wal::Logged;
 
 pub mod btree;
 pub mod btree_index;
@@ -166,12 +167,13 @@ impl fmt::Display for IndexMetadata {
 pub trait IndexTrait {
     fn metadata(&self) -> &IndexMetadata;
 
-    /// Adds `key` for the row at `locator`. Returns `false`, changing
-    /// nothing, if that entry exists.
+    /// Adds `key` for the row at `locator`, logged as `by`'s change.
+    /// Returns `false`, changing nothing, if that entry exists. A
+    /// transaction's insert is undone if it aborts.
     ///
     /// Entries are not versioned. Writers inside a transaction go through
     /// `Transaction::insert_entry` instead; see `concurrency::index_versions`.
-    fn insert_entry(&self, key: &Tuple, locator: &RowLocator) -> Result<bool>;
+    fn insert_entry(&self, key: &Tuple, locator: &RowLocator, by: Logged<'_>) -> Result<bool>;
 
     /// Removes `key` for the row at `locator`, if present, and returns
     /// whether it was. Other rows with `key` keep their entries.

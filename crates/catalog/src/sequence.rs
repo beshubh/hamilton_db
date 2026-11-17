@@ -81,7 +81,7 @@ pub(crate) fn create_heap(bpm: &Arc<BufferPoolManager>) -> Result<TableHeap> {
         is_called: 0,
     };
     let tuple = Tuple::from_bytes(row.as_bytes().to_vec());
-    let rid = heap.insert(&TupleMeta::new(CATALOG_TS), &tuple)?;
+    let rid = heap.insert(Logged::System, &TupleMeta::new(CATALOG_TS), &tuple)?;
     debug_assert_eq!((rid.page_id, rid.slot), (heap.first_page_id(), SLOT));
     Ok(heap)
 }
@@ -220,6 +220,7 @@ impl Sequence {
                 slot: SLOT,
                 meta,
                 payload: row.as_bytes(),
+                padded_to: size_of::<SequenceRow>(),
             })?;
         }
         Ok(())
@@ -271,6 +272,7 @@ fn put(page: &mut MtrPage<'_>, meta: &TupleMeta, last_value: i64, log_cnt: i32) 
         slot: SLOT,
         meta: *meta,
         payload: row.as_bytes(),
+        padded_to: size_of::<SequenceRow>(),
     })?;
     Ok(())
 }

@@ -7,12 +7,14 @@ use std::time::{Duration, Instant};
 use common::TxnId;
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 
+use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::concurrency::read_ts::ReadTimestamps;
 use crate::concurrency::transaction::{Garbage, Transaction, TransactionState};
 use crate::concurrency::watermark::Watermark;
 use crate::error::Result;
 use crate::index::IndexTrait;
 use crate::table::undo_log::UndoLog;
+use crate::wal::TxnLog;
 
 /// Begins and ends transactions. It owns the watermark, the one undo log
 /// every table's versions go into, and the read timestamps of every table's
@@ -42,6 +44,8 @@ pub struct TransactionManager {
 
 /// What the manager shares with its collector thread.
 struct Shared {
+    /// The database whose log the transactions write.
+    bpm: Arc<BufferPoolManager>,
     watermark: Arc<Watermark>,
     undo: Arc<UndoLog>,
     read_ts: Arc<ReadTimestamps>,
@@ -72,10 +76,12 @@ struct Passes {
 }
 
 impl TransactionManager {
-    /// A manager whose first transaction gets Tid `next_tid`, with its
-    /// collector thread started. See `Watermark::new`.
-    pub fn new(next_tid: TxnId) -> Self {
+    /// A manager of transactions on the database behind `bpm`, whose first
+    /// gets Tid `next_tid`, with its collector thread started. `next_tid`
+    /// must be above every Tid in the log. See `Watermark::new`.
+    pub fn new(bpm: Arc<BufferPoolManager>, next_tid: TxnId) -> Self {
         let shared = Arc::new(Shared {
+            bpm,
             watermark: Arc::new(Watermark::new(next_tid)),
             undo: Arc::new(UndoLog::new()),
             read_ts: Arc::new(ReadTimestamps::new()),
@@ -102,7 +108,7 @@ impl TransactionManager {
     pub fn begin(&self) -> Arc<Transaction> {
         let tid = self.shared.watermark.begin();
         Arc::new(Transaction::new(
-            tid,
+            TxnLog::new(tid, Arc::clone(&self.shared.bpm)),
             Arc::clone(&self.shared.undo),
             Arc::clone(&self.shared.read_ts),
             Arc::clone(&self.shared.watermark),
@@ -110,17 +116,17 @@ impl TransactionManager {
         ))
     }
 
-    /// Commits `txn`: unlocks the versions it wrote, which makes them
-    /// visible to newer transactions. Fails with `TransactionNotRunning` if
-    /// it has already ended. If unlocking a tuple fails, the error is
-    /// returned and `txn` stays running, partly committed; there is no log
-    /// to finish or undo it.
+    /// Commits `txn`: logs its `Commit` and returns once that is durable,
+    /// having unlocked the versions it wrote, which makes them visible to
+    /// newer transactions. Fails only with `TransactionNotRunning`, if it
+    /// has already ended. Past the `Commit`, a failure stops the process,
+    /// and recovery finishes the commit.
     pub fn commit(&self, txn: &Transaction) -> Result<()> {
         self.end(txn, TransactionState::Committed)
     }
 
-    /// Aborts `txn`: puts back every tuple it wrote as it was before. Fails
-    /// as `commit` does.
+    /// Aborts `txn`: puts back every tuple and index entry it wrote, as its
+    /// records in the log say. Fails as `commit` does.
     pub fn abort(&self, txn: &Transaction) -> Result<()> {
         self.end(txn, TransactionState::Aborted)
     }

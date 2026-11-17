@@ -9,12 +9,22 @@
 //! over from an older log never pass for a record. `lsn` and `prev_lsn` are
 //! only known inside the log's critical section, so `RecordBuf` checksums the
 //! rest up front and `Log::append` folds them in with `crc32c_combine`.
+//!
+//! The body depends on the kind:
+//!
+//! ```text
+//! Update                undo | page changes
+//! Clr                   undo_next u64 | page changes
+//! Completion, System    page changes
+//! Commit, Abort, End    (empty)
+//! ```
 
-use common::{INVALID_LSN, Lsn, PageId, TxnId};
+use common::{INVALID_LSN, Lsn, PageId, Rid, TxnId};
 
 use crate::error::{Result, StorageError};
 use crate::page::PAGE_SIZE;
-use crate::wal::op::Ops;
+use crate::table::table_page::TupleMeta;
+use crate::wal::op::{Ops, Reader, encode_meta};
 
 pub const HEADER_SIZE: usize = 33;
 
@@ -117,6 +127,14 @@ impl RecordBuf {
     pub(crate) fn tail_crc(&self) -> u32 {
         self.tail_crc
     }
+
+    pub(crate) fn kind(&self) -> Kind {
+        Kind::try_from(self.bytes[KIND]).expect("set by begin")
+    }
+
+    pub(crate) fn tid(&self) -> TxnId {
+        read_u64(&self.bytes, TID)
+    }
 }
 
 /// Fills in `lsn` and `prev_lsn` of a record copied into the log buffer, and
@@ -173,6 +191,182 @@ impl<'a> Record<'a> {
     pub fn has_prev(&self) -> bool {
         self.prev_lsn != INVALID_LSN
     }
+
+    /// The pages the record changes and frees, or `None` for a kind that
+    /// changes none.
+    pub fn page_changes(&self) -> Result<Option<PageChanges<'a>>> {
+        let changes = match self.kind {
+            Kind::Update => Undo::decode(self.body)?.1,
+            Kind::Clr => self.split_undo_next()?.1,
+            Kind::Completion | Kind::System => self.body,
+            Kind::Commit | Kind::Abort | Kind::End => return Ok(None),
+        };
+        PageChanges::decode(changes).map(Some)
+    }
+
+    /// How to take back the change of an `Update` record.
+    pub fn undo(&self) -> Result<Undo<'a>> {
+        if self.kind != Kind::Update {
+            return Err(StorageError::CorruptLog(format!(
+                "{:?} at {} has no undo",
+                self.kind, self.lsn
+            )));
+        }
+        Ok(Undo::decode(self.body)?.0)
+    }
+
+    /// The record a `Clr` leaves to undo next: the one before the record it
+    /// compensates, in its transaction.
+    pub fn undo_next(&self) -> Result<Lsn> {
+        if self.kind != Kind::Clr {
+            return Err(StorageError::CorruptLog(format!(
+                "{:?} at {} is not a compensation",
+                self.kind, self.lsn
+            )));
+        }
+        Ok(self.split_undo_next()?.0)
+    }
+
+    fn split_undo_next(&self) -> Result<(Lsn, &'a [u8])> {
+        let (undo_next, rest) = self
+            .body
+            .split_first_chunk::<8>()
+            .ok_or_else(|| StorageError::CorruptLog(format!("truncated record at {}", self.lsn)))?;
+        Ok((u64::from_le_bytes(*undo_next), rest))
+    }
+}
+
+/// How to take back one change of a transaction, which its `Update` record
+/// carries. A heap change is undone in place, by slot: the transaction
+/// keeps the tuple locked until it ends, so nothing else changes it, and a
+/// tuple never grows by undoing (see `TableHeap`'s padding rule). An index
+/// entry is undone by key, wherever splits have moved it since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Undo<'a> {
+    Heap {
+        rid: Rid,
+        /// The payload length the tuple's commit keeps, for a change that
+        /// gave the tuple its payload: less than the tuple's length when a
+        /// shrinking update padded it. `None` for a change that left the
+        /// payload as it was.
+        keep_len: Option<usize>,
+        before: Before<'a>,
+    },
+    /// Remove `entry`, if it is there, from the B+ tree whose header page
+    /// is `header`.
+    IndexEntry { header: PageId, entry: &'a [u8] },
+}
+
+/// A heap tuple before the change an `Undo::Heap` takes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Before<'a> {
+    /// The change inserted the tuple.
+    Inserted,
+    /// The change set only the tuple's meta, which was this.
+    Meta(TupleMeta),
+    /// The tuple's meta and stored payload, padding included.
+    Tuple { meta: TupleMeta, payload: &'a [u8] },
+}
+
+const UNDO_HEAP: u8 = 1;
+const UNDO_INDEX_ENTRY: u8 = 2;
+const BEFORE_INSERTED: u8 = 1;
+const BEFORE_META: u8 = 2;
+const BEFORE_TUPLE: u8 = 3;
+const KEEP_ALL: u16 = u16::MAX;
+
+impl<'a> Undo<'a> {
+    /// Appends the undo to `buf`:
+    ///
+    /// ```text
+    /// heap          1 | page_id i32 | slot u16 | keep_len u16 | before
+    /// index entry   2 | header i32 | len u16 | entry
+    ///
+    /// before: 1 (inserted) | 2 meta | 3 meta len u16 payload
+    /// ```
+    ///
+    /// `keep_len` is `u16::MAX` for `None`.
+    pub(crate) fn encode(&self, buf: &mut Vec<u8>) {
+        let u16_of = |n: usize| u16::try_from(n).expect("larger than a page");
+        match *self {
+            Self::Heap {
+                rid,
+                keep_len,
+                before,
+            } => {
+                buf.push(UNDO_HEAP);
+                buf.extend_from_slice(&rid.page_id.to_le_bytes());
+                buf.extend_from_slice(&rid.slot.to_le_bytes());
+                let keep_len = keep_len.map_or(KEEP_ALL, u16_of);
+                buf.extend_from_slice(&keep_len.to_le_bytes());
+                match before {
+                    Before::Inserted => buf.push(BEFORE_INSERTED),
+                    Before::Meta(meta) => {
+                        buf.push(BEFORE_META);
+                        encode_meta(buf, &meta);
+                    }
+                    Before::Tuple { meta, payload } => {
+                        buf.push(BEFORE_TUPLE);
+                        encode_meta(buf, &meta);
+                        buf.extend_from_slice(&u16_of(payload.len()).to_le_bytes());
+                        buf.extend_from_slice(payload);
+                    }
+                }
+            }
+            Self::IndexEntry { header, entry } => {
+                buf.push(UNDO_INDEX_ENTRY);
+                buf.extend_from_slice(&header.to_le_bytes());
+                buf.extend_from_slice(&u16_of(entry.len()).to_le_bytes());
+                buf.extend_from_slice(entry);
+            }
+        }
+    }
+
+    /// The undo at the start of `bytes`, and the bytes after it.
+    fn decode(bytes: &'a [u8]) -> Result<(Self, &'a [u8])> {
+        let mut r = Reader(bytes);
+        let undo = match r.u8()? {
+            UNDO_HEAP => {
+                let rid = Rid::new(r.i32()?, r.u16()?);
+                let keep_len = match r.u16()? {
+                    KEEP_ALL => None,
+                    len => Some(len.into()),
+                };
+                let before = match r.u8()? {
+                    BEFORE_INSERTED => Before::Inserted,
+                    BEFORE_META => Before::Meta(r.meta()?),
+                    BEFORE_TUPLE => {
+                        let meta = r.meta()?;
+                        let len = r.u16()?.into();
+                        Before::Tuple {
+                            meta,
+                            payload: r.bytes(len)?,
+                        }
+                    }
+                    other => return Err(corrupt_undo(other)),
+                };
+                Self::Heap {
+                    rid,
+                    keep_len,
+                    before,
+                }
+            }
+            UNDO_INDEX_ENTRY => {
+                let header = r.i32()?;
+                let len = r.u16()?.into();
+                Self::IndexEntry {
+                    header,
+                    entry: r.bytes(len)?,
+                }
+            }
+            other => return Err(corrupt_undo(other)),
+        };
+        Ok((undo, r.0))
+    }
+}
+
+fn corrupt_undo(tag: u8) -> StorageError {
+    StorageError::CorruptLog(format!("unknown undo {tag}"))
 }
 
 /// The body of a record that changes pages (`Update`, `Clr`, `Completion`

@@ -3,15 +3,19 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use common::{
-    ColumnReader, INVALID_PAGE_ID, PageId, Rid, Schema, SlotId, Tuple, Value, ValueError, ValueRef,
+    Column, ColumnReader, DataType, INVALID_PAGE_ID, PageId, Rid, Schema, SlotId, Tuple, Value,
+    ValueError, ValueRef,
 };
 
+use crate::buffer::arc_replacer::AccessType;
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::buffer::traced_buffer_pool_manager::TracedBufferPoolManager;
-use crate::error::Result;
+use crate::error::{Result, StorageError};
 use crate::index::btree::Btree;
 use crate::index::{IndexMetadata, IndexTrait, LocatorKind, RowLocator};
+use crate::page::btree_header_page::BtreeHeaderPage;
 use crate::page::btree_page::{KeyComparator, check_key_size};
+use crate::wal::Logged;
 
 type Tree = Btree<EntryComparator>;
 
@@ -134,6 +138,15 @@ enum EntryLayout {
     KeyPk,
 }
 
+impl EntryLayout {
+    fn of(locator: LocatorKind) -> Self {
+        match locator {
+            LocatorKind::Rid => Self::KeyRid,
+            LocatorKind::PrimaryKey => Self::KeyPk,
+        }
+    }
+}
+
 /// Orders a `BtreeIndex`'s entries by key, then by what follows the key (a
 /// rid, or a primary key's bytes) to separate rows with equal keys.
 ///
@@ -148,6 +161,50 @@ pub struct EntryComparator {
 }
 
 impl EntryComparator {
+    fn new(key_schema: Arc<Schema>, layout: EntryLayout) -> Self {
+        Self {
+            keys: KeySchemaComparator::new(key_schema),
+            layout,
+        }
+    }
+
+    /// The comparator whose `describe` gave `format`, with a key schema of
+    /// unnamed, nullable columns of the described types: the order depends
+    /// on nothing else.
+    fn from_format(format: &[u8], header_page_id: PageId) -> Result<Self> {
+        let mismatch = || StorageError::BtreeMismatch(header_page_id);
+        let (&[layout, num_columns], mut rest) =
+            format.split_first_chunk::<2>().ok_or_else(mismatch)?;
+        let layout = match layout {
+            1 => EntryLayout::KeyRid,
+            2 => EntryLayout::KeyPk,
+            _ => return Err(mismatch()),
+        };
+        let mut columns = Vec::with_capacity(num_columns.into());
+        for _ in 0..num_columns {
+            let (&tag, after) = rest.split_first().ok_or_else(mismatch)?;
+            rest = after;
+            let data_type = match tag {
+                1 => DataType::Int,
+                2 => DataType::BigInt,
+                3 => DataType::Double,
+                4 => DataType::Bool,
+                5 => {
+                    let (len, after) = rest.split_first_chunk::<4>().ok_or_else(mismatch)?;
+                    rest = after;
+                    DataType::Varchar(u32::from_le_bytes(*len))
+                }
+                6 => DataType::Timestamptz,
+                _ => return Err(mismatch()),
+            };
+            columns.push(Column::new("", data_type, true));
+        }
+        if !rest.is_empty() {
+            return Err(mismatch());
+        }
+        Ok(Self::new(Arc::new(Schema::new(columns)), layout))
+    }
+
     /// The entry for `key` in the row at `locator`.
     fn entry(&self, key: &[u8], locator: &RowLocator) -> Vec<u8> {
         let locator_len = match locator {
@@ -201,6 +258,31 @@ impl KeyComparator for EntryComparator {
             EntryLayout::KeyPk => {
                 let ((a_key, a_pk), (b_key, b_pk)) = (split_pk(a), split_pk(b));
                 self.keys.compare(a_key, b_key).then(a_pk.cmp(b_pk))
+            }
+        }
+    }
+
+    /// `layout u8 | num_columns u8 | column*`, a column being its type's
+    /// tag, and for a VARCHAR its length as a little-endian `u32`.
+    fn describe(&self, out: &mut Vec<u8>) {
+        out.push(match self.layout {
+            EntryLayout::KeyRid => 1,
+            EntryLayout::KeyPk => 2,
+        });
+        let columns = self.keys.key_schema.columns();
+        out.push(u8::try_from(columns.len()).expect("a key has few columns"));
+        for column in columns {
+            match column.data_type {
+                DataType::Int => out.push(1),
+                DataType::BigInt => out.push(2),
+                DataType::Double => out.push(3),
+                DataType::Bool => out.push(4),
+                DataType::Varchar(len) => {
+                    out.push(5);
+                    out.extend_from_slice(&len.to_le_bytes());
+                }
+                DataType::Timestamptz => out.push(6),
+                DataType::Array => unreachable!("arrays are never stored"),
             }
         }
     }
@@ -297,14 +379,10 @@ impl BtreeIndex {
         header_page_id: PageId,
         bpm: Arc<BufferPoolManager>,
     ) -> Result<Self> {
-        let layout = match metadata.locator() {
-            LocatorKind::Rid => EntryLayout::KeyRid,
-            LocatorKind::PrimaryKey => EntryLayout::KeyPk,
-        };
-        let comparator = EntryComparator {
-            keys: KeySchemaComparator::new(Arc::clone(metadata.key_schema())),
-            layout,
-        };
+        let comparator = EntryComparator::new(
+            Arc::clone(metadata.key_schema()),
+            EntryLayout::of(metadata.locator()),
+        );
         let tree = Tree::new(
             metadata.name(),
             header_page_id,
@@ -312,6 +390,19 @@ impl BtreeIndex {
             comparator,
         )?;
         Ok(Self { metadata, tree })
+    }
+
+    /// Opens the tree of the index whose header page is `header_page_id`,
+    /// ordered as the header records, without the catalog: undo runs
+    /// before the catalog can be read.
+    pub(crate) fn open_tree(bpm: Arc<BufferPoolManager>, header_page_id: PageId) -> Result<Tree> {
+        let comparator = {
+            let guard = bpm.checked_read_page(header_page_id, AccessType::Index)?;
+            let header = BtreeHeaderPage::new(guard.get_data())?;
+            EntryComparator::from_format(header.entry_format(), header_page_id)?
+        };
+        let bpm = Arc::new(TracedBufferPoolManager::new(bpm));
+        Tree::new("", header_page_id, bpm, comparator)
     }
 
     /// The tree, whose keys are entries as its comparator's `key_of` reads
@@ -427,7 +518,7 @@ impl IndexTrait for BtreeIndex {
 
     /// Fails with `KeyTooLarge` if the encoded key is longer than
     /// `MAX_KEY_SIZE`, or too long to fit in an entry with the primary key.
-    fn insert_entry(&self, key: &Tuple, locator: &RowLocator) -> Result<bool> {
+    fn insert_entry(&self, key: &Tuple, locator: &RowLocator, by: Logged<'_>) -> Result<bool> {
         self.check_locator(locator);
         let (max, rid) = match locator {
             RowLocator::Rid(rid) => (Self::MAX_KEY_SIZE, *rid),
@@ -438,7 +529,7 @@ impl IndexTrait for BtreeIndex {
         };
         check_key_size(key.data(), max)?;
         let entry = self.tree.comparator().entry(key.data(), locator);
-        self.tree.insert(&entry, rid)
+        self.tree.insert_by(by, &entry, rid)
     }
 
     fn delete_entry(&self, key: &Tuple, locator: &RowLocator) -> Result<bool> {

@@ -347,10 +347,13 @@ fn assert_logged_as_ops(
 fn a_heap_insert_into_a_dirty_page_logs_only_the_row() {
     let db = setup(4);
     let heap = TableHeap::create(Arc::clone(&db.bpm)).unwrap();
-    heap.insert(&TupleMeta::new(1), &row(b"first")).unwrap();
+    heap.insert(Logged::System, &TupleMeta::new(1), &row(b"first"))
+        .unwrap();
     let before = in_memory(&db.bpm, heap.first_page_id());
     let end = db.bpm.log().end();
-    let rid = heap.insert(&TupleMeta::new(2), &row(b"second")).unwrap();
+    let rid = heap
+        .insert(Logged::System, &TupleMeta::new(2), &row(b"second"))
+        .unwrap();
 
     let after = in_memory(&db.bpm, rid.page_id);
     assert_eq!(page_lsn(&after), end);
@@ -398,10 +401,13 @@ fn a_new_heap_page_is_logged_as_ops_that_format_it() {
 fn the_first_change_after_a_write_logs_the_whole_page() {
     let db = setup(4);
     let heap = TableHeap::create(Arc::clone(&db.bpm)).unwrap();
-    heap.insert(&TupleMeta::new(1), &row(b"first")).unwrap();
+    heap.insert(Logged::System, &TupleMeta::new(1), &row(b"first"))
+        .unwrap();
     db.bpm.flush_page(heap.first_page_id()).unwrap();
     let end = db.bpm.log().end();
-    let rid = heap.insert(&TupleMeta::new(2), &row(b"second")).unwrap();
+    let rid = heap
+        .insert(Logged::System, &TupleMeta::new(2), &row(b"second"))
+        .unwrap();
 
     let (pages, _) = logged(&db.bpm, end);
     assert_eq!(page_ids(&pages), [rid.page_id]);
@@ -412,7 +418,8 @@ fn the_first_change_after_a_write_logs_the_whole_page() {
 
     let before = in_memory(&db.bpm, rid.page_id);
     let next = db.bpm.log().end();
-    heap.insert(&TupleMeta::new(3), &row(b"third")).unwrap();
+    heap.insert(Logged::System, &TupleMeta::new(3), &row(b"third"))
+        .unwrap();
     let after = in_memory(&db.bpm, rid.page_id);
     assert_logged_as_ops(&db.bpm, next, rid.page_id, &before, &after);
 }
@@ -448,7 +455,9 @@ fn a_page_changed_raw_after_its_ops_is_logged_as_an_image() {
 fn ops_larger_than_the_page_are_logged_as_an_image() {
     let db = setup(4);
     let heap = TableHeap::create(Arc::clone(&db.bpm)).unwrap();
-    let rid = heap.insert(&TupleMeta::new(1), &row(b"row")).unwrap();
+    let rid = heap
+        .insert(Logged::System, &TupleMeta::new(1), &row(b"row"))
+        .unwrap();
     let mtr = db.bpm.mtr(Logged::System);
     let mut page = mtr.write_page(rid.page_id).unwrap();
     for len in [MAX_PAYLOAD_SIZE, 1, MAX_PAYLOAD_SIZE] {
@@ -456,6 +465,7 @@ fn ops_larger_than_the_page_are_logged_as_an_image() {
             slot: rid.slot,
             meta: TupleMeta::new(2),
             payload: &vec![7; len],
+            padded_to: len,
         };
         page.apply(set).unwrap();
     }

@@ -8,13 +8,15 @@
 //! that would break Tid order as `Conflict`; the caller then aborts the
 //! transaction.
 //!
-//! Every write goes into the write set, by table, so that commit can clear
-//! the bit on each written tuple (`TableHeap::stamp_commit`) and abort can
-//! put back each tuple's version from before the transaction
-//! (`TableHeap::rollback`). Either way, the tuples it leaves deleted go to
-//! the `TransactionManager`, which ends the Tid in the watermark. Its
-//! background collector reclaims them once the watermark passes the Tid,
-//! with the undo records below it.
+//! Every write is logged as the transaction's (`wal::TxnLog`), and goes
+//! into the write set, by table. Commit logs `Commit` and waits for it to
+//! be durable, then clears the bit on each written tuple in page order.
+//! Abort takes the writes back from the log (`wal::undo`). Either way, the
+//! tuples it leaves deleted go to the `TransactionManager`, which ends the
+//! Tid in the watermark. Its background collector reclaims them once the
+//! watermark passes the Tid, with the undo records below it. Once `Commit`
+//! or `Abort` is logged, a failure stops the process, and recovery
+//! finishes the transaction from the log.
 //!
 //! Index entries are added at once and never removed by a write: the
 //! entries a transaction's writes leave behind are retired, and garbage
@@ -22,11 +24,8 @@
 //!
 //! **Known gaps.** Phantoms: read timestamps guard the tuples a transaction
 //! read, not rows inserted later that it should have seen, so schedules
-//! with inserts are not serializable. Nothing is logged, so a commit or
-//! abort that fails partway leaves some tuples done and the rest locked,
-//! and the transaction stays running; a crash does the same to every
-//! running transaction. Reclaimed tuples keep their slots (see
-//! `table_page`).
+//! with inserts are not serializable. Reclaimed tuples keep their slots
+//! (see `table_page`).
 
 use std::collections::{HashMap, HashSet};
 use std::mem;
@@ -47,6 +46,8 @@ use crate::table::table_heap::TableHeap;
 use crate::table::table_iterator::{TableIterator, TableRow};
 use crate::table::table_page::TupleMeta;
 use crate::table::undo_log::UndoLog;
+use crate::wal::txn_log::{self, TxnLog};
+use crate::wal::{Logged, NoUnwind, fatal, undo};
 
 /// What an ended transaction leaves for garbage collection: the tuples it
 /// left deleted and the index entries it retired. `built` holds the entries
@@ -96,6 +97,7 @@ pub enum TransactionState {
 /// Debug builds panic if that happens.
 pub struct Transaction {
     tid: TxnId,
+    log: TxnLog,
     /// Reads and writes hold this shared for their whole call, and commit
     /// and abort exclusively, so a transaction never ends halfway through a
     /// write and misses it.
@@ -108,9 +110,9 @@ pub struct Transaction {
     write_set: Mutex<HashMap<PageId, TableWrites, IntKeys>>,
     /// The manager's entry lock; see `index_versions`.
     entry_lock: Arc<RwLock<()>>,
-    /// The index entries this transaction added or found already there,
-    /// oldest first.
-    index_writes: Mutex<Vec<IndexWrite>>,
+    /// The index entries this transaction needed and found already there.
+    /// The ones it added are in the log, which an abort undoes.
+    found: Mutex<Vec<TableEntry>>,
     /// The index entries this transaction's writes left behind.
     retired: Mutex<Vec<TableEntry>>,
     /// The index entries `build_index` added.
@@ -124,30 +126,24 @@ pub struct Transaction {
 type EndHook = Box<dyn FnOnce(TransactionState) + Send>;
 
 /// The tuples a transaction wrote in one table, keyed by the table's first
-/// page. The schema is kept because rollback decodes the deltas.
+/// page, each with the payload length its commit keeps: the length of the
+/// newest payload it wrote there, or `None` if it only deleted the tuple.
 struct TableWrites {
     heap: Arc<TableHeap>,
-    schema: Schema,
-    rids: HashSet<Rid, IntKeys>,
-}
-
-/// An index entry a transaction needs: one it `added`, or found already in
-/// the index.
-struct IndexWrite {
-    entry: TableEntry,
-    added: bool,
+    rids: HashMap<Rid, Option<usize>, IntKeys>,
 }
 
 impl Transaction {
     pub(crate) fn new(
-        tid: TxnId,
+        log: TxnLog,
         undo: Arc<UndoLog>,
         read_ts: Arc<ReadTimestamps>,
         watermark: Arc<Watermark>,
         entry_lock: Arc<RwLock<()>>,
     ) -> Self {
         Self {
-            tid,
+            tid: log.tid(),
+            log,
             state: RwLock::new(TransactionState::Running),
             undo,
             read_ts,
@@ -155,7 +151,7 @@ impl Transaction {
             oldest: AtomicBool::new(false),
             write_set: Mutex::new(HashMap::default()),
             entry_lock,
-            index_writes: Mutex::new(Vec::new()),
+            found: Mutex::new(Vec::new()),
             retired: Mutex::new(Vec::new()),
             built: Mutex::new(Vec::new()),
             on_end: Mutex::new(Vec::new()),
@@ -173,10 +169,8 @@ impl Transaction {
 
     /// Runs `hook` with the outcome once the transaction's writes are
     /// committed or rolled back, newest hook first, for a change made
-    /// outside the heap, such as a sequence restart. If ending the writes
-    /// fails partway, hooks are told `Aborted`, so that outcome must be the
-    /// safe one. A hook runs with the state locked and must not use the
-    /// transaction.
+    /// outside the heap, such as a sequence restart. A hook runs with the
+    /// state locked and must not use the transaction.
     pub fn on_end(&self, hook: impl FnOnce(TransactionState) + Send + 'static) -> Result<()> {
         let _state = self.running()?;
         self.on_end.lock().push(Box::new(hook));
@@ -215,14 +209,15 @@ impl Transaction {
         new: &Tuple,
     ) -> Result<Rid> {
         let _running = self.running()?;
-        match heap.update_versioned(rid, new, self.write_ts(), schema, &self.undo, &self.read_ts) {
+        let (ts, undo, read_ts) = (self.write_ts(), &*self.undo, &*self.read_ts);
+        match heap.update_versioned(self.logged(), rid, new, ts, schema, undo, read_ts) {
             Ok(()) => {
-                self.record_write(heap, schema, rid);
+                self.record_write(heap, rid, Some(new.len()));
                 Ok(rid)
             }
             Err(StorageError::PageFull) => {
-                heap.delete_versioned(rid, self.write_ts(), &self.undo, &self.read_ts)?;
-                self.record_write(heap, schema, rid);
+                heap.delete_versioned(self.logged(), rid, ts, undo, read_ts)?;
+                self.record_write(heap, rid, None);
                 self.insert_locked(heap, schema, new)
             }
             Err(e) => Err(e),
@@ -230,16 +225,17 @@ impl Transaction {
     }
 
     /// Deletes the tuple at `rid`. Fails as `update` does.
-    pub fn delete(&self, heap: &Arc<TableHeap>, schema: &Schema, rid: Rid) -> Result<()> {
+    pub fn delete(&self, heap: &Arc<TableHeap>, rid: Rid) -> Result<()> {
         let _running = self.running()?;
-        heap.delete_versioned(rid, self.write_ts(), &self.undo, &self.read_ts)?;
-        self.record_write(heap, schema, rid);
+        let ts = self.write_ts();
+        heap.delete_versioned(self.logged(), rid, ts, &self.undo, &self.read_ts)?;
+        self.record_write(heap, rid, None);
         Ok(())
     }
 
     /// Makes sure `index`, one of `table`'s, holds `key` for the row at
-    /// `locator`, which this transaction has just written at `rid`. Abort
-    /// removes the entry if this added it.
+    /// `locator`, which this transaction has just written at `rid`. An
+    /// abort removes the entry if this added it.
     ///
     /// In a unique index the key must also be free, as `index_versions`
     /// describes: returns `false`, adding nothing, if the row this
@@ -257,7 +253,7 @@ impl Transaction {
         let _running = self.running()?;
         let added = {
             let _entries = self.entry_lock.read();
-            index.insert_entry(key, locator)?
+            index.insert_entry(key, locator, self.logged())?
         };
         let free = match index_versions::must_be_free(index, key) {
             Ok(true) => self.key_is_free(table, index, key, rid),
@@ -265,21 +261,21 @@ impl Transaction {
             Err(e) => Err(e),
         };
         if matches!(free, Ok(false)) {
+            // Redo-only: undoing the insert finds the entry gone.
             if added {
                 index.delete_entry(key, locator)?;
             }
             return Ok(false);
         }
-        // Recorded on `Conflict` too, for abort to remove.
-        self.index_writes.lock().push(IndexWrite {
-            entry: TableEntry {
+        // Recorded on `Conflict` too, for an abort to retire.
+        if !added {
+            self.found.lock().push(TableEntry {
                 table: Arc::clone(table),
                 index: Arc::clone(index),
                 key: key.clone(),
                 locator: locator.clone(),
-            },
-            added,
-        });
+            });
+        }
         free
     }
 
@@ -335,9 +331,10 @@ impl Transaction {
                 for (key, locator) in
                     index_versions::row_entries(table, index, rid, watermark, &self.undo)?
                 {
+                    // Redo-only: an index that is never recorded is never read.
                     {
                         let _entries = self.entry_lock.read();
-                        index.insert_entry(&key, &locator)?;
+                        index.insert_entry(&key, &locator, Logged::System)?;
                     }
                     self.built.lock().push(TableEntry {
                         table: Arc::clone(table),
@@ -405,28 +402,36 @@ impl Transaction {
         })
     }
 
-    /// Clears the lock on every tuple written, or rolls each back along
-    /// with the index entries added, and sets the state to `outcome`.
-    /// Returns the garbage: the tuples left deleted (those deleted by a
-    /// commit, and those inserted by an abort), the entries retired by a
-    /// commit or found already there by an abort, and either way the
-    /// entries an index build added. The manager calls this before ending
-    /// the Tid.
+    /// Commits or rolls back every write, runs the `on_end` hooks, and sets
+    /// the state to `outcome`. Returns the garbage: the tuples left deleted
+    /// (those deleted by a commit, and those inserted by an abort), the
+    /// entries retired by a commit or found already there by an abort, and
+    /// either way the entries an index build added. The manager calls this
+    /// before ending the Tid. Fails only if the transaction has ended.
     pub(crate) fn finish(&self, outcome: TransactionState) -> Result<Garbage> {
         let mut state = self.state.write();
         if *state != TransactionState::Running {
             return Err(StorageError::TransactionNotRunning(self.tid));
         }
+        // Past `Commit` or `Abort`, unwinding would leave the transaction
+        // running for a caller to end the other way.
+        let _ending = NoUnwind("ending a transaction");
         let mut garbage = Garbage::default();
-        let ended = self.end_writes(outcome, &mut garbage);
-        let told = if ended.is_ok() {
-            outcome
-        } else {
-            TransactionState::Aborted
+        garbage.built.append(&mut self.built.lock());
+        let write_set = mem::take(&mut *self.write_set.lock());
+        let committed = match outcome {
+            TransactionState::Committed => self.commit_writes(write_set, &mut garbage),
+            TransactionState::Aborted => {
+                self.roll_back_writes(write_set, &mut garbage);
+                false
+            }
+            TransactionState::Running => unreachable!("a transaction ends running"),
         };
         let hooks = mem::take(&mut *self.on_end.lock());
-        hooks.into_iter().rev().for_each(|hook| hook(told));
-        ended?;
+        hooks.into_iter().rev().for_each(|hook| hook(outcome));
+        if committed {
+            self.log.end();
+        }
         garbage.deferred = mem::take(&mut *self.after_readers.lock())
             .into_iter()
             .map(|work| Box::new(move || work(outcome)) as Box<dyn FnOnce() + Send>)
@@ -435,44 +440,57 @@ impl Transaction {
         Ok(garbage)
     }
 
-    fn end_writes(&self, outcome: TransactionState, garbage: &mut Garbage) -> Result<()> {
-        let mut index_writes = self.index_writes.lock();
-        let mut retired = self.retired.lock();
-        garbage.built.append(&mut self.built.lock());
-        if outcome == TransactionState::Aborted {
-            while let Some(IndexWrite { entry, added }) = index_writes.pop() {
-                if added {
-                    entry.index.delete_entry(&entry.key, &entry.locator)?;
-                } else {
-                    garbage.entries.push(entry);
-                }
-            }
-            retired.clear();
-        } else {
-            index_writes.clear();
-            garbage.entries.append(&mut retired);
+    /// Logs `Commit`, then stamps the tuples in `write_set`, in page order.
+    /// Returns whether `Commit` was logged: a transaction without records
+    /// logs none, and no `End` either.
+    fn commit_writes(
+        &self,
+        write_set: HashMap<PageId, TableWrites, IntKeys>,
+        garbage: &mut Garbage,
+    ) -> bool {
+        self.found.lock().clear();
+        garbage.entries.append(&mut self.retired.lock());
+        if !self.log.commit() {
+            debug_assert!(write_set.is_empty(), "writes that logged nothing");
+            return false;
         }
-        let mut write_set = self.write_set.lock();
-        for table in write_set.values() {
-            for &rid in &table.rids {
-                let is_deleted = match outcome {
-                    TransactionState::Committed => {
-                        table.heap.stamp_commit(rid, self.tid, &table.schema)?
-                    }
-                    TransactionState::Aborted => {
-                        table
-                            .heap
-                            .rollback(rid, self.tid, &table.schema, &self.undo)?
-                    }
-                    TransactionState::Running => unreachable!("a transaction ends running"),
-                };
-                if is_deleted {
-                    garbage.tuples.push((Arc::clone(&table.heap), rid));
-                }
+        for table in write_set.into_values() {
+            let mut writes: Vec<_> = table.rids.into_iter().collect();
+            writes.sort_unstable_by_key(|&(rid, _)| rid);
+            let deleted = |rid| garbage.tuples.push((Arc::clone(&table.heap), rid));
+            if let Err(e) = txn_log::stamp(&self.log, &writes, deleted) {
+                fatal(format_args!(
+                    "cannot stamp the commit of transaction {}: {e}",
+                    self.tid
+                ));
             }
         }
-        write_set.clear();
-        Ok(())
+        true
+    }
+
+    /// Takes back every write the log holds, including the index entries
+    /// added. The ones found already there may still be needed by others,
+    /// so they become garbage.
+    fn roll_back_writes(
+        &self,
+        write_set: HashMap<PageId, TableWrites, IntKeys>,
+        garbage: &mut Garbage,
+    ) {
+        garbage.entries.append(&mut self.found.lock());
+        self.retired.lock().clear();
+        let inserted: HashSet<Rid, IntKeys> = match undo::rollback(&self.log) {
+            Ok(inserted) => inserted.into_iter().collect(),
+            Err(e) => fatal(format_args!(
+                "cannot roll back transaction {}: {e}",
+                self.tid
+            )),
+        };
+        for table in write_set.into_values() {
+            let tuples = table.rids.into_keys().filter(|rid| inserted.contains(rid));
+            garbage
+                .tuples
+                .extend(tuples.map(|rid| (Arc::clone(&table.heap), rid)));
+        }
     }
 
     pub(crate) fn undo_log(&self) -> &Arc<UndoLog> {
@@ -506,6 +524,10 @@ impl Transaction {
         self.tid | TXN_UNCOMMITTED_BIT
     }
 
+    fn logged(&self) -> Logged<'_> {
+        Logged::Txn(&self.log)
+    }
+
     /// Inserts `tuple` locked and records it. The caller holds `running`.
     fn insert_locked(&self, heap: &Arc<TableHeap>, schema: &Schema, tuple: &Tuple) -> Result<Rid> {
         let mut has_nulls = false;
@@ -516,8 +538,8 @@ impl Transaction {
             has_nulls,
             ..TupleMeta::new(self.write_ts())
         };
-        let rid = heap.insert(&meta, tuple)?;
-        self.record_write(heap, schema, rid);
+        let rid = heap.insert(self.logged(), &meta, tuple)?;
+        self.record_write(heap, rid, Some(tuple.len()));
         Ok(rid)
     }
 
@@ -645,17 +667,18 @@ impl Transaction {
         })
     }
 
-    fn record_write(&self, heap: &Arc<TableHeap>, schema: &Schema, rid: Rid) {
-        self.write_set
-            .lock()
+    /// Records a write to the tuple at `rid`, which gave it a payload of
+    /// `keep_len` bytes unpadded, or left its payload alone.
+    fn record_write(&self, heap: &Arc<TableHeap>, rid: Rid, keep_len: Option<usize>) {
+        let mut write_set = self.write_set.lock();
+        let table = write_set
             .entry(heap.first_page_id())
             .or_insert_with(|| TableWrites {
                 heap: Arc::clone(heap),
-                schema: schema.clone(),
-                rids: HashSet::default(),
-            })
-            .rids
-            .insert(rid);
+                rids: HashMap::default(),
+            });
+        let kept = table.rids.entry(rid).or_insert(keep_len);
+        *kept = keep_len.or(*kept);
     }
 }
 

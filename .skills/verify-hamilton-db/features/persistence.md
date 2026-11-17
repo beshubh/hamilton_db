@@ -54,7 +54,7 @@ Preconditions:
 
 ## Gotchas
 
-- Opening the files after `hdb crash` replays the log, so every statement that returned before the kill is there. A statement still running at the kill is not. With several connections writing, another connection's commit can sync an unfinished transaction's writes, and those rows survive locked: reading them fails with a serialization error, because recovery does not roll back unfinished transactions yet. Don't swap `crash` for `restart` to prove durability.
+- Opening the files after `hdb crash` replays the log, so every statement that returned before the kill is there. A statement still running at the kill is not, and neither is anything from a transaction block left open: recovery rolls those back, so no row stays locked. Don't swap `crash` for `restart` to prove durability.
 - The port changes on every start. Anything holding the old port (an open `hdb repl` tab, a `psql` in another pane) is dead after a restart.
 - `hdb restart` doesn't rebuild. To test that a new build reads an old database, `hdb stop && hdb up`.
 - Bumping the catalog `VERSION` makes old files unreadable by design: start over with `hdb down && hdb up`.

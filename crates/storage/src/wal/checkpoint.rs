@@ -11,14 +11,7 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::error::{Result, StorageError};
-
-#[cfg(test)]
-thread_local! {
-    /// Runs in `take` after it reads the log's end and before it scans the
-    /// frames, so a test can change and write a page in between.
-    static AFTER_START: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
-        const { std::cell::RefCell::new(None) };
-}
+use crate::wal::txn_log::Att;
 
 /// What recovery needs to know about the log as of a checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,14 +28,18 @@ pub(crate) struct Checkpoint {
     /// Pages whose changes may not be on disk, each with the first record
     /// that changed it since it was last written.
     pub dirty: Vec<(PageId, Lsn)>,
+    /// The transactions with records before `start_lsn` and no `End`.
+    pub att: Att,
 }
 
 impl Checkpoint {
-    /// The oldest record recovery from this checkpoint reads. It never
-    /// moves back from one checkpoint to the next, so the log segments
-    /// wholly before it are never needed again.
+    /// The oldest record recovery from this checkpoint reads: redo's start,
+    /// or the first record of a transaction it may have to finish or undo.
+    /// It never moves back from one checkpoint to the next, so the log
+    /// segments wholly before it are never needed again.
     pub(crate) fn log_needed_from(&self) -> Lsn {
-        self.redo_lsn.min(self.start_lsn)
+        let oldest_txn = self.att.oldest_first_lsn().unwrap_or(self.start_lsn);
+        self.redo_lsn.min(self.start_lsn).min(oldest_txn)
     }
 
     /// The checkpoint in `bytes`, as `encode` wrote it. A database has none
@@ -56,15 +53,16 @@ impl Checkpoint {
                 redo_lsn: end,
                 next_page_id: 0,
                 dirty: Vec::new(),
+                att: Att::default(),
             });
         }
         let corrupt = || StorageError::CorruptMetadata("bad checkpoint".into());
-        let (head, entries) = bytes.split_at_checked(24).ok_or_else(corrupt)?;
+        let (head, rest) = bytes.split_at_checked(24).ok_or_else(corrupt)?;
         let u64_at = |at: usize| u64::from_le_bytes(head[at..at + 8].try_into().unwrap());
         let num_dirty = u32::from_le_bytes(head[20..24].try_into().unwrap()) as usize;
-        if entries.len() != num_dirty * DIRTY_ENTRY {
-            return Err(corrupt());
-        }
+        let (entries, rest) = rest
+            .split_at_checked(num_dirty * DIRTY_ENTRY)
+            .ok_or_else(corrupt)?;
         let dirty = entries
             .chunks_exact(DIRTY_ENTRY)
             .map(|entry| {
@@ -72,17 +70,23 @@ impl Checkpoint {
                 (page_id, u64::from_le_bytes(entry[4..].try_into().unwrap()))
             })
             .collect();
+        let (att, rest) = Att::decode(rest)?;
+        if !rest.is_empty() {
+            return Err(corrupt());
+        }
         Ok(Self {
             start_lsn: u64_at(0),
             redo_lsn: u64_at(8),
             next_page_id: PageId::from_le_bytes(head[16..20].try_into().unwrap()),
             dirty,
+            att,
         })
     }
 
     /// Lays the checkpoint out as `start_lsn: u64, redo_lsn: u64,
-    /// next_page_id: i32, num_dirty: u32, (page_id: i32, rec_lsn: u64)*`,
-    /// all little-endian.
+    /// next_page_id: i32, num_dirty: u32, (page_id: i32, rec_lsn: u64)*,
+    /// att`, all little-endian, the transaction table as `Att::encode` lays
+    /// it out.
     fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(24 + self.dirty.len() * DIRTY_ENTRY);
         bytes.extend_from_slice(&self.start_lsn.to_le_bytes());
@@ -93,6 +97,7 @@ impl Checkpoint {
             bytes.extend_from_slice(&page_id.to_le_bytes());
             bytes.extend_from_slice(&rec_lsn.to_le_bytes());
         }
+        self.att.encode(&mut bytes);
         bytes
     }
 }
@@ -146,18 +151,19 @@ pub(crate) fn sharp(bpm: &BufferPoolManager) -> Result<Checkpoint> {
 fn take(bpm: &BufferPoolManager, last_start: &mut Lsn) -> Result<Checkpoint> {
     let log = bpm.log();
     let disk = bpm.disk_manager();
-    let start_lsn = log.end();
-    #[cfg(test)]
-    AFTER_START.with_borrow_mut(|hook| hook.as_mut().map(|hook| hook()));
+    // Under the log's lock, so a page left out of `dirty` takes its next
+    // change after `start_lsn`, logged whole: redo never reads a page from
+    // disk. A free logged before `start_lsn` and applied after the
+    // directory copy is still pending, so redo reads from it.
+    let (start_lsn, att, dirty, pending_free) = log.at_end(|end, att| {
+        let pending_free = bpm.checkpoints().oldest_pending_free();
+        (end, att.clone(), bpm.dirty_pages(), pending_free)
+    });
     // Frames are scanned before the directory is copied. A page the scan
     // finds clean finished its write, and a first write's slot is in the
     // directory before the frame is marked clean, so the copy has it. A page
     // still dirty is redone from the record at its rec_lsn, which replaces
     // all of it.
-    let dirty = bpm.dirty_pages();
-    // A free logged before `start_lsn` and applied after the copy is still
-    // pending here, so redo reads from it.
-    let pending_free = bpm.checkpoints().oldest_pending_free();
     let directory = disk.directory();
     let next_page_id = bpm.next_page_id();
     // The log is synced first. The frees the copy shows, and the writes of
@@ -174,6 +180,7 @@ fn take(bpm: &BufferPoolManager, last_start: &mut Lsn) -> Result<Checkpoint> {
         redo_lsn,
         next_page_id,
         dirty,
+        att,
     };
     // Saving it would replace a checkpoint recovery can start from with one
     // it cannot.
@@ -266,9 +273,10 @@ mod tests {
     use crate::page::PAGE_SIZE;
     use crate::page::page_header::PageHeader;
     use crate::table::table_heap::TableHeap;
-    use crate::table::table_page::TupleMeta;
+    use crate::table::table_page::{TablePage, TupleMeta};
     use crate::wal::mtr::{BEFORE_FREES, Logged};
-    use common::{PageId, Rid, Tuple};
+    use crate::wal::txn_log::TxnLog;
+    use common::{PageId, Tuple};
     use tempfile::TempDir;
 
     fn open(dir: &TempDir) -> crate::Storage {
@@ -307,43 +315,6 @@ mod tests {
         Tuple::from_bytes(bytes.to_vec())
     }
 
-    /// A heap with two rows, whose page a fuzzy checkpoint does not list
-    /// though the log changes it after the checkpoint began. The second
-    /// row's insert is logged as an op, and the page written, between the
-    /// checkpoint reading the log's end and scanning the frames.
-    fn heap_the_checkpoint_missed(storage: &crate::Storage) -> (TableHeap, Rid) {
-        let heap = TableHeap::create(Arc::clone(&storage.bpm)).unwrap();
-        heap.insert(&TupleMeta::new(1), &row(b"first")).unwrap();
-        let (bpm, first) = (Arc::clone(&storage.bpm), heap.first_page_id());
-        let inserted = Arc::new(parking_lot::Mutex::new(None));
-        let rid = Arc::clone(&inserted);
-        AFTER_START.set(Some(Box::new(move || {
-            let heap = TableHeap::open(Arc::clone(&bpm), first).unwrap();
-            let second = heap.insert(&TupleMeta::new(2), &row(b"second")).unwrap();
-            bpm.flush_page(second.page_id).unwrap();
-            *rid.lock() = Some(second);
-        })));
-        fuzzy(&storage.bpm).unwrap();
-        AFTER_START.set(None);
-        let rid = inserted.lock().expect("the checkpoint ran the hook");
-        (heap, rid)
-    }
-
-    #[test]
-    fn ops_a_page_has_on_disk_are_not_made_again() {
-        let dir = TempDir::new().unwrap();
-        let storage = open(&dir);
-        let (heap, rid) = heap_the_checkpoint_missed(&storage);
-        let first = heap.first_page_id();
-        drop((heap, storage));
-
-        let storage = open(&dir);
-        let heap = TableHeap::open(Arc::clone(&storage.bpm), first).unwrap();
-        let rows: Vec<_> = heap.iter().unwrap().map(|row| row.unwrap().1).collect();
-        assert_eq!(rows.len(), 2, "{rows:?}");
-        assert_eq!(heap.get(rid).unwrap().0, TupleMeta::new(2));
-    }
-
     /// Flips a byte of the page's copy on disk, as a torn write would.
     fn tear(storage: &crate::Storage, page_id: PageId) {
         let disk = storage.bpm.disk_manager();
@@ -353,13 +324,20 @@ mod tests {
         disk.write_page(page_id, &data).unwrap();
     }
 
+    /// A page clean when a fuzzy checkpoint began logs all of itself with
+    /// its next change, so a torn write of it after the checkpoint is
+    /// repaired without reading its copy on disk.
     #[test]
-    fn ops_for_a_torn_page_wait_for_a_record_that_replaces_it() {
+    fn a_page_torn_after_a_checkpoint_is_redone_from_its_next_change() {
         let dir = TempDir::new().unwrap();
         let storage = open(&dir);
-        let (heap, rid) = heap_the_checkpoint_missed(&storage);
-        // The page is clean, so this change logs all of it.
-        heap.update_meta(rid, &TupleMeta::new(3)).unwrap();
+        let heap = TableHeap::create(Arc::clone(&storage.bpm)).unwrap();
+        let rid = heap
+            .insert(Logged::System, &TupleMeta::new(1), &row(b"first"))
+            .unwrap();
+        storage.bpm.flush_page(rid.page_id).unwrap();
+        fuzzy(&storage.bpm).unwrap();
+        heap.update_meta(rid, &TupleMeta::new(2)).unwrap();
         storage.bpm.flush_page(rid.page_id).unwrap();
         tear(&storage, rid.page_id);
         let first = heap.first_page_id();
@@ -367,22 +345,31 @@ mod tests {
 
         let storage = open(&dir);
         let heap = TableHeap::open(Arc::clone(&storage.bpm), first).unwrap();
-        assert_eq!(heap.get(rid).unwrap().0, TupleMeta::new(3));
+        assert_eq!(heap.get(rid).unwrap().0, TupleMeta::new(2));
+        let guard = storage.bpm.read_page(rid.page_id, AccessType::Unknown);
+        assert!(TablePage::new(guard.get_data()).is_ok());
     }
 
     #[test]
-    fn a_torn_page_no_later_record_replaces_fails_the_open() {
+    fn a_checkpoint_saves_the_transactions_without_an_end() {
         let dir = TempDir::new().unwrap();
         let storage = open(&dir);
-        let (heap, rid) = heap_the_checkpoint_missed(&storage);
-        tear(&storage, rid.page_id);
-        drop((heap, storage));
-
-        let path = dir.path().join("test.db");
-        let opened = crate::open_with(Arc::new(OsFs), path, 4, None, crate::wal::SEGMENT_SIZE);
-        let Err(StorageError::CorruptLog(msg)) = opened else {
-            panic!("the open did not fail");
-        };
-        assert!(msg.contains(&format!("page {}", rid.page_id)), "{msg}");
+        let log = storage.bpm.log();
+        let (running, done) = (TxnLog::new(7, Arc::clone(&storage.bpm)), 8);
+        let heap = TableHeap::create(Arc::clone(&storage.bpm)).unwrap();
+        heap.insert(Logged::Txn(&running), &TupleMeta::new(7), &row(b"r"))
+            .unwrap();
+        let ended = TxnLog::new(done, Arc::clone(&storage.bpm));
+        heap.insert(Logged::Txn(&ended), &TupleMeta::new(8), &row(b"e"))
+            .unwrap();
+        ended.end();
+        let checkpoint = sharp(&storage.bpm).unwrap();
+        let entries = checkpoint.att.entries();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].0, 7);
+        assert_eq!(Some(entries[0].1.last_lsn), log.last_lsn(7));
+        assert!(checkpoint.log_needed_from() <= entries[0].1.first_lsn);
+        let decoded = Checkpoint::decode(&checkpoint.encode(), 0).unwrap();
+        assert_eq!(decoded, checkpoint);
     }
 }

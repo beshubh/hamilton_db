@@ -2,12 +2,14 @@
 //! and removal, so a test can build the files a crash after any of them
 //! would leave behind: what was synced, plus some, all or none of what was
 //! not.
+#![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use storage::disk::fs::{Fs, FsFile};
@@ -156,6 +158,8 @@ pub struct CrashFs(Arc<Shared>);
 
 struct Shared {
     state: Mutex<State>,
+    /// How long each sync takes before what it covers is durable.
+    sync_delay: Mutex<Duration>,
 }
 
 struct State {
@@ -180,7 +184,14 @@ impl CrashFs {
                 events: Vec::new(),
                 locked: HashSet::new(),
             }),
+            sync_delay: Mutex::new(Duration::ZERO),
         }))
+    }
+
+    /// Makes each sync take `delay` before what it covers is durable, as a
+    /// disk's flush takes time.
+    pub fn slow_syncs(&self, delay: Duration) {
+        *self.0.sync_delay.lock() = delay;
     }
 
     /// Writes, size changes, syncs, replaces and removals so far.
@@ -388,6 +399,7 @@ impl FsFile for Handle {
     }
 
     fn sync(&self) -> io::Result<()> {
+        std::thread::sleep(*self.fs.0.sync_delay.lock());
         self.record(Event::Sync {
             path: self.path.clone(),
         })

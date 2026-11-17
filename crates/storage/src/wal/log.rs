@@ -15,12 +15,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use common::Lsn;
+use common::{Lsn, TxnId};
 use parking_lot::{Mutex, RwLock};
 
 use crate::disk::fs::{Fs, FsFile};
 use crate::error::{Result, StorageError};
 use crate::wal::record::{HEADER_SIZE, Record, RecordBuf, record_len, seal};
+use crate::wal::txn_log::Att;
 
 /// Bytes before the first record in a segment: magic, version, padding, the
 /// first record's LSN, and reserved space.
@@ -30,7 +31,8 @@ const FILE_HEADER_SIZE: u64 = 32;
 pub const FIRST_LSN: Lsn = FILE_HEADER_SIZE;
 
 const MAGIC: u64 = u64::from_le_bytes(*b"HAMDBWAL");
-const VERSION: u32 = 1;
+/// 2: `Update` and `Clr` records carry undo, and `HeapSetTuple` its padding.
+const VERSION: u32 = 2;
 
 /// Appends stop to flush once the tail holds this much. A record larger
 /// than this still goes in, alone.
@@ -66,6 +68,8 @@ struct Tail {
     /// LSN of `buf[0]`.
     start: Lsn,
     buf: Vec<u8>,
+    /// Changed only as records are appended, so it always agrees with them.
+    att: Att,
 }
 
 struct Io {
@@ -138,6 +142,7 @@ impl Log {
             tail: Mutex::new(Tail {
                 start: end,
                 buf: Vec::with_capacity(BUFFER_SIZE),
+                att: Att::default(),
             }),
             io: Mutex::new(Io {
                 batch: Vec::with_capacity(BUFFER_SIZE),
@@ -151,11 +156,12 @@ impl Log {
     }
 
     /// Appends `record`, which `RecordBuf::finish` has ended, and returns
-    /// its LSN. `link(lsn)` runs inside the critical section and returns the
-    /// record's `prev_lsn`: whatever it records about `lsn` is seen by
-    /// anyone who appends after. Flushes first if the tail is full. Fails
-    /// only if an earlier flush failed.
-    pub fn append(&self, record: &RecordBuf, link: impl FnOnce(Lsn) -> Lsn) -> Result<Lsn> {
+    /// its LSN. The record's `prev_lsn` is its transaction's last record,
+    /// from the active transaction table, which the record then updates.
+    /// `on_append(lsn)` runs inside the critical section: whatever it
+    /// records about `lsn` is seen by anyone who appends after. Flushes
+    /// first if the tail is full. Fails only if an earlier flush failed.
+    pub fn append(&self, record: &RecordBuf, on_append: impl FnOnce(Lsn)) -> Result<Lsn> {
         debug_assert!(
             record.len() >= HEADER_SIZE,
             "append of an unfinished record"
@@ -172,7 +178,8 @@ impl Log {
             let lsn = tail.start + tail.buf.len() as Lsn;
             let at = tail.buf.len();
             tail.buf.extend_from_slice(record.bytes());
-            let prev_lsn = link(lsn);
+            let prev_lsn = tail.att.link(record.tid(), record.kind(), lsn);
+            on_append(lsn);
             seal(&mut tail.buf[at..], lsn, prev_lsn, record.tail_crc());
             return Ok(lsn);
         }
@@ -244,6 +251,25 @@ impl Log {
     pub fn end(&self) -> Lsn {
         let tail = self.tail.lock();
         tail.start + tail.buf.len() as Lsn
+    }
+
+    /// Runs `f` with the LSN the next record will get and the active
+    /// transaction table, holding off appends meanwhile.
+    pub(crate) fn at_end<R>(&self, f: impl FnOnce(Lsn, &Att) -> R) -> R {
+        let tail = self.tail.lock();
+        f(tail.start + tail.buf.len() as Lsn, &tail.att)
+    }
+
+    /// The last record of transaction `tid`, unless it has none or has
+    /// ended.
+    pub fn last_lsn(&self, tid: TxnId) -> Option<Lsn> {
+        self.tail.lock().att.get(tid).map(|entry| entry.last_lsn)
+    }
+
+    /// Makes `att`, which recovery rebuilt, the active transaction table,
+    /// so the records that finish its transactions chain onto theirs.
+    pub(crate) fn restore_att(&self, att: Att) {
+        self.tail.lock().att = att;
     }
 
     /// One past the last durable byte.

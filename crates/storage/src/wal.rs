@@ -8,13 +8,17 @@ pub mod mtr;
 pub mod op;
 pub mod record;
 mod recovery;
+pub mod txn_log;
+pub(crate) mod undo;
 
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub use mtr::{Logged, Mtr, MtrPage};
 pub use op::PageOp;
+pub use txn_log::TxnLog;
 
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::disk::disk_manager::DiskManager;
@@ -84,4 +88,37 @@ pub fn open_with(
     let checkpointer =
         checkpoint_interval.map(|interval| Checkpointer::start(Arc::clone(&bpm), interval));
     Ok(Storage { bpm, checkpointer })
+}
+
+/// Stops the process on a failure that leaves a change in memory the log
+/// cannot account for. Unwinding would let the change reach disk, or let a
+/// caller take back a commit that a crash keeps; recovery finishes the work
+/// from the log instead.
+pub(crate) fn fatal(why: fmt::Arguments<'_>) -> ! {
+    eprintln!("hamilton: {why}");
+    std::process::abort()
+}
+
+/// Runs `f` until it gets a frame. Work that must finish once begun, such
+/// as stamping a durable commit or undoing a write, would otherwise stop
+/// the process when other transactions briefly pin every frame.
+pub(crate) fn when_a_frame_is_free<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
+    loop {
+        match f() {
+            Err(crate::error::StorageError::NoFreeFrame) => std::thread::yield_now(),
+            result => return result,
+        }
+    }
+}
+
+/// Stops the process if dropped while unwinding, for work that must not
+/// stop halfway once it began, such as stamping a commit that is durable.
+pub(crate) struct NoUnwind(pub(crate) &'static str);
+
+impl Drop for NoUnwind {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            fatal(format_args!("panicked while {}", self.0));
+        }
+    }
 }

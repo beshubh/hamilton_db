@@ -117,9 +117,12 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
 
     /// Opens the tree whose header page is `header_page_id`. A header page
     /// that was allocated but never written, as the catalog leaves it, is
-    /// formatted as an empty tree first.
+    /// formatted as an empty tree first, recording how `comparator` orders
+    /// keys and `NUM_TOMBS`.
     ///
-    /// Fails with `UnexpectedPageType` if the page is some other kind of page.
+    /// Fails with `UnexpectedPageType` if the page is some other kind of
+    /// page, and with `BtreeMismatch` if the tree was built with another
+    /// order or `NUM_TOMBS`.
     pub fn new(
         index_name: impl Into<String>,
         header_page_id: PageId,
@@ -127,12 +130,17 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
         comparator: CmpT,
     ) -> Result<Self> {
         {
+            let mut format = Vec::new();
+            comparator.describe(&mut format);
             let mtr = bpm.bpm().mtr(Logged::System);
             let mut header = bpm.write_page(&mtr, header_page_id)?;
             if page_type(header.data()) == Ok(PageType::Invalid) {
-                BtreeHeaderPage::init(header.raw_mut());
+                BtreeHeaderPage::init(header.raw_mut()).set_entry_format(NUM_TOMBS, &format);
             } else {
-                BtreeHeaderPage::new(header.data())?;
+                let header = BtreeHeaderPage::new(header.data())?;
+                if header.num_tombs() != NUM_TOMBS || header.entry_format() != format {
+                    return Err(StorageError::BtreeMismatch(header_page_id));
+                }
             }
         }
 
@@ -212,18 +220,26 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     ///
     /// Fails with `KeyTooLarge` if `key` is longer than `MAX_KEY_SIZE`.
     pub fn insert(&self, key: &[u8], rid: Rid) -> Result<bool> {
+        self.insert_by(Logged::System, key, rid)
+    }
+
+    /// `insert`, logged as `by`'s change. A transaction's insert is undone
+    /// by removing `key` from this tree, which `undo` opens from its header
+    /// alone, so the comparator must describe itself.
+    pub(crate) fn insert_by(&self, by: Logged<'_>, key: &[u8], rid: Rid) -> Result<bool> {
         check_key_size(key, Self::MAX_KEY_SIZE)?;
-        match self.insert_optimistic(key, rid)? {
+        match self.insert_optimistic(by, key, rid)? {
             Some(inserted) => Ok(inserted),
-            None => self.insert_pessimistic(key, rid),
+            None => self.insert_pessimistic(by, key, rid),
         }
     }
 
     /// Inserts `key` into its leaf, holding only read latches above it.
     /// Returns `None`, changing nothing, if the tree is empty or the leaf
     /// has no room for `key`: either needs the pessimistic insert.
-    fn insert_optimistic(&self, key: &[u8], rid: Rid) -> Result<Option<bool>> {
-        let mtr = self.mtr();
+    fn insert_optimistic(&self, by: Logged<'_>, key: &[u8], rid: Rid) -> Result<Option<bool>> {
+        let mtr = self.mtr(by);
+        mtr.undo_index_insert(self.header_page_id, key);
         let Some((mut guard, _)) = self.find_leaf_mut(&mtr, key)? else {
             return Ok(None);
         };
@@ -243,8 +259,9 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     ///
     /// On the way down, reaching a safe page releases every page above it,
     /// the header page included: a split stops there, so they do not change.
-    fn insert_pessimistic(&self, key: &[u8], rid: Rid) -> Result<bool> {
-        let mtr = self.mtr();
+    fn insert_pessimistic(&self, by: Logged<'_>, key: &[u8], rid: Rid) -> Result<bool> {
+        let mtr = self.mtr(by);
+        mtr.undo_index_insert(self.header_page_id, key);
         let mut ctx = Context::new();
         let mut header = self.bpm.write_page(&mtr, self.header_page_id)?;
         ctx.root_page_id = BtreeHeaderPage::new(header.data())?.root_page_id();
@@ -395,9 +412,14 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
 
     /// Removes `key`, if the tree holds it. Returns whether it did.
     pub fn remove(&self, key: &[u8]) -> Result<bool> {
-        match self.remove_optimistic(key)? {
+        self.remove_by(Logged::System, key)
+    }
+
+    /// `remove`, logged as `by`'s change, which must not need undo.
+    pub(crate) fn remove_by(&self, by: Logged<'_>, key: &[u8]) -> Result<bool> {
+        match self.remove_optimistic(by, key)? {
             Some(removed) => Ok(removed),
-            None => self.remove_pessimistic(key),
+            None => self.remove_pessimistic(by, key),
         }
     }
 
@@ -405,8 +427,8 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     /// returns whether it was there. Returns `None`, changing nothing, if
     /// that would leave the leaf underfull, or a root leaf empty: either
     /// needs the pessimistic remove.
-    fn remove_optimistic(&self, key: &[u8]) -> Result<Option<bool>> {
-        let mtr = self.mtr();
+    fn remove_optimistic(&self, by: Logged<'_>, key: &[u8]) -> Result<Option<bool>> {
+        let mtr = self.mtr(by);
         let Some((mut guard, is_root)) = self.find_leaf_mut(&mtr, key)? else {
             return Ok(Some(false));
         };
@@ -430,8 +452,8 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     /// On the way down, reaching a safe page releases every page above it,
     /// the header page included: rebalancing stops there, so they do not
     /// change.
-    fn remove_pessimistic(&self, key: &[u8]) -> Result<bool> {
-        let mtr = self.mtr();
+    fn remove_pessimistic(&self, by: Logged<'_>, key: &[u8]) -> Result<bool> {
+        let mtr = self.mtr(by);
         let mut ctx = Context::new();
         let header = self.bpm.write_page(&mtr, self.header_page_id)?;
         ctx.root_page_id = BtreeHeaderPage::new(header.data())?.root_page_id();
@@ -767,8 +789,8 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
         Ok(Some(guard))
     }
 
-    fn mtr(&self) -> Mtr<'_> {
-        self.bpm.bpm().mtr(Logged::System)
+    fn mtr<'a>(&'a self, by: Logged<'a>) -> Mtr<'a> {
+        self.bpm.bpm().mtr(by)
     }
 
     /// Descends to the leaf whose range holds `key` like `find_leaf`, but
