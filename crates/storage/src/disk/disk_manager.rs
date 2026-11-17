@@ -34,7 +34,6 @@ const META_VERSION: u32 = 2;
 /// to bytes another page wrote (docs/internals/recovery.md).
 pub struct DiskManager {
     db_file_name: PathBuf,
-    log_file_name: PathBuf,
     meta_file_name: PathBuf,
     fs: Arc<dyn Fs>,
     /// Only read and written with positioned I/O, so it needs no lock.
@@ -90,7 +89,6 @@ impl DiskManager {
     /// has `db_file` open.
     pub fn open(fs: Arc<dyn Fs>, db_file: impl AsRef<Path>) -> Result<Self> {
         let db_file_name = db_file.as_ref().to_path_buf();
-        let log_file_name = db_file_name.with_extension("log");
         let meta_file_name = db_file_name.with_extension("meta");
 
         let db_io = fs.open(&db_file_name)?;
@@ -122,7 +120,6 @@ impl DiskManager {
 
         Ok(Self {
             db_file_name,
-            log_file_name,
             meta_file_name,
             fs,
             db_io,
@@ -253,16 +250,8 @@ impl DiskManager {
         &self.db_file_name
     }
 
-    pub fn log_file_name(&self) -> &Path {
-        &self.log_file_name
-    }
-
     pub fn meta_file_name(&self) -> &Path {
         &self.meta_file_name
-    }
-
-    pub(crate) fn fs(&self) -> &dyn Fs {
-        &*self.fs
     }
 
     /// Keeps every page read and write from starting until the returned guard
@@ -519,7 +508,6 @@ mod tests {
         let (dir, dm) = setup();
         assert!(dir.path().join("test.db").exists());
         assert!(dir.path().join("test.meta").exists());
-        assert_eq!(dm.log_file_name(), dir.path().join("test.log"));
         assert_eq!(
             dm.db_file_size().unwrap(),
             (DEFAULT_DB_IO_SIZE * PAGE_SIZE) as u64

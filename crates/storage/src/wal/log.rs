@@ -1,29 +1,32 @@
-//! The write-ahead log file and its in-memory tail.
+//! The write-ahead log: an in-memory tail, and segment files on disk.
 //!
 //! An LSN is the byte position of a record's first byte in the log as if it
-//! had never been cut: the file header names the LSN its first record has,
-//! so a log can start over in a new file (`start_over`) without page LSNs on
-//! disk going stale. No record is at `INVALID_LSN`. Flushes cut
-//! at record boundaries, so the record at `lsn` is durable exactly when
-//! `lsn < durable_end()`.
+//! were one file without headers, starting at `FIRST_LSN`. On disk the log
+//! is cut into segments, `<path>.00000001` on, each starting with a header
+//! that names its first record's LSN, which is where the previous segment
+//! ends. No record spans two segments, and none is at `INVALID_LSN`.
+//! Flushes cut at record boundaries, so the record at `lsn` is durable
+//! exactly when `lsn < durable_end()`.
 
+use std::ffi::OsString;
 use std::io;
 use std::mem;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use common::Lsn;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::disk::fs::{Fs, FsFile};
 use crate::error::{Result, StorageError};
 use crate::wal::record::{HEADER_SIZE, Record, RecordBuf, record_len, seal};
 
-/// Bytes before the first record in the file: magic, version, padding, the
+/// Bytes before the first record in a segment: magic, version, padding, the
 /// first record's LSN, and reserved space.
 const FILE_HEADER_SIZE: u64 = 32;
 
-/// The first LSN of a log that has never started over.
+/// The LSN of the first record a log ever holds.
 pub const FIRST_LSN: Lsn = FILE_HEADER_SIZE;
 
 const MAGIC: u64 = u64::from_le_bytes(*b"HAMDBWAL");
@@ -33,25 +36,25 @@ const VERSION: u32 = 1;
 /// than this still goes in, alone.
 const BUFFER_SIZE: usize = 1 << 20;
 
-/// How much a scan reads from the file at a time.
+/// How much a scan reads from a segment at a time.
 const SCAN_CHUNK: usize = 64 << 10;
 
-/// The log: records are appended to an in-memory tail and reach the file
-/// when someone needs them durable.
-///
-/// `flush_to` is group commit without a thread: the first caller to find its
-/// record not yet durable takes the I/O lock, swaps out the whole tail and
-/// writes and syncs it, and every caller whose record was in that batch
-/// returns when it is done. Lock order is `io`, then `tail`; `append` never
-/// holds `tail` while it waits for `io`.
+/// The log. `flush_to` is group commit without a thread: the first caller
+/// whose record is not durable writes and syncs the whole tail for everyone.
+/// Lock order is `io`, then `tail`, then `segments`; `append` never holds
+/// `tail` while it waits for `io`.
 pub struct Log {
-    file: Box<dyn FsFile>,
-    /// LSN of the first record in the file.
-    base: Lsn,
+    fs: Arc<dyn Fs>,
+    /// Segment `n` is this path with `.n`, eight digits at least, appended.
+    path: PathBuf,
+    /// A batch starts a new segment once the last holds this many bytes.
+    segment_size: u64,
     tail: Mutex<Tail>,
-    /// Held by the caller writing a batch. Holds the buffer it writes from,
-    /// swapped with the tail's so neither allocates after the first batch.
-    io: Mutex<Vec<u8>>,
+    /// Held by the caller writing a batch.
+    io: Mutex<Io>,
+    /// Every segment, oldest first. Only a caller holding `io` adds one, and
+    /// the last, which batches go to, is never removed.
+    segments: RwLock<Vec<Segment>>,
     durable_end: AtomicU64,
     /// Set when a write or sync failed. The batch it held is lost, so no
     /// later record can be made durable after it.
@@ -65,74 +68,86 @@ struct Tail {
     buf: Vec<u8>,
 }
 
-impl Log {
-    /// Opens the log at `path` on `fs`, creating it if needed. The log ends
-    /// at the first record that is cut short or fails its checksum, which is
-    /// where a crash in the middle of a write leaves it; anything after that
-    /// is cut off the file.
-    pub fn open(fs: &dyn Fs, path: impl AsRef<Path>) -> Result<Self> {
-        let file = fs.open(path.as_ref())?;
-        let len = file.size()?;
-        let base = if len < FILE_HEADER_SIZE {
-            file.set_size(0)?;
-            file.write_at(&file_header(FIRST_LSN), 0)?;
-            file.sync()?;
-            FIRST_LSN
-        } else {
-            let mut header = [0u8; FILE_HEADER_SIZE as usize];
-            file.read_at(&mut header, 0)?;
-            if u64::from_le_bytes(header[..8].try_into().unwrap()) != MAGIC {
-                return Err(corrupt("not a hamilton_db log file"));
-            }
-            let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
-            if version != VERSION {
-                return Err(corrupt(format!("unsupported log version {version}")));
-            }
-            let base = u64::from_le_bytes(header[16..24].try_into().unwrap());
-            if base < FIRST_LSN {
-                return Err(corrupt(format!("first lsn {base} is inside the header")));
-            }
-            base
-        };
+struct Io {
+    /// The buffer a batch is written from, swapped with the tail's so
+    /// neither allocates after the first batch.
+    batch: Vec<u8>,
+    /// The last segment.
+    segment: Segment,
+}
 
-        let file_lsns = base + (file.size()? - FILE_HEADER_SIZE);
+#[derive(Clone)]
+struct Segment {
+    seq: u64,
+    /// LSN of its first record.
+    base: Lsn,
+    file: Arc<dyn FsFile>,
+}
+
+impl Segment {
+    /// One past the LSN of the last byte in the file.
+    fn file_end(&self) -> Result<Lsn> {
+        Ok(self.base + self.file.size()? - FILE_HEADER_SIZE)
+    }
+}
+
+impl Log {
+    /// Opens the log whose segments are `path` with a number appended,
+    /// creating the first if there is none, and cuts the last segment at its
+    /// first torn record. Fails with `CorruptLog` if a segment is missing or
+    /// does not go on from where the one before it ends.
+    pub fn open(fs: Arc<dyn Fs>, path: impl AsRef<Path>, segment_size: u64) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let mut segments: Vec<Segment> = Vec::new();
+        for seq in segment_numbers(&*fs, &path)? {
+            let file: Arc<dyn FsFile> = Arc::from(fs.open(&segment_path(&path, seq))?);
+            let base = read_header(&*file, seq)?;
+            if let Some(prev) = segments.last() {
+                if seq != prev.seq + 1 {
+                    return Err(corrupt(format!("log segment {} is missing", prev.seq + 1)));
+                }
+                let prev_end = prev.file_end()?;
+                if base != prev_end {
+                    return Err(corrupt(format!(
+                        "log segment {seq} starts at {base}, but segment {} ends at {prev_end}",
+                        prev.seq
+                    )));
+                }
+            }
+            segments.push(Segment { seq, base, file });
+        }
+        if segments.is_empty() {
+            segments.push(create_segment(&*fs, &path, 1, FIRST_LSN)?);
+        }
+
+        let last = segments.last().expect("the log has a segment").clone();
+        let file_end = last.file_end()?;
         let end = {
-            let mut scan = FileScan::new(&*file, base, base, file_lsns);
+            let mut scan = FileScan::new(vec![last.clone()], last.base, file_end);
             while scan.next_record()?.is_some() {}
             scan.pos
         };
-        if end < file_lsns {
-            file.set_size(offset_of(base, end))?;
-            file.sync()?;
+        if end < file_end {
+            last.file.set_size(offset_of(last.base, end))?;
+            last.file.sync()?;
         }
         Ok(Self {
-            file,
-            base,
+            fs,
+            path,
+            segment_size,
             tail: Mutex::new(Tail {
                 start: end,
                 buf: Vec::with_capacity(BUFFER_SIZE),
             }),
-            io: Mutex::new(Vec::with_capacity(BUFFER_SIZE)),
+            io: Mutex::new(Io {
+                batch: Vec::with_capacity(BUFFER_SIZE),
+                segment: last,
+            }),
+            segments: RwLock::new(segments),
             durable_end: AtomicU64::new(end),
             failed: AtomicBool::new(false),
             num_syncs: AtomicUsize::new(0),
         })
-    }
-
-    /// Replaces the log file at `path` with an empty one that goes on from
-    /// the end of this log, once nothing in it is needed any more. Every
-    /// record must be durable.
-    pub(crate) fn start_over(&mut self, fs: &dyn Fs, path: &Path) -> Result<()> {
-        let end = self.end();
-        assert_eq!(
-            self.durable_end(),
-            end,
-            "start_over with records not durable"
-        );
-        fs.replace(path, &file_header(end))?;
-        self.file = fs.open(path)?;
-        self.base = end;
-        Ok(())
     }
 
     /// Appends `record`, which `RecordBuf::finish` has ended, and returns
@@ -171,34 +186,48 @@ impl Log {
         if self.durable_end.load(Ordering::Acquire) > lsn {
             return Ok(());
         }
-        let mut batch = self.io.lock();
+        let mut io = self.io.lock();
         self.check_failed()?;
         if self.durable_end.load(Ordering::Acquire) > lsn {
             return Ok(());
         }
+        let io = &mut *io;
         let start = {
             let mut tail = self.tail.lock();
             debug_assert!(
                 lsn < tail.start + tail.buf.len() as Lsn,
                 "flush_to({lsn}) past the end of the log"
             );
-            mem::swap(&mut tail.buf, &mut *batch);
+            mem::swap(&mut tail.buf, &mut io.batch);
             let start = tail.start;
-            tail.start += batch.len() as Lsn;
+            tail.start += io.batch.len() as Lsn;
             start
         };
-        let written = self
-            .file
-            .write_at(&batch, offset_of(self.base, start))
-            .and_then(|()| self.file.sync());
-        if let Err(e) = written {
+        if let Err(e) = self.write_batch(io, start) {
             self.failed.store(true, Ordering::Release);
-            return Err(e.into());
+            return Err(e);
         }
         self.durable_end
-            .store(start + batch.len() as Lsn, Ordering::Release);
-        batch.clear();
+            .store(start + io.batch.len() as Lsn, Ordering::Release);
+        io.batch.clear();
         self.num_syncs.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Writes and syncs the batch, whose first record is at `start`. Starts
+    /// a new segment first if the last is full: every record before `start`
+    /// is durable by now, so a segment is never left behind with a torn end.
+    fn write_batch(&self, io: &mut Io, start: Lsn) -> Result<()> {
+        if start - io.segment.base >= self.segment_size {
+            let segment = create_segment(&*self.fs, &self.path, io.segment.seq + 1, start)?;
+            self.segments.write().push(segment.clone());
+            io.segment = segment;
+        }
+        let segment = &io.segment;
+        segment
+            .file
+            .write_at(&io.batch, offset_of(segment.base, start))?;
+        segment.file.sync()?;
         Ok(())
     }
 
@@ -223,7 +252,7 @@ impl Log {
     }
 
     /// Copies the record at `lsn` into `buf` and views it there. The record
-    /// may still be in memory or already in the file.
+    /// may still be in memory or already in a segment.
     pub fn read<'b>(&self, lsn: Lsn, buf: &'b mut Vec<u8>) -> Result<Record<'b>> {
         buf.clear();
         {
@@ -236,42 +265,78 @@ impl Log {
         }
         if buf.is_empty() {
             // Already swapped out of the tail: once the batch holding it is
-            // done, it is in the file.
+            // done, it is in its segment.
             drop(self.io.lock());
             self.check_failed()?;
-            if lsn < self.base || lsn >= self.durable_end() {
+            let (segment, end) = self.segment_holding(lsn).ok_or_else(|| no_record(lsn))?;
+            if lsn + HEADER_SIZE as Lsn > end {
                 return Err(no_record(lsn));
             }
             buf.resize(HEADER_SIZE, 0);
-            read_exact_at(&*self.file, buf, offset_of(self.base, lsn))?;
+            let at = offset_of(segment.base, lsn);
+            read_exact_at(&*segment.file, buf, at)?;
             let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
-            if len < HEADER_SIZE || lsn + len as Lsn > self.durable_end() {
+            if len < HEADER_SIZE || lsn + len as Lsn > end {
                 return Err(no_record(lsn));
             }
             buf.resize(len, 0);
-            let body = offset_of(self.base, lsn) + HEADER_SIZE as u64;
-            read_exact_at(&*self.file, &mut buf[HEADER_SIZE..], body)?;
+            read_exact_at(
+                &*segment.file,
+                &mut buf[HEADER_SIZE..],
+                at + HEADER_SIZE as u64,
+            )?;
         }
         Record::decode(lsn, buf)?.ok_or_else(|| no_record(lsn))
     }
 
+    /// The segment holding the durable byte at `lsn`, and where its durable
+    /// part ends.
+    fn segment_holding(&self, lsn: Lsn) -> Option<(Segment, Lsn)> {
+        let durable_end = self.durable_end();
+        let segments = self.segments.read();
+        let next = segments.partition_point(|segment| segment.base <= lsn);
+        let end = segments.get(next).map_or(durable_end, |s| s.base);
+        let segment = segments.get(next.checked_sub(1)?)?;
+        (lsn < end).then(|| (segment.clone(), end))
+    }
+
     /// Reads the durable records from `from` on, in order. Records still in
     /// memory are not seen; flush first if they matter.
-    pub fn scan(&self, from: Lsn) -> LogScan<'_> {
-        LogScan(FileScan::new(
-            &*self.file,
-            self.base,
-            from,
-            self.durable_end(),
-        ))
+    pub fn scan(&self, from: Lsn) -> LogScan {
+        let segments = self.segments.read();
+        let first = segments.partition_point(|segment| segment.base <= from);
+        // A scan from before the first segment finds no record where it
+        // starts.
+        let segments = match first.checked_sub(1) {
+            Some(first) => segments[first..].to_vec(),
+            None => Vec::new(),
+        };
+        LogScan(FileScan::new(segments, from, self.durable_end()))
     }
 
-    /// LSN of the oldest record the file can hold.
+    /// Removes, oldest first, every segment whose records all come before
+    /// `lsn`, except the last. Each removal is durable before the next
+    /// starts, so a crash leaves the rest numbered without a gap.
+    pub fn remove_segments_before(&self, lsn: Lsn) -> Result<()> {
+        loop {
+            let oldest = match &self.segments.read()[..] {
+                [oldest, next, ..] if next.base <= lsn => oldest.seq,
+                _ => return Ok(()),
+            };
+            self.fs.remove(&segment_path(&self.path, oldest))?;
+            let mut segments = self.segments.write();
+            if segments.first().is_some_and(|s| s.seq == oldest) {
+                segments.remove(0);
+            }
+        }
+    }
+
+    /// LSN of the oldest record the log can hold.
     pub fn first_lsn(&self) -> Lsn {
-        self.base
+        self.segments.read()[0].base
     }
 
-    /// Number of syncs of the log file since it was opened.
+    /// Number of syncs of the log since it was opened.
     pub fn num_syncs(&self) -> usize {
         self.num_syncs.load(Ordering::Relaxed)
     }
@@ -285,20 +350,30 @@ impl Log {
 }
 
 /// A forward scan over durable records. See `Log::scan`.
-pub struct LogScan<'a>(FileScan<'a>);
+pub struct LogScan(FileScan);
 
-impl LogScan<'_> {
-    /// The next record, or `None` at the end of the log.
+impl LogScan {
+    /// The next record, or `None` at the end of the log. Fails with
+    /// `CorruptLog` where a record should be and none is, such as a
+    /// damaged record in a segment before the last.
     pub fn next_record(&mut self) -> Result<Option<Record<'_>>> {
-        self.0.next_record()
+        let pos = self.0.pos;
+        if pos >= self.0.limit {
+            return Ok(None);
+        }
+        match self.0.next_record()? {
+            Some(record) => Ok(Some(record)),
+            None => Err(no_record(pos)),
+        }
     }
 }
 
-/// Reads records from the file in chunks, up to `limit`.
-struct FileScan<'a> {
-    file: &'a dyn FsFile,
-    /// LSN at the end of the file header.
-    base: Lsn,
+/// Reads records from segments in chunks, up to `limit`.
+struct FileScan {
+    /// The segments it reads, oldest first. The first holds `pos`.
+    segments: Vec<Segment>,
+    /// Index in `segments` of the one holding `pos`.
+    at: usize,
     /// LSN of the next record.
     pos: Lsn,
     limit: Lsn,
@@ -307,11 +382,11 @@ struct FileScan<'a> {
     buf_start: Lsn,
 }
 
-impl<'a> FileScan<'a> {
-    fn new(file: &'a dyn FsFile, base: Lsn, from: Lsn, limit: Lsn) -> Self {
+impl FileScan {
+    fn new(segments: Vec<Segment>, from: Lsn, limit: Lsn) -> Self {
         Self {
-            file,
-            base,
+            segments,
+            at: 0,
             pos: from,
             limit,
             buf: Vec::new(),
@@ -319,7 +394,15 @@ impl<'a> FileScan<'a> {
         }
     }
 
+    /// The record at `pos`, or `None` if no whole, intact one starts there.
     fn next_record(&mut self) -> Result<Option<Record<'_>>> {
+        while self
+            .segments
+            .get(self.at + 1)
+            .is_some_and(|next| next.base <= self.pos)
+        {
+            self.at += 1;
+        }
         if !self.fill(HEADER_SIZE)? {
             return Ok(None);
         }
@@ -336,30 +419,106 @@ impl<'a> FileScan<'a> {
         Ok(Some(record))
     }
 
-    /// Makes `buf` hold `n` bytes from `pos`, reading more of the file if
-    /// needed. Returns `false` if the log ends first.
+    /// Makes `buf` hold `n` bytes from `pos`, reading more of the segment if
+    /// needed. Returns `false` if the segment, or the scan, ends first.
     fn fill(&mut self, n: usize) -> Result<bool> {
-        if self.pos + n as Lsn > self.limit {
+        let Some(segment) = self.segments.get(self.at) else {
+            return Ok(false);
+        };
+        let end = self
+            .segments
+            .get(self.at + 1)
+            .map_or(self.limit, |next| next.base.min(self.limit));
+        if self.pos + n as Lsn > end {
             return Ok(false);
         }
         let have = (self.buf_start + self.buf.len() as Lsn).saturating_sub(self.pos) as usize;
         if self.pos >= self.buf_start && have >= n {
             return Ok(true);
         }
-        let want = n.max(SCAN_CHUNK).min((self.limit - self.pos) as usize);
+        let want = n.max(SCAN_CHUNK).min((end - self.pos) as usize);
         self.buf.resize(want, 0);
-        read_exact_at(self.file, &mut self.buf, offset_of(self.base, self.pos))?;
+        read_exact_at(
+            &*segment.file,
+            &mut self.buf,
+            offset_of(segment.base, self.pos),
+        )?;
         self.buf_start = self.pos;
         Ok(true)
     }
 }
 
-/// Where the byte at `lsn` is in a file whose first record is at `base`.
+/// Where the byte at `lsn` is in a segment whose first record is at `base`.
 fn offset_of(base: Lsn, lsn: Lsn) -> u64 {
     lsn - base + FILE_HEADER_SIZE
 }
 
-/// The header of a log file whose first record is at `base`.
+fn segment_path(path: &Path, seq: u64) -> PathBuf {
+    let mut name = OsString::from(path.as_os_str());
+    name.push(format!(".{seq:08}"));
+    PathBuf::from(name)
+}
+
+/// The numbers of the segments of the log at `path`, in order.
+fn segment_numbers(fs: &dyn Fs, path: &Path) -> Result<Vec<u64>> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| corrupt(format!("bad log path {}", path.display())))?;
+    let prefix = format!("{name}.");
+    let files = fs.list(path.parent().unwrap_or(Path::new("")))?;
+    // A single-file log from before segments would otherwise be ignored,
+    // and the changes in it lost.
+    if files.iter().any(|file| file.to_str() == Some(name)) {
+        return Err(corrupt(format!(
+            "{} is a log from an older version; start the database fresh",
+            path.display()
+        )));
+    }
+    let mut numbers: Vec<u64> = files
+        .iter()
+        .filter_map(|file| {
+            let number = file.to_str()?.strip_prefix(&prefix)?;
+            number.bytes().all(|b| b.is_ascii_digit()).then_some(())?;
+            number.parse().ok()
+        })
+        .collect();
+    numbers.sort_unstable();
+    Ok(numbers)
+}
+
+/// Creates segment `seq`, whose first record will be at `base`. The file
+/// appears whole with its header, or not at all.
+fn create_segment(fs: &dyn Fs, path: &Path, seq: u64, base: Lsn) -> Result<Segment> {
+    let path = segment_path(path, seq);
+    fs.replace(&path, &file_header(base))?;
+    let file = Arc::from(fs.open(&path)?);
+    Ok(Segment { seq, base, file })
+}
+
+/// The LSN of the first record in segment `seq`, from its header.
+fn read_header(file: &dyn FsFile, seq: u64) -> Result<Lsn> {
+    let mut header = [0u8; FILE_HEADER_SIZE as usize];
+    if file.read_at(&mut header, 0)? < header.len() {
+        return Err(corrupt(format!("log segment {seq} has no header")));
+    }
+    if u64::from_le_bytes(header[..8].try_into().unwrap()) != MAGIC {
+        return Err(corrupt(format!(
+            "log segment {seq} is not a hamilton_db log file"
+        )));
+    }
+    let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    if version != VERSION {
+        return Err(corrupt(format!("unsupported log version {version}")));
+    }
+    let base = u64::from_le_bytes(header[16..24].try_into().unwrap());
+    if base < FIRST_LSN {
+        return Err(corrupt(format!("first lsn {base} is inside the header")));
+    }
+    Ok(base)
+}
+
+/// The header of a segment whose first record is at `base`.
 fn file_header(base: Lsn) -> [u8; FILE_HEADER_SIZE as usize] {
     let mut header = [0u8; FILE_HEADER_SIZE as usize];
     header[..8].copy_from_slice(&MAGIC.to_le_bytes());

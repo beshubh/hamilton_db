@@ -1,8 +1,10 @@
-//! An in-memory `Fs` that records every write, size change, sync and
-//! replace, so a test can build the files a crash after any of them would
-//! leave behind: what was synced, plus some, all or none of what was not.
+//! An in-memory `Fs` that records every write, size change, sync, replace
+//! and removal, so a test can build the files a crash after any of them
+//! would leave behind: what was synced, plus some, all or none of what was
+//! not.
 
 use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +30,9 @@ enum Event {
         path: PathBuf,
         bytes: Vec<u8>,
     },
+    Remove {
+        path: PathBuf,
+    },
 }
 
 /// What a crash does with each write not synced yet.
@@ -45,6 +50,9 @@ pub enum Lost {
 #[derive(Clone, Default)]
 struct Files {
     files: BTreeMap<PathBuf, File>,
+    /// Every file removed since the first fs, as it was then. Crashes keep
+    /// them, for `with_removed`.
+    removed: BTreeMap<PathBuf, Vec<u8>>,
 }
 
 #[derive(Clone, Default)]
@@ -84,6 +92,11 @@ impl Files {
                 file.durable = bytes.clone();
                 file.unsynced.clear();
             }
+            Event::Remove { path } => {
+                if let Some(file) = self.files.remove(path) {
+                    self.removed.insert(path.clone(), file.current);
+                }
+            }
         }
     }
 
@@ -120,7 +133,10 @@ impl Files {
                 (path.clone(), file)
             })
             .collect();
-        Self { files }
+        Self {
+            files,
+            removed: self.removed.clone(),
+        }
     }
 }
 
@@ -167,7 +183,7 @@ impl CrashFs {
         }))
     }
 
-    /// Writes, size changes, syncs and replaces so far.
+    /// Writes, size changes, syncs, replaces and removals so far.
     pub fn num_events(&self) -> usize {
         self.0.state.lock().events.len()
     }
@@ -175,12 +191,16 @@ impl CrashFs {
     /// A new fs holding the files a crash right after the first `n` events
     /// would leave, recording from there.
     pub fn crash_after(&self, n: usize, lost: Lost) -> CrashFs {
+        Self::from(self.files_after(n).crash(lost))
+    }
+
+    fn files_after(&self, n: usize) -> Files {
         let state = self.0.state.lock();
         let mut files = state.start.clone();
         for event in &state.events[..n] {
             files.apply(event);
         }
-        Self::from(files.crash(lost))
+        files
     }
 
     /// Calls `f` with each moment since this fs was made, in order: before
@@ -201,6 +221,31 @@ impl CrashFs {
     /// nothing would leave them.
     pub fn crash_now(&self) -> CrashFs {
         self.crash_after(self.num_events(), Lost::Nothing)
+    }
+
+    /// A new fs holding the files as they are now, and every file removed
+    /// since the first fs this one was crashed from, as it was then.
+    pub fn with_removed(&self) -> CrashFs {
+        let mut files = self.files_after(self.num_events()).crash(Lost::Nothing);
+        for (path, bytes) in std::mem::take(&mut files.removed) {
+            files.files.entry(path).or_insert_with(|| File {
+                current: bytes.clone(),
+                durable: bytes,
+                unsynced: Vec::new(),
+            });
+        }
+        Self::from(files)
+    }
+
+    /// The paths of the files in `dir` now, in order.
+    pub fn files_in(&self, dir: &Path) -> Vec<PathBuf> {
+        let state = self.0.state.lock();
+        let in_dir = state
+            .now
+            .files
+            .keys()
+            .filter(|path| path.parent() == Some(dir));
+        in_dir.cloned().collect()
     }
 
     /// The contents of `path` now.
@@ -268,6 +313,21 @@ impl Fs for CrashFs {
         });
         Ok(())
     }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        self.record(Event::Remove {
+            path: path.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn list(&self, dir: &Path) -> io::Result<Vec<OsString>> {
+        let names = self
+            .files_in(dir)
+            .into_iter()
+            .map(|path| path.file_name().expect("a file has a name").to_os_string());
+        Ok(names.collect())
+    }
 }
 
 struct Handle {
@@ -276,43 +336,61 @@ struct Handle {
     locked: Mutex<bool>,
 }
 
+impl Handle {
+    /// Runs `f` on what reads see of the file now. Fails once the file is
+    /// removed, where a real handle would go on, so that a test sees code
+    /// touch a file it removed.
+    fn with_current<T>(&self, f: impl FnOnce(&[u8]) -> T) -> io::Result<T> {
+        let state = self.fs.0.state.lock();
+        match state.now.files.get(&self.path) {
+            Some(file) => Ok(f(&file.current)),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} was removed", self.path.display()),
+            )),
+        }
+    }
+
+    fn record(&self, event: Event) -> io::Result<()> {
+        self.with_current(|_| ())?;
+        self.fs.record(event);
+        Ok(())
+    }
+}
+
 impl FsFile for Handle {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        let state = self.fs.0.state.lock();
-        let data = &state.now.files[&self.path].current;
-        let start = (offset as usize).min(data.len());
-        let n = buf.len().min(data.len() - start);
-        buf[..n].copy_from_slice(&data[start..start + n]);
-        Ok(n)
+        self.with_current(|data| {
+            let start = (offset as usize).min(data.len());
+            let n = buf.len().min(data.len() - start);
+            buf[..n].copy_from_slice(&data[start..start + n]);
+            n
+        })
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        self.fs.record(Event::Write {
+        self.record(Event::Write {
             path: self.path.clone(),
             offset,
             bytes: buf.to_vec(),
-        });
-        Ok(())
+        })
     }
 
     fn size(&self) -> io::Result<u64> {
-        let state = self.fs.0.state.lock();
-        Ok(state.now.files[&self.path].current.len() as u64)
+        self.with_current(|data| data.len() as u64)
     }
 
     fn set_size(&self, size: u64) -> io::Result<()> {
-        self.fs.record(Event::SetSize {
+        self.record(Event::SetSize {
             path: self.path.clone(),
             size,
-        });
-        Ok(())
+        })
     }
 
     fn sync(&self) -> io::Result<()> {
-        self.fs.record(Event::Sync {
+        self.record(Event::Sync {
             path: self.path.clone(),
-        });
-        Ok(())
+        })
     }
 
     fn try_lock(&self) -> io::Result<bool> {

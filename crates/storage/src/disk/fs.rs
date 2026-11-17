@@ -20,6 +20,13 @@ pub trait Fs: Send + Sync {
     /// Replaces the contents of `path` with `bytes` in one durable step: a
     /// crash leaves either the old file or the new one.
     fn replace(&self, path: &Path, bytes: &[u8]) -> io::Result<()>;
+
+    /// Deletes `path`, if there is such a file, in one durable step: once
+    /// this returns, a crash never brings it back.
+    fn remove(&self, path: &Path) -> io::Result<()>;
+
+    /// The names of the files in `dir`, the current directory if empty.
+    fn list(&self, dir: &Path) -> io::Result<Vec<OsString>>;
 }
 
 /// A file opened by an `Fs`, read and written at offsets.
@@ -76,6 +83,26 @@ impl Fs for OsFs {
         drop(tmp);
         fs::rename(&tmp_path, path)?;
         sync_parent_dir(path)
+    }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        sync_parent_dir(path)
+    }
+
+    fn list(&self, dir: &Path) -> io::Result<Vec<OsString>> {
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        fs::read_dir(dir)?
+            .map(|entry| Ok(entry?.file_name()))
+            .collect()
     }
 }
 

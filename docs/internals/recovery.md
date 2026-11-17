@@ -22,6 +22,14 @@ The record at a dirty page's `rec_lsn` holds the page's image, because every rec
 - a page whose first write the saved directory does not know about, which reads as zeros, and
 - a slot that still holds bytes the page wrote earlier.
 
+## The log is numbered segments
+
+The log is a run of segment files next to the database, `<name>.log.00000001` and up ([`log.rs`](../../crates/storage/src/wal/log.rs)). An LSN is a position in the log as if it were one file. A segment starts at the LSN where the one before it ends, and its header names that LSN, so page LSNs and checkpoints never need to know which segment holds a record.
+
+Segments are numbered instead of named by LSN, so a gap in the numbers shows a missing segment. Opening the log then fails with `CorruptLog` instead of reading on past the hole.
+
+A batch goes whole into one segment, and a new segment starts only once every record before it is durable. Every segment but the last is therefore complete, and opening the log checks that each one ends where the next begins. Only the last segment can end in a torn record, and only there does a bad record mark the end of the log. Anywhere else it is an error. A new segment appears with its header in one atomic step (`Fs::replace`), so a crash while starting one leaves no new segment or an empty one.
+
 ## The `.meta` file is the checkpoint
 
 The log has no checkpoint records. A checkpoint saves its record in the `.meta` file, next to the page directory. The record holds where analysis starts, where redo starts, the next page id, and the dirty pages. One atomic rename publishes the record and the directory together, so recovery always starts from a directory that matches its checkpoint. Only [`checkpoint.rs`](../../crates/storage/src/wal/checkpoint.rs) reads the record.
@@ -41,14 +49,23 @@ The thread that `storage::open` starts takes a fuzzy checkpoint every 30 seconds
 3. Scan the frames for dirty pages, note the oldest free that is logged but not applied yet, and only then copy the directory. A first write adds the page's slot to the directory before its frame is marked clean, so a page that the scan finds clean is in the copy, and a page still dirty gets redone from its image. An mtr applies its frees after it appends its record, so the copy may still list a freed page. Redo starts no later than that free and replays it.
 4. Sync the log, then the db file. Every free in the copy is now logged, and every write that the dirty page table leaves out is durable.
 5. Save the `.meta`, then release the slots that the copy no longer lists.
+6. Remove the log segments that the saved checkpoint no longer needs.
 
 A sharp checkpoint (`BufferPoolManager::checkpoint`) writes every dirty page first. `Storage::close` takes one. Recovery takes one when it ends, and TRUNCATE takes one before its commit. Dropping `Storage` without closing it is a crash, which is how tests crash a database.
 
-## Recovery replays frees and starts the log over
+## Checkpoints remove the log they no longer need
+
+After each `.meta` rename, the checkpoint removes every segment whose records all come before `Checkpoint::log_needed_from`, the oldest record that recovery from that checkpoint reads ([`checkpoint.rs`](../../crates/storage/src/wal/checkpoint.rs)). Today that is the earlier of the checkpoint's start and its redo start. Undo will add the first record of the oldest running transaction.
+
+The bound must never move back from one checkpoint to the next, or a new checkpoint would need log that an older one removed. It holds today because `rec_lsn` and pending frees are recorded under the log's lock. A dirty page or pending free older than the previous checkpoint's start was therefore already in that checkpoint, and pulled its bound down as far. A transaction table must be copied under the same lock for the same reason. A checkpoint whose bound is below the log's first LSN fails, and the saved `.meta` stays.
+
+Segments go oldest first, and each removal is durable before the next starts, so a crash never leaves a gap in the numbers. A crash after the rename and before a removal leaves old segments behind, and the next checkpoint removes them. The segment being written is never removed, so after recovery the log is one segment, which may still hold records from before recovery's checkpoint. Nothing reads them.
+
+## Recovery replays frees
 
 Redo replays every free from the checkpoint's redo start, not only those after a page's first record. Replaying a free twice does no harm, because page ids are never reused. The next page id is raised past every page the log names. An id that was handed out but never logged can be handed out again after a crash, since nothing durable names it.
 
-Recovery appends nothing to the log, so a crash anywhere in it leaves the files recovery started from. It ends with a sharp checkpoint, then starts the log over in a new file whose header names its first LSN, so page LSNs on disk stay comparable with the log's. The `.meta` is saved before the log starts over, and recovery refuses to start over if that checkpoint still needs any log. A log that ends before the checkpoint began makes the open fail. A `.meta` with no checkpoint belongs to a database whose first open never finished, so records in the log next to it are left from other files, and recovery skips them.
+Recovery appends nothing to the log, so a crash anywhere in it leaves files that recover the same pages. It ends with a sharp checkpoint. A log that lacks a record the checkpoint needs makes the open fail. A `.meta` with no checkpoint belongs to a database whose first open never finished, so records in the log next to it are left from other files, and recovery skips them.
 
 ## Commits sync the log
 
@@ -64,4 +81,6 @@ No log record names a transaction, so recovery replays page changes without know
 
 ## The log decides what a crash test expects
 
-[`recovery.rs`](../../crates/storage/tests/recovery.rs) runs a workload on [`CrashFs`](../../crates/storage/tests/util/crash_fs.rs), which records every write, sync, and rename. The test then recovers the files that a crash after each of those events would leave, with none, all, or a random part of the unsynced writes lost or torn. Every page must equal its last image in the records that survived. A new redo form needs a matching change to that oracle.
+[`recovery.rs`](../../crates/storage/tests/recovery.rs) runs a workload on [`CrashFs`](../../crates/storage/tests/util/crash_fs.rs), which records every write, sync, rename, and removal. The test then recovers the files that a crash after each of those events would leave, with none, all, or a random part of the unsynced writes lost or torn. Every page must equal its last image in the records that survived. `CrashFs` keeps every segment a checkpoint removed, and the oracle reads those too, so a page whose last record left the log is still checked against it. A new redo form needs a matching change to that oracle.
+
+A crash sweep must also start from a recovered database, because recovery leaves states a first crash never meets: pages last logged before the log's first segment, and free slots rebuilt from the `.meta`.

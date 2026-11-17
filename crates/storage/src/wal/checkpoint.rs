@@ -1,5 +1,6 @@
 //! Checkpoints: the record recovery starts from, saved in the `.meta` file
-//! together with the page directory, so one rename publishes both.
+//! together with the page directory, so one rename publishes both. Once it
+//! is saved, the log segments it no longer needs are removed.
 
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -29,6 +30,13 @@ pub(crate) struct Checkpoint {
 }
 
 impl Checkpoint {
+    /// The oldest record recovery from this checkpoint reads. It never
+    /// moves back from one checkpoint to the next, so the log segments
+    /// wholly before it are never needed again.
+    pub(crate) fn log_needed_from(&self) -> Lsn {
+        self.redo_lsn.min(self.start_lsn)
+    }
+
     /// The checkpoint in `bytes`, as `encode` wrote it. A database has none
     /// until its first open ends with a checkpoint, before it logs anything,
     /// so for empty `bytes` any records before the log's `end` belong to
@@ -156,8 +164,20 @@ fn take(bpm: &BufferPoolManager, last_start: &mut Lsn) -> Result<Checkpoint> {
         next_page_id,
         dirty,
     };
+    // Saving it would replace a checkpoint recovery can start from with one
+    // it cannot.
+    if checkpoint.log_needed_from() < log.first_lsn() {
+        return Err(StorageError::CorruptLog(format!(
+            "the checkpoint needs the log from {}, which was removed",
+            checkpoint.log_needed_from()
+        )));
+    }
     disk.save_meta(&directory, &checkpoint.encode())?;
     *last_start = start_lsn;
+    // The checkpoint is saved; a segment left behind is removed by the next.
+    if let Err(e) = log.remove_segments_before(checkpoint.log_needed_from()) {
+        eprintln!("hamilton: cannot remove old log segments: {e}");
+    }
     Ok(checkpoint)
 }
 
@@ -165,7 +185,7 @@ fn take(bpm: &BufferPoolManager, last_start: &mut Lsn) -> Result<Checkpoint> {
 const POLL: Duration = Duration::from_secs(1);
 
 /// The log growth that triggers a checkpoint before its interval is up.
-const LOG_GROWTH: u64 = 64 << 20;
+const LOG_GROWTH: u64 = crate::wal::SEGMENT_SIZE;
 
 /// A thread that takes a fuzzy checkpoint every interval, or sooner once
 /// the log has grown by `LOG_GROWTH`, until dropped.
@@ -237,7 +257,8 @@ mod tests {
     use tempfile::TempDir;
 
     fn open(dir: &TempDir) -> crate::Storage {
-        crate::open_with(Arc::new(OsFs), dir.path().join("test.db"), 4, None).unwrap()
+        let path = dir.path().join("test.db");
+        crate::open_with(Arc::new(OsFs), path, 4, None, crate::wal::SEGMENT_SIZE).unwrap()
     }
 
     #[test]

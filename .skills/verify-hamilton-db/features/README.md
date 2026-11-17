@@ -34,5 +34,5 @@ Keep implementation details out. Name only user paths, stable handles, required 
 - [SQL statements](./sql.md): DDL, DML, queries, types, identity columns, `TRUNCATE`, errors.
 - [Indexes](./indexes.md): primary keys, secondary and unique indexes, and proof that a query uses one.
 - [Transactions](./transactions.md): `BEGIN`/`COMMIT`/`ROLLBACK` and MVTO conflicts across connections.
-- [Persistence](./persistence.md): data across restarts, crashes, and the one-process-per-database rule.
+- [Persistence](./persistence.md): data across restarts and crashes, the one-process-per-database rule, and a log that stays bounded.
 - [Shell and clients](./shell.md): `hamilton-cli` commands and interactive shell, and `psql`.

@@ -10,20 +10,20 @@ use crate::wal::checkpoint::{self, Checkpoint};
 use crate::wal::record::{Kind, PageChanges, PageRedo, Record};
 
 /// Brings every page up to date with the log, from the checkpoint in the
-/// `.meta` file on, then takes a sharp checkpoint and starts the log over.
-/// Writes no records, so a crash in the middle of it leaves the database as
-/// it found it, to recover again.
-pub(crate) fn recover(bpm: &mut BufferPoolManager) -> Result<()> {
+/// `.meta` file on, then takes a sharp checkpoint, which needs no log
+/// before the end, so every segment but the last goes. Writes no records,
+/// so a crash in the middle of it leaves files that recover the same pages.
+pub(crate) fn recover(bpm: &BufferPoolManager) -> Result<()> {
     let log = bpm.log();
     let checkpoint = Checkpoint::decode(bpm.disk_manager().opened_checkpoint(), log.durable_end())?;
     let in_log = log.first_lsn()..=log.durable_end();
-    if !in_log.contains(&checkpoint.redo_lsn)
+    if !in_log.contains(&checkpoint.log_needed_from())
         || !in_log.contains(&checkpoint.start_lsn)
         || checkpoint.redo_lsn > checkpoint.start_lsn
     {
         return Err(StorageError::CorruptLog(format!(
             "the checkpoint reads from {} and {}, but the log holds {}..{}",
-            checkpoint.redo_lsn,
+            checkpoint.log_needed_from(),
             checkpoint.start_lsn,
             in_log.start(),
             in_log.end(),
@@ -38,7 +38,7 @@ pub(crate) fn recover(bpm: &mut BufferPoolManager) -> Result<()> {
             saved.redo_lsn
         )));
     }
-    bpm.start_log_over()
+    Ok(())
 }
 
 /// Finds the pages redo must bring up to date, each with the first record

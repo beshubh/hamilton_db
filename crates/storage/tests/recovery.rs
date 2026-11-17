@@ -7,7 +7,10 @@ mod crash_fs;
 
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 
 use common::{Lsn, PageId};
 use crash_fs::{CrashFs, Lost, next};
@@ -22,9 +25,14 @@ use storage::wal::checkpoint;
 use storage::wal::log::{FIRST_LSN, Log};
 use storage::wal::record::{Kind, PageChanges, PageRedo};
 
+const DIR: &str = "/db";
 const DB: &str = "/db/test.db";
 const LOG: &str = "/db/test.log";
 const META: &str = "/db/test.meta";
+
+/// Small, so a few records fill a segment and the workloads here start and
+/// remove many.
+const SEGMENT: u64 = 32 << 10;
 
 /// Where tests put their bytes: past the page header.
 const AT: usize = PageHeader::SIZE;
@@ -34,20 +42,35 @@ const AT: usize = PageHeader::SIZE;
 const CHECKSUM: Range<usize> = 8..12;
 
 fn open(fs: &CrashFs, frames: usize) -> Storage {
-    storage::open_with(Arc::new(fs.clone()), DB, frames, None).unwrap()
+    storage::open_with(Arc::new(fs.clone()), DB, frames, None, SEGMENT).unwrap()
+}
+
+/// The numbers of the log's segments in `fs`, oldest first.
+fn segments(fs: &CrashFs) -> Vec<u64> {
+    let prefix = format!("{LOG}.");
+    fs.files_in(DIR.as_ref())
+        .iter()
+        .filter_map(|path| path.to_str()?.strip_prefix(&prefix)?.parse().ok())
+        .collect()
+}
+
+fn segment_path(n: u64) -> PathBuf {
+    PathBuf::from(format!("{LOG}.{n:08}"))
 }
 
 /// Each page the log names: its last image and that record's LSN, or
 /// `None` once a record frees it.
 type Pages = BTreeMap<PageId, Option<(Lsn, Box<[u8; PAGE_SIZE]>)>>;
 
-/// The pages the records in `fs`'s log leave, and where the log ends,
-/// read straight from the log: what recovery must bring back. Opening the
-/// log cuts a torn tail off it, so `fs` should be a copy.
+/// The pages the records in `fs`'s log leave, and where the log ends: what
+/// recovery must bring back. Read from every segment the log ever had,
+/// removed ones too, so a page whose last record a checkpoint removed is
+/// still checked.
 fn logged_pages(fs: &CrashFs) -> (Pages, Lsn) {
-    let log = Log::open(fs, LOG).unwrap();
+    let log = Log::open(Arc::new(fs.with_removed()), LOG, SEGMENT).unwrap();
+    assert_eq!(log.first_lsn(), FIRST_LSN, "a segment is missing");
     let mut pages = Pages::new();
-    let mut scan = log.scan(log.first_lsn());
+    let mut scan = log.scan(FIRST_LSN);
     while let Some(record) = scan.next_record().unwrap() {
         assert_eq!(record.kind, Kind::System);
         let changes = PageChanges::decode(record.body).unwrap();
@@ -96,9 +119,10 @@ fn assert_recovered(bpm: &BufferPoolManager, pages: &Pages, allocated: PageId, a
 /// Recovers a copy of `image` and checks it against what its log says,
 /// then, if `reopen`, closes and opens it again and checks that too.
 fn recover_and_check(image: &CrashFs, allocated: PageId, reopen: bool, at: &str) {
-    let (pages, end) = logged_pages(&image.crash_now());
+    let (pages, end) = logged_pages(image);
     let storage = open(image, 4);
-    assert_eq!(storage.bpm.log().first_lsn(), end, "{at}: log end");
+    assert_eq!(storage.bpm.log().end(), end, "{at}: log end");
+    assert_eq!(segments(image).len(), 1, "{at}: segments left");
     assert_recovered(&storage.bpm, &pages, allocated, at);
     if reopen {
         storage.close().unwrap();
@@ -122,6 +146,17 @@ impl Workload {
             storage: open(fs, 4),
             rng: seed,
             live: Vec::new(),
+        }
+    }
+
+    /// Opens the database in `fs` again and goes on with the pages its log
+    /// left.
+    fn resume(fs: &CrashFs, seed: u64) -> Self {
+        let (pages, _) = logged_pages(fs);
+        let live = pages.iter().filter(|(_, page)| page.is_some());
+        Self {
+            live: live.map(|(&page_id, _)| page_id).collect(),
+            ..Self::new(fs, seed)
         }
     }
 
@@ -161,6 +196,17 @@ impl Workload {
                 self.bpm().new_page();
             }
             _ => self.bpm().log().flush_all().unwrap(),
+        }
+    }
+
+    /// Creates, changes or frees a page: one mtr, and nothing else. Creates
+    /// more than it frees, so the pages soon outgrow the pool.
+    fn write(&mut self) {
+        match next(&mut self.rng) % 5 {
+            _ if self.live.len() < 3 => self.create(),
+            0 | 1 => self.create(),
+            2 => self.free(),
+            _ => self.change(),
         }
     }
 
@@ -211,15 +257,65 @@ fn every_crash_point_recovers_exactly_the_logged_pages() {
     let allocated = workload.allocated();
     drop(workload);
 
+    let started = segments(&fs);
+    assert!(started[0] > 1, "no checkpoint removed a segment");
+    assert!(
+        *started.last().unwrap() > 8,
+        "only {started:?} were started"
+    );
     let mut crashes = 0;
+    let mut most_segments = 0;
     fs.for_each_moment(|n, moment| {
         for lost in [Lost::Nothing, Lost::Everything, Lost::Some(n as u64)] {
             let at = format!("crash after event {n}, losing {lost:?}");
-            recover_and_check(&moment.crash(lost), allocated, n % 8 == 0, &at);
+            let image = moment.crash(lost);
+            most_segments = most_segments.max(segments(&image).len());
+            recover_and_check(&image, allocated, n % 8 == 0, &at);
             crashes += 1;
         }
     });
     assert!(crashes > 600, "only {crashes} crash points");
+    assert!(
+        most_segments * 2 < *started.last().unwrap() as usize,
+        "the log grew to {most_segments} segments"
+    );
+}
+
+/// Recovery leaves pages written before the log's first record, slots freed
+/// in a `.meta` it did not save, and a log that is one segment: a second
+/// crash must find all of that in order.
+#[test]
+fn every_crash_point_after_a_recovery_recovers_exactly_the_logged_pages() {
+    let fs = CrashFs::new();
+    let mut workload = Workload::new(&fs, 0x9e11);
+    workload.run(150);
+    drop(workload);
+
+    let events = fs.num_events();
+    for (first_crash, lost) in [(events / 2, Lost::Some(3)), (events, Lost::Everything)] {
+        let image = fs.crash_after(first_crash, lost);
+        let (pages, _) = logged_pages(&image);
+        let mut workload = Workload::resume(&image, first_crash as u64);
+        let base = workload.bpm().log().first_lsn();
+        assert!(
+            pages.values().flatten().any(|&(lsn, _)| lsn < base),
+            "no page was last logged before the log's first segment"
+        );
+        workload.run(150);
+        let allocated = workload.allocated();
+        drop(workload);
+
+        let mut crashes = 0;
+        image.for_each_moment(|n, moment| {
+            for lost in [Lost::Nothing, Lost::Everything, Lost::Some(n as u64)] {
+                let at =
+                    format!("crash after event {first_crash}, then after {n}, losing {lost:?}");
+                recover_and_check(&moment.crash(lost), allocated, n % 16 == 0, &at);
+                crashes += 1;
+            }
+        });
+        assert!(crashes > 300, "only {crashes} crash points");
+    }
 }
 
 #[test]
@@ -263,7 +359,7 @@ fn a_crash_during_recovery_recovers_the_same_pages() {
     let points = fs.num_events();
     for crash_at in [points / 3, points / 2, points] {
         let image = fs.crash_after(crash_at, Lost::Some(crash_at as u64));
-        let (pages, _) = logged_pages(&image.crash_now());
+        let (pages, _) = logged_pages(&image);
         drop(open(&image, 4));
         let recovering = image.num_events();
         assert!(recovering > 0, "recovery wrote nothing");
@@ -285,29 +381,25 @@ fn a_crash_during_recovery_recovers_the_same_pages() {
 #[test]
 fn every_prefix_of_the_log_recovers_the_pages_its_records_leave() {
     let fs = CrashFs::new();
-    let storage = storage::open_with(Arc::new(fs.clone()), DB, 256, None).unwrap();
+    // One segment, so a cut is a length of its file.
+    let storage = storage::open_with(Arc::new(fs.clone()), DB, 256, None, u64::MAX).unwrap();
     let mut workload = Workload {
         storage,
         rng: 0x106,
         live: Vec::new(),
     };
     for _ in 0..60 {
-        match next(&mut workload.rng) % 4 {
-            0 => workload.create(),
-            1 if workload.live.len() > 2 => workload.free(),
-            _ if workload.live.len() > 2 => workload.change(),
-            _ => workload.create(),
-        }
+        workload.write();
     }
     let allocated = workload.allocated();
     workload.bpm().log().flush_all().unwrap();
     drop(workload);
 
-    let log_bytes = fs.contents(LOG.as_ref());
-    let (_, end) = logged_pages(&fs.crash_now());
+    let first = segment_path(1);
+    let log_bytes = fs.contents(&first);
+    let (_, end) = logged_pages(&fs);
     let mut cuts = vec![end];
-    let log = Log::open(&fs.crash_now(), LOG).unwrap();
-    assert_eq!(log.first_lsn(), FIRST_LSN);
+    let log = Log::open(Arc::new(fs.crash_now()), LOG, u64::MAX).unwrap();
     let mut scan = log.scan(FIRST_LSN);
     while let Some(record) = scan.next_record().unwrap() {
         cuts.push(record.lsn);
@@ -315,12 +407,182 @@ fn every_prefix_of_the_log_recovers_the_pages_its_records_leave() {
     assert!(cuts.len() > 60, "{} records", cuts.len());
 
     for cut in cuts {
-        // With the log starting at `FIRST_LSN`, an LSN is its byte offset.
-        let image = fs.with_contents(LOG.as_ref(), &log_bytes[..cut as usize]);
-        let (_, recovered_end) = logged_pages(&image.crash_now());
+        // In the first segment, an LSN is its byte offset.
+        let image = fs.with_contents(&first, &log_bytes[..cut as usize]);
+        let (_, recovered_end) = logged_pages(&image);
         assert_eq!(recovered_end, cut);
         recover_and_check(&image, allocated, false, &format!("log cut at {cut}"));
     }
+}
+
+/// A writer's mtrs and evictions race checkpoints that save the dirty page
+/// table, flush the log and remove segments as they go.
+#[test]
+fn pages_changed_during_fuzzy_checkpoints_recover_to_their_last_image() {
+    let fs = CrashFs::new();
+    // Room for an mtr's three pages and a page a checkpoint is writing.
+    let mut workload = Workload {
+        storage: open(&fs, 8),
+        rng: 0xf022,
+        live: Vec::new(),
+    };
+    let done = Arc::new(AtomicBool::new(false));
+    let checkpoints = {
+        let bpm = Arc::clone(&workload.storage.bpm);
+        let done = Arc::clone(&done);
+        thread::spawn(move || {
+            let mut taken = 0;
+            while !done.load(Ordering::Acquire) {
+                checkpoint::fuzzy(&bpm).unwrap();
+                taken += 1;
+                thread::yield_now();
+            }
+            taken
+        })
+    };
+    let writer = thread::spawn(move || {
+        for _ in 0..600 {
+            workload.write();
+        }
+        workload
+    });
+    let workload = writer.join().unwrap();
+    done.store(true, Ordering::Release);
+    let taken = checkpoints.join().unwrap();
+    let allocated = workload.allocated();
+    drop(workload);
+
+    assert!(
+        taken >= 10,
+        "only {taken} checkpoints ran during the writes"
+    );
+    assert!(segments(&fs)[0] > 1, "no checkpoint removed a segment");
+    let events = fs.num_events();
+    let stride = (events / 400).max(1);
+    fs.for_each_moment(|n, moment| {
+        if n % stride == 0 || n == events {
+            for lost in [Lost::Nothing, Lost::Everything, Lost::Some(n as u64)] {
+                let at = format!("crash after event {n} of {events}, losing {lost:?}");
+                recover_and_check(&moment.crash(lost), allocated, false, &at);
+            }
+        }
+    });
+}
+
+#[test]
+fn a_crash_while_starting_a_segment_recovers() {
+    let fs = CrashFs::new();
+    let storage = open(&fs, 4);
+    let page_id = storage.bpm.new_page();
+    let mut starts = Vec::new();
+    for i in 0..40u8 {
+        write(&storage.bpm, page_id, &[i; 64]);
+        let (before, last) = (fs.num_events(), segments(&fs).len());
+        storage.bpm.log().flush_all().unwrap();
+        if segments(&fs).len() > last {
+            starts.push(before..fs.num_events());
+        }
+    }
+    let allocated = storage.bpm.new_page();
+    drop(storage);
+
+    assert!(starts.len() >= 3, "only {} segments started", starts.len());
+    for flush in starts {
+        for n in flush.start..=flush.end {
+            for lost in [Lost::Nothing, Lost::Everything, Lost::Some(n as u64)] {
+                let at = format!(
+                    "crash after event {n} of a flush that started a segment, losing {lost:?}"
+                );
+                recover_and_check(&fs.crash_after(n, lost), allocated, false, &at);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_crash_between_saving_a_checkpoint_and_removing_its_segments_recovers() {
+    let fs = CrashFs::new();
+    let mut workload = Workload::new(&fs, 0x5e9);
+    for _ in 0..60 {
+        workload.write();
+        workload.bpm().log().flush_all().unwrap();
+    }
+    let segments_before = segments(&fs).len();
+    let before = fs.num_events();
+    workload.bpm().checkpoint().unwrap();
+    let after = fs.num_events();
+    let allocated = workload.allocated();
+    drop(workload);
+
+    assert!(segments_before >= 3, "only {segments_before} segments");
+    assert_eq!(segments(&fs).len(), 1, "the checkpoint removed the rest");
+    for n in before..=after {
+        for lost in [Lost::Nothing, Lost::Everything, Lost::Some(n as u64)] {
+            let at =
+                format!("crash after event {n} of a checkpoint {before}..{after}, losing {lost:?}");
+            recover_and_check(&fs.crash_after(n, lost), allocated, false, &at);
+        }
+    }
+}
+
+/// Changes `other` until the log has started `count` more segments.
+fn fill_segments(fs: &CrashFs, bpm: &BufferPoolManager, other: PageId, count: usize) {
+    let target = segments(fs).len() + count;
+    for i in 0u64.. {
+        if segments(fs).len() >= target {
+            return;
+        }
+        write(bpm, other, &i.to_le_bytes());
+        bpm.log().flush_all().unwrap();
+    }
+}
+
+#[test]
+fn a_checkpoint_keeps_every_segment_from_its_oldest_dirty_page_on() {
+    let fs = CrashFs::new();
+    let storage = open(&fs, 4);
+    let bpm = &storage.bpm;
+    let (kept, other) = (bpm.new_page(), bpm.new_page());
+    fill_segments(&fs, bpm, other, 2);
+    bpm.flush_page(other).unwrap();
+    write(bpm, kept, b"kept page");
+    let pinned = bpm.read_page(kept, AccessType::Unknown);
+    let rec_lsn = page_lsn(pinned.get_data());
+    fill_segments(&fs, bpm, other, 2);
+
+    let before = bpm.log().first_lsn();
+    checkpoint::fuzzy(bpm).unwrap();
+    let first = bpm.log().first_lsn();
+    assert!(first > before, "the checkpoint removed no segment");
+    assert!(first <= rec_lsn, "the checkpoint removed {kept}'s change");
+    let mut buf = Vec::new();
+    assert_eq!(bpm.log().read(rec_lsn, &mut buf).unwrap().lsn, rec_lsn);
+    drop(pinned);
+    let image = fs.crash_now();
+    drop(storage);
+
+    let storage = open(&image, 4);
+    assert_eq!(read(&storage.bpm, kept, 9), b"kept page");
+}
+
+#[test]
+fn a_checkpoint_that_needs_removed_log_is_not_saved() {
+    let fs = CrashFs::new();
+    let storage = open(&fs, 4);
+    let bpm = &storage.bpm;
+    let (dirty, other) = (bpm.new_page(), bpm.new_page());
+    write(bpm, dirty, b"dirty page");
+    let _pinned = bpm.read_page(dirty, AccessType::Unknown);
+    fill_segments(&fs, bpm, other, 2);
+    // As a bound that moved back would have: the dirty page's change goes.
+    bpm.log().remove_segments_before(bpm.log().end()).unwrap();
+
+    let saved = fs.contents(META.as_ref());
+    assert!(matches!(
+        checkpoint::fuzzy(bpm),
+        Err(storage::StorageError::CorruptLog(_))
+    ));
+    assert_eq!(fs.contents(META.as_ref()), saved, "the .meta changed");
 }
 
 /// Changes a page through an mtr of its own, writing `bytes` at `AT`.
@@ -455,8 +717,10 @@ fn a_log_that_ends_before_the_checkpoint_is_refused() {
     storage.bpm.checkpoint().unwrap();
     drop(storage);
 
-    let image = fs.with_contents(LOG.as_ref(), &[]);
-    let opened = storage::open_with(Arc::new(image), DB, 4, None);
+    let image = segments(&fs)
+        .into_iter()
+        .fold(fs.crash_now(), |image, n| image.without(&segment_path(n)));
+    let opened = storage::open_with(Arc::new(image), DB, 4, None, SEGMENT);
     assert!(matches!(opened, Err(storage::StorageError::CorruptLog(_))));
 }
 
@@ -471,4 +735,20 @@ fn a_log_left_from_another_database_is_not_replayed() {
 
     let storage = open(&fresh, 4);
     assert_eq!(storage.bpm.new_page(), 0, "the new database has no pages");
+}
+
+#[test]
+fn a_segment_missing_from_the_middle_of_the_log_is_refused() {
+    let fs = CrashFs::new();
+    let storage = open(&fs, 4);
+    let (page_id, other) = (storage.bpm.new_page(), storage.bpm.new_page());
+    write(&storage.bpm, page_id, b"page");
+    storage.bpm.checkpoint().unwrap();
+    fill_segments(&fs, &storage.bpm, other, 3);
+    drop(storage);
+
+    let present = segments(&fs);
+    let image = fs.crash_now().without(&segment_path(present[1]));
+    let opened = storage::open_with(Arc::new(image), DB, 4, None, SEGMENT);
+    assert!(matches!(opened, Err(storage::StorageError::CorruptLog(_))));
 }

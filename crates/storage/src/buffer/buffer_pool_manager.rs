@@ -260,14 +260,6 @@ impl BufferPoolManager {
         self.next_page_id.fetch_max(page_id, Ordering::AcqRel);
     }
 
-    /// Starts the log over in a new file at its end, once a sharp
-    /// checkpoint has made every record in it unneeded. Only recovery calls
-    /// this, before the pool is shared.
-    pub(crate) fn start_log_over(&mut self) -> Result<()> {
-        let log = Arc::get_mut(&mut self.log).expect("the log is shared during recovery");
-        log.start_over(self.disk_manager.fs(), self.disk_manager.log_file_name())
-    }
-
     /// Number of frames in the pool.
     pub fn size(&self) -> usize {
         self.num_frames
@@ -638,11 +630,13 @@ impl BufferPoolManager {
             self.replacer.remove(frame_id);
             frame.reset();
             state.free_frames.push_front(frame_id);
-        } else if unused {
-            // Keep the page: it changed again, or was not written.
+        } else {
+            // Keep the page: it changed again, was not written, or another
+            // thread holds it. `evict` took it out of the replacer, and a
+            // flush's pin does not put it back, so it goes back here.
             self.replacer
                 .record_access(frame_id, page_id, AccessType::Unknown);
-            self.replacer.set_evictable(frame_id, true);
+            self.replacer.set_evictable(frame_id, unused);
         }
         written
     }
@@ -726,6 +720,7 @@ mod tests {
     use crate::page::PAGE_SIZE;
     use crate::page::page_header::PageHeader;
     use crate::test_util::{stall_io, within_timeout};
+    use crate::wal::SEGMENT_SIZE;
     use std::thread;
     use tempfile::TempDir;
 
@@ -741,7 +736,7 @@ mod tests {
 
     fn open(dir: &TempDir, num_frames: usize) -> Arc<BufferPoolManager> {
         let path = dir.path().join("test.db");
-        crate::open_with(Arc::new(OsFs), path, num_frames, None)
+        crate::open_with(Arc::new(OsFs), path, num_frames, None, SEGMENT_SIZE)
             .unwrap()
             .bpm
     }
@@ -1209,6 +1204,51 @@ mod tests {
         assert_eq!(dm.num_writes(), 1);
         // Evicts `wanted` and reads the victim back from disk.
         assert_eq!(read_bytes(&bpm, victim, 5), b"dirty");
+    }
+
+    #[test]
+    fn a_victim_a_flush_holds_through_its_write_back_can_be_evicted_after() {
+        let (_dir, dm, bpm) = setup(1);
+        let (victim, wanted) = (bpm.new_page(), bpm.new_page());
+        write_bytes(&bpm, victim, b"dirty");
+
+        // The victim's first write waits for `first`, its second for `second`.
+        let (first, first_rx) = std::sync::mpsc::channel::<()>();
+        let (second, second_rx) = std::sync::mpsc::channel::<()>();
+        let gates = Mutex::new(vec![second_rx, first_rx]);
+        dm.set_before_io(move |page_id| {
+            let gate = (page_id == victim).then(|| gates.lock().pop()).flatten();
+            if let Some(gate) = gate {
+                let _ = gate.recv();
+            }
+        });
+        let loader = {
+            let bpm = Arc::clone(&bpm);
+            thread::spawn(move || bpm.checked_read_page(wanted, AccessType::Unknown).map(drop))
+        };
+        let other = Arc::clone(&bpm);
+        within_timeout(move || wait_for_pins(&other, victim, 1));
+        let flusher = {
+            let bpm = Arc::clone(&bpm);
+            thread::spawn(move || bpm.flush_page(victim).unwrap())
+        };
+        let other = Arc::clone(&bpm);
+        within_timeout(move || wait_for_pins(&other, victim, 2));
+
+        // The loader's write-back ends while the flush still holds the page,
+        // so the loader keeps it and finds no other frame.
+        first.send(()).unwrap();
+        assert!(matches!(
+            loader.join().unwrap(),
+            Err(StorageError::NoFreeFrame)
+        ));
+        second.send(()).unwrap();
+        assert!(flusher.join().unwrap());
+
+        assert!(
+            bpm.checked_read_page(wanted, AccessType::Unknown).is_ok(),
+            "the victim's frame was lost to the replacer"
+        );
     }
 
     #[test]

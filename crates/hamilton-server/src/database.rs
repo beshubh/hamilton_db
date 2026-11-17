@@ -23,8 +23,8 @@ pub struct Database {
 
 impl Database {
     /// Opens the database stored at `path`, creating it if there is none,
-    /// and recovers what a crash left behind. Its `.meta` and `.log` files
-    /// sit next to it. Fails if another process has it open.
+    /// and recovers what a crash left behind. Its `.meta` file and log
+    /// segments sit next to it. Fails if another process has it open.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let storage = storage::open(path, DEFAULT_POOL_SIZE)?;
         let catalog = Arc::new(Catalog::open(Arc::clone(&storage.bpm))?);

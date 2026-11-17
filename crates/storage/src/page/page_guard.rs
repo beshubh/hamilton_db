@@ -335,6 +335,7 @@ mod tests {
     use crate::disk::disk_manager::DiskManager;
     use crate::disk::fs::OsFs;
     use crate::page::page_header::PageHeader;
+    use crate::wal::SEGMENT_SIZE;
     use tempfile::TempDir;
     use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
@@ -365,7 +366,8 @@ mod tests {
         fn new() -> Self {
             let dir = TempDir::new().unwrap();
             let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-            let log = Log::open(&OsFs, dm.log_file_name()).unwrap();
+            let log_path = dir.path().join("test.log");
+            let log = Log::open(Arc::new(OsFs), log_path, SEGMENT_SIZE).unwrap();
             let frame = Arc::new(FrameHeader::new(0));
             frame.set_page_id(Some(PAGE));
             let replacer = Arc::new(ArcReplacer::new(4));
