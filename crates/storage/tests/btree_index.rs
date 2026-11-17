@@ -76,7 +76,7 @@ fn long_strings_compare_by_value() {
 fn new_index_is_empty() {
     let dir = TempDir::new().unwrap();
     let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(4, dm));
+    let bpm = Arc::new(BufferPoolManager::new(4, dm).unwrap());
     let header_page_id = bpm.new_page();
     let metadata = IndexMetadata::new(
         "users_id_name",
@@ -124,7 +124,7 @@ fn index_with(
 ) -> IndexFixture {
     let dir = TempDir::new().unwrap();
     let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(32, dm));
+    let bpm = Arc::new(BufferPoolManager::new(32, dm).unwrap());
     let header_page_id = bpm.new_page();
     let table = table_schema();
     let key_schema = Arc::new(Schema::new(

@@ -24,7 +24,7 @@ impl Db {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
         let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = Arc::new(BufferPoolManager::new(16, dm));
+        let bpm = Arc::new(BufferPoolManager::new(16, dm).unwrap());
         let catalog = Catalog::open(bpm).unwrap();
         catalog
             .create_table(

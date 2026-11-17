@@ -19,7 +19,7 @@ use tempfile::TempDir;
 fn setup(num_frames: usize) -> (TempDir, TableHeap) {
     let dir = TempDir::new().unwrap();
     let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(num_frames, dm));
+    let bpm = Arc::new(BufferPoolManager::new(num_frames, dm).unwrap());
     (dir, TableHeap::create(bpm).unwrap())
 }
 

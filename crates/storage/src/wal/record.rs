@@ -10,9 +10,10 @@
 //! only known inside the log's critical section, so `RecordBuf` checksums the
 //! rest up front and `Log::append` folds them in with `crc32c_combine`.
 
-use common::{INVALID_LSN, Lsn, TxnId};
+use common::{INVALID_LSN, Lsn, PageId, TxnId};
 
 use crate::error::{Result, StorageError};
+use crate::page::PAGE_SIZE;
 
 pub const HEADER_SIZE: usize = 33;
 
@@ -170,6 +171,109 @@ impl<'a> Record<'a> {
 
     pub fn has_prev(&self) -> bool {
         self.prev_lsn != INVALID_LSN
+    }
+}
+
+/// The body of a record that changes pages (`Update`, `Clr`, `Completion`
+/// or `System`): how to redo each page it changed, and the pages it freed.
+///
+/// ```text
+/// num_pages u16 | (page_id i32 | form u8 | form body)* | num_frees u32 | page_id i32*
+/// ```
+///
+/// The form says how the page is redone; it is `IMAGE`, followed by the
+/// whole page, for every page so far.
+#[derive(Debug, Clone, Copy)]
+pub struct PageChanges<'a> {
+    num_pages: u16,
+    pages: &'a [u8],
+    frees: &'a [u8],
+}
+
+/// How one page of a `PageChanges` is redone.
+#[derive(Debug, Clone, Copy)]
+pub enum PageRedo<'a> {
+    /// The page after the change, except for its LSN, which is the record's.
+    Image(&'a [u8; PAGE_SIZE]),
+}
+
+const IMAGE: u8 = 1;
+const PAGE_ENTRY_HEADER: usize = 5;
+
+impl<'a> PageChanges<'a> {
+    /// Checks and views the body of a page-change record.
+    pub fn decode(body: &'a [u8]) -> Result<Self> {
+        let corrupt = |what: &str| StorageError::CorruptLog(format!("page changes: {what}"));
+        let (num_pages, entries) = body
+            .split_first_chunk::<2>()
+            .ok_or_else(|| corrupt("truncated"))?;
+        let num_pages = u16::from_le_bytes(*num_pages);
+        let mut rest = entries;
+        for _ in 0..num_pages {
+            if rest.get(4) != Some(&IMAGE) {
+                return Err(corrupt("unknown page form"));
+            }
+            rest = rest
+                .get(PAGE_ENTRY_HEADER + PAGE_SIZE..)
+                .ok_or_else(|| corrupt("truncated"))?;
+        }
+        let pages = &entries[..entries.len() - rest.len()];
+        let (num_frees, frees) = rest
+            .split_first_chunk::<4>()
+            .ok_or_else(|| corrupt("truncated"))?;
+        if frees.len() != u32::from_le_bytes(*num_frees) as usize * size_of::<PageId>() {
+            return Err(corrupt("bad length"));
+        }
+        Ok(Self {
+            num_pages,
+            pages,
+            frees,
+        })
+    }
+
+    pub fn pages(&self) -> impl Iterator<Item = (PageId, PageRedo<'a>)> + 'a {
+        let mut rest = self.pages;
+        (0..self.num_pages).map(move |_| {
+            let (entry, next) = rest.split_at(PAGE_ENTRY_HEADER + PAGE_SIZE);
+            rest = next;
+            let page_id = PageId::from_le_bytes(entry[..4].try_into().unwrap());
+            let image = entry[PAGE_ENTRY_HEADER..].try_into().unwrap();
+            (page_id, PageRedo::Image(image))
+        })
+    }
+
+    pub fn frees(&self) -> impl Iterator<Item = PageId> + 'a {
+        self.frees
+            .chunks_exact(size_of::<PageId>())
+            .map(|id| PageId::from_le_bytes(id.try_into().unwrap()))
+    }
+}
+
+/// Appends a `PageChanges` body to `body`: an image of each page in
+/// `images`, then `frees`.
+///
+/// # Panics
+/// If there are more than `u16::MAX` images.
+pub(crate) fn encode_page_changes<'p>(
+    body: &mut Vec<u8>,
+    images: impl Iterator<Item = (PageId, &'p [u8; PAGE_SIZE])>,
+    frees: &[PageId],
+) {
+    let num_pages_at = body.len();
+    body.extend_from_slice(&[0; 2]);
+    let mut num_pages: u16 = 0;
+    for (page_id, data) in images {
+        num_pages = num_pages
+            .checked_add(1)
+            .expect("too many pages in one record");
+        body.extend_from_slice(&page_id.to_le_bytes());
+        body.push(IMAGE);
+        body.extend_from_slice(data);
+    }
+    body[num_pages_at..num_pages_at + 2].copy_from_slice(&num_pages.to_le_bytes());
+    body.extend_from_slice(&(frees.len() as u32).to_le_bytes());
+    for page_id in frees {
+        body.extend_from_slice(&page_id.to_le_bytes());
     }
 }
 

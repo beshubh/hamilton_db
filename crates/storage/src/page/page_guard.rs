@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use common::PageId;
+use common::{Lsn, PageId};
 use parking_lot::Mutex;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, Immutable, KnownLayout};
 
 use crate::{
     buffer::{
@@ -13,7 +13,11 @@ use crate::{
     },
     disk::disk_scheduler::{DiskFuture, DiskScheduler},
     error::Result,
-    page::{PAGE_SIZE, PageBuf, page_header::stamp_checksum},
+    page::{
+        PAGE_SIZE, PageBuf,
+        page_header::{page_lsn, stamp_checksum},
+    },
+    wal::log::Log,
 };
 
 /// Shared, latched access to a page in the buffer pool.
@@ -30,7 +34,6 @@ pub struct ReadPageGuard {
     frame: Arc<FrameHeader>,
     replacer: Arc<ArcReplacer>,
     bpm_latch: BpmLatch,
-    disk_scheduler: Arc<DiskScheduler>,
     /// `Some` until `drop`, which releases it before unpinning.
     latch: Option<FrameReadLatch>,
 }
@@ -42,7 +45,6 @@ impl ReadPageGuard {
         frame: Arc<FrameHeader>,
         replacer: Arc<ArcReplacer>,
         bpm_latch: BpmLatch,
-        disk_scheduler: Arc<DiskScheduler>,
     ) -> Self {
         debug_assert!(
             frame.pin_count() > 0,
@@ -54,7 +56,6 @@ impl ReadPageGuard {
             frame,
             replacer,
             bpm_latch,
-            disk_scheduler,
             latch,
         }
     }
@@ -66,7 +67,6 @@ impl ReadPageGuard {
         frame: Arc<FrameHeader>,
         replacer: Arc<ArcReplacer>,
         bpm_latch: BpmLatch,
-        disk_scheduler: Arc<DiskScheduler>,
     ) -> Option<Self> {
         let Some(latch) = frame.try_get_data() else {
             unpin_frame(&frame, &replacer, &bpm_latch);
@@ -77,7 +77,6 @@ impl ReadPageGuard {
             frame,
             replacer,
             bpm_latch,
-            disk_scheduler,
             latch: Some(latch),
         })
     }
@@ -102,16 +101,26 @@ impl ReadPageGuard {
         self.frame.is_dirty()
     }
 
+    /// The first record that changed the page since it was last written, or
+    /// `INVALID_LSN` if none did.
+    pub fn rec_lsn(&self) -> Lsn {
+        self.frame.rec_lsn()
+    }
+
     /// Writes the page to disk if it is dirty, then marks it clean.
-    pub fn flush(&self) -> Result<()> {
-        flush_page(self.page_id, &self.frame, self.buf(), &self.disk_scheduler)
+    pub(crate) fn flush(&self, disk_scheduler: &DiskScheduler, log: &Log) -> Result<()> {
+        flush_page(self.page_id, &self.frame, self.buf(), disk_scheduler, log)
     }
 
     /// Like `flush`, but only queues the write, so many pages can be written
     /// at once. Returns `None` if the page is clean.
-    pub(crate) fn start_flush(self) -> Option<PendingFlush> {
-        let write = queue_write(self.page_id, &self.frame, self.buf(), &self.disk_scheduler)?;
-        Some(PendingFlush { guard: self, write })
+    pub(crate) fn start_flush(
+        self,
+        disk_scheduler: &DiskScheduler,
+        log: &Log,
+    ) -> Result<Option<PendingFlush>> {
+        let write = queue_write(self.page_id, &self.frame, self.buf(), disk_scheduler, log)?;
+        Ok(write.map(|write| PendingFlush { guard: self, write }))
     }
 
     fn buf(&self) -> &PageBuf {
@@ -130,7 +139,7 @@ impl PendingFlush {
     /// Waits for the write, then marks the page clean.
     pub(crate) fn wait(self) -> Result<()> {
         self.write.wait()?;
-        self.guard.frame.set_dirty(false);
+        self.guard.frame.mark_clean();
         Ok(())
     }
 }
@@ -145,13 +154,13 @@ impl Drop for ReadPageGuard {
 /// Exclusive, latched access to a page in the buffer pool.
 ///
 /// Same lifecycle as `ReadPageGuard`, but holds the frame's latch in exclusive
-/// mode. Any mutable access marks the page dirty.
+/// mode. It gives no mutable access: a durable page changes only through an
+/// `Mtr`, and a temporary one through a `TempPageGuard`.
 pub struct WritePageGuard {
     page_id: PageId,
     frame: Arc<FrameHeader>,
     replacer: Arc<ArcReplacer>,
     bpm_latch: BpmLatch,
-    disk_scheduler: Arc<DiskScheduler>,
     /// `Some` until `drop`, which releases it before unpinning.
     latch: Option<FrameWriteLatch>,
 }
@@ -163,7 +172,6 @@ impl WritePageGuard {
         frame: Arc<FrameHeader>,
         replacer: Arc<ArcReplacer>,
         bpm_latch: BpmLatch,
-        disk_scheduler: Arc<DiskScheduler>,
     ) -> Self {
         debug_assert!(
             frame.pin_count() > 0,
@@ -175,7 +183,6 @@ impl WritePageGuard {
             frame,
             replacer,
             bpm_latch,
-            disk_scheduler,
             latch,
         }
     }
@@ -188,11 +195,6 @@ impl WritePageGuard {
         self.buf()
     }
 
-    /// Mutable access to the page bytes. Marks the page dirty.
-    pub fn get_data_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
-        self.buf_mut()
-    }
-
     /// Views the start of the page as a `T`, without copying.
     ///
     /// # Panics
@@ -201,25 +203,18 @@ impl WritePageGuard {
         view_as(self.buf())
     }
 
-    /// Views the start of the page as a mutable `T`, without copying. Marks
-    /// the page dirty.
-    ///
-    /// # Panics
-    /// If `T` is larger than a page or needs more than 8-byte alignment.
-    pub fn as_mut<T: FromBytes + IntoBytes + KnownLayout>(&mut self) -> &mut T {
-        match T::mut_from_prefix(&mut self.buf_mut()[..]) {
-            Ok((value, _rest)) => value,
-            Err(_) => panic!("{}", cast_error::<T>()),
-        }
-    }
-
     pub fn is_dirty(&self) -> bool {
         self.frame.is_dirty()
     }
 
-    /// Writes the page to disk if it is dirty, then marks it clean.
-    pub fn flush(&self) -> Result<()> {
-        flush_page(self.page_id, &self.frame, self.buf(), &self.disk_scheduler)
+    /// Mutable access to the page bytes, marking the page dirty. Only for
+    /// `Mtr`, which logs what changes: any other change would go unlogged.
+    pub(crate) fn data_mut_for_mtr(&mut self) -> &mut [u8; PAGE_SIZE] {
+        self.buf_mut()
+    }
+
+    pub(crate) fn frame(&self) -> &FrameHeader {
+        &self.frame
     }
 
     fn buf(&self) -> &PageBuf {
@@ -227,7 +222,7 @@ impl WritePageGuard {
     }
 
     fn buf_mut(&mut self) -> &mut PageBuf {
-        self.frame.set_dirty(true);
+        self.frame.mark_dirty();
         self.latch.as_mut().expect("latch is held until drop")
     }
 }
@@ -236,6 +231,29 @@ impl Drop for WritePageGuard {
     fn drop(&mut self) {
         drop(self.latch.take());
         unpin_frame(&self.frame, &self.replacer, &self.bpm_latch);
+    }
+}
+
+/// Exclusive, latched access to a temporary page (see `TEMP_PAGE_BASE`).
+/// Its changes are never logged: nothing reads the page after a restart.
+pub struct TempPageGuard(WritePageGuard);
+
+impl TempPageGuard {
+    pub(crate) fn new(guard: WritePageGuard) -> Self {
+        Self(guard)
+    }
+
+    pub fn page_id(&self) -> PageId {
+        self.0.page_id()
+    }
+
+    pub fn get_data(&self) -> &[u8; PAGE_SIZE] {
+        self.0.get_data()
+    }
+
+    /// Mutable access to the page bytes. Marks the page dirty.
+    pub fn get_data_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+        self.0.buf_mut()
     }
 }
 
@@ -276,34 +294,38 @@ fn unpin_frame(
 
 /// Writes the page to disk if it is dirty, then marks it clean. `data` must
 /// be the frame's data seen through its latch, held until this returns, so no
-/// writer can change the page between the copy and clearing the dirty flag.
+/// writer can change the page between the copy and marking it clean.
 pub(crate) fn flush_page(
     page_id: PageId,
     frame: &FrameHeader,
     data: &PageBuf,
     disk_scheduler: &DiskScheduler,
+    log: &Log,
 ) -> Result<()> {
-    if let Some(write) = queue_write(page_id, frame, data, disk_scheduler) {
+    if let Some(write) = queue_write(page_id, frame, data, disk_scheduler, log)? {
         write.wait()?;
-        frame.set_dirty(false);
+        frame.mark_clean();
     }
     Ok(())
 }
 
-/// Queues a write of the page if it is dirty. The caller marks it clean once
-/// the write is done, holding the latch until then (see `flush_page`).
+/// Queues a write of the page if it is dirty, once the log is durable up to
+/// the page's LSN. The caller marks it clean once the write is done, holding
+/// the latch until then (see `flush_page`).
 fn queue_write(
     page_id: PageId,
     frame: &FrameHeader,
     data: &PageBuf,
     disk_scheduler: &DiskScheduler,
-) -> Option<DiskFuture<()>> {
+    log: &Log,
+) -> Result<Option<DiskFuture<()>>> {
     if !frame.is_dirty() {
-        return None;
+        return Ok(None);
     }
+    log.flush_to(page_lsn(data))?;
     let mut data = Box::new(data.0);
     stamp_checksum(page_id, &mut data);
-    Some(disk_scheduler.write_page(page_id, data))
+    Ok(Some(disk_scheduler.write_page(page_id, data)))
 }
 
 #[cfg(test)]
@@ -311,6 +333,7 @@ mod tests {
     use super::*;
     use crate::buffer::arc_replacer::AccessType;
     use crate::disk::disk_manager::DiskManager;
+    use crate::page::page_header::PageHeader;
     use tempfile::TempDir;
     use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
@@ -332,6 +355,7 @@ mod tests {
         replacer: Arc<ArcReplacer>,
         bpm_latch: BpmLatch,
         disk_scheduler: Arc<DiskScheduler>,
+        log: Log,
     }
 
     const PAGE: PageId = 7;
@@ -340,6 +364,7 @@ mod tests {
         fn new() -> Self {
             let dir = TempDir::new().unwrap();
             let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
+            let log = Log::create(dm.log_file_name()).unwrap();
             let frame = Arc::new(FrameHeader::new(0));
             frame.set_page_id(Some(PAGE));
             let replacer = Arc::new(ArcReplacer::new(4));
@@ -350,6 +375,7 @@ mod tests {
                 replacer,
                 bpm_latch: Arc::new(Mutex::new(BufferPoolManagerState::default())),
                 disk_scheduler: Arc::new(DiskScheduler::new(dm)),
+                log,
             }
         }
 
@@ -361,7 +387,6 @@ mod tests {
                 Arc::clone(&self.frame),
                 Arc::clone(&self.replacer),
                 Arc::clone(&self.bpm_latch),
-                Arc::clone(&self.disk_scheduler),
             )
         }
 
@@ -372,9 +397,15 @@ mod tests {
                 Arc::clone(&self.frame),
                 Arc::clone(&self.replacer),
                 Arc::clone(&self.bpm_latch),
-                Arc::clone(&self.disk_scheduler),
             )
         }
+    }
+
+    /// The `Header` just past the page header, which holds the page's LSN.
+    fn header_mut(guard: &mut WritePageGuard) -> &mut Header {
+        Header::mut_from_prefix(&mut guard.data_mut_for_mtr()[PageHeader::SIZE..])
+            .unwrap()
+            .0
     }
 
     #[test]
@@ -382,7 +413,7 @@ mod tests {
         let f = Fixture::new();
         {
             let mut guard = f.write();
-            let header = guard.as_mut::<Header>();
+            let header = header_mut(&mut guard);
             header.page_type = 1;
             header.size = 42;
             header.next_page_id = -1;
@@ -390,14 +421,16 @@ mod tests {
         let guard = f.read();
         assert_eq!(guard.page_id(), PAGE);
         assert_eq!(
-            guard.as_ref::<Header>(),
+            Header::ref_from_prefix(&guard.get_data()[PageHeader::SIZE..])
+                .unwrap()
+                .0,
             &Header {
                 page_type: 1,
                 size: 42,
                 next_page_id: -1
             }
         );
-        assert_eq!(&guard.get_data()[..4], &1u32.to_ne_bytes());
+        assert_eq!(guard.as_ref::<PageHeader>().lsn(), 0);
     }
 
     #[test]
@@ -406,7 +439,7 @@ mod tests {
         let mut guard = f.write();
         let _ = guard.as_ref::<Header>();
         assert!(!guard.is_dirty());
-        guard.get_data_mut()[0] = 1;
+        guard.data_mut_for_mtr()[PageHeader::SIZE] = 1;
         assert!(guard.is_dirty());
     }
 
@@ -444,21 +477,21 @@ mod tests {
     #[test]
     fn flush_writes_dirty_page_to_disk() {
         let f = Fixture::new();
-        let mut guard = f.write();
-        guard.get_data_mut()[..5].copy_from_slice(b"hello");
-        guard.flush().unwrap();
+        f.write().data_mut_for_mtr()[PageHeader::SIZE..][..5].copy_from_slice(b"hello");
+        let guard = f.read();
+        guard.flush(&f.disk_scheduler, &f.log).unwrap();
         assert!(!guard.is_dirty());
         drop(guard);
 
         let on_disk = f.disk_scheduler.read_page(PAGE).wait().unwrap();
-        assert_eq!(&on_disk[..5], b"hello");
+        assert_eq!(&on_disk[PageHeader::SIZE..][..5], b"hello");
     }
 
     #[test]
     fn flush_skips_clean_page() {
         let f = Fixture::new();
         let guard = f.read();
-        guard.flush().unwrap();
+        guard.flush(&f.disk_scheduler, &f.log).unwrap();
         // Nothing was written, so the page still reads as zeroes.
         let on_disk = f.disk_scheduler.read_page(PAGE).wait().unwrap();
         assert!(on_disk.iter().all(|&b| b == 0));
@@ -477,10 +510,15 @@ mod tests {
         let f = Fixture::new();
         let mut guard = f.write();
         let handle = std::thread::spawn(move || {
-            guard.as_mut::<Header>().size = 9;
+            header_mut(&mut guard).size = 9;
         });
         handle.join().unwrap();
-        assert_eq!(f.read().as_ref::<Header>().size, 9);
+        let guard = f.read();
+        let header = Header::ref_from_prefix(&guard.get_data()[PageHeader::SIZE..])
+            .unwrap()
+            .0;
+        assert_eq!(header.size, 9);
+        drop(guard);
         assert_eq!(f.frame.pin_count(), 0);
     }
 }

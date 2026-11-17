@@ -54,7 +54,7 @@ fn setup() -> Db {
 fn setup_with(by_name: IndexKind) -> Db {
     let dir = TempDir::new().unwrap();
     let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(16, dm));
+    let bpm = Arc::new(BufferPoolManager::new(16, dm).unwrap());
     let pkey = new_index(&bpm, "t_pkey", 0, IndexKind::PrimaryKey, LocatorKind::Rid);
     let by_name = new_index(&bpm, "t_name", 1, by_name, LocatorKind::PrimaryKey);
     let by_name_rid = new_index(

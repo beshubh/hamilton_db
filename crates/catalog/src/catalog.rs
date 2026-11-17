@@ -12,6 +12,7 @@ use storage::concurrency::transaction::{Transaction, TransactionState};
 use storage::index::btree_index::BtreeIndex;
 use storage::index::{Index, IndexMetadata, LocatorKind};
 use storage::table::table_heap::TableHeap;
+use storage::wal::Logged;
 
 use crate::error::{CatalogError, Result};
 use crate::header_page::{CATALOG_PAGE_ID, SystemTableRoots, read_next_tid, write_next_tid};
@@ -259,9 +260,11 @@ impl Catalog {
             )));
         }
         let system = SystemTables::create(&bpm)?;
-        let mut guard = bpm.checked_write_page(CATALOG_PAGE_ID, AccessType::Unknown)?;
-        system.roots().write_to(guard.get_data_mut());
-        drop(guard);
+        {
+            let mtr = bpm.mtr(Logged::System);
+            let mut page = mtr.write_page(CATALOG_PAGE_ID)?;
+            system.roots().write_to(page.raw_mut());
+        }
         Ok(Self {
             bpm,
             system,
@@ -290,11 +293,11 @@ impl Catalog {
     /// Commits call this with a `tid` read before they take the page, so
     /// one that is slow to get here must not undo a later commit's record.
     pub fn set_next_tid(&self, tid: TxnId) -> Result<()> {
-        let mut guard = self
-            .bpm
-            .checked_write_page(CATALOG_PAGE_ID, AccessType::Lookup)?;
-        let recorded = read_next_tid(guard.get_data());
-        write_next_tid(guard.get_data_mut(), recorded.max(tid));
+        let mtr = self.bpm.mtr(Logged::System);
+        let mut page = mtr.write_page(CATALOG_PAGE_ID)?;
+        if tid > read_next_tid(page.data()) {
+            write_next_tid(page.raw_mut(), tid);
+        }
         Ok(())
     }
 
@@ -1329,7 +1332,7 @@ mod tests {
 
     fn open_files(dir: &TempDir, num_frames: usize) -> (Arc<DiskManager>, Arc<BufferPoolManager>) {
         let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = Arc::new(BufferPoolManager::new(num_frames, Arc::clone(&dm)));
+        let bpm = Arc::new(BufferPoolManager::new(num_frames, Arc::clone(&dm)).unwrap());
         (dm, bpm)
     }
 
@@ -2194,10 +2197,11 @@ mod tests {
     fn rejects_database_whose_page_0_is_not_a_catalog() {
         let dir = TempDir::new().unwrap();
         let (dm, bpm) = open_files(&dir, 4);
-        let page_id = bpm.new_page();
-        let mut guard = bpm.write_page(page_id, AccessType::Unknown);
-        storage::page::page_header::PageHeader::init(guard.get_data_mut(), PageType::Table);
-        drop(guard);
+        {
+            let mtr = bpm.mtr(Logged::System);
+            let mut page = mtr.new_page().unwrap();
+            storage::page::page_header::PageHeader::init(page.raw_mut(), PageType::Table);
+        }
         assert!(matches!(Catalog::open(bpm), Err(CatalogError::Corrupt(_))));
         drop(dm);
     }

@@ -33,7 +33,10 @@ impl Database {
     /// has it open.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let disk = Arc::new(DiskManager::new(path)?);
-        let bpm = Arc::new(BufferPoolManager::new(DEFAULT_POOL_SIZE, Arc::clone(&disk)));
+        let bpm = Arc::new(BufferPoolManager::new(
+            DEFAULT_POOL_SIZE,
+            Arc::clone(&disk),
+        )?);
         let catalog = Arc::new(Catalog::open(Arc::clone(&bpm))?);
         let root = ExecutionEngine::new(Arc::clone(&catalog))?;
         Ok(Self {

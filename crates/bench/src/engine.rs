@@ -38,7 +38,7 @@ impl Hamilton {
     pub fn new(frames: usize) -> Result<Self> {
         let dir = TempDir::new()?;
         let disk = Arc::new(DiskManager::new(dir.path().join("bench.db"))?);
-        let bpm = Arc::new(BufferPoolManager::new(frames, Arc::clone(&disk)));
+        let bpm = Arc::new(BufferPoolManager::new(frames, Arc::clone(&disk))?);
         let catalog = Arc::new(Catalog::open(Arc::clone(&bpm))?);
         Ok(Self {
             disk,

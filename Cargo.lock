@@ -1243,6 +1243,7 @@ dependencies = [
  "enum_dispatch",
  "hashlink",
  "parking_lot",
+ "smallvec",
  "tempfile",
  "thiserror",
  "zerocopy",

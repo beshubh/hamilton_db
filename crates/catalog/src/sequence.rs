@@ -31,11 +31,11 @@ use std::sync::{Arc, LazyLock};
 
 use common::{Column, DataType, PageId, Schema, SlotId, Tuple};
 use parking_lot::Mutex;
-use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
-use storage::page::page_guard::WritePageGuard;
+use storage::page::PAGE_SIZE;
 use storage::table::table_heap::TableHeap;
 use storage::table::table_page::{TablePage, TupleMeta};
+use storage::wal::{Logged, MtrPage};
 use zerocopy::byteorder::little_endian::{I32, I64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -140,10 +140,9 @@ impl Sequence {
             *last = self.after(*last)?;
             return Ok(*last);
         }
-        let mut guard = self
-            .bpm
-            .checked_write_page(self.page_id, AccessType::Lookup)?;
-        let (meta, mut row) = self.read(&guard)?;
+        let mtr = self.bpm.mtr(Logged::System);
+        let mut page = mtr.write_page(self.page_id)?;
+        let (meta, row) = self.read(page.data())?;
 
         let is_called = row.is_called == 1;
         let value = if is_called {
@@ -151,22 +150,22 @@ impl Sequence {
         } else {
             row.last_value.get()
         };
-        let log_cnt = match row.log_cnt.get() {
-            // A clean page was just written as it is, by a checkpoint or an
-            // eviction, so disk no longer covers the values after it.
-            n if is_called && n > 0 && guard.is_dirty() => n - 1,
-            _ => {
-                let logged = value.saturating_add(LOG_VALS.into()).min(self.max);
-                self.log_ahead(&mut guard, &meta, logged)?;
-                // At most LOG_VALS.
-                (logged - value) as i32
-            }
-        };
+        let log_cnt = row.log_cnt.get();
+        // A clean page was just written as it is, by a checkpoint or an
+        // eviction, so disk no longer covers the values after it.
+        if is_called && log_cnt > 0 && page.is_dirty() {
+            put(&mut page, &meta, value, log_cnt - 1)?;
+            return Ok(value);
+        }
+        drop(page);
+        drop(mtr);
 
-        row.last_value = value.into();
-        row.log_cnt = log_cnt.into();
-        row.is_called = 1;
-        TablePage::new(guard.get_data_mut())?.update(SLOT, &meta, row.as_bytes())?;
+        let logged = value.saturating_add(LOG_VALS.into()).min(self.max);
+        self.log_ahead(&meta, logged)?;
+        let mtr = self.bpm.mtr(Logged::System);
+        // At most LOG_VALS.
+        let log_cnt = (logged - value) as i32;
+        put(&mut mtr.write_page(self.page_id)?, &meta, value, log_cnt)?;
         Ok(value)
     }
 
@@ -213,20 +212,17 @@ impl Sequence {
         row: &SequenceRow,
         replace: impl FnOnce(&SequenceRow) -> bool,
     ) -> Result<()> {
-        let mut guard = self
-            .bpm
-            .checked_write_page(self.page_id, AccessType::Lookup)?;
-        let (meta, current) = self.read(&guard)?;
+        let mtr = self.bpm.mtr(Logged::System);
+        let mut page = mtr.write_page(self.page_id)?;
+        let (meta, current) = self.read(page.data())?;
         if replace(&current) {
-            TablePage::new(guard.get_data_mut())?.update(SLOT, &meta, row.as_bytes())?;
+            TablePage::new(page.raw_mut())?.update(SLOT, &meta, row.as_bytes())?;
         }
         Ok(())
     }
 
-    /// Reads the row without `get_data_mut`, which dirties the page even if
-    /// the caller then fails.
-    fn read(&self, guard: &WritePageGuard) -> Result<(TupleMeta, SequenceRow)> {
-        let page = TablePage::new(guard.get_data())?;
+    fn read(&self, data: &[u8; PAGE_SIZE]) -> Result<(TupleMeta, SequenceRow)> {
+        let page = TablePage::new(data)?;
         let (meta, payload) = page.get(SLOT)?;
         let row = SequenceRow::read_from_bytes(payload).map_err(|_| self.corrupt())?;
         if row.null_bitmap != 0 || row.is_called > 1 {
@@ -236,35 +232,40 @@ impl Sequence {
     }
 
     /// Writes the row to disk as if every value through `last_value` had
-    /// been handed out, leaving the page (latched by `guard`) holding that
-    /// row for the caller to overwrite with the real one.
-    fn log_ahead(
-        &self,
-        guard: &mut WritePageGuard,
-        meta: &TupleMeta,
-        last_value: i64,
-    ) -> Result<()> {
-        // TODO(wal): write the row as a WAL record instead and stamp its LSN
-        // on the page. Writing the page survives a process crash but, with
-        // no fsync, not a power loss.
+    /// been handed out, for the caller to overwrite with the real one.
+    fn log_ahead(&self, meta: &TupleMeta, last_value: i64) -> Result<()> {
         log::debug!(
             "sequence {}: WAL record would cover values through {last_value}",
             self.name
         );
-        let ahead = SequenceRow {
-            null_bitmap: 0,
-            last_value: last_value.into(),
-            log_cnt: 0.into(),
-            is_called: 1,
-        };
-        TablePage::new(guard.get_data_mut())?.update(SLOT, meta, ahead.as_bytes())?;
-        guard.flush()?;
+        put(
+            &mut self.bpm.mtr(Logged::System).write_page(self.page_id)?,
+            meta,
+            last_value,
+            0,
+        )?;
+        // TODO(wal): nothing replays the log yet, so the page itself goes to
+        // disk. Without an fsync of the db file, that survives a process
+        // crash but not a power loss.
+        self.bpm.flush_page(self.page_id)?;
         Ok(())
     }
 
     fn corrupt(&self) -> CatalogError {
         CatalogError::Corrupt(format!("sequence {} has a malformed row", self.name))
     }
+}
+
+/// Writes a handed-out `last_value` with `log_cnt` over the row on `page`.
+fn put(page: &mut MtrPage<'_>, meta: &TupleMeta, last_value: i64, log_cnt: i32) -> Result<()> {
+    let row = SequenceRow {
+        null_bitmap: 0,
+        last_value: last_value.into(),
+        log_cnt: log_cnt.into(),
+        is_called: 1,
+    };
+    TablePage::new(page.raw_mut())?.update(SLOT, meta, row.as_bytes())?;
+    Ok(())
 }
 
 /// The same sequence, not one in the same state: bound statements compare
@@ -292,6 +293,7 @@ impl fmt::Debug for Sequence {
 mod tests {
     use super::*;
     use common::Value;
+    use storage::buffer::arc_replacer::AccessType;
     use storage::disk::disk_manager::DiskManager;
     use tempfile::TempDir;
 
@@ -302,7 +304,7 @@ mod tests {
 
     fn sequence_on_disk(dir: &TempDir, max: i64) -> (Sequence, TableHeap, Arc<DiskManager>) {
         let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = Arc::new(BufferPoolManager::new(4, Arc::clone(&dm)));
+        let bpm = Arc::new(BufferPoolManager::new(4, Arc::clone(&dm)).unwrap());
         let heap = create_heap(&bpm).unwrap();
         let seq = Sequence::new(7, "t_id_seq".into(), bpm, heap.first_page_id(), max);
         (seq, heap, dm)

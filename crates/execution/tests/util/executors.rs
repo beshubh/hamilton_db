@@ -47,7 +47,7 @@ impl Db {
     pub fn new() -> Self {
         let dir = TempDir::new().unwrap();
         let disk = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = Arc::new(BufferPoolManager::new(NUM_FRAMES, Arc::clone(&disk)));
+        let bpm = Arc::new(BufferPoolManager::new(NUM_FRAMES, Arc::clone(&disk)).unwrap());
         let catalog = Arc::new(Catalog::open(Arc::clone(&bpm)).unwrap());
         let users = catalog.create_table("users", users_schema(), &[]).unwrap();
         Self {

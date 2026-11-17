@@ -29,7 +29,7 @@ impl Db {
 
     fn open(dir: TempDir) -> Self {
         let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = Arc::new(BufferPoolManager::new(16, Arc::clone(&dm)));
+        let bpm = Arc::new(BufferPoolManager::new(16, Arc::clone(&dm)).unwrap());
         let catalog = Arc::new(Catalog::open(bpm).unwrap());
         Self {
             _dir: dir,
@@ -343,7 +343,7 @@ fn explain_of_a_transaction_command_is_an_error() {
 fn dropping_the_engine_rolls_back_an_open_block() {
     let dir = TempDir::new().unwrap();
     let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(16, dm));
+    let bpm = Arc::new(BufferPoolManager::new(16, dm).unwrap());
     let catalog = Arc::new(Catalog::open(bpm).unwrap());
 
     let mut engine = ExecutionEngine::new(Arc::clone(&catalog)).unwrap();

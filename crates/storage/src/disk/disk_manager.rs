@@ -12,7 +12,7 @@ use common::PageId;
 use parking_lot::Mutex;
 
 use crate::error::{Result, StorageError};
-use crate::page::PAGE_SIZE;
+use crate::page::{PAGE_SIZE, TEMP_PAGE_BASE};
 
 /// Number of pages the db file has room for when first created.
 pub const DEFAULT_DB_IO_SIZE: usize = 16;
@@ -105,7 +105,10 @@ impl DiskManager {
             meta_dirty: false,
         };
         match fs::read(&meta_file_name) {
-            Ok(bytes) => state.load_meta(&bytes)?,
+            Ok(bytes) => {
+                state.load_meta(&bytes)?;
+                state.free_temp_pages();
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 // The meta file is saved before the db file is grown, so a
                 // db file with data but no meta file was not made by us.
@@ -158,11 +161,13 @@ impl DiskManager {
         state.pages.get(&page_id).map(|e| e.free_space as usize)
     }
 
-    /// One past the highest page id that has a slot in the db file, or 0 for
-    /// an empty database. Ids handed out but never written are not counted.
+    /// One past the highest durable page id that has a slot in the db file,
+    /// or 0 for an empty database. Ids handed out but never written are not
+    /// counted.
     pub fn next_page_id(&self) -> PageId {
         let state = self.state.lock();
-        state.pages.keys().max().map_or(0, |&max| max + 1)
+        let durable = state.pages.keys().filter(|&&id| id < TEMP_PAGE_BASE);
+        durable.max().map_or(0, |&max| max + 1)
     }
 
     /// Records how many bytes are free in the page.
@@ -302,6 +307,21 @@ impl DiskState {
         let offset = self.allocate_slot(db_io)?;
         self.first_writes += 1;
         Ok((offset, true))
+    }
+
+    /// Frees the slots of temporary pages, which nothing reads after a
+    /// restart.
+    fn free_temp_pages(&mut self) {
+        let free_slots = &mut self.free_slots;
+        let before = self.pages.len();
+        self.pages.retain(|&page_id, entry| {
+            let temp = page_id >= TEMP_PAGE_BASE;
+            if temp {
+                free_slots.push(entry.offset);
+            }
+            !temp
+        });
+        self.meta_dirty |= self.pages.len() != before;
     }
 
     /// Adds the page at `offset` to `pages`, or frees the slot if the write
@@ -770,6 +790,21 @@ mod tests {
 
         assert_eq!(dm.free_space(0), Some(100));
         assert_eq!(dm.free_space(1), Some(PAGE_SIZE));
+    }
+
+    #[test]
+    fn temporary_pages_are_freed_on_reopen() {
+        let (dir, dm) = setup();
+        dm.write_page(TEMP_PAGE_BASE, &page_filled(1)).unwrap();
+        dm.write_page(0, &page_filled(2)).unwrap();
+        let temp_offset = dm.state.lock().pages[&TEMP_PAGE_BASE].offset;
+        assert_eq!(dm.next_page_id(), 1);
+        let dm = reopen(&dir, dm);
+
+        assert!(!dm.has_page(TEMP_PAGE_BASE));
+        assert_eq!(dm.next_page_id(), 1);
+        dm.write_page(1, &page_filled(3)).unwrap();
+        assert_eq!(dm.state.lock().pages[&1].offset, temp_offset);
     }
 
     #[test]

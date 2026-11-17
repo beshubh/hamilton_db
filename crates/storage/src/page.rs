@@ -13,6 +13,10 @@ pub mod page_header;
 
 pub const PAGE_SIZE: usize = 4096;
 
+/// Page ids from here up are temporary pages (`BufferPoolManager::new_temp_page`),
+/// which are never logged and never read after a restart.
+pub const TEMP_PAGE_BASE: PageId = 1 << 30;
+
 pub type PageData = Box<[u8; PAGE_SIZE]>;
 pub type PageReadGuard<'a> = RwLockReadGuard<'a, PageData>;
 pub type PageWriteGuard<'a> = RwLockWriteGuard<'a, PageData>;

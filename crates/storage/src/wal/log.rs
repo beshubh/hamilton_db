@@ -131,6 +131,12 @@ impl Log {
         })
     }
 
+    /// Creates an empty log at `path`, replacing any log there.
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        File::create(path.as_ref())?;
+        Self::open(path)
+    }
+
     /// Appends `record`, which `RecordBuf::finish` has ended, and returns
     /// its LSN. `link(lsn)` runs inside the critical section and returns the
     /// record's `prev_lsn`: whatever it records about `lsn` is seen by
@@ -163,6 +169,7 @@ impl Log {
     /// every record before it. `lsn` must be a record already appended, or
     /// `INVALID_LSN`, which is always durable.
     pub fn flush_to(&self, lsn: Lsn) -> Result<()> {
+        self.check_failed()?;
         if self.durable_end.load(Ordering::Acquire) > lsn {
             return Ok(());
         }

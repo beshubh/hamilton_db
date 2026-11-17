@@ -62,6 +62,15 @@ struct RidBytes {
 
 const _: () = assert!(size_of::<RidBytes>() == 6);
 
+/// Where `insert_at` puts a key, as `insert_position` found it on a page
+/// that has not changed since.
+#[derive(Debug, Clone, Copy)]
+pub struct InsertPosition {
+    index: usize,
+    /// The tombstone of the key at `index`, which the insert revives.
+    tomb: Option<usize>,
+}
+
 /// A view of a B+tree leaf page with room for `NUM_TOMBS` tombstones over
 /// borrowed page bytes `BufT`, such as `guard.get_data()` (read-only) or
 /// `guard.get_data_mut()` (read-write).
@@ -197,6 +206,26 @@ impl<BufT: Deref<Target = [u8; PAGE_SIZE]>, const NUM_TOMBS: usize> BtreeLeafPag
         Self::entry_size(Self::LAYOUT.key(&self.data, removed).len())
     }
 
+    /// Where `insert` would put `key`. Fails as `insert` does, and like it
+    /// changes nothing then.
+    pub fn insert_position(&self, key: &[u8], cmp: &impl KeyComparator) -> Result<InsertPosition> {
+        check_key_size(key, Self::MAX_KEY_SIZE)?;
+        let index = self.key_index(key, cmp);
+        if self.holds_at(index, key, cmp) {
+            let tomb = self
+                .tomb_position(index)
+                .ok_or(StorageError::DuplicateKey)?;
+            return Ok(InsertPosition {
+                index,
+                tomb: Some(tomb),
+            });
+        }
+        if !self.has_room_for(key.len()) {
+            return Err(StorageError::PageFull);
+        }
+        Ok(InsertPosition { index, tomb: None })
+    }
+
     /// Index of the first key `>= key`, tombstoned or not, or `size` if there
     /// is none. A range scan starts here.
     pub fn key_index(&self, key: &[u8], cmp: &impl KeyComparator) -> usize {
@@ -279,18 +308,18 @@ impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>, const NUM_TOMBS: usize>
     /// entry does not fit; the caller splits the page first, or makes room
     /// with `purge_tombstones`.
     pub fn insert(&mut self, key: &[u8], rid: Rid, cmp: &impl KeyComparator) -> Result<usize> {
-        check_key_size(key, Self::MAX_KEY_SIZE)?;
-        let index = self.key_index(key, cmp);
-        if self.holds_at(index, key, cmp) {
-            let Some(pos) = self.tomb_position(index) else {
-                return Err(StorageError::DuplicateKey);
-            };
+        let position = self.insert_position(key, cmp)?;
+        Ok(self.insert_at(position, key, rid))
+    }
+
+    /// Inserts `key` with `rid` at `position`, which `insert_position` gave
+    /// for `key`, and returns its index.
+    pub fn insert_at(&mut self, position: InsertPosition, key: &[u8], rid: Rid) -> usize {
+        let InsertPosition { index, tomb } = position;
+        if let Some(pos) = tomb {
             self.remove_tomb(pos);
             self.write_value(index, rid);
-            return Ok(index);
-        }
-        if !self.has_room_for(key.len()) {
-            return Err(StorageError::PageFull);
+            return index;
         }
         for pos in 0..self.num_tombstones() {
             let t = self.read_tomb(pos);
@@ -299,7 +328,7 @@ impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>, const NUM_TOMBS: usize>
             }
         }
         Self::LAYOUT.insert(&mut self.data, index, key, rid_bytes(rid).as_bytes());
-        Ok(index)
+        index
     }
 
     /// Deletes `key` by tombstoning it, and returns its record id, or `None`

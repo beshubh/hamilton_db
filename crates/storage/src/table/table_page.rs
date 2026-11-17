@@ -773,21 +773,23 @@ mod tests {
         use crate::buffer::arc_replacer::AccessType;
         use crate::buffer::buffer_pool_manager::BufferPoolManager;
         use crate::disk::disk_manager::DiskManager;
+        use crate::wal::mtr::Logged;
         use std::sync::Arc;
 
         let dir = tempfile::TempDir::new().unwrap();
         let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = BufferPoolManager::new(2, dm);
-        let pid = bpm.new_page();
-        {
-            let mut guard = bpm.write_page(pid, AccessType::Unknown);
-            let mut page = TablePage::init(guard.get_data_mut());
+        let bpm = BufferPoolManager::new(2, dm).unwrap();
+        let pid = {
+            let mtr = bpm.mtr(Logged::System);
+            let mut guard = mtr.new_page().unwrap();
+            let mut page = TablePage::init(guard.raw_mut());
             page.insert(&TupleMeta::new(1), b"persisted").unwrap();
-        }
+            guard.page_id()
+        };
         // Push the page out of the pool so it is read back from disk.
         for _ in 0..2 {
             let other = bpm.new_page();
-            drop(bpm.write_page(other, AccessType::Unknown));
+            drop(bpm.read_page(other, AccessType::Unknown));
         }
         let guard = bpm.read_page(pid, AccessType::Unknown);
         let page = TablePage::new(guard.get_data()).unwrap();

@@ -286,7 +286,10 @@ mod tests {
     fn setup(num_frames: usize) -> (TempDir, Arc<BufferPoolManager>) {
         let dir = TempDir::new().unwrap();
         let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        (dir, Arc::new(BufferPoolManager::new(num_frames, dm)))
+        (
+            dir,
+            Arc::new(BufferPoolManager::new(num_frames, dm).unwrap()),
+        )
     }
 
     fn tuple(bytes: impl AsRef<[u8]>) -> Tuple {

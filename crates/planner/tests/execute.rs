@@ -37,7 +37,7 @@ impl Db {
     fn with_settings(settings: ExecutionSettings) -> Self {
         let dir = TempDir::new().unwrap();
         let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = Arc::new(BufferPoolManager::new(8, dm));
+        let bpm = Arc::new(BufferPoolManager::new(8, dm).unwrap());
         let catalog = Arc::new(Catalog::open(bpm).unwrap());
         let engine = ExecutionEngine::new(catalog)
             .unwrap()

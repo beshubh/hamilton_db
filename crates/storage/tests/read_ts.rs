@@ -24,7 +24,7 @@ struct Db {
 fn setup(num_frames: usize) -> Db {
     let dir = TempDir::new().unwrap();
     let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(num_frames, dm));
+    let bpm = Arc::new(BufferPoolManager::new(num_frames, dm).unwrap());
     let heap = Arc::new(TableHeap::create(bpm).unwrap());
     Db {
         _dir: dir,

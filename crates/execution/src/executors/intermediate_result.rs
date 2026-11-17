@@ -155,17 +155,14 @@ impl IntermediatePages {
 
     /// A new page, for a [`PartitionWriter`] to fill.
     fn allocate(&mut self) -> PageId {
-        let page_id = self.bpm().new_page();
+        let page_id = self.bpm().new_temp_page();
         self.page_ids.insert(page_id);
         page_id
     }
 
     /// Writes `data`, a whole page, to page `page_id`.
     fn write(&self, page_id: PageId, data: &[u8; PAGE_SIZE]) -> Result<()> {
-        let mut guard = self
-            .bpm()
-            .checked_write_page(page_id, AccessType::Unknown)?;
-        *guard.get_data_mut() = *data;
+        *self.bpm().write_temp_page(page_id)?.get_data_mut() = *data;
         Ok(())
     }
 
@@ -175,20 +172,15 @@ impl IntermediatePages {
         if self.try_append(result, tuple)? {
             return Ok(());
         }
-        let page_id = self.bpm().new_page();
-        self.page_ids.insert(page_id);
-        let mut guard = self
-            .bpm()
-            .checked_write_page(page_id, AccessType::Unknown)?;
+        let page_id = self.allocate();
+        let mut guard = self.bpm().write_temp_page(page_id)?;
         IntermediateResultPage::init(guard.get_data_mut()).insert_tuple(tuple.data())?;
         drop(guard);
 
         if result.last_page_id == INVALID_PAGE_ID {
             result.first_page_id = page_id;
         } else {
-            let mut last = self
-                .bpm()
-                .checked_write_page(result.last_page_id, AccessType::Unknown)?;
+            let mut last = self.bpm().write_temp_page(result.last_page_id)?;
             IntermediateResultPage::new(last.get_data_mut())?.set_next_page_id(page_id);
         }
         result.last_page_id = page_id;
@@ -203,9 +195,7 @@ impl IntermediatePages {
         if result.last_page_id == INVALID_PAGE_ID {
             return Ok(false);
         }
-        let mut guard = self
-            .bpm()
-            .checked_write_page(result.last_page_id, AccessType::Unknown)?;
+        let mut guard = self.bpm().write_temp_page(result.last_page_id)?;
         match IntermediateResultPage::new(guard.get_data_mut())?.insert_tuple(tuple.data()) {
             Ok(_) => {
                 result.tuple_count += 1;
@@ -261,9 +251,7 @@ impl IntermediatePages {
     /// Replaces the rows on page `page_id` with `tuples`, which must fit,
     /// keeping its link to the next page.
     pub fn rewrite_page(&self, page_id: PageId, tuples: &[Tuple]) -> Result<()> {
-        let mut guard = self
-            .bpm()
-            .checked_write_page(page_id, AccessType::Unknown)?;
+        let mut guard = self.bpm().write_temp_page(page_id)?;
         let next_page_id = IntermediateResultPage::new(guard.get_data())?.next_page_id();
         let mut page = IntermediateResultPage::init(guard.get_data_mut());
         page.set_next_page_id(next_page_id);
