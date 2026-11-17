@@ -57,6 +57,14 @@ pub enum StorageError {
     #[error("unsupported metadata version {0}")]
     UnsupportedMetadataVersion(u32),
 
+    #[error("corrupt log: {0}")]
+    CorruptLog(String),
+
+    /// An earlier write or sync of the log failed, so nothing more can be
+    /// made durable.
+    #[error("the log failed earlier and accepts no more records")]
+    LogFailed,
+
     /// The page's header names a different page type than the caller expects.
     #[error("expected a {expected:?} page, found page type {found}")]
     UnexpectedPageType { expected: PageType, found: u32 },

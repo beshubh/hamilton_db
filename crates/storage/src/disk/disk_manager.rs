@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Write};
+#[cfg(not(unix))]
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::PageId;
 use parking_lot::Mutex;
@@ -43,8 +45,6 @@ pub struct DiskManager {
     /// Only read and written with positioned I/O, so it needs no lock.
     db_io: File,
     state: Mutex<DiskState>,
-    log: Mutex<LogState>,
-    flush_log: AtomicBool,
     num_reads: AtomicUsize,
     num_writes: AtomicUsize,
     num_deletes: AtomicUsize,
@@ -78,14 +78,8 @@ struct PageEntry {
     free_space: u32,
 }
 
-struct LogState {
-    log_io: File,
-    num_flushes: usize,
-}
-
 impl DiskManager {
-    /// Opens (or creates) `db_file` with matching `.log` and `.meta` files
-    /// next to it. The page directory of an existing database is loaded from
+    /// Opens (or creates) `db_file` with a matching `.meta` file next to it. The page directory of an existing database is loaded from
     /// its `.meta` file. Fails with `DatabaseLocked` while another manager
     /// has `db_file` open.
     pub fn new(db_file: impl AsRef<Path>) -> Result<Self> {
@@ -100,7 +94,6 @@ impl DiskManager {
             TryLockError::WouldBlock => StorageError::DatabaseLocked(db_file_name.clone()),
             TryLockError::Error(e) => e.into(),
         })?;
-        let log_io = open_rw(&log_file_name)?;
 
         // The capacity is not saved; it follows from the db file's length.
         let db_len = db_io.metadata()?.len() as usize;
@@ -135,11 +128,6 @@ impl DiskManager {
             meta_file_name,
             db_io,
             state: Mutex::new(state),
-            log: Mutex::new(LogState {
-                log_io,
-                num_flushes: 0,
-            }),
-            flush_log: AtomicBool::new(false),
             num_reads: AtomicUsize::new(0),
             num_writes: AtomicUsize::new(0),
             num_deletes: AtomicUsize::new(0),
@@ -148,12 +136,10 @@ impl DiskManager {
         })
     }
 
-    /// Saves the metadata and flushes all files to stable storage. The files
-    /// are closed when the `DiskManager` is dropped.
+    /// Saves the metadata and flushes the db file to stable storage. The
+    /// files are closed when the `DiskManager` is dropped.
     pub fn shut_down(&self) -> Result<()> {
-        self.checkpoint()?;
-        self.log.lock().log_io.sync_all()?;
-        Ok(())
+        self.checkpoint()
     }
 
     /// Flushes the db file and saves the metadata file if it changed.
@@ -248,46 +234,6 @@ impl DiskManager {
             state.meta_dirty = true;
             self.num_deletes.fetch_add(1, Ordering::Relaxed);
         }
-    }
-
-    /// Appends `log_data` to the log file and flushes it.
-    pub fn write_log(&self, log_data: &[u8]) -> Result<()> {
-        if log_data.is_empty() {
-            return Ok(());
-        }
-        let mut log = self.log.lock();
-        self.flush_log.store(true, Ordering::Release);
-        let result = log
-            .log_io
-            .seek(SeekFrom::End(0))
-            .and_then(|_| log.log_io.write_all(log_data))
-            .and_then(|_| log.log_io.flush());
-        log.num_flushes += 1;
-        self.flush_log.store(false, Ordering::Release);
-        Ok(result?)
-    }
-
-    /// Reads `log_data.len()` bytes from the log file starting at `offset`.
-    /// Returns `false` if `offset` is past the end of the log; a short read
-    /// leaves the rest of the buffer zeroed.
-    pub fn read_log(&self, log_data: &mut [u8], offset: u64) -> Result<bool> {
-        let mut log = self.log.lock();
-        if offset >= log.log_io.metadata()?.len() {
-            return Ok(false);
-        }
-        log.log_io.seek(SeekFrom::Start(offset))?;
-        let n = read_full(&mut log.log_io, log_data)?;
-        log_data[n..].fill(0);
-        Ok(true)
-    }
-
-    pub fn num_flushes(&self) -> usize {
-        self.log.lock().num_flushes
-    }
-
-    /// Whether a log flush is in progress.
-    pub fn flush_state(&self) -> bool {
-        self.flush_log.load(Ordering::Acquire)
     }
 
     /// Pages read from the db file. Reads of pages never written are not
@@ -512,7 +458,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// Makes a rename inside the directory durable.
 #[cfg(unix)]
-fn sync_parent_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
     match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => File::open(dir)?.sync_all(),
         _ => File::open(".")?.sync_all(),
@@ -551,7 +497,7 @@ fn check_page_id(page_id: PageId) -> Result<()> {
 /// Writes all of `buf` at `offset` in one positioned write (`pwrite`),
 /// without moving the file's cursor.
 #[cfg(unix)]
-fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+pub(crate) fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
     std::os::unix::fs::FileExt::write_all_at(file, buf, offset)
 }
 
@@ -560,7 +506,7 @@ fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
 static CURSOR: Mutex<()> = Mutex::new(());
 
 #[cfg(not(unix))]
-fn write_all_at(mut file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+pub(crate) fn write_all_at(mut file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
     let _cursor = CURSOR.lock();
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(buf)
@@ -569,7 +515,7 @@ fn write_all_at(mut file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
 /// Reads at `offset` until `buf` is full or EOF, with positioned reads
 /// (`pread`), returning the number of bytes read.
 #[cfg(unix)]
-fn read_full_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+pub(crate) fn read_full_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     use std::os::unix::fs::FileExt;
     let mut n = 0;
     while n < buf.len() {
@@ -584,13 +530,14 @@ fn read_full_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
 }
 
 #[cfg(not(unix))]
-fn read_full_at(mut file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+pub(crate) fn read_full_at(mut file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     let _cursor = CURSOR.lock();
     file.seek(SeekFrom::Start(offset))?;
     read_full(file, buf)
 }
 
 /// Reads until `buf` is full or EOF, returning the number of bytes read.
+#[cfg(not(unix))]
 fn read_full(mut file: impl Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
@@ -624,10 +571,9 @@ mod tests {
     }
 
     #[test]
-    fn creates_db_and_log_files() {
+    fn creates_db_and_meta_files() {
         let (dir, dm) = setup();
         assert!(dir.path().join("test.db").exists());
-        assert!(dir.path().join("test.log").exists());
         assert!(dir.path().join("test.meta").exists());
         assert_eq!(dm.log_file_name(), dir.path().join("test.log"));
         assert_eq!(
@@ -734,21 +680,6 @@ mod tests {
         let (_dir, dm) = setup();
         let err = dm.write_page(INVALID_PAGE_ID, &page_filled(0)).unwrap_err();
         assert!(matches!(err, StorageError::InvalidPageId(INVALID_PAGE_ID)));
-    }
-
-    #[test]
-    fn log_roundtrip() {
-        let (_dir, dm) = setup();
-        dm.write_log(b"hello ").unwrap();
-        dm.write_log(b"world").unwrap();
-        dm.write_log(b"").unwrap(); // ignored
-        assert_eq!(dm.num_flushes(), 2);
-        assert!(!dm.flush_state());
-
-        let mut buf = [0xffu8; 8];
-        assert!(dm.read_log(&mut buf, 6).unwrap());
-        assert_eq!(&buf, b"world\0\0\0");
-        assert!(!dm.read_log(&mut buf, 100).unwrap());
     }
 
     /// The page directory the last save left in the `.meta` file, read

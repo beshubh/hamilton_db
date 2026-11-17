@@ -9,6 +9,7 @@ pub mod error;
 pub mod index;
 pub mod page;
 pub mod table;
+pub mod wal;
 
 pub use error::{Result, StorageError};
 
