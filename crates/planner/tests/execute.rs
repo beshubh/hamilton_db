@@ -9,8 +9,6 @@ use common::{IndexKind, Tuple, Value};
 use execution::ExecutionError;
 use execution::execution_context::{self, ExecutionSettings};
 use planner::{Binder, EngineError, ExecutionEngine, Output, PlannerError};
-use storage::buffer::buffer_pool_manager::BufferPoolManager;
-use storage::disk::disk_manager::DiskManager;
 use storage::index::IndexTrait;
 use tempfile::TempDir;
 
@@ -36,8 +34,7 @@ impl Db {
 
     fn with_settings(settings: ExecutionSettings) -> Self {
         let dir = TempDir::new().unwrap();
-        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = Arc::new(BufferPoolManager::new(8, dm).unwrap());
+        let bpm = storage::open(dir.path().join("test.db"), 8).unwrap().bpm;
         let catalog = Arc::new(Catalog::open(bpm).unwrap());
         let engine = ExecutionEngine::new(catalog)
             .unwrap()

@@ -6,7 +6,7 @@ A database is three files next to each other: `<name>.db`, `<name>.meta` and `<n
 
 - `persist-create` creates the three files when started on a path that doesn't exist.
 - `persist-restart` keeps schema, indexes, rows and identity sequences across a clean restart.
-- `persist-crash` behavior after the server is killed without shutting down.
+- `persist-crash` keeps every committed row after the server is killed without shutting down.
 - `persist-lock` refuses a second server on the same files.
 - `persist-shutdown` exits 0 and logs `shut down` on SIGTERM.
 
@@ -47,11 +47,11 @@ Preconditions:
 
 - **Lock.** With the server up, run `target/debug/hamilton-server --port 0 /tmp/hamilton-verify/$HDB_RUN/data/verify.db; echo "exit=$?"`. It prints `is already open in another process` and `exit=1`, and `hdb doctor` still exits 0.
 
-- **Crash.** Run `hdb sql persist-precrash` with `INSERT INTO ps_notes (body) VALUES ('doomed'); SELECT count(*) FROM ps_notes;`, then `hdb crash`, `hdb start`, and `hdb sql persist-postcrash` with `SELECT * FROM ps_notes ORDER BY id;`. The server must start and answer; record which rows survived. See Gotchas for what to expect today.
+- **Crash.** Run `hdb sql persist-precrash` with `INSERT INTO ps_notes (body) VALUES ('doomed'); SELECT count(*) FROM ps_notes;`, then `hdb crash`, `hdb start`, and `hdb sql persist-postcrash` with `SELECT * FROM ps_notes ORDER BY id;`. The server must start and answer with every committed row, `doomed` included.
 
 ## Gotchas
 
-- There is no crash recovery yet: a row committed just before `hdb crash` is lost unless a periodic checkpoint happened to run first (observed at 4f7a538: the committed `INSERT` was gone after SIGKILL). That is the current behavior, not a pass. When a change claims durability, this journey must show the row surviving; don't swap `crash` for `restart` to get there.
+- Opening the files after `hdb crash` replays the log, so every statement that returned before the kill is there. A statement still running at the kill is not. With several connections writing, another connection's commit can sync an unfinished transaction's writes, and those rows survive locked: reading them fails with a serialization error, because recovery does not roll back unfinished transactions yet. Don't swap `crash` for `restart` to prove durability.
 - The port changes on every start. Anything holding the old port (an open `hdb repl` tab, a `psql` in another pane) is dead after a restart.
 - `hdb restart` doesn't rebuild. To test that a new build reads an old database, `hdb stop && hdb up`.
 - Bumping the catalog `VERSION` makes old files unreadable by design: start over with `hdb down && hdb up`.

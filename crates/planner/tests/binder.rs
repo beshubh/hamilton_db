@@ -1,10 +1,6 @@
-use std::sync::Arc;
-
 use catalog::Catalog;
 use common::{Column, DataType, Schema, Value, ValueError};
 use parser::{BinaryOp, JoinKind, Statement, UnaryOp};
-use storage::buffer::buffer_pool_manager::BufferPoolManager;
-use storage::disk::disk_manager::DiskManager;
 use tempfile::TempDir;
 
 use planner::Binder;
@@ -23,8 +19,7 @@ struct Db {
 impl Db {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
-        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = Arc::new(BufferPoolManager::new(16, dm).unwrap());
+        let bpm = storage::open(dir.path().join("test.db"), 16).unwrap().bpm;
         let catalog = Catalog::open(bpm).unwrap();
         catalog
             .create_table(

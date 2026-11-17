@@ -2,15 +2,12 @@
 //! through the undo log, and garbage collection of undo records.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use common::{Column, DataType, PageId, Rid, Schema, Tuple, Value};
 use storage::StorageError;
-use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::concurrency::read_ts::ReadTimestamps;
-use storage::disk::disk_manager::DiskManager;
 use storage::table::table_heap::TableHeap;
 use storage::table::table_page::{INVALID_UNDO_PTR, TupleMeta};
 use storage::table::undo_log::UndoLog;
@@ -18,8 +15,9 @@ use tempfile::TempDir;
 
 fn setup(num_frames: usize) -> (TempDir, TableHeap) {
     let dir = TempDir::new().unwrap();
-    let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(num_frames, dm).unwrap());
+    let bpm = storage::open(dir.path().join("test.db"), num_frames)
+        .unwrap()
+        .bpm;
     (dir, TableHeap::create(bpm).unwrap())
 }
 

@@ -46,8 +46,10 @@ pub struct Db {
 impl Db {
     pub fn new() -> Self {
         let dir = TempDir::new().unwrap();
-        let disk = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = Arc::new(BufferPoolManager::new(NUM_FRAMES, Arc::clone(&disk)).unwrap());
+        let bpm = storage::open(dir.path().join("test.db"), NUM_FRAMES)
+            .unwrap()
+            .bpm;
+        let disk = Arc::clone(bpm.disk_manager());
         let catalog = Arc::new(Catalog::open(Arc::clone(&bpm)).unwrap());
         let users = catalog.create_table("users", users_schema(), &[]).unwrap();
         Self {

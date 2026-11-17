@@ -6,6 +6,7 @@ use std::thread;
 
 use common::{INVALID_LSN, Lsn};
 use storage::StorageError;
+use storage::disk::fs::OsFs;
 use storage::wal::log::{FIRST_LSN, Log};
 use storage::wal::record::{HEADER_SIZE, Kind, RecordBuf};
 use tempfile::TempDir;
@@ -34,7 +35,7 @@ fn scan_all(log: &Log) -> Vec<(Lsn, Lsn, u64, Kind, Vec<u8>)> {
 
 fn setup() -> (TempDir, Log) {
     let dir = TempDir::new().unwrap();
-    let log = Log::open(dir.path().join("t.log")).unwrap();
+    let log = Log::open(&OsFs, dir.path().join("t.log")).unwrap();
     (dir, log)
 }
 
@@ -127,7 +128,7 @@ fn only_durable_records_survive_reopening() {
     append(&log, Kind::Update, 1, a, b"lost");
     drop(log);
 
-    let log = Log::open(log_path(&dir)).unwrap();
+    let log = Log::open(&OsFs, log_path(&dir)).unwrap();
     let records = scan_all(&log);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].4, b"kept");
@@ -170,7 +171,7 @@ fn a_full_tail_is_flushed_by_the_append_that_overflows_it() {
     }
     log.flush_all().unwrap();
     drop(log);
-    let log = Log::open(log_path(&dir)).unwrap();
+    let log = Log::open(&OsFs, log_path(&dir)).unwrap();
     assert_eq!(scan_all(&log).len(), 40);
 }
 
@@ -202,7 +203,7 @@ fn a_torn_record_ends_the_log_and_is_cut_off() {
         .unwrap()
         .set_len(c + 10)
         .unwrap();
-    let log = Log::open(&path).unwrap();
+    let log = Log::open(&OsFs, &path).unwrap();
     assert_eq!(scan_all(&log).len(), 2);
     assert_eq!(log.end(), c);
     assert_eq!(file_len(&path), c);
@@ -211,7 +212,7 @@ fn a_torn_record_ends_the_log_and_is_cut_off() {
     assert_eq!(d, c);
     log.flush_all().unwrap();
     drop(log);
-    let log = Log::open(&path).unwrap();
+    let log = Log::open(&OsFs, &path).unwrap();
     let kinds: Vec<_> = scan_all(&log).into_iter().map(|r| r.3).collect();
     assert_eq!(kinds, [Kind::Update, Kind::Update, Kind::Abort]);
 }
@@ -237,7 +238,7 @@ fn a_record_that_fails_its_checksum_ends_the_log() {
     file.write_all_at(&[byte[0] ^ 1], at).unwrap();
     drop(file);
 
-    let log = Log::open(&path).unwrap();
+    let log = Log::open(&OsFs, &path).unwrap();
     assert_eq!(scan_all(&log).len(), 1);
     assert_eq!(log.end(), b);
 }
@@ -263,7 +264,7 @@ fn a_record_copied_to_another_position_is_not_a_record() {
     file.write_all_at(&bytes, end).unwrap();
     drop(file);
 
-    let log = Log::open(&path).unwrap();
+    let log = Log::open(&OsFs, &path).unwrap();
     assert_eq!(scan_all(&log).len(), 1);
     assert_eq!(log.end(), end);
 }
@@ -290,7 +291,10 @@ fn an_intact_record_of_an_unknown_kind_is_an_error() {
     file.write_all_at(&bytes, a).unwrap();
     drop(file);
 
-    assert!(matches!(Log::open(&path), Err(StorageError::CorruptLog(_))));
+    assert!(matches!(
+        Log::open(&OsFs, &path),
+        Err(StorageError::CorruptLog(_))
+    ));
 }
 
 #[test]
@@ -298,7 +302,10 @@ fn a_file_that_is_not_a_log_is_refused() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("t.log");
     fs::write(&path, [1u8; 64]).unwrap();
-    assert!(matches!(Log::open(&path), Err(StorageError::CorruptLog(_))));
+    assert!(matches!(
+        Log::open(&OsFs, &path),
+        Err(StorageError::CorruptLog(_))
+    ));
 }
 
 #[test]
@@ -328,7 +335,7 @@ fn concurrent_appenders_and_flushers_lose_nothing() {
     assert!(log.num_syncs() <= 8 * 20);
     drop(log);
 
-    let log = Log::open(log_path(&dir)).unwrap();
+    let log = Log::open(&OsFs, log_path(&dir)).unwrap();
     let records = scan_all(&log);
     assert_eq!(records.len(), 8 * 200);
     for t in 1..=8u64 {

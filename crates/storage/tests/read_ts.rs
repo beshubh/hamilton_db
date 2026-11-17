@@ -8,10 +8,8 @@ use std::thread;
 
 use common::{Column, DataType, Rid, Schema, Tuple, TxnId, Value};
 use storage::StorageError;
-use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::concurrency::transaction::Transaction;
 use storage::concurrency::transaction_manager::TransactionManager;
-use storage::disk::disk_manager::DiskManager;
 use storage::table::table_heap::TableHeap;
 use tempfile::TempDir;
 
@@ -23,8 +21,9 @@ struct Db {
 
 fn setup(num_frames: usize) -> Db {
     let dir = TempDir::new().unwrap();
-    let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(num_frames, dm).unwrap());
+    let bpm = storage::open(dir.path().join("test.db"), num_frames)
+        .unwrap()
+        .bpm;
     let heap = Arc::new(TableHeap::create(bpm).unwrap());
     Db {
         _dir: dir,

@@ -510,7 +510,6 @@ fn check_write(rid: Rid, head: &TupleMeta, ts: u64, read_ts: &ReadTimestamps) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk::disk_manager::DiskManager;
     use crate::table::table_page::MAX_PAYLOAD_SIZE;
     use std::collections::HashSet;
     use std::thread;
@@ -518,11 +517,10 @@ mod tests {
 
     fn setup(num_frames: usize) -> (TempDir, Arc<BufferPoolManager>) {
         let dir = TempDir::new().unwrap();
-        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        (
-            dir,
-            Arc::new(BufferPoolManager::new(num_frames, dm).unwrap()),
-        )
+        let bpm = crate::open(dir.path().join("test.db"), num_frames)
+            .unwrap()
+            .bpm;
+        (dir, bpm)
     }
 
     fn tuple(bytes: impl AsRef<[u8]>) -> Tuple {

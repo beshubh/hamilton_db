@@ -11,7 +11,6 @@ use common::Value;
 use execution::ExecutionError;
 use planner::{EngineError, ExecutionEngine, Output, TransactionStatus};
 use storage::StorageError;
-use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::disk::disk_manager::DiskManager;
 use storage::index::Index;
 use tempfile::TempDir;
@@ -28,8 +27,8 @@ impl Db {
     }
 
     fn open(dir: TempDir) -> Self {
-        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = Arc::new(BufferPoolManager::new(16, Arc::clone(&dm)).unwrap());
+        let bpm = storage::open(dir.path().join("test.db"), 16).unwrap().bpm;
+        let dm = Arc::clone(bpm.disk_manager());
         let catalog = Arc::new(Catalog::open(bpm).unwrap());
         Self {
             _dir: dir,
@@ -342,8 +341,7 @@ fn explain_of_a_transaction_command_is_an_error() {
 #[test]
 fn dropping_the_engine_rolls_back_an_open_block() {
     let dir = TempDir::new().unwrap();
-    let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(16, dm).unwrap());
+    let bpm = storage::open(dir.path().join("test.db"), 16).unwrap().bpm;
     let catalog = Arc::new(Catalog::open(bpm).unwrap());
 
     let mut engine = ExecutionEngine::new(Arc::clone(&catalog)).unwrap();
@@ -364,8 +362,8 @@ fn dropping_the_engine_rolls_back_an_open_block() {
     );
 }
 
-/// The next Tid is recorded at each commit, so a new engine on the same
-/// catalog starts above every committed row.
+/// The next Tid is recorded before each statement that can write, so a new
+/// engine on the same catalog starts above every committed row.
 #[test]
 fn a_new_engine_starts_above_committed_tids() {
     let mut db = Db::with_tables();
@@ -381,6 +379,21 @@ fn a_new_engine_starts_above_committed_tids() {
         &outputs[0],
         Output::Rows { rows, .. } if rows == &[[int(0)], [int(0)]]
     ));
+}
+
+/// A transaction's writes can reach the log before it commits, so a crash
+/// must not hand its Tid out again: the next transaction would take its
+/// locked rows for its own.
+#[test]
+fn a_crash_never_hands_out_the_tid_of_a_transaction_whose_writes_survived() {
+    let mut db = Db::with_tables();
+    db.ok("BEGIN");
+    let pending = db.engine.transaction_manager().next_tid() - 1;
+    db.ok("INSERT INTO log VALUES (3, 'pending')");
+    // Syncs the log, the uncommitted insert with it.
+    db.engine.catalog().bpm().checkpoint().unwrap();
+    let crashed = db.crash_copy();
+    assert!(crashed.engine.transaction_manager().next_tid() > pending);
 }
 
 /// A conflict is a failed statement like any other.
@@ -1091,8 +1104,7 @@ fn a_crash_never_leaves_a_restarted_sequence_behind_the_rows() {
         let values: Vec<_> = (0..50).map(|n| format!("({n})")).collect();
         db.ok(&format!("INSERT INTO t (n) VALUES {}", values.join(", ")));
         if end != "COMMIT, never checkpointed" {
-            db.engine.catalog().bpm().flush_all_pages().unwrap();
-            db.disk.checkpoint().unwrap();
+            db.engine.catalog().bpm().checkpoint().unwrap();
         }
 
         db.ok("BEGIN");

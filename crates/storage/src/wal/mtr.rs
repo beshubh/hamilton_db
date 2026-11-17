@@ -32,6 +32,14 @@ thread_local! {
     static RECORD: RefCell<RecordBuf> = RefCell::new(RecordBuf::new());
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs in `finish` after the append and before the frees, so a test
+    /// can take a checkpoint in between.
+    pub(crate) static BEFORE_FREES: RefCell<Option<Box<dyn FnMut()>>> =
+        const { RefCell::new(None) };
+}
+
 /// Page changes logged as one record, which redo applies whole or not at
 /// all. A changed page stays latched until the record is appended; an
 /// unchanged one is released when its `MtrPage` drops, so B+tree writers can
@@ -115,14 +123,24 @@ impl<'a> Mtr<'a> {
             set_page_lsn(guard.data_mut_for_mtr(), lsn);
         }
         drop(changed);
-        for page_id in frees {
+        #[cfg(test)]
+        BEFORE_FREES.with_borrow_mut(|hook| hook.as_mut().map(|hook| hook()));
+        for &page_id in &frees {
             loop {
-                match self.bpm.delete_page(page_id) {
+                match self.bpm.discard_page(page_id) {
                     Err(StorageError::PagePinned(_)) => std::thread::yield_now(),
-                    Err(e) => panic!("cannot delete page {page_id}, freed at {lsn}: {e}"),
+                    Err(e) => {
+                        // The free is logged; a checkpoint must not save a
+                        // directory that still lists the page.
+                        eprintln!("hamilton: cannot delete page {page_id}, freed at {lsn}: {e}");
+                        std::process::abort()
+                    }
                     Ok(()) => break,
                 }
             }
+        }
+        if !frees.is_empty() {
+            self.bpm.checkpoints().free_applied(lsn);
         }
         Some(lsn)
     }
@@ -138,10 +156,15 @@ impl<'a> Mtr<'a> {
         encode_page_changes(record.body(), images, frees);
         record.finish();
         // Under the log's lock, so whoever reads the log's end past this
-        // record also sees the rec_lsn of every page it changed.
+        // record also sees the rec_lsn of every page it changed, and its
+        // frees as pending. Takes no buffer pool, frame or disk lock: an
+        // eviction holds a frame latch while it waits on the log.
         let appended = self.bpm.log().append(&record, |lsn| {
             for guard in changed {
                 guard.frame().set_rec_lsn_if_clean(lsn);
+            }
+            if !frees.is_empty() {
+                self.bpm.checkpoints().free_logged(lsn);
             }
             INVALID_LSN
         });
@@ -157,6 +180,13 @@ impl<'a> Mtr<'a> {
 
 impl Drop for Mtr<'_> {
     fn drop(&mut self) {
+        let state = self.state.get_mut();
+        if std::thread::panicking() && !(state.changed.is_empty() && state.frees.is_empty()) {
+            // The panic may have stopped a change halfway; logging it would
+            // make that durable. Recovery redoes whole mtrs only.
+            eprintln!("hamilton: panicked in the middle of a page change");
+            std::process::abort();
+        }
         self.finish();
     }
 }

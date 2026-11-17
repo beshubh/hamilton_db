@@ -287,11 +287,10 @@ impl Catalog {
     }
 
     /// Records `tid` as the next Tid in the header page, unless a larger one
-    /// is recorded already. It reaches disk when the page is flushed, like
-    /// any other.
+    /// is recorded already.
     ///
-    /// Commits call this with a `tid` read before they take the page, so
-    /// one that is slow to get here must not undo a later commit's record.
+    /// Statements call this with a `tid` read before they take the page, so
+    /// one that is slow to get here must not undo a later one's record.
     pub fn set_next_tid(&self, tid: TxnId) -> Result<()> {
         let mtr = self.bpm.mtr(Logged::System);
         let mut page = mtr.write_page(CATALOG_PAGE_ID)?;
@@ -747,9 +746,7 @@ impl Catalog {
     fn discard_if_empty(&self, index: &NewIndex) {
         let Index::BtreeIndex(btree) = &*index.index;
         if btree.tree().is_empty().unwrap_or(false) {
-            // Only space is lost if this fails, and the fill's error is the
-            // one to report.
-            let _ = self.bpm.delete_page(index.header_page_id);
+            self.bpm.mtr(Logged::System).free_page(index.header_page_id);
         }
     }
 
@@ -945,8 +942,7 @@ impl Catalog {
     }
 
     fn prepare_tables(&self, tables: &[TableOid], prepared: &AtomicBool) -> Result<()> {
-        self.bpm.flush_all_pages()?;
-        self.bpm.sync_disk()?;
+        self.bpm.checkpoint()?;
         prepared.store(true, Ordering::Release);
         for &oid in tables {
             let (table, indexes) = {
@@ -1042,7 +1038,8 @@ fn tree(
 }
 
 /// Frees the pages of a heap and its indexes that nothing points to any
-/// more. Freeing is only to save space, so failures are logged.
+/// more. Freeing is only to save space, so pages that cannot be listed are
+/// left allocated and the failure logged.
 fn free_pages(bpm: &BufferPoolManager, table: &TableInfo, indexes: &[Arc<IndexInfo>]) {
     let mut pages = match table.heap.page_ids() {
         Ok(pages) => pages,
@@ -1054,19 +1051,9 @@ fn free_pages(bpm: &BufferPoolManager, table: &TableInfo, indexes: &[Arc<IndexIn
             Err(e) => log::error!("freeing the old index {}: {e}", index.name),
         }
     }
+    let mtr = bpm.mtr(Logged::System);
     for page_id in pages {
-        // A checkpoint may pin the page for a moment. Past that, something
-        // still uses it, so it is left allocated.
-        for attempt in 0.. {
-            match bpm.delete_page(page_id) {
-                Err(StorageError::PagePinned(_)) if attempt < 1000 => std::thread::yield_now(),
-                Err(e) => {
-                    log::error!("freeing page {page_id}: {e}");
-                    break;
-                }
-                Ok(()) => break,
-            }
-        }
+        mtr.free_page(page_id);
     }
 }
 
@@ -1280,7 +1267,7 @@ fn corrupt(err: CatalogError) -> CatalogError {
 mod tests {
     use super::*;
     use common::{Tuple, Value};
-    use storage::disk::disk_manager::DiskManager;
+    use storage::Storage;
     use storage::index::IndexTrait;
     use storage::page::page_header::PageType;
     use storage::table::table_page::{TablePage, TupleMeta};
@@ -1288,52 +1275,53 @@ mod tests {
 
     struct Db {
         dir: TempDir,
-        dm: Arc<DiskManager>,
+        storage: Storage,
         catalog: Catalog,
     }
 
     impl Db {
         fn new(num_frames: usize) -> Self {
-            let dir = TempDir::new().unwrap();
-            let (dm, bpm) = open_files(&dir, num_frames);
-            let catalog = Catalog::open(bpm).unwrap();
-            Self { dir, dm, catalog }
+            Self::open(TempDir::new().unwrap(), num_frames)
         }
 
-        /// Writes every page and saves the files' metadata, as the server's
-        /// checkpoints do.
+        fn open(dir: TempDir, num_frames: usize) -> Self {
+            let storage = storage::open(dir.path().join("test.db"), num_frames).unwrap();
+            let catalog = Catalog::open(Arc::clone(&storage.bpm)).unwrap();
+            Self {
+                dir,
+                storage,
+                catalog,
+            }
+        }
+
         fn checkpoint(&self) {
-            self.catalog.bpm.flush_all_pages().unwrap();
-            self.dm.checkpoint().unwrap();
+            self.storage.bpm.checkpoint().unwrap();
         }
 
-        /// Drops everything unflushed and opens the files again, as after a
-        /// crash: disk holds only pages something wrote, and the metadata of
-        /// the last checkpoint.
+        /// Drops everything and opens the files again, as after a crash:
+        /// disk holds the pages something wrote, the log what was synced,
+        /// and the `.meta` file the last checkpoint.
         fn crash(self) -> Self {
-            let Db { dir, dm, catalog } = self;
-            drop((catalog, dm));
-            let (dm, bpm) = open_files(&dir, 8);
-            let catalog = Catalog::open(bpm).unwrap();
-            Self { dir, dm, catalog }
+            let Db {
+                dir,
+                storage,
+                catalog,
+            } = self;
+            drop((catalog, storage));
+            Self::open(dir, 8)
         }
 
-        /// Flushes everything, shuts the files down and opens them again.
+        /// Closes the files and opens them again.
         fn restart(self) -> Self {
-            let Db { dir, dm, catalog } = self;
-            catalog.bpm.flush_all_pages().unwrap();
-            dm.shut_down().unwrap();
-            drop((catalog, dm));
-            let (dm, bpm) = open_files(&dir, 8);
-            let catalog = Catalog::open(bpm).unwrap();
-            Self { dir, dm, catalog }
+            let Db {
+                dir,
+                storage,
+                catalog,
+            } = self;
+            drop(catalog);
+            storage.close().unwrap();
+            Self::open(dir, 8)
         }
-    }
-
-    fn open_files(dir: &TempDir, num_frames: usize) -> (Arc<DiskManager>, Arc<BufferPoolManager>) {
-        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = Arc::new(BufferPoolManager::new(num_frames, Arc::clone(&dm)).unwrap());
-        (dm, bpm)
     }
 
     fn users() -> Schema {
@@ -1495,7 +1483,7 @@ mod tests {
         let db = Db::new(8);
         db.catalog.create_table("users", users(), &[]).unwrap();
         db.catalog.bpm.flush_all_pages().unwrap();
-        let writes = db.dm.num_writes();
+        let writes = db.storage.bpm.disk_manager().num_writes();
         for _ in 0..3 {
             let failed = db.catalog.create_index_with(
                 "users_name",
@@ -1508,7 +1496,7 @@ mod tests {
         }
         // The header pages left the pool unwritten.
         db.catalog.bpm.flush_all_pages().unwrap();
-        assert_eq!(db.dm.num_writes(), writes);
+        assert_eq!(db.storage.bpm.disk_manager().num_writes(), writes);
         let first = db.catalog.create_index("a", "users", &["id"]).unwrap();
         let second = db.catalog.create_index("b", "users", &["id"]).unwrap();
         assert_eq!(second.oid, first.oid + 1);
@@ -2196,13 +2184,12 @@ mod tests {
     #[test]
     fn rejects_database_whose_page_0_is_not_a_catalog() {
         let dir = TempDir::new().unwrap();
-        let (dm, bpm) = open_files(&dir, 4);
+        let bpm = storage::open(dir.path().join("test.db"), 4).unwrap().bpm;
         {
             let mtr = bpm.mtr(Logged::System);
             let mut page = mtr.new_page().unwrap();
             storage::page::page_header::PageHeader::init(page.raw_mut(), PageType::Table);
         }
         assert!(matches!(Catalog::open(bpm), Err(CatalogError::Corrupt(_))));
-        drop(dm);
     }
 }

@@ -4,8 +4,6 @@ use std::sync::Arc;
 
 use common::{Column, DataType, IndexKind, Rid, Schema, Tuple, Value, ValueError};
 use storage::StorageError;
-use storage::buffer::buffer_pool_manager::BufferPoolManager;
-use storage::disk::disk_manager::DiskManager;
 use storage::index::btree_index::{BtreeIndex, KeySchemaComparator};
 use storage::index::{Index, IndexMetadata, IndexTrait, LocatorKind, RowLocator};
 use storage::page::btree_page::KeyComparator;
@@ -75,8 +73,7 @@ fn long_strings_compare_by_value() {
 #[test]
 fn new_index_is_empty() {
     let dir = TempDir::new().unwrap();
-    let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(4, dm).unwrap());
+    let bpm = storage::open(dir.path().join("test.db"), 4).unwrap().bpm;
     let header_page_id = bpm.new_page();
     let metadata = IndexMetadata::new(
         "users_id_name",
@@ -123,8 +120,7 @@ fn index_with(
     locator: LocatorKind,
 ) -> IndexFixture {
     let dir = TempDir::new().unwrap();
-    let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(32, dm).unwrap());
+    let bpm = storage::open(dir.path().join("test.db"), 32).unwrap().bpm;
     let header_page_id = bpm.new_page();
     let table = table_schema();
     let key_schema = Arc::new(Schema::new(

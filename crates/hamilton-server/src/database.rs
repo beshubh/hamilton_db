@@ -4,23 +4,17 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use catalog::Catalog;
 use planner::{EngineError, ExecutionEngine, Output, TransactionStatus};
-use storage::buffer::buffer_pool_manager::{BufferPoolManager, DEFAULT_POOL_SIZE};
-use storage::disk::disk_manager::DiskManager;
-
-/// How often dirty pages are written out while the server runs.
-const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+use storage::Storage;
+use storage::buffer::buffer_pool_manager::DEFAULT_POOL_SIZE;
 
 pub struct Database {
-    checkpointer: Checkpointer,
-    disk: Arc<DiskManager>,
-    bpm: Arc<BufferPoolManager>,
+    storage: Storage,
     catalog: Arc<Catalog>,
     /// Never runs a statement. Sessions are made from it so that they share
     /// its transaction manager.
@@ -28,21 +22,15 @@ pub struct Database {
 }
 
 impl Database {
-    /// Opens the database stored at `path`, creating it if there is none.
-    /// Its `.meta` and `.log` files sit next to it. Fails if another process
-    /// has it open.
+    /// Opens the database stored at `path`, creating it if there is none,
+    /// and recovers what a crash left behind. Its `.meta` and `.log` files
+    /// sit next to it. Fails if another process has it open.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let disk = Arc::new(DiskManager::new(path)?);
-        let bpm = Arc::new(BufferPoolManager::new(
-            DEFAULT_POOL_SIZE,
-            Arc::clone(&disk),
-        )?);
-        let catalog = Arc::new(Catalog::open(Arc::clone(&bpm))?);
+        let storage = storage::open(path, DEFAULT_POOL_SIZE)?;
+        let catalog = Arc::new(Catalog::open(Arc::clone(&storage.bpm))?);
         let root = ExecutionEngine::new(Arc::clone(&catalog))?;
         Ok(Self {
-            checkpointer: Checkpointer::start(Arc::clone(&bpm), Arc::clone(&disk)),
-            disk,
-            bpm,
+            storage,
             catalog,
             root,
         })
@@ -69,67 +57,15 @@ impl Database {
         }
     }
 
-    /// Writes everything to disk and closes the files. Every session has
-    /// been dropped by now, rolling back the blocks they had open.
+    /// Takes a checkpoint and closes the files, so the next open has
+    /// nothing to recover. Every session has been dropped by now, rolling
+    /// back the blocks they had open.
     pub fn close(self) -> Result<()> {
-        drop(self.checkpointer);
         // Dropping the last engine stops the garbage collector, which
         // writes pages.
         drop(self.root);
-        self.bpm.flush_all_pages()?;
-        self.disk.shut_down()?;
+        self.storage.close()?;
         Ok(())
-    }
-}
-
-/// A thread that writes every dirty page to disk each
-/// `CHECKPOINT_INTERVAL`, until dropped.
-struct Checkpointer {
-    shared: Arc<(Mutex<bool>, Condvar)>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Checkpointer {
-    fn start(bpm: Arc<BufferPoolManager>, disk: Arc<DiskManager>) -> Self {
-        let shared = Arc::new((Mutex::new(false), Condvar::new()));
-        let thread = {
-            let shared = Arc::clone(&shared);
-            thread::Builder::new()
-                .name("checkpoint".into())
-                .spawn(move || {
-                    let (stop, wake) = &*shared;
-                    loop {
-                        let stop = stop.lock().unwrap();
-                        let (stop, _) = wake
-                            .wait_timeout_while(stop, CHECKPOINT_INTERVAL, |stop| !*stop)
-                            .unwrap();
-                        if *stop {
-                            return;
-                        }
-                        drop(stop);
-                        if let Err(err) = bpm.flush_all_pages().and_then(|()| disk.checkpoint()) {
-                            eprintln!("hamilton-server: checkpoint failed: {err}");
-                        }
-                    }
-                })
-                .expect("failed to start the checkpoint thread")
-        };
-        Self {
-            shared,
-            thread: Some(thread),
-        }
-    }
-}
-
-impl Drop for Checkpointer {
-    fn drop(&mut self) {
-        let (stop, wake) = &*self.shared;
-        *stop.lock().unwrap() = true;
-        wake.notify_one();
-        if let Some(thread) = self.thread.take() {
-            // A checkpoint thread that panicked has already reported it.
-            let _ = thread.join();
-        }
     }
 }
 

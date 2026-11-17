@@ -32,8 +32,10 @@ struct Db {
 
 fn setup(frames: usize) -> Db {
     let dir = TempDir::new().unwrap();
-    let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(frames, Arc::clone(&dm)).unwrap());
+    let bpm = storage::open(dir.path().join("test.db"), frames)
+        .unwrap()
+        .bpm;
+    let dm = Arc::clone(bpm.disk_manager());
     Db { _dir: dir, dm, bpm }
 }
 

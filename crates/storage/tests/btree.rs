@@ -8,9 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use common::{INVALID_PAGE_ID, PageId, Rid};
 use storage::StorageError;
 use storage::buffer::arc_replacer::AccessType;
-use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::buffer::traced_buffer_pool_manager::{PageAccess, TracedBufferPoolManager};
-use storage::disk::disk_manager::DiskManager;
 use storage::index::btree::Btree;
 use storage::index::index_iter::IndexIterator;
 use storage::page::PAGE_SIZE;
@@ -107,10 +105,11 @@ fn setup_no_tombs(frames: usize) -> Fixture<0> {
 
 fn setup_with<const NUM_TOMBS: usize>(frames: usize) -> Fixture<NUM_TOMBS> {
     let dir = TempDir::new().unwrap();
-    let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(TracedBufferPoolManager::new(Arc::new(
-        BufferPoolManager::new(frames, dm).unwrap(),
-    )));
+    let bpm = Arc::new(TracedBufferPoolManager::new(
+        storage::open(dir.path().join("test.db"), frames)
+            .unwrap()
+            .bpm,
+    ));
     let header_page_id = bpm.new_page();
     let tree = Btree::new("idx", header_page_id, Arc::clone(&bpm), CMP).unwrap();
     Fixture {

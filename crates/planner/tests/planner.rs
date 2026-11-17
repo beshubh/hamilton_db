@@ -6,8 +6,6 @@ use execution::expressions::{AbstractExpr, Expr};
 use execution::plans::{
     AbstractPlanNode, Aggregate, HashJoinPlan, JoinType, PlanNode, WindowColumn, WindowFunctionKind,
 };
-use storage::buffer::buffer_pool_manager::BufferPoolManager;
-use storage::disk::disk_manager::DiskManager;
 use tempfile::TempDir;
 
 use planner::bound::BoundStatement;
@@ -26,8 +24,7 @@ struct Db {
 impl Db {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
-        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = Arc::new(BufferPoolManager::new(16, dm).unwrap());
+        let bpm = storage::open(dir.path().join("test.db"), 16).unwrap().bpm;
         let catalog = Catalog::open(bpm).unwrap();
         catalog
             .create_table(

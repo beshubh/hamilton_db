@@ -15,4 +15,4 @@ heap (rid 3:1): ts 30 -> record: ts 20, name = 'b' -> record: ts 10, v = 1 -> en
 - **A locked update that shrinks a tuple keeps the tuple's old length**, padded with zeros. A rollback therefore always fits back in place and never has to move the row. Commit releases the padding.
 - **A delete sets a flag** and pushes a record with an empty delta. The bytes stay on the page. After no reader can see the tuple, `reclaim` frees the bytes and marks the slot dead.
 - **Dead slots are never reused.** An index entry may still name the rid, and must not lead to an unrelated tuple. Known gap: nothing frees dead slots yet, so each one keeps its entry in the slot array. Freeing them needs a garbage collection that also removes the index entries that name the rid.
-- **Not durable.** Undo records are only in memory. [Restart and crashes in MVTO](mvto.md#restart-and-crashes) explains why a clean restart does not need them.
+- **Not durable.** Undo records are only in memory. [Restart and crashes in MVTO](mvto.md#restart-and-crashes) explains why a restart does not need them.

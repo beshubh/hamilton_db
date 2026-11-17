@@ -301,7 +301,13 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
         }
         .expect("each half of a split has room for one more key");
 
-        self.insert_into_parent(&mtr, &mut ctx, leaf_page_id, separator, right_page_id)?;
+        finish_change(self.insert_into_parent(
+            &mtr,
+            &mut ctx,
+            leaf_page_id,
+            separator,
+            right_page_id,
+        ));
         Ok(true)
     }
 
@@ -457,7 +463,7 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
         }
         let (mut guard, left) = self.latch_left_sibling(&mtr, &ctx, guard)?;
         LeafPageMut::<NUM_TOMBS>::new(guard.raw_mut())?.remove(key, &self.comparator);
-        self.rebalance(&mtr, &mut ctx, guard, left)?;
+        finish_change(self.rebalance(&mtr, &mut ctx, guard, left));
         Ok(true)
     }
 
@@ -791,6 +797,17 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
             // taken.
             parent = guard;
         }
+    }
+}
+
+/// The rest of a split or merge that has changed a page already. Failing
+/// now, say for want of a frame, would leave the tree half changed, and the
+/// mtr logs what it holds when it drops, so the process stops instead:
+/// recovery redoes whole mtrs only.
+fn finish_change(result: Result<()>) {
+    if let Err(e) = result {
+        eprintln!("hamilton: cannot finish a B+ tree split or merge: {e}");
+        std::process::abort();
     }
 }
 

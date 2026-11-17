@@ -771,14 +771,10 @@ mod tests {
     #[test]
     fn through_buffer_pool() {
         use crate::buffer::arc_replacer::AccessType;
-        use crate::buffer::buffer_pool_manager::BufferPoolManager;
-        use crate::disk::disk_manager::DiskManager;
         use crate::wal::mtr::Logged;
-        use std::sync::Arc;
 
         let dir = tempfile::TempDir::new().unwrap();
-        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = BufferPoolManager::new(2, dm).unwrap();
+        let bpm = crate::open(dir.path().join("test.db"), 2).unwrap().bpm;
         let pid = {
             let mtr = bpm.mtr(Logged::System);
             let mut guard = mtr.new_page().unwrap();

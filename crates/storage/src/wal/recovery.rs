@@ -1,0 +1,106 @@
+//! Restart recovery: analysis, then redo, then a sharp checkpoint.
+
+use std::collections::HashMap;
+
+use common::{Lsn, PageId};
+
+use crate::buffer::buffer_pool_manager::BufferPoolManager;
+use crate::error::{Result, StorageError};
+use crate::wal::checkpoint::{self, Checkpoint};
+use crate::wal::record::{Kind, PageChanges, PageRedo, Record};
+
+/// Brings every page up to date with the log, from the checkpoint in the
+/// `.meta` file on, then takes a sharp checkpoint and starts the log over.
+/// Writes no records, so a crash in the middle of it leaves the database as
+/// it found it, to recover again.
+pub(crate) fn recover(bpm: &mut BufferPoolManager) -> Result<()> {
+    let log = bpm.log();
+    let checkpoint = Checkpoint::decode(bpm.disk_manager().opened_checkpoint(), log.durable_end())?;
+    let in_log = log.first_lsn()..=log.durable_end();
+    if !in_log.contains(&checkpoint.redo_lsn)
+        || !in_log.contains(&checkpoint.start_lsn)
+        || checkpoint.redo_lsn > checkpoint.start_lsn
+    {
+        return Err(StorageError::CorruptLog(format!(
+            "the checkpoint reads from {} and {}, but the log holds {}..{}",
+            checkpoint.redo_lsn,
+            checkpoint.start_lsn,
+            in_log.start(),
+            in_log.end(),
+        )));
+    }
+    let dirty = analyze(bpm, &checkpoint)?;
+    redo(bpm, checkpoint.redo_lsn, dirty)?;
+    let saved = checkpoint::sharp(bpm)?;
+    if !saved.dirty.is_empty() || saved.redo_lsn != saved.start_lsn {
+        return Err(StorageError::CorruptLog(format!(
+            "recovery left pages that need the log from {}",
+            saved.redo_lsn
+        )));
+    }
+    bpm.start_log_over()
+}
+
+/// Finds the pages redo must bring up to date, each with the first record
+/// it must apply: those dirty at the checkpoint, and those the log changes
+/// after it began, less the ones it frees. Raises the next page id past
+/// every page the log names.
+fn analyze(bpm: &BufferPoolManager, checkpoint: &Checkpoint) -> Result<HashMap<PageId, Lsn>> {
+    let mut dirty: HashMap<PageId, Lsn> = checkpoint.dirty.iter().copied().collect();
+    let mut next_page_id = checkpoint
+        .next_page_id
+        .max(bpm.disk_manager().next_page_id());
+    let mut scan = bpm.log().scan(checkpoint.start_lsn);
+    while let Some(record) = scan.next_record()? {
+        let Some(changes) = page_changes(&record)? else {
+            continue;
+        };
+        for (page_id, _) in changes.pages() {
+            dirty.entry(page_id).or_insert(record.lsn);
+            next_page_id = next_page_id.max(page_id + 1);
+        }
+        for page_id in changes.frees() {
+            dirty.remove(&page_id);
+            next_page_id = next_page_id.max(page_id + 1);
+        }
+    }
+    bpm.raise_next_page_id(next_page_id);
+    Ok(dirty)
+}
+
+/// Applies, from `redo_lsn` on, every record to the pages in `dirty` it is
+/// not older than, and replays every free. The record at each page's first
+/// LSN holds its image, so redo never reads a page from disk.
+fn redo(bpm: &BufferPoolManager, redo_lsn: Lsn, mut dirty: HashMap<PageId, Lsn>) -> Result<()> {
+    let mut scan = bpm.log().scan(redo_lsn);
+    while let Some(record) = scan.next_record()? {
+        let Some(changes) = page_changes(&record)? else {
+            continue;
+        };
+        for (page_id, redo) in changes.pages() {
+            if dirty
+                .get(&page_id)
+                .is_some_and(|&first| first <= record.lsn)
+            {
+                match redo {
+                    PageRedo::Image(image) => bpm.redo_image(page_id, image, record.lsn)?,
+                }
+            }
+        }
+        for page_id in changes.frees() {
+            dirty.remove(&page_id);
+            bpm.discard_page(page_id)?;
+        }
+    }
+    Ok(())
+}
+
+/// The page changes in `record`, if it is of a kind that has them.
+fn page_changes<'a>(record: &Record<'a>) -> Result<Option<PageChanges<'a>>> {
+    match record.kind {
+        Kind::Update | Kind::Clr | Kind::Completion | Kind::System => {
+            PageChanges::decode(record.body).map(Some)
+        }
+        Kind::Commit | Kind::Abort | Kind::End => Ok(None),
+    }
+}

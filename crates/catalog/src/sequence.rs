@@ -244,9 +244,8 @@ impl Sequence {
             last_value,
             0,
         )?;
-        // TODO(wal): nothing replays the log yet, so the page itself goes to
-        // disk. Without an fsync of the db file, that survives a process
-        // crash but not a power loss.
+        // Writing the page syncs the log through this record first, which is
+        // what makes the values survive a crash. TODO(wal): sync only the log.
         self.bpm.flush_page(self.page_id)?;
         Ok(())
     }
@@ -303,8 +302,8 @@ mod tests {
     }
 
     fn sequence_on_disk(dir: &TempDir, max: i64) -> (Sequence, TableHeap, Arc<DiskManager>) {
-        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = Arc::new(BufferPoolManager::new(4, Arc::clone(&dm)).unwrap());
+        let bpm = storage::open(dir.path().join("test.db"), 4).unwrap().bpm;
+        let dm = Arc::clone(bpm.disk_manager());
         let heap = create_heap(&bpm).unwrap();
         let seq = Sequence::new(7, "t_id_seq".into(), bpm, heap.first_page_id(), max);
         (seq, heap, dm)

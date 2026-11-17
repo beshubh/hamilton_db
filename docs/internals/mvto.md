@@ -11,7 +11,7 @@ The tuple header in the heap page is on disk. It holds:
 - The deleted flag.
 - The write lock, which is not a separate field. While the writer is running, `ts` holds the writer's Tid with `TXN_UNCOMMITTED_BIT` set. There is no lock table.
 
-The next Tid is also on disk, in the catalog header page. The engine writes it before each commit.
+The next Tid is also on disk, in the catalog header page. The engine writes it before each statement that can write.
 
 The rest is in memory only, and a restart loses it:
 
@@ -54,18 +54,14 @@ One collector thread in [`TransactionManager`](../../crates/storage/src/concurre
 
 ## Restart and crashes
 
-There is no WAL. While the server runs, dirty pages reach disk in two ways: when the buffer pool evicts them, and at a periodic checkpoint ([`Checkpointer`](../../crates/hamilton-server/src/database.rs)). A checkpoint writes every dirty page, uncommitted versions included, and is not atomic across pages. A commit waits for neither.
+Opening a database replays the log, so after a crash the pages hold every change that the log kept, including every acknowledged commit ([Recovery](recovery.md)). The log does not hold what MVTO keeps in memory. A restart, clean or not, loses the undo log, the read timestamps, and the watermark. That does no harm:
 
-Only a clean shutdown is safe. It stops the checkpoints and writes everything after the last transaction has ended. A restart loses the undo log, the read timestamps, and the watermark. After a clean shutdown the loss does no harm:
-
-- The new Tid counter starts from the catalog header, above every committed `ts` on disk. New readers therefore see those versions as committed.
+- The new Tid counter starts from the catalog header, which is above every `ts` on disk. New readers therefore see the committed versions as committed.
 - No reader is older than the versions on disk, so no reader walks an undo chain. Stale `undo_ptr`s are still on disk. `older_record` rejects them, because it requires the record's `rid` and `writer_ts` to match.
 
-A crash is not safe. Commits since the last checkpoint are lost, and a crash during a checkpoint leaves some pages written and others not. A locked tuple that reached disk keeps the uncommitted bit and an older Tid, so every later reader and writer fails on that tuple with `Conflict`. Nothing clears these locks when the database opens.
+A crash does leave the locks of the transactions it cut off. A locked tuple keeps the uncommitted bit and an older Tid, so every later reader and writer fails on that tuple with `Conflict`. Nothing clears these locks when the database opens.
 
-Sequences need their own protection. `nextval` changes a sequence row ([`sequence.rs`](../../crates/catalog/src/sequence.rs)) in place, outside any transaction, at `ts` 0, so a crash also loses the latest changes to the row. Without more care, the sequence would then hand out ids that are already on disk. A sequence's page is in constant use, so it is written mostly at checkpoints, while the table pages that hold its ids are written whenever they are evicted.
-
-So `nextval` writes the row to disk 32 values ahead before it hands those values out. A checkpoint or an eviction can then write the page with the row's current value, which leaves the page clean. On its first call after that, `nextval` writes ahead again. After a crash, the sequence skips up to 32 values and never repeats one. The write ahead does the job of the WAL record that Postgres writes. `nextval` does not fsync, so the write survives a process crash but not a power loss.
+`nextval` changes a sequence row in place, outside any transaction, at `ts` 0. It writes the row to disk 32 values ahead before it hands those values out ([`sequence.rs`](../../crates/catalog/src/sequence.rs)). The write syncs the log through that change first, so after a crash the sequence skips up to 32 values and never repeats one.
 
 `TRUNCATE ... RESTART IDENTITY` is the only change that moves a sequence back. The row therefore does not change until the truncate is on disk, as the next section explains.
 
@@ -80,16 +76,17 @@ TRUNCATE does not delete rows. It gives the table a new, empty heap and new inde
 
 A commit that truncated costs a checkpoint. The engine prepares the commit first (`prepare_commit`):
 
-1. A checkpoint writes every page and the disk's list of pages.
+1. A sharp checkpoint writes every page and saves the page directory.
 2. The catalog rows are pointed at the new pages in memory. A failure up to here aborts the transaction.
 3. The transaction commits.
 4. The new heap is written again, with its rows now stamped committed. Then the pages that hold the catalog rows are written.
 5. The restarted sequence is written, and the old pages are freed.
 
-A crash before the catalog rows reach disk finds the old table, complete. The checkpoint's sync holds the disk manager's lock, so every page read from disk and every page write to disk stalls until the sync ends.
+A crash before the log holds the catalog rows' new page ids finds the old table, complete.
 
 ## Known gaps
 
 - **Phantoms.** Read timestamps guard tuples that exist. If an older transaction inserts a row that a newer transaction's scan should have seen, nothing detects it. Schedules with inserts are therefore not serializable.
 - **The catalog is not transactional.** CREATE TABLE and CREATE INDEX are rejected inside a block.
 - **A commit or abort that fails partway** leaves the transaction running, with some tuples finished and the rest locked.
+- **Crash recovery restores pages, not transactions.** See [Transactions are not recovered](recovery.md#transactions-are-not-recovered).

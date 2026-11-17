@@ -3,11 +3,12 @@ use crate::{
     disk::{disk_manager::DiskManager, disk_scheduler::DiskScheduler},
     error::{Result, StorageError},
     page::{
-        PageBuf, TEMP_PAGE_BASE,
+        PAGE_SIZE, PageBuf, TEMP_PAGE_BASE,
         page_guard::{PendingFlush, ReadPageGuard, TempPageGuard, WritePageGuard, flush_page},
-        page_header::verify_checksum,
+        page_header::{set_page_lsn, verify_checksum},
     },
     wal::{
+        checkpoint::{self, Checkpoints},
         log::Log,
         mtr::{Logged, Mtr},
     },
@@ -42,7 +43,8 @@ pub struct FrameHeader {
     is_dirty: AtomicBool,
     /// The first record that changed the page since it was last written, or
     /// `INVALID_LSN` if none did. Changes only under the frame latch: set
-    /// write-latched by the log append, cleared read-latched by the write.
+    /// write-latched by the log append, cleared read-latched once the write,
+    /// and with it a first write's `finish_first_write`, is done.
     rec_lsn: AtomicU64,
     /// Page currently stored in the frame, or `INVALID_PAGE_ID` if empty.
     page_id: AtomicI32,
@@ -193,15 +195,14 @@ pub struct BufferPoolManager {
     /// deleted.
     disk_manager: Arc<DiskManager>,
     log: Arc<Log>,
+    checkpoints: Checkpoints,
 }
 
 impl BufferPoolManager {
-    /// Page ids continue after the highest page already in `disk_manager`'s
-    /// db file, so reopening a database never hands out a page id in use.
-    /// The log next to the db file starts over empty: nothing reads it back
-    /// yet.
-    pub fn new(num_frames: usize, disk_manager: Arc<DiskManager>) -> Result<Self> {
-        let log = Arc::new(Log::create(disk_manager.log_file_name())?);
+    /// A pool over `disk_manager` and `log`, whose page ids continue after
+    /// the highest page in the db file. Recovery (`storage::open`) raises
+    /// that past every page the log names before anything else runs.
+    pub(crate) fn new(num_frames: usize, disk_manager: Arc<DiskManager>, log: Log) -> Self {
         let frames = (0..num_frames)
             .map(|i| Arc::new(FrameHeader::new(i as FrameId)))
             .collect();
@@ -210,7 +211,7 @@ impl BufferPoolManager {
             free_frames: (0..num_frames as FrameId).collect(),
         };
         let next_page_id = disk_manager.next_page_id();
-        Ok(Self {
+        Self {
             num_frames,
             next_page_id: AtomicI32::new(next_page_id),
             next_temp_page_id: AtomicI32::new(TEMP_PAGE_BASE),
@@ -219,8 +220,9 @@ impl BufferPoolManager {
             replacer: Arc::new(ArcReplacer::new(num_frames)),
             disk_scheduler: Arc::new(DiskScheduler::new(Arc::clone(&disk_manager))),
             disk_manager,
-            log,
-        })
+            log: Arc::new(log),
+            checkpoints: Checkpoints::default(),
+        }
     }
 
     /// Opens a mini-transaction, through which durable pages change.
@@ -232,10 +234,38 @@ impl BufferPoolManager {
         &self.log
     }
 
-    /// Syncs the db file and saves which pages it holds, so that pages
-    /// written so far are found on reopening (`DiskManager::checkpoint`).
-    pub fn sync_disk(&self) -> Result<()> {
-        self.disk_manager.checkpoint()
+    pub fn disk_manager(&self) -> &Arc<DiskManager> {
+        &self.disk_manager
+    }
+
+    /// Takes a sharp checkpoint: writes every dirty page, then saves the
+    /// page directory and the checkpoint in the `.meta` file, so that a
+    /// restart has next to nothing to redo (`wal::checkpoint`).
+    pub fn checkpoint(&self) -> Result<()> {
+        checkpoint::sharp(self).map(drop)
+    }
+
+    pub(crate) fn checkpoints(&self) -> &Checkpoints {
+        &self.checkpoints
+    }
+
+    /// The page id `new_page` hands out next.
+    pub(crate) fn next_page_id(&self) -> PageId {
+        self.next_page_id.load(Ordering::Acquire)
+    }
+
+    /// Makes `new_page` hand out ids from `page_id` on, unless it already
+    /// does from a higher one.
+    pub(crate) fn raise_next_page_id(&self, page_id: PageId) {
+        self.next_page_id.fetch_max(page_id, Ordering::AcqRel);
+    }
+
+    /// Starts the log over in a new file at its end, once a sharp
+    /// checkpoint has made every record in it unneeded. Only recovery calls
+    /// this, before the pool is shared.
+    pub(crate) fn start_log_over(&mut self) -> Result<()> {
+        let log = Arc::get_mut(&mut self.log).expect("the log is shared during recovery");
+        log.start_over(self.disk_manager.fs(), self.disk_manager.log_file_name())
     }
 
     /// Number of frames in the pool.
@@ -267,10 +297,20 @@ impl BufferPoolManager {
         ))
     }
 
+    /// Frees a temporary page, in memory and on disk. Fails with
+    /// `PagePinned` if a guard holds the page, and with `InvalidPageId` for a
+    /// durable page, which only an `Mtr` frees.
+    pub fn delete_page(&self, page_id: PageId) -> Result<()> {
+        if page_id < TEMP_PAGE_BASE {
+            return Err(StorageError::InvalidPageId(page_id));
+        }
+        self.discard_page(page_id)
+    }
+
     /// Removes a page from the buffer pool and frees it on disk. Fails with
     /// `PagePinned` if a guard holds the page. A page that is not in memory is
-    /// still freed on disk.
-    pub fn delete_page(&self, page_id: PageId) -> Result<()> {
+    /// still freed on disk, and one freed already is ignored.
+    pub(crate) fn discard_page(&self, page_id: PageId) -> Result<()> {
         {
             let mut state = self.latch.lock();
             if let Some(&frame_id) = state.page_table.get(&page_id) {
@@ -299,7 +339,7 @@ impl BufferPoolManager {
         access_type: AccessType,
     ) -> Result<ReadPageGuard> {
         loop {
-            let frame = self.pin_page(page_id, access_type)?;
+            let frame = self.pin_page(page_id, access_type, Load::Read)?;
             let guard = ReadPageGuard::new(
                 page_id,
                 Arc::clone(&frame),
@@ -323,7 +363,7 @@ impl BufferPoolManager {
         access_type: AccessType,
     ) -> Result<WritePageGuard> {
         loop {
-            let frame = self.pin_page(page_id, access_type)?;
+            let frame = self.pin_page(page_id, access_type, Load::Read)?;
             let guard = WritePageGuard::new(
                 page_id,
                 Arc::clone(&frame),
@@ -335,6 +375,29 @@ impl BufferPoolManager {
                 return Ok(guard);
             }
         }
+    }
+
+    /// Puts `image`, the page as the record at `lsn` left it, in the page's
+    /// frame, without reading the page from disk: its copy there may be torn,
+    /// missing or stale, and the image replaces all of it.
+    pub(crate) fn redo_image(
+        &self,
+        page_id: PageId,
+        image: &[u8; PAGE_SIZE],
+        lsn: Lsn,
+    ) -> Result<()> {
+        let frame = self.pin_page(page_id, AccessType::Unknown, Load::Zeroed)?;
+        let mut guard = WritePageGuard::new(
+            page_id,
+            Arc::clone(&frame),
+            Arc::clone(&self.replacer),
+            Arc::clone(&self.latch),
+        );
+        let data = guard.data_mut_for_mtr();
+        data.copy_from_slice(image);
+        set_page_lsn(data, lsn);
+        guard.frame().set_rec_lsn_if_clean(lsn);
+        Ok(())
     }
 
     /// Like `checked_read_page`, for callers that know the page can be loaded.
@@ -371,12 +434,49 @@ impl BufferPoolManager {
 
     /// Flushes every page currently in memory. Pages evicted while this runs
     /// were already written back by the eviction.
-    ///
-    /// Pages are written in batches, with every write in a batch queued
-    /// before waiting on any, so the disk scheduler's workers run them in
-    /// parallel.
     pub fn flush_all_pages(&self) -> Result<()> {
         let page_ids: Vec<PageId> = self.latch.lock().page_table.keys().copied().collect();
+        self.flush_pages(&page_ids)
+    }
+
+    /// Flushes every page whose first change since it was last written is
+    /// older than the record at `lsn`.
+    pub(crate) fn flush_older_than(&self, lsn: Lsn) -> Result<()> {
+        let page_ids: Vec<PageId> = {
+            let state = self.latch.lock();
+            let old = |&(_, &frame_id): &(&PageId, &FrameId)| {
+                let rec_lsn = self.frame(frame_id).rec_lsn();
+                rec_lsn != INVALID_LSN && rec_lsn < lsn
+            };
+            state
+                .page_table
+                .iter()
+                .filter(old)
+                .map(|(&id, _)| id)
+                .collect()
+        };
+        self.flush_pages(&page_ids)
+    }
+
+    /// The durable pages in memory with changes not yet written, each with
+    /// its `rec_lsn`. Read without latches, so it can race a page being
+    /// written or evicted, but never misses a page whose change is older
+    /// than the call and whose write had not finished by then.
+    pub(crate) fn dirty_pages(&self) -> Vec<(PageId, Lsn)> {
+        self.frames
+            .iter()
+            .filter_map(|frame| {
+                let page_id = frame.page_id()?;
+                let rec_lsn = frame.rec_lsn();
+                (rec_lsn != INVALID_LSN).then_some((page_id, rec_lsn))
+            })
+            .collect()
+    }
+
+    /// Writes the dirty pages among `page_ids` in batches, with every write
+    /// in a batch queued before waiting on any, so the disk scheduler's
+    /// workers run them in parallel.
+    fn flush_pages(&self, page_ids: &[PageId]) -> Result<()> {
         // Each batch keeps its pages pinned, so a small pool flushes fewer at
         // once to leave frames free for other threads.
         let batch_size = (self.num_frames / 8).clamp(1, 64);
@@ -463,7 +563,12 @@ impl BufferPoolManager {
     /// The buffer pool latch is only held to look up and change the page
     /// table. A miss that picks a dirty victim writes it back first and then
     /// starts over, since the page may have been loaded in the meantime.
-    fn pin_page(&self, page_id: PageId, access_type: AccessType) -> Result<Arc<FrameHeader>> {
+    fn pin_page(
+        &self,
+        page_id: PageId,
+        access_type: AccessType,
+        load: Load,
+    ) -> Result<Arc<FrameHeader>> {
         let next_page_id = if page_id < TEMP_PAGE_BASE {
             &self.next_page_id
         } else {
@@ -497,7 +602,7 @@ impl BufferPoolManager {
                 self.write_back_victim(frame_id, state)?;
                 continue;
             }
-            return self.load_page(page_id, frame_id, access_type, state);
+            return self.load_page(page_id, frame_id, access_type, load, state);
         }
     }
 
@@ -553,6 +658,7 @@ impl BufferPoolManager {
         page_id: PageId,
         frame_id: FrameId,
         access_type: AccessType,
+        load: Load,
         mut state: MutexGuard<'_, BufferPoolManagerState>,
     ) -> Result<Arc<FrameHeader>> {
         let frame = Arc::clone(self.frame(frame_id));
@@ -567,7 +673,7 @@ impl BufferPoolManager {
         let mut data = frame.get_data_mut();
         drop(state);
 
-        if !self.disk_manager.has_page(page_id) {
+        if load == Load::Zeroed || !self.disk_manager.has_page(page_id) {
             data.fill(0);
             drop(data);
             return Ok(frame);
@@ -604,10 +710,19 @@ impl BufferPoolManager {
     }
 }
 
+/// How `pin_page` fills a frame for a page not in memory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Load {
+    Read,
+    /// With zeros, for a caller about to overwrite the whole page.
+    Zeroed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::disk::disk_scheduler::DEFAULT_NUM_WORKERS;
+    use crate::disk::fs::OsFs;
     use crate::page::PAGE_SIZE;
     use crate::page::page_header::PageHeader;
     use crate::test_util::{stall_io, within_timeout};
@@ -618,11 +733,17 @@ mod tests {
     /// sets.
     const AT: usize = PageHeader::SIZE;
 
-    fn setup(num_frames: usize) -> (TempDir, Arc<DiskManager>, BufferPoolManager) {
+    fn setup(num_frames: usize) -> (TempDir, Arc<DiskManager>, Arc<BufferPoolManager>) {
         let dir = TempDir::new().unwrap();
-        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = BufferPoolManager::new(num_frames, Arc::clone(&dm)).unwrap();
-        (dir, dm, bpm)
+        let bpm = open(&dir, num_frames);
+        (dir, Arc::clone(bpm.disk_manager()), bpm)
+    }
+
+    fn open(dir: &TempDir, num_frames: usize) -> Arc<BufferPoolManager> {
+        let path = dir.path().join("test.db");
+        crate::open_with(Arc::new(OsFs), path, num_frames, None)
+            .unwrap()
+            .bpm
     }
 
     /// Writes `bytes` to the page through an mtr and returns its record's LSN.
@@ -656,22 +777,20 @@ mod tests {
         }
     }
 
-    /// Writes `bytes` to a new page on disk and returns a pool over `dm` that
-    /// has nothing cached.
+    /// Writes `bytes` to a new page on disk and reopens the database, so
+    /// nothing is cached.
     fn page_on_disk(
-        dm: &Arc<DiskManager>,
-        bpm: BufferPoolManager,
+        dir: &TempDir,
+        bpm: Arc<BufferPoolManager>,
         bytes: &[u8],
-    ) -> (PageId, Arc<BufferPoolManager>) {
+    ) -> (PageId, Arc<DiskManager>, Arc<BufferPoolManager>) {
         let pid = bpm.new_page();
         write_bytes(&bpm, pid, bytes);
-        bpm.flush_all_pages().unwrap();
+        bpm.checkpoint().unwrap();
         let frames = bpm.size();
         drop(bpm);
-        (
-            pid,
-            Arc::new(BufferPoolManager::new(frames, Arc::clone(dm)).unwrap()),
-        )
+        let bpm = open(dir, frames);
+        (pid, Arc::clone(bpm.disk_manager()), bpm)
     }
 
     #[test]
@@ -690,12 +809,10 @@ mod tests {
             let pid = bpm.new_page();
             write_bytes(&bpm, pid, b"x");
         }
-        bpm.flush_all_pages().unwrap();
-        dm.shut_down().unwrap();
+        bpm.checkpoint().unwrap();
         drop((bpm, dm));
 
-        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = BufferPoolManager::new(2, dm).unwrap();
+        let bpm = open(&dir, 2);
         assert_eq!(bpm.new_page(), 3);
         assert_eq!(read_bytes(&bpm, 2, 1), b"x");
     }
@@ -768,7 +885,7 @@ mod tests {
     #[test]
     fn delete_page() {
         let (_dir, dm, bpm) = setup(1);
-        let pid = bpm.new_page();
+        let pid = bpm.new_temp_page();
         let guard = bpm.read_page(pid, AccessType::Unknown);
         assert!(matches!(
             bpm.delete_page(pid),
@@ -783,6 +900,16 @@ mod tests {
         // The freed frame can hold another page.
         let other = bpm.new_page();
         bpm.checked_read_page(other, AccessType::Unknown).unwrap();
+    }
+
+    #[test]
+    fn a_durable_page_is_freed_only_through_an_mtr() {
+        let (_dir, _dm, bpm) = setup(1);
+        let pid = bpm.new_page();
+        assert!(matches!(
+            bpm.delete_page(pid),
+            Err(StorageError::InvalidPageId(p)) if p == pid
+        ));
     }
 
     #[test]
@@ -882,7 +1009,6 @@ mod tests {
     #[test]
     fn flush_all_pages_writes_pages_in_parallel() {
         let (_dir, dm, bpm) = setup(64);
-        let bpm = Arc::new(bpm);
         let pids: Vec<_> = (0..8).map(|_| bpm.new_page()).collect();
         for &pid in &pids {
             write_bytes(&bpm, pid, &[pid as u8 + 1; 4]);
@@ -920,7 +1046,6 @@ mod tests {
     #[test]
     fn flush_all_pages_waits_for_a_page_being_written() {
         let (_dir, dm, bpm) = setup(64);
-        let bpm = Arc::new(bpm);
         let (busy, other) = (bpm.new_page(), bpm.new_page());
         write_bytes(&bpm, other, b"other");
         let mtr = bpm.mtr(Logged::System);
@@ -953,7 +1078,6 @@ mod tests {
     #[test]
     fn concurrent_access_with_eviction() {
         let (_dir, _dm, bpm) = setup(4);
-        let bpm = Arc::new(bpm);
         let pids: Vec<_> = (0..16).map(|_| bpm.new_page()).collect();
 
         let handles: Vec<_> = (0..4)
@@ -984,7 +1108,6 @@ mod tests {
     #[test]
     fn miss_does_not_block_other_pages() {
         let (_dir, dm, bpm) = setup(2);
-        let bpm = Arc::new(bpm);
         let (cached, missing) = (bpm.new_page(), bpm.new_page());
         drop(bpm.read_page(cached, AccessType::Unknown));
 
@@ -1004,8 +1127,9 @@ mod tests {
 
     #[test]
     fn threads_wanting_a_loading_page_share_its_read() {
-        let (_dir, dm, bpm) = setup(2);
-        let (pid, bpm) = page_on_disk(&dm, bpm, b"shared");
+        let (dir, dm, bpm) = setup(2);
+        drop(dm);
+        let (pid, dm, bpm) = page_on_disk(&dir, bpm, b"shared");
         let reads = dm.num_reads();
 
         let io = dm.pause_io();
@@ -1028,8 +1152,9 @@ mod tests {
 
     #[test]
     fn failed_load_lets_waiters_retry() {
-        let (_dir, dm, bpm) = setup(2);
-        let (pid, bpm) = page_on_disk(&dm, bpm, b"data");
+        let (dir, dm, bpm) = setup(2);
+        drop(dm);
+        let (pid, dm, bpm) = page_on_disk(&dir, bpm, b"data");
         let mut buf = [0u8; PAGE_SIZE];
         dm.read_page(pid, &mut buf).unwrap();
         buf[PAGE_SIZE - 1] ^= 1;
@@ -1065,7 +1190,6 @@ mod tests {
     #[test]
     fn dirty_victim_stays_readable_during_write_back() {
         let (_dir, dm, bpm) = setup(1);
-        let bpm = Arc::new(bpm);
         let (victim, wanted) = (bpm.new_page(), bpm.new_page());
         write_bytes(&bpm, victim, b"dirty");
 

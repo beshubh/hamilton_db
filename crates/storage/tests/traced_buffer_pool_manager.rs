@@ -1,18 +1,13 @@
-use std::sync::Arc;
-
 use storage::StorageError;
 use storage::buffer::arc_replacer::AccessType;
-use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::buffer::traced_buffer_pool_manager::{PageAccess, TracedBufferPoolManager};
-use storage::disk::disk_manager::DiskManager;
 use storage::page::page_header::PageHeader;
 use storage::wal::Logged;
 use tempfile::TempDir;
 
 fn setup() -> (TempDir, TracedBufferPoolManager) {
     let dir = TempDir::new().unwrap();
-    let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(4, dm).unwrap());
+    let bpm = storage::open(dir.path().join("test.db"), 4).unwrap().bpm;
     (dir, TracedBufferPoolManager::new(bpm))
 }
 

@@ -40,10 +40,10 @@
 //! Sessions share one `TransactionManager`, so their transactions are
 //! ordered against each other by Tid as MVTO requires.
 //!
-//! Every commit first records the next Tid in the catalog header, so that a
-//! restarted session never starts below a committed `ts` on disk (see
-//! `storage::concurrency::watermark`). There is no write-ahead log: what
-//! reaches disk, and when, is up to whoever flushes the buffer pool.
+//! Every statement that can write first records the next Tid in the catalog
+//! header, so that a restarted session never starts below a `ts` on disk,
+//! committed or locked (see `storage::concurrency::watermark`). Every commit
+//! syncs the log before it returns.
 
 use std::mem;
 use std::sync::Arc;
@@ -355,17 +355,20 @@ impl ExecutionEngine {
         Instant::now() < deadline
     }
 
-    /// Readies the catalog changes `txn` made, records the next Tid in the
-    /// catalog header, then commits `txn`. If this fails, `txn` is still
-    /// running and must be aborted.
+    /// Readies the catalog changes `txn` made, commits `txn`, then syncs the
+    /// log, so the commit survives a crash once this returns. If this fails
+    /// before the commit, `txn` is still running and must be aborted.
     fn commit(&self, txn: &Transaction) -> Result<()> {
         self.catalog
             .prepare_commit(txn)
             .map_err(ExecutionError::from)?;
-        self.catalog
-            .set_next_tid(self.txn_manager.next_tid())
-            .map_err(ExecutionError::from)?;
         self.txn_manager.commit(txn).map_err(ExecutionError::from)?;
+        // TODO(wal): a commit record synced before the stamps replaces this.
+        if let Err(e) = self.catalog.bpm().log().flush_all() {
+            // Others may already read the commit, so it cannot be aborted.
+            eprintln!("hamilton: cannot sync a commit: {e}");
+            std::process::abort();
+        }
         Ok(())
     }
 
@@ -376,6 +379,17 @@ impl ExecutionEngine {
         plan: &AbstractPlanNode,
         bound: &BoundStatement,
     ) -> Result<Output> {
+        // Recorded before the statement writes anything, so whatever of it
+        // a crash keeps, the catalog header that recovery brings back is
+        // past its Tid, and a restart never hands that Tid out again.
+        if !matches!(
+            bound,
+            BoundStatement::Select(_) | BoundStatement::Explain(_)
+        ) {
+            self.catalog
+                .set_next_tid(self.txn_manager.next_tid())
+                .map_err(ExecutionError::from)?;
+        }
         let ctx = Arc::new(ExecutionContext::new(
             Arc::clone(&self.catalog),
             Arc::clone(txn),

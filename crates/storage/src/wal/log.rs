@@ -2,12 +2,11 @@
 //!
 //! An LSN is the byte position of a record's first byte in the log as if it
 //! had never been cut: the file header names the LSN its first record has,
-//! so a log can start over in a new file without page LSNs on disk going
-//! stale. No record is at `INVALID_LSN`. Flushes cut
+//! so a log can start over in a new file (`start_over`) without page LSNs on
+//! disk going stale. No record is at `INVALID_LSN`. Flushes cut
 //! at record boundaries, so the record at `lsn` is durable exactly when
 //! `lsn < durable_end()`.
 
-use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem;
 use std::path::Path;
@@ -16,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use common::Lsn;
 use parking_lot::Mutex;
 
-use crate::disk::disk_manager::{read_full_at, sync_parent_dir, write_all_at};
+use crate::disk::fs::{Fs, FsFile};
 use crate::error::{Result, StorageError};
 use crate::wal::record::{HEADER_SIZE, Record, RecordBuf, record_len, seal};
 
@@ -46,7 +45,7 @@ const SCAN_CHUNK: usize = 64 << 10;
 /// returns when it is done. Lock order is `io`, then `tail`; `append` never
 /// holds `tail` while it waits for `io`.
 pub struct Log {
-    file: File,
+    file: Box<dyn FsFile>,
     /// LSN of the first record in the file.
     base: Lsn,
     tail: Mutex<Tail>,
@@ -67,32 +66,21 @@ struct Tail {
 }
 
 impl Log {
-    /// Opens the log at `path`, creating it if needed. The log ends at the
-    /// first record that is cut short or fails its checksum, which is where
-    /// a crash in the middle of a write leaves it; anything after that is
-    /// cut off the file.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        let len = file.metadata()?.len();
+    /// Opens the log at `path` on `fs`, creating it if needed. The log ends
+    /// at the first record that is cut short or fails its checksum, which is
+    /// where a crash in the middle of a write leaves it; anything after that
+    /// is cut off the file.
+    pub fn open(fs: &dyn Fs, path: impl AsRef<Path>) -> Result<Self> {
+        let file = fs.open(path.as_ref())?;
+        let len = file.size()?;
         let base = if len < FILE_HEADER_SIZE {
-            let mut header = [0u8; FILE_HEADER_SIZE as usize];
-            header[..8].copy_from_slice(&MAGIC.to_le_bytes());
-            header[8..12].copy_from_slice(&VERSION.to_le_bytes());
-            header[16..24].copy_from_slice(&FIRST_LSN.to_le_bytes());
-            file.set_len(0)?;
-            write_all_at(&file, &header, 0)?;
-            file.sync_all()?;
-            sync_parent_dir(path)?;
+            file.set_size(0)?;
+            file.write_at(&file_header(FIRST_LSN), 0)?;
+            file.sync()?;
             FIRST_LSN
         } else {
             let mut header = [0u8; FILE_HEADER_SIZE as usize];
-            read_full_at(&file, &mut header, 0)?;
+            file.read_at(&mut header, 0)?;
             if u64::from_le_bytes(header[..8].try_into().unwrap()) != MAGIC {
                 return Err(corrupt("not a hamilton_db log file"));
             }
@@ -107,15 +95,15 @@ impl Log {
             base
         };
 
-        let file_lsns = base + (file.metadata()?.len() - FILE_HEADER_SIZE);
+        let file_lsns = base + (file.size()? - FILE_HEADER_SIZE);
         let end = {
-            let mut scan = FileScan::new(&file, base, base, file_lsns);
+            let mut scan = FileScan::new(&*file, base, base, file_lsns);
             while scan.next_record()?.is_some() {}
             scan.pos
         };
         if end < file_lsns {
-            file.set_len(offset_of(base, end))?;
-            file.sync_all()?;
+            file.set_size(offset_of(base, end))?;
+            file.sync()?;
         }
         Ok(Self {
             file,
@@ -131,10 +119,20 @@ impl Log {
         })
     }
 
-    /// Creates an empty log at `path`, replacing any log there.
-    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        File::create(path.as_ref())?;
-        Self::open(path)
+    /// Replaces the log file at `path` with an empty one that goes on from
+    /// the end of this log, once nothing in it is needed any more. Every
+    /// record must be durable.
+    pub(crate) fn start_over(&mut self, fs: &dyn Fs, path: &Path) -> Result<()> {
+        let end = self.end();
+        assert_eq!(
+            self.durable_end(),
+            end,
+            "start_over with records not durable"
+        );
+        fs.replace(path, &file_header(end))?;
+        self.file = fs.open(path)?;
+        self.base = end;
+        Ok(())
     }
 
     /// Appends `record`, which `RecordBuf::finish` has ended, and returns
@@ -189,8 +187,10 @@ impl Log {
             tail.start += batch.len() as Lsn;
             start
         };
-        let written = write_all_at(&self.file, &batch, offset_of(self.base, start))
-            .and_then(|()| self.file.sync_data());
+        let written = self
+            .file
+            .write_at(&batch, offset_of(self.base, start))
+            .and_then(|()| self.file.sync());
         if let Err(e) = written {
             self.failed.store(true, Ordering::Release);
             return Err(e.into());
@@ -243,14 +243,14 @@ impl Log {
                 return Err(no_record(lsn));
             }
             buf.resize(HEADER_SIZE, 0);
-            read_exact_at(&self.file, buf, offset_of(self.base, lsn))?;
+            read_exact_at(&*self.file, buf, offset_of(self.base, lsn))?;
             let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
             if len < HEADER_SIZE || lsn + len as Lsn > self.durable_end() {
                 return Err(no_record(lsn));
             }
             buf.resize(len, 0);
             let body = offset_of(self.base, lsn) + HEADER_SIZE as u64;
-            read_exact_at(&self.file, &mut buf[HEADER_SIZE..], body)?;
+            read_exact_at(&*self.file, &mut buf[HEADER_SIZE..], body)?;
         }
         Record::decode(lsn, buf)?.ok_or_else(|| no_record(lsn))
     }
@@ -259,7 +259,7 @@ impl Log {
     /// memory are not seen; flush first if they matter.
     pub fn scan(&self, from: Lsn) -> LogScan<'_> {
         LogScan(FileScan::new(
-            &self.file,
+            &*self.file,
             self.base,
             from,
             self.durable_end(),
@@ -296,7 +296,7 @@ impl LogScan<'_> {
 
 /// Reads records from the file in chunks, up to `limit`.
 struct FileScan<'a> {
-    file: &'a File,
+    file: &'a dyn FsFile,
     /// LSN at the end of the file header.
     base: Lsn,
     /// LSN of the next record.
@@ -308,7 +308,7 @@ struct FileScan<'a> {
 }
 
 impl<'a> FileScan<'a> {
-    fn new(file: &'a File, base: Lsn, from: Lsn, limit: Lsn) -> Self {
+    fn new(file: &'a dyn FsFile, base: Lsn, from: Lsn, limit: Lsn) -> Self {
         Self {
             file,
             base,
@@ -359,8 +359,17 @@ fn offset_of(base: Lsn, lsn: Lsn) -> u64 {
     lsn - base + FILE_HEADER_SIZE
 }
 
-fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
-    if read_full_at(file, buf, offset)? < buf.len() {
+/// The header of a log file whose first record is at `base`.
+fn file_header(base: Lsn) -> [u8; FILE_HEADER_SIZE as usize] {
+    let mut header = [0u8; FILE_HEADER_SIZE as usize];
+    header[..8].copy_from_slice(&MAGIC.to_le_bytes());
+    header[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    header[16..24].copy_from_slice(&base.to_le_bytes());
+    header
+}
+
+fn read_exact_at(file: &dyn FsFile, buf: &mut [u8], offset: u64) -> Result<()> {
+    if file.read_at(buf, offset)? < buf.len() {
         return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
     }
     Ok(())

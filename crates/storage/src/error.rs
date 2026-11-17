@@ -24,10 +24,6 @@ pub enum StorageError {
     #[error("invalid page id {0}")]
     InvalidPageId(PageId),
 
-    /// The page has no slot in the db file.
-    #[error("page {0} is not allocated")]
-    PageNotAllocated(PageId),
-
     /// The page cannot be deleted while a guard holds it.
     #[error("page {0} is pinned")]
     PagePinned(PageId),
@@ -35,9 +31,6 @@ pub enum StorageError {
     /// Every frame in the buffer pool is pinned, so nothing can be evicted.
     #[error("no free frame in the buffer pool")]
     NoFreeFrame,
-
-    #[error("free space {0} is larger than a page")]
-    InvalidFreeSpace(usize),
 
     /// A page read from disk does not match its checksum.
     #[error("page {page_id} is corrupted: checksum is {stored:#010x}, expected {expected:#010x}")]

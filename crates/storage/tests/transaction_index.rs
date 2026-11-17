@@ -13,7 +13,6 @@ use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::concurrency::index_versions::IndexedTable;
 use storage::concurrency::transaction::Transaction;
 use storage::concurrency::transaction_manager::TransactionManager;
-use storage::disk::disk_manager::DiskManager;
 use storage::index::btree_index::BtreeIndex;
 use storage::index::{Index, IndexMetadata, IndexTrait, LocatorKind, RowLocator};
 use storage::table::table_heap::TableHeap;
@@ -53,8 +52,7 @@ fn setup() -> Db {
 /// `setup`, with both name indexes of kind `by_name`.
 fn setup_with(by_name: IndexKind) -> Db {
     let dir = TempDir::new().unwrap();
-    let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(16, dm).unwrap());
+    let bpm = storage::open(dir.path().join("test.db"), 16).unwrap().bpm;
     let pkey = new_index(&bpm, "t_pkey", 0, IndexKind::PrimaryKey, LocatorKind::Rid);
     let by_name = new_index(&bpm, "t_name", 1, by_name, LocatorKind::PrimaryKey);
     let by_name_rid = new_index(
