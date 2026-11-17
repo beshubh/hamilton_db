@@ -2,25 +2,41 @@
 
 A durable page reaches disk only after the log records that changed it are durable, so a crash loses nothing that the log kept. Opening a database (`storage::open` in [`wal.rs`](../../crates/storage/src/wal.rs)) replays the log into the pages before anything reads them. The design is ARIES with steal and no-force. It has no undo yet, so transactions are not recovered, as a later section explains.
 
-## One mtr writes one record of full images
+## One mtr writes one record
 
-A durable page changes only through a mini-transaction ([`mtr.rs`](../../crates/storage/src/wal/mtr.rs)). `WritePageGuard` gives no mutable access, so code that changes a page another way does not compile. One mtr writes one log record, and the record holds the full image of every page the mtr changed. A record is in the log whole or not at all, so recovery never finds half of an mtr. That is why a B+ tree split is atomic. The leaf, its new sibling, and the parent go into one record.
-
-With full images, redo needs no schema, no comparator, and nothing from disk. It never reads a page. It writes the image over whatever the frame holds. Temporary pages, from `TEMP_PAGE_BASE` up, are never logged, because nothing reads them after a restart.
+A durable page changes only through a mini-transaction ([`mtr.rs`](../../crates/storage/src/wal/mtr.rs)). `WritePageGuard` gives no mutable access, so code that changes a page another way does not compile. One mtr writes one log record, which covers every page the mtr changed. A record is in the log whole or not at all, so recovery never finds half of an mtr. That is why a B+ tree split is atomic. The leaf, its new sibling, and the parent go into one record. Temporary pages, from `TEMP_PAGE_BASE` up, are never logged, because nothing reads them after a restart.
 
 Dropping an mtr logs whatever its pages hold, even when the code that changed them stopped halfway. So nothing may fail between an mtr's first change and its last. A B+ tree split or merge that fails after its first change aborts the process (`finish_change` in [`btree.rs`](../../crates/storage/src/index/btree.rs)). So does a panic while an mtr holds changes. The half-made change never reaches the log, and recovery redoes only whole mtrs.
+
+## Rows are logged as ops, everything else as images
+
+A caller changes a page in one of two ways. `MtrPage::apply` makes a `PageOp` ([`op.rs`](../../crates/storage/src/wal/op.rs)), one slot-level change to a table page or a B+ tree leaf, and logs the op in a few bytes. `MtrPage::raw_mut` hands out the page's bytes, and the mtr logs the whole page. Splits, merges, header pages, and page 0 go through `raw_mut`, so redo has no code for them.
+
+Redo makes an op with the same `PageOp::apply` that made the change. Three rules keep the two equal:
+
+- `apply` reads nothing but the page and the op. Redo runs before the catalog can be read, so an op never needs a schema or a comparator. The caller does that work first and logs its result. `LeafInsert` carries the slot that the comparator chose, and `HeapStamp` carries the length that the schema gave.
+- `apply` checks before it changes anything. An op that fails leaves the page as it was, and nothing is logged for it.
+- A leaf's slots start after its tombstone buffer, and the page does not record the buffer's size. The leaf ops carry it.
+
+Debug builds check the rules in every mtr (`check_redo` in [`mtr.rs`](../../crates/storage/src/wal/mtr.rs)). The mtr decodes each page's logged ops, makes them on a copy of the page from before the mtr, and aborts the process unless the copy then equals the page. Every test that changes a row therefore also tests redo of that change.
+
+## A page's first change after a write logs all of it
+
+The mtr picks each page's form when it commits, and the caller has no say. A page changed through `raw_mut` is logged as an image. So is a page that was clean, with no `rec_lsn`, unless its ops start with `HeapInit`, which formats the whole page. Ops larger than a page are logged as an image too. Every other page is logged as its ops. The page's write latch keeps its `rec_lsn` from changing between that choice and the append.
+
+The rule makes the record at a dirty page's `rec_lsn` replace the whole page. Redo starts each page that the checkpoint lists as dirty at that record, so it needs nothing of the page from disk, and it repairs three failures the same way:
+
+- a torn page write,
+- a page whose first write the saved directory does not know about, which reads as zeros, and
+- a slot that still holds bytes the page wrote earlier.
+
+The price is an image each time a page changes after a write. Under heavy eviction that comes more often than the one image per page per checkpoint that Postgres logs. [`wal.rs`](../../crates/bench/src/bin/wal.rs) in the bench crate measures the log that each kind of statement writes.
 
 ## Pages wait for their records
 
 `queue_write` in [`page_guard.rs`](../../crates/storage/src/page/page_guard.rs) syncs the log through a page's LSN before it writes the page. An eviction can therefore wait on a log sync.
 
 A frame's `rec_lsn` is the first record that changed the page since the page was last written. The frames that have a `rec_lsn` are the dirty page table. No other table exists that could disagree with them.
-
-The record at a dirty page's `rec_lsn` holds the page's image, because every record does. Redo starts each page at that record, so it repairs three failures the same way:
-
-- a torn page write,
-- a page whose first write the saved directory does not know about, which reads as zeros, and
-- a slot that still holds bytes the page wrote earlier.
 
 ## The log is numbered segments
 
@@ -46,7 +62,7 @@ The thread that `storage::open` starts takes a fuzzy checkpoint every 30 seconds
 
 1. Write the pages first changed before the previous checkpoint began. Redo then reads about two checkpoint intervals of log.
 2. Read the end of the log. Analysis starts there.
-3. Scan the frames for dirty pages, note the oldest free that is logged but not applied yet, and only then copy the directory. A first write adds the page's slot to the directory before its frame is marked clean, so a page that the scan finds clean is in the copy, and a page still dirty gets redone from its image. An mtr applies its frees after it appends its record, so the copy may still list a freed page. Redo starts no later than that free and replays it.
+3. Scan the frames for dirty pages, note the oldest free that is logged but not applied yet, and only then copy the directory. A first write adds the page's slot to the directory before its frame is marked clean, so a page that the scan finds clean is in the copy, and a page still dirty gets redone from the record at its `rec_lsn`. An mtr applies its frees after it appends its record, so the copy may still list a freed page. Redo starts no later than that free and replays it.
 4. Sync the log, then the db file. Every free in the copy is now logged, and every write that the dirty page table leaves out is durable.
 5. Save the `.meta`, then release the slots that the copy no longer lists.
 6. Remove the log segments that the saved checkpoint no longer needs.
@@ -67,6 +83,12 @@ Redo replays every free from the checkpoint's redo start, not only those after a
 
 Recovery appends nothing to the log, so a crash anywhere in it leaves files that recover the same pages. It ends with a sharp checkpoint. A log that lacks a record the checkpoint needs makes the open fail. A `.meta` with no checkpoint belongs to a database whose first open never finished, so records in the log next to it are left from other files, and recovery skips them.
 
+## Redo reads a page from disk only for ops
+
+Analysis adds a page that the checkpoint does not list at the page's first record after the checkpoint began, and that record can be ops. The checkpoint reads the log's end before it scans the frames, so a page can take an op and be written in between, and the scan then finds the page clean. Redo makes such ops on the page's copy on disk, unless the copy's LSN shows that it has them already.
+
+Any write of the page that a crash can tear came after a record that replaces the whole page, and redo reaches that record. So when the copy fails its checksum, or reads as zeros, redo skips the page's records until one replaces it ([`recovery.rs`](../../crates/storage/src/wal/recovery.rs)). A page that still cannot be read when redo ends fails the open with `CorruptLog`.
+
 ## Commits sync the log
 
 The engine syncs the log after a commit stamps its tuples, so a commit survives a crash once the client hears of it ([`engine.rs`](../../crates/planner/src/engine.rs)). A reader can see the stamps before the sync ends. The engine also records the next Tid in the catalog header before each statement that can write. A crash that keeps any of a transaction's writes therefore keeps a next Tid above that transaction's Tid.
@@ -81,6 +103,6 @@ No log record names a transaction, so recovery replays page changes without know
 
 ## The log decides what a crash test expects
 
-[`recovery.rs`](../../crates/storage/tests/recovery.rs) runs a workload on [`CrashFs`](../../crates/storage/tests/util/crash_fs.rs), which records every write, sync, rename, and removal. The test then recovers the files that a crash after each of those events would leave, with none, all, or a random part of the unsynced writes lost or torn. Every page must equal its last image in the records that survived. `CrashFs` keeps every segment a checkpoint removed, and the oracle reads those too, so a page whose last record left the log is still checked against it. A new redo form needs a matching change to that oracle.
+[`recovery.rs`](../../crates/storage/tests/recovery.rs) runs a workload on [`CrashFs`](../../crates/storage/tests/util/crash_fs.rs), which records every write, sync, rename, and removal. The test then recovers the files that a crash after each of those events would leave, with none, all, or a random part of the unsynced writes lost or torn. Every page must equal what the records that survived leave, which is its last image with the ops logged after it made on it. The workload changes raw pages, table pages, and leaves, and the test checks that the log holds both forms. `CrashFs` keeps every segment a checkpoint removed, and the oracle reads those too, so a page whose last record left the log is still checked against it. A new redo form needs a matching change to that oracle.
 
 A crash sweep must also start from a recovered database, because recovery leaves states a first crash never meets: pages last logged before the log's first segment, and free slots rebuilt from the `.meta`.

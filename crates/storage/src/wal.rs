@@ -5,6 +5,7 @@
 pub mod checkpoint;
 pub mod log;
 pub mod mtr;
+pub mod op;
 pub mod record;
 mod recovery;
 
@@ -13,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use mtr::{Logged, Mtr, MtrPage};
+pub use op::PageOp;
 
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::disk::disk_manager::DiskManager;

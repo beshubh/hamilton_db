@@ -1,6 +1,7 @@
 //! Crash recovery: whatever moment a crash comes at, and whatever unsynced
 //! writes it loses or tears, opening the database again leaves every page
-//! exactly as the records that survived in the log say.
+//! exactly as the records that survived in the log say: its last image,
+//! with the ops logged after it made on it.
 
 #[path = "util/crash_fs.rs"]
 mod crash_fs;
@@ -12,18 +13,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use common::{Lsn, PageId};
+use common::{Lsn, PageId, Rid, TXN_UNCOMMITTED_BIT};
 use crash_fs::{CrashFs, Lost, next};
 use storage::Storage;
 use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::disk::disk_manager::DiskManager;
 use storage::page::PAGE_SIZE;
+use storage::page::btree_leaf_page::BtreeLeafPage;
+use storage::page::btree_page::BytewiseComparator;
 use storage::page::page_header::{PageHeader, page_lsn, verify_checksum};
-use storage::wal::Logged;
+use storage::table::table_page::{TablePage, TupleMeta};
 use storage::wal::checkpoint;
 use storage::wal::log::{FIRST_LSN, Log};
 use storage::wal::record::{Kind, PageChanges, PageRedo};
+use storage::wal::{Logged, MtrPage, PageOp};
 
 const DIR: &str = "/db";
 const DB: &str = "/db/test.db";
@@ -58,8 +62,8 @@ fn segment_path(n: u64) -> PathBuf {
     PathBuf::from(format!("{LOG}.{n:08}"))
 }
 
-/// Each page the log names: its last image and that record's LSN, or
-/// `None` once a record frees it.
+/// Each page the log names: the page its records leave and the last one's
+/// LSN, or `None` once a record frees it.
 type Pages = BTreeMap<PageId, Option<(Lsn, Box<[u8; PAGE_SIZE]>)>>;
 
 /// The pages the records in `fs`'s log leave, and where the log ends: what
@@ -74,8 +78,28 @@ fn logged_pages(fs: &CrashFs) -> (Pages, Lsn) {
     while let Some(record) = scan.next_record().unwrap() {
         assert_eq!(record.kind, Kind::System);
         let changes = PageChanges::decode(record.body).unwrap();
-        for (page_id, PageRedo::Image(image)) in changes.pages() {
-            pages.insert(page_id, Some((record.lsn, Box::new(*image))));
+        for (page_id, redo) in changes.pages() {
+            let page = pages.entry(page_id).or_insert(None);
+            let data = match page {
+                Some((lsn, data)) => {
+                    *lsn = record.lsn;
+                    data
+                }
+                None => {
+                    // Whatever was there before a page's first record does
+                    // not matter: it replaces the whole page.
+                    assert!(
+                        redo.replaces_page(),
+                        "page {page_id} starts at {} with ops",
+                        record.lsn
+                    );
+                    &mut page.insert((record.lsn, Box::new([0; PAGE_SIZE]))).1
+                }
+            };
+            match redo {
+                PageRedo::Image(image) => **data = *image,
+                PageRedo::Ops(ops) => ops.apply(data).unwrap(),
+            }
         }
         for page_id in changes.frees() {
             pages.insert(page_id, None);
@@ -84,9 +108,26 @@ fn logged_pages(fs: &CrashFs) -> (Pages, Lsn) {
     (pages, log.end())
 }
 
-/// Asserts that `bpm` holds exactly `pages`: each logged page its last
-/// image, no slot for a freed page or one below `allocated` the log never
-/// named, and page ids handed out from now on past all of them.
+/// How many page entries in `fs`'s log, every segment it ever had, are
+/// images and how many are ops.
+fn forms(fs: &CrashFs) -> (usize, usize) {
+    let log = Log::open(Arc::new(fs.with_removed()), LOG, SEGMENT).unwrap();
+    let (mut images, mut ops) = (0, 0);
+    let mut scan = log.scan(FIRST_LSN);
+    while let Some(record) = scan.next_record().unwrap() {
+        for (_, redo) in PageChanges::decode(record.body).unwrap().pages() {
+            match redo {
+                PageRedo::Image(_) => images += 1,
+                PageRedo::Ops(_) => ops += 1,
+            }
+        }
+    }
+    (images, ops)
+}
+
+/// Asserts that `bpm` holds exactly `pages`: each logged page as its
+/// records leave it, no slot for a freed page or one below `allocated` the
+/// log never named, and page ids handed out from now on past all of them.
 fn assert_recovered(bpm: &BufferPoolManager, pages: &Pages, allocated: PageId, at: &str) {
     for (&page_id, expected) in pages {
         let Some((lsn, image)) = expected else {
@@ -103,7 +144,7 @@ fn assert_recovered(bpm: &BufferPoolManager, pages: &Pages, allocated: PageId, a
         assert_eq!(page_lsn(data), *lsn, "{at}: LSN of page {page_id}");
         assert!(
             data[CHECKSUM.end..] == image[CHECKSUM.end..],
-            "{at}: page {page_id} is not its image at {lsn}"
+            "{at}: page {page_id} is not as the records up to {lsn} leave it"
         );
     }
     for page_id in (0..allocated).filter(|id| !pages.contains_key(id)) {
@@ -131,13 +172,39 @@ fn recover_and_check(image: &CrashFs, allocated: PageId, reopen: bool, at: &str)
     }
 }
 
+/// How the workload changes a page: raw bytes, logged as images, or the
+/// ops of a table page or a B+tree leaf.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Shape {
+    Raw,
+    Heap,
+    Leaf,
+}
+
+impl Shape {
+    fn of(data: &[u8; PAGE_SIZE]) -> Self {
+        if TablePage::new(data).is_ok() {
+            Self::Heap
+        } else if Leaf::new(data).is_ok() {
+            Self::Leaf
+        } else {
+            Self::Raw
+        }
+    }
+}
+
+/// Leaves keep tombstones, so the leaf ops revive and give them up too.
+const NUM_TOMBS: usize = 2;
+
+type Leaf<'a> = BtreeLeafPage<&'a [u8; PAGE_SIZE], NUM_TOMBS>;
+
 /// Pages changed, created, freed, flushed and checkpointed at random,
 /// through a pool too small to hold them, so pages are written before
 /// their changes are durable and slots are freed and reused.
 struct Workload {
     storage: Storage,
     rng: u64,
-    live: Vec<PageId>,
+    live: Vec<(PageId, Shape)>,
 }
 
 impl Workload {
@@ -153,9 +220,11 @@ impl Workload {
     /// left.
     fn resume(fs: &CrashFs, seed: u64) -> Self {
         let (pages, _) = logged_pages(fs);
-        let live = pages.iter().filter(|(_, page)| page.is_some());
+        let live = pages
+            .iter()
+            .filter_map(|(&page_id, page)| Some((page_id, Shape::of(&page.as_ref()?.1))));
         Self {
-            live: live.map(|(&page_id, _)| page_id).collect(),
+            live: live.collect(),
             ..Self::new(fs, seed)
         }
     }
@@ -164,12 +233,17 @@ impl Workload {
         &self.storage.bpm
     }
 
-    fn pick(&mut self) -> PageId {
-        self.live[next(&mut self.rng) as usize % self.live.len()]
+    fn below(&mut self, n: usize) -> usize {
+        next(&mut self.rng) as usize % n.max(1)
+    }
+
+    fn pick(&mut self) -> (PageId, Shape) {
+        let at = self.below(self.live.len());
+        self.live[at]
     }
 
     fn scribble(&mut self, data: &mut [u8; PAGE_SIZE]) {
-        let at = AT + next(&mut self.rng) as usize % (PAGE_SIZE - AT - 8);
+        let at = AT + self.below(PAGE_SIZE - AT - 8);
         data[at..at + 8].copy_from_slice(&next(&mut self.rng).to_le_bytes());
     }
 
@@ -186,7 +260,7 @@ impl Workload {
             3..=9 => self.change(),
             10..=11 => self.free(),
             12..=14 => {
-                let page_id = self.pick();
+                let (page_id, _) = self.pick();
                 self.bpm().flush_page(page_id).unwrap();
             }
             15 => checkpoint::fuzzy(self.bpm()).unwrap(),
@@ -214,33 +288,174 @@ impl Workload {
         let bpm = Arc::clone(&self.storage.bpm);
         let mtr = bpm.mtr(Logged::System);
         let mut page = mtr.new_page().unwrap();
-        self.scribble(page.raw_mut());
-        self.live.push(page.page_id());
+        let shape = [Shape::Raw, Shape::Heap, Shape::Leaf][self.below(3)];
+        match shape {
+            Shape::Raw => self.scribble(page.raw_mut()),
+            Shape::Heap => page.apply(PageOp::HeapInit).unwrap(),
+            Shape::Leaf => drop(BtreeLeafPage::<_, NUM_TOMBS>::init(page.raw_mut())),
+        }
+        for _ in 0..self.below(3) {
+            self.change_page(&mut page, shape);
+        }
+        self.live.push((page.page_id(), shape));
     }
 
-    /// Changes up to three pages in one mtr.
+    /// Changes up to three pages in one mtr, most often ones of the last
+    /// few it changed, which are then still dirty and log their ops.
     fn change(&mut self) {
         let bpm = Arc::clone(&self.storage.bpm);
         let mtr = bpm.mtr(Logged::System);
         let mut changed = Vec::new();
-        for _ in 0..1 + next(&mut self.rng) % 3 {
-            let page_id = self.pick();
+        for _ in 0..1 + self.below(3) {
+            let (page_id, shape) = if self.below(4) > 0 {
+                let recent = self.live.len().saturating_sub(3);
+                let at = recent + self.below(self.live.len() - recent);
+                self.live[at]
+            } else {
+                self.pick()
+            };
+            // Keeps `live` in the order pages last changed.
+            self.live.retain(|&(id, _)| id != page_id);
+            self.live.push((page_id, shape));
             if !changed.contains(&page_id) {
                 changed.push(page_id);
-                self.scribble(mtr.write_page(page_id).unwrap().raw_mut());
+                let mut page = mtr.write_page(page_id).unwrap();
+                for _ in 0..1 + self.below(3) {
+                    self.change_page(&mut page, shape);
+                }
             }
         }
     }
 
     /// Frees a page and changes another in the same mtr, as a merge does.
     fn free(&mut self) {
-        let freed = self.pick();
-        self.live.retain(|&id| id != freed);
-        let other = self.pick();
+        let (freed, _) = self.pick();
+        self.live.retain(|&(id, _)| id != freed);
+        let (other, shape) = self.pick();
         let bpm = Arc::clone(&self.storage.bpm);
         let mtr = bpm.mtr(Logged::System);
-        self.scribble(mtr.write_page(other).unwrap().raw_mut());
+        self.change_page(&mut mtr.write_page(other).unwrap(), shape);
         mtr.free_page(freed);
+    }
+
+    /// Makes one change to `page`. A raw page gets a scribble, and a table
+    /// page or a leaf gets an op, or now and then a change through
+    /// `raw_mut`. An op the page has no room for is left out.
+    fn change_page(&mut self, page: &mut MtrPage<'_>, shape: Shape) {
+        if shape == Shape::Raw {
+            return self.scribble(page.raw_mut());
+        }
+        if self.below(10) == 0 {
+            let payload = vec![self.below(256) as u8; self.below(64)];
+            let data = page.raw_mut();
+            return match shape {
+                Shape::Heap => drop(TablePage::new(data).unwrap().insert(&self.meta(), &payload)),
+                _ => drop(self.leaf_insert(data)),
+            };
+        }
+        let op_rng = next(&mut self.rng);
+        let mut payload = Vec::new();
+        let op = match shape {
+            Shape::Heap => self.heap_op(page.data(), op_rng, &mut payload),
+            _ => self.leaf_op(page.data(), op_rng, &mut payload),
+        };
+        if let Some(op) = op {
+            match page.apply(op) {
+                Ok(()) | Err(storage::StorageError::PageFull) => {}
+                Err(e) => panic!("{op:?}: {e}"),
+            }
+        }
+    }
+
+    fn meta(&mut self) -> TupleMeta {
+        let locked = if self.below(2) == 0 {
+            TXN_UNCOMMITTED_BIT
+        } else {
+            0
+        };
+        TupleMeta {
+            ts: (next(&mut self.rng) % 1000) | locked,
+            undo_ptr: next(&mut self.rng) % 3,
+            is_deleted: self.below(4) == 0,
+            has_nulls: self.below(2) == 0,
+        }
+    }
+
+    /// A heap op that `data` can take, its payload put in `payload`.
+    fn heap_op<'p>(
+        &mut self,
+        data: &[u8; PAGE_SIZE],
+        choice: u64,
+        payload: &'p mut Vec<u8>,
+    ) -> Option<PageOp<'p>> {
+        let page = TablePage::new(data).unwrap();
+        let live: Vec<_> = page
+            .iter()
+            .map(|(slot, meta, bytes)| (slot, meta, bytes.len()))
+            .collect();
+        payload.resize(1 + self.below(200), self.below(256) as u8);
+        let meta = self.meta();
+        if live.is_empty() || choice.is_multiple_of(6) {
+            return Some(PageOp::HeapInsert {
+                slot: page.insert_slot(),
+                meta,
+                payload,
+            });
+        }
+        let (slot, old, len) = live[self.below(live.len())];
+        Some(match choice % 6 {
+            1 => PageOp::HeapSetTuple {
+                slot,
+                meta,
+                payload,
+            },
+            2 => PageOp::HeapSetMeta { slot, meta },
+            3 if old.ts & TXN_UNCOMMITTED_BIT != 0 => PageOp::HeapStamp {
+                slot,
+                keep_len: len - self.below(len + 1),
+            },
+            4 => PageOp::HeapMarkDead { slot },
+            _ => PageOp::HeapSetNext {
+                next: self.below(1000) as PageId,
+            },
+        })
+    }
+
+    /// A leaf op that `data` can take, with its key put in `key`. It
+    /// removes a key, or inserts one from a small range, so some are there
+    /// already or tombstoned.
+    fn leaf_op<'k>(
+        &mut self,
+        data: &[u8; PAGE_SIZE],
+        choice: u64,
+        key: &'k mut Vec<u8>,
+    ) -> Option<PageOp<'k>> {
+        let leaf = Leaf::new(data).unwrap();
+        let live: Vec<usize> = (0..leaf.size())
+            .filter(|&i| !leaf.is_tombstone(i))
+            .collect();
+        if choice.is_multiple_of(3) && !live.is_empty() {
+            let index = live[self.below(live.len())];
+            return Some(PageOp::LeafRemove {
+                num_tombs: NUM_TOMBS,
+                index,
+            });
+        }
+        key.extend_from_slice(&(self.below(300) as u16).to_be_bytes());
+        key.resize(2 + self.below(40), b'k');
+        let position = leaf.insert_position(key, &BytewiseComparator).ok()?;
+        Some(PageOp::LeafInsert {
+            num_tombs: NUM_TOMBS,
+            position,
+            key,
+            rid: Rid::new(self.below(100) as PageId, self.below(100) as u16),
+        })
+    }
+
+    fn leaf_insert(&mut self, data: &mut [u8; PAGE_SIZE]) -> storage::Result<usize> {
+        let key = (self.below(300) as u16).to_be_bytes();
+        let rid = Rid::new(1, self.below(100) as u16);
+        BtreeLeafPage::<_, NUM_TOMBS>::new(data)?.insert(&key, rid, &BytewiseComparator)
     }
 
     /// One past the highest page id handed out so far.
@@ -257,6 +472,8 @@ fn every_crash_point_recovers_exactly_the_logged_pages() {
     let allocated = workload.allocated();
     drop(workload);
 
+    let (images, ops) = forms(&fs);
+    assert!(images > 50 && ops > 50, "{images} images and {ops} ops");
     let started = segments(&fs);
     assert!(started[0] > 1, "no checkpoint removed a segment");
     assert!(
@@ -418,7 +635,7 @@ fn every_prefix_of_the_log_recovers_the_pages_its_records_leave() {
 /// A writer's mtrs and evictions race checkpoints that save the dirty page
 /// table, flush the log and remove segments as they go.
 #[test]
-fn pages_changed_during_fuzzy_checkpoints_recover_to_their_last_image() {
+fn pages_changed_during_fuzzy_checkpoints_recover_as_logged() {
     let fs = CrashFs::new();
     // Room for an mtr's three pages and a page a checkpoint is writing.
     let mut workload = Workload {

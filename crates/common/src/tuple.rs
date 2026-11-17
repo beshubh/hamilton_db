@@ -145,18 +145,21 @@ impl Tuple {
     /// column, such as the zeros the table heap pads an uncommitted shrinking
     /// update with.
     pub fn encoded_len(&self, schema: &Schema) -> Result<usize> {
+        Self::encoded_len_of(&self.data, schema)
+    }
+
+    /// `encoded_len` of the tuple bytes `data`, without copying them.
+    pub fn encoded_len_of(data: &[u8], schema: &Schema) -> Result<usize> {
         let mut end = schema.fixed_len();
-        if self.data.len() < end {
+        if data.len() < end {
             return Err(ValueError::CorruptTuple(
                 "shorter than its fixed-width part",
             ));
         }
         for (idx, column) in schema.columns().iter().enumerate() {
-            if matches!(column.data_type, DataType::Varchar(_))
-                && !is_null(schema, &self.data, idx)?
-            {
+            if matches!(column.data_type, DataType::Varchar(_)) && !is_null(schema, data, idx)? {
                 let at = schema.fixed_offset(idx);
-                end = end.max(varchar_range(schema, &self.data, at)?.end);
+                end = end.max(varchar_range(schema, data, at)?.end);
             }
         }
         Ok(end)

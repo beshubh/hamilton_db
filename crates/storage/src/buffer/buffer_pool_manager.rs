@@ -3,14 +3,15 @@ use crate::{
     disk::{disk_manager::DiskManager, disk_scheduler::DiskScheduler},
     error::{Result, StorageError},
     page::{
-        PAGE_SIZE, PageBuf, TEMP_PAGE_BASE,
+        PageBuf, TEMP_PAGE_BASE,
         page_guard::{PendingFlush, ReadPageGuard, TempPageGuard, WritePageGuard, flush_page},
-        page_header::{set_page_lsn, verify_checksum},
+        page_header::{PageHeader, PageType, page_lsn, set_page_lsn, verify_checksum},
     },
     wal::{
         checkpoint::{self, Checkpoints},
         log::Log,
         mtr::{Logged, Mtr},
+        record::PageRedo,
     },
 };
 use common::hash::IntKeys;
@@ -369,27 +370,46 @@ impl BufferPoolManager {
         }
     }
 
-    /// Puts `image`, the page as the record at `lsn` left it, in the page's
-    /// frame, without reading the page from disk: its copy there may be torn,
-    /// missing or stale, and the image replaces all of it.
-    pub(crate) fn redo_image(
-        &self,
-        page_id: PageId,
-        image: &[u8; PAGE_SIZE],
-        lsn: Lsn,
-    ) -> Result<()> {
-        let frame = self.pin_page(page_id, AccessType::Unknown, Load::Zeroed)?;
+    /// Makes `redo`, the change the record at `lsn` made to the page. A
+    /// change that replaces the page never reads its copy on disk, which may
+    /// be torn, missing or stale. Ops skip a copy whose LSN shows it has
+    /// them, and return `false` if it fails its checksum or is unformatted.
+    pub(crate) fn redo(&self, page_id: PageId, redo: PageRedo<'_>, lsn: Lsn) -> Result<bool> {
+        let load = if redo.replaces_page() {
+            Load::Zeroed
+        } else {
+            Load::Read
+        };
+        let frame = match self.pin_page(page_id, AccessType::Unknown, load) {
+            Err(StorageError::ChecksumMismatch { .. }) => return Ok(false),
+            frame => frame?,
+        };
         let mut guard = WritePageGuard::new(
             page_id,
             Arc::clone(&frame),
             Arc::clone(&self.replacer),
             Arc::clone(&self.latch),
         );
+        if !redo.replaces_page() {
+            if guard.as_ref::<PageHeader>().page_type() == Ok(PageType::Invalid) {
+                return Ok(false);
+            }
+            if page_lsn(guard.get_data()) >= lsn {
+                return Ok(true);
+            }
+        }
         let data = guard.data_mut_for_mtr();
-        data.copy_from_slice(image);
+        match redo {
+            PageRedo::Image(image) => data.copy_from_slice(image),
+            PageRedo::Ops(ops) => ops.apply(data).map_err(|e| {
+                StorageError::CorruptLog(format!(
+                    "cannot redo the record at {lsn} on page {page_id}: {e}"
+                ))
+            })?,
+        }
         set_page_lsn(data, lsn);
         guard.frame().set_rec_lsn_if_clean(lsn);
-        Ok(())
+        Ok(true)
     }
 
     /// Like `checked_read_page`, for callers that know the page can be loaded.

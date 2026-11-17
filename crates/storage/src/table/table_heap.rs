@@ -16,6 +16,7 @@ use crate::table::table_iterator::{TableIterator, TableRow};
 use crate::table::table_page::{INVALID_UNDO_PTR, TablePage, TupleMeta};
 use crate::table::undo_log::{self, UndoLog, UndoRecord};
 use crate::wal::mtr::{Logged, Mtr};
+use crate::wal::op::PageOp;
 
 /// A table stored as a linked list of table pages, reached through the
 /// buffer pool.
@@ -51,7 +52,7 @@ impl TableHeap {
         let page_id = {
             let mtr = bpm.mtr(Logged::System);
             let mut page = mtr.new_page()?;
-            TablePage::init(page.raw_mut());
+            page.apply(PageOp::HeapInit)?;
             page.page_id()
         };
         Ok(Self {
@@ -101,9 +102,14 @@ impl TableHeap {
         let mut last_page_id = self.last_page_id.lock();
         let mtr = self.bpm.mtr(Logged::System);
         let mut guard = mtr.write_page(*last_page_id)?;
-        let mut page = TablePage::new(guard.raw_mut())?;
-        match page.insert(meta, tuple.data()) {
-            Ok(slot) => return Ok(Rid::new(*last_page_id, slot)),
+        let insert = |slot| PageOp::HeapInsert {
+            slot,
+            meta: *meta,
+            payload: tuple.data(),
+        };
+        let slot = TablePage::new(guard.data())?.insert_slot();
+        match guard.apply(insert(slot)) {
+            Ok(()) => return Ok(Rid::new(*last_page_id, slot)),
             Err(StorageError::PageFull) => {}
             Err(e) => return Err(e),
         }
@@ -112,11 +118,11 @@ impl TableHeap {
         // while still holding the old last page cannot deadlock.
         let mut new_guard = mtr.new_page()?;
         let new_page_id = new_guard.page_id();
-        let mut new_page = TablePage::init(new_guard.raw_mut());
-        let slot = new_page.insert(meta, tuple.data())?;
-        page.set_next_page_id(new_page_id);
+        new_guard.apply(PageOp::HeapInit)?;
+        new_guard.apply(insert(0))?;
+        guard.apply(PageOp::HeapSetNext { next: new_page_id })?;
         *last_page_id = new_page_id;
-        Ok(Rid::new(new_page_id, slot))
+        Ok(Rid::new(new_page_id, 0))
     }
 
     /// The tuple at `rid`, copied out of the page and carrying `rid`. Deleted
@@ -135,7 +141,10 @@ impl TableHeap {
     pub fn update_meta(&self, rid: Rid, meta: &TupleMeta) -> Result<()> {
         let mtr = self.mtr();
         let mut guard = mtr.write_page(rid.page_id)?;
-        TablePage::new(guard.raw_mut())?.update_meta(rid.slot, meta)
+        guard.apply(PageOp::HeapSetMeta {
+            slot: rid.slot,
+            meta: *meta,
+        })
     }
 
     /// Marks the tuple at `rid` deleted as of `ts`, with `undo_ptr` pointing
@@ -151,7 +160,10 @@ impl TableHeap {
             is_deleted: true,
             ..old
         };
-        TablePage::new(guard.raw_mut())?.update_meta(rid.slot, &meta)
+        guard.apply(PageOp::HeapSetMeta {
+            slot: rid.slot,
+            meta,
+        })
     }
 
     /// Replaces the tuple at `rid`, keeping its `Rid`. Fails with `PageFull`
@@ -160,8 +172,11 @@ impl TableHeap {
     pub fn update_in_place(&self, rid: Rid, meta: &TupleMeta, tuple: &Tuple) -> Result<()> {
         let mtr = self.mtr();
         let mut guard = mtr.write_page(rid.page_id)?;
-        TablePage::new(guard.data())?.check_update(rid.slot, tuple.len())?;
-        TablePage::new(guard.raw_mut())?.update(rid.slot, meta, tuple.data())
+        guard.apply(PageOp::HeapSetTuple {
+            slot: rid.slot,
+            meta: *meta,
+            payload: tuple.data(),
+        })
     }
 
     /// Replaces the tuple at `rid` with `new`, written at `ts`, keeping its
@@ -221,7 +236,11 @@ impl TableHeap {
             is_deleted: false,
             has_nulls: new_values.iter().any(|value| matches!(value, Value::Null)),
         };
-        TablePage::new(guard.raw_mut())?.update(rid.slot, &meta, data)
+        guard.apply(PageOp::HeapSetTuple {
+            slot: rid.slot,
+            meta,
+            payload: data,
+        })
     }
 
     /// Marks the tuple at `rid` deleted as of `ts`. The version before the
@@ -255,7 +274,10 @@ impl TableHeap {
             is_deleted: true,
             ..head
         };
-        TablePage::new(guard.raw_mut())?.update_meta(rid.slot, &meta)
+        guard.apply(PageOp::HeapSetMeta {
+            slot: rid.slot,
+            meta,
+        })
     }
 
     /// The version of the tuple at `rid` visible at `ts`, with its meta, or
@@ -348,22 +370,19 @@ impl TableHeap {
     pub fn stamp_commit(&self, rid: Rid, tid: TxnId, schema: &Schema) -> Result<bool> {
         let mtr = self.mtr();
         let mut guard = mtr.write_page(rid.page_id)?;
-        let mut page = TablePage::new(guard.raw_mut())?;
+        let page = TablePage::new(guard.data())?;
         let (head, payload) = page.get(rid.slot)?;
         debug_assert_eq!(
             head.ts,
             tid | TXN_UNCOMMITTED_BIT,
             "tuple {rid} is not locked by transaction {tid}"
         );
-        let meta = TupleMeta { ts: tid, ..head };
-        let tuple = Tuple::from_bytes(payload.to_vec());
-        let len = tuple.encoded_len(schema)?;
-        if len < tuple.len() {
-            page.update(rid.slot, &meta, &tuple.data()[..len])?;
-        } else {
-            page.update_meta(rid.slot, &meta)?;
-        }
-        Ok(meta.is_deleted)
+        let keep_len = Tuple::encoded_len_of(payload, schema)?;
+        guard.apply(PageOp::HeapStamp {
+            slot: rid.slot,
+            keep_len,
+        })?;
+        Ok(head.is_deleted)
     }
 
     /// Undoes every write the running transaction `tid` made to the tuple at
@@ -380,7 +399,7 @@ impl TableHeap {
         let locked = tid | TXN_UNCOMMITTED_BIT;
         let mtr = self.mtr();
         let mut guard = mtr.write_page(rid.page_id)?;
-        let mut page = TablePage::new(guard.raw_mut())?;
+        let page = TablePage::new(guard.data())?;
         let (head, payload) = page.get(rid.slot)?;
         debug_assert_eq!(
             head.ts, locked,
@@ -398,7 +417,10 @@ impl TableHeap {
                     is_deleted: true,
                     ..meta
                 };
-                page.update_meta(rid.slot, &meta)?;
+                guard.apply(PageOp::HeapSetMeta {
+                    slot: rid.slot,
+                    meta,
+                })?;
                 return Ok(true);
             }
             let record = undo_log::older_record(rid, &meta, undo)?;
@@ -423,7 +445,11 @@ impl TableHeap {
                 data
             }
         };
-        page.update(rid.slot, &meta, &data)?;
+        guard.apply(PageOp::HeapSetTuple {
+            slot: rid.slot,
+            meta,
+            payload: &data,
+        })?;
         Ok(false)
     }
 
@@ -444,7 +470,7 @@ impl TableHeap {
         if !(head.is_deleted && committed && head.ts < watermark) {
             return Ok(false);
         }
-        TablePage::new(guard.raw_mut())?.mark_dead(rid.slot)?;
+        guard.apply(PageOp::HeapMarkDead { slot: rid.slot })?;
         Ok(true)
     }
 

@@ -12,9 +12,9 @@ use storage::disk::disk_manager::DiskManager;
 use storage::page::page_header::{PageHeader, page_lsn};
 use storage::page::{PAGE_SIZE, TEMP_PAGE_BASE};
 use storage::table::table_heap::TableHeap;
-use storage::table::table_page::TupleMeta;
-use storage::wal::Logged;
+use storage::table::table_page::{MAX_PAYLOAD_SIZE, TablePage, TupleMeta};
 use storage::wal::record::{Kind, PageChanges, PageRedo};
+use storage::wal::{Logged, PageOp};
 use tempfile::TempDir;
 
 /// Where tests put their bytes: past the page header, whose LSN an mtr sets.
@@ -47,8 +47,25 @@ fn write(bpm: &BufferPoolManager, page_id: PageId, bytes: &[u8]) -> Lsn {
     mtr.commit().unwrap()
 }
 
-/// The pages the record at `lsn` holds images of, and the pages it frees.
-fn logged(bpm: &BufferPoolManager, lsn: Lsn) -> (Vec<(PageId, [u8; PAGE_SIZE])>, Vec<PageId>) {
+/// How a record logs one page: its image, or the page its ops leave when
+/// made on `base`.
+#[derive(Debug, PartialEq)]
+enum Form {
+    Image(Box<[u8; PAGE_SIZE]>),
+    Ops {
+        ops: Vec<String>,
+        replace_page: bool,
+        redone: Box<[u8; PAGE_SIZE]>,
+    },
+}
+
+/// How the record at `lsn` logs each page, with ops made on `base`, and
+/// the pages it frees.
+fn logged_on(
+    bpm: &BufferPoolManager,
+    lsn: Lsn,
+    base: &[u8; PAGE_SIZE],
+) -> (Vec<(PageId, Form)>, Vec<PageId>) {
     let mut buf = Vec::new();
     let record = bpm.log().read(lsn, &mut buf).unwrap();
     assert_eq!(
@@ -58,9 +75,33 @@ fn logged(bpm: &BufferPoolManager, lsn: Lsn) -> (Vec<(PageId, [u8; PAGE_SIZE])>,
     let changes = PageChanges::decode(record.body).unwrap();
     let pages = changes
         .pages()
-        .map(|(page_id, PageRedo::Image(image))| (page_id, *image))
+        .map(|(page_id, redo)| {
+            let form = match redo {
+                PageRedo::Image(image) => Form::Image(Box::new(*image)),
+                PageRedo::Ops(ops) => {
+                    let mut redone = Box::new(*base);
+                    ops.apply(&mut redone).unwrap();
+                    Form::Ops {
+                        ops: ops.iter().map(|op| format!("{:?}", op.unwrap())).collect(),
+                        replace_page: ops.replace_page(),
+                        redone,
+                    }
+                }
+            };
+            (page_id, form)
+        })
         .collect();
     (pages, changes.frees().collect())
+}
+
+/// The pages the record at `lsn` holds images of, and the pages it frees.
+fn logged(bpm: &BufferPoolManager, lsn: Lsn) -> (Vec<(PageId, [u8; PAGE_SIZE])>, Vec<PageId>) {
+    let (pages, frees) = logged_on(bpm, lsn, &[0; PAGE_SIZE]);
+    let images = pages.into_iter().map(|(page_id, form)| match form {
+        Form::Image(image) => (page_id, *image),
+        ops => panic!("page {page_id} is logged as {ops:?}"),
+    });
+    (images.collect(), frees)
 }
 
 fn in_memory(bpm: &BufferPoolManager, page_id: PageId) -> [u8; PAGE_SIZE] {
@@ -280,17 +321,170 @@ fn a_freed_page_is_deleted_once_its_record_is_appended() {
     assert!(!db.dm.has_page(freed));
 }
 
+fn row(bytes: &[u8]) -> Tuple {
+    Tuple::from_bytes(bytes.to_vec())
+}
+
+/// Asserts that the record at `lsn` logs only `page_id`, as ops that give
+/// `after` when made on `before`, and returns the ops.
+fn assert_logged_as_ops(
+    bpm: &BufferPoolManager,
+    lsn: Lsn,
+    page_id: PageId,
+    before: &[u8; PAGE_SIZE],
+    after: &[u8; PAGE_SIZE],
+) -> Vec<String> {
+    let (pages, _) = logged_on(bpm, lsn, before);
+    let [(logged_id, Form::Ops { ops, redone, .. })] = <[_; 1]>::try_from(pages).unwrap() else {
+        panic!("page {page_id} is not logged as ops");
+    };
+    assert_eq!(logged_id, page_id);
+    assert_eq!(redone[PAST_LSN..], after[PAST_LSN..], "redo of {ops:?}");
+    ops
+}
+
 #[test]
-fn a_heap_insert_logs_the_page_it_changed() {
+fn a_heap_insert_into_a_dirty_page_logs_only_the_row() {
     let db = setup(4);
     let heap = TableHeap::create(Arc::clone(&db.bpm)).unwrap();
+    heap.insert(&TupleMeta::new(1), &row(b"first")).unwrap();
+    let before = in_memory(&db.bpm, heap.first_page_id());
     let end = db.bpm.log().end();
-    let tuple = Tuple::from_bytes(b"row".to_vec());
-    let rid = heap.insert(&TupleMeta::new(1), &tuple).unwrap();
+    let rid = heap.insert(&TupleMeta::new(2), &row(b"second")).unwrap();
 
-    let page = in_memory(&db.bpm, rid.page_id);
-    assert_eq!(page_lsn(&page), end);
+    let after = in_memory(&db.bpm, rid.page_id);
+    assert_eq!(page_lsn(&after), end);
+    let ops = assert_logged_as_ops(&db.bpm, end, rid.page_id, &before, &after);
+    let expected = PageOp::HeapInsert {
+        slot: rid.slot,
+        meta: TupleMeta::new(2),
+        payload: b"second",
+    };
+    assert_eq!(ops, [format!("{expected:?}")]);
+}
+
+#[test]
+fn a_new_heap_page_is_logged_as_ops_that_format_it() {
+    let db = setup(4);
+    let end = db.bpm.log().end();
+    let heap = TableHeap::create(Arc::clone(&db.bpm)).unwrap();
+
+    let junk = [0xee; PAGE_SIZE];
+    let (pages, _) = logged_on(&db.bpm, end, &junk);
+    let page = in_memory(&db.bpm, heap.first_page_id());
+    match &pages[..] {
+        [
+            (
+                page_id,
+                Form::Ops {
+                    replace_page: true,
+                    redone,
+                    ..
+                },
+            ),
+        ] => {
+            assert_eq!(*page_id, heap.first_page_id());
+            assert_eq!(
+                redone[PAST_LSN..],
+                page[PAST_LSN..],
+                "formatting needs no old page"
+            );
+        }
+        other => panic!("logged as {other:?}"),
+    }
+}
+
+#[test]
+fn the_first_change_after_a_write_logs_the_whole_page() {
+    let db = setup(4);
+    let heap = TableHeap::create(Arc::clone(&db.bpm)).unwrap();
+    heap.insert(&TupleMeta::new(1), &row(b"first")).unwrap();
+    db.bpm.flush_page(heap.first_page_id()).unwrap();
+    let end = db.bpm.log().end();
+    let rid = heap.insert(&TupleMeta::new(2), &row(b"second")).unwrap();
+
     let (pages, _) = logged(&db.bpm, end);
     assert_eq!(page_ids(&pages), [rid.page_id]);
-    assert_eq!(pages[0].1[PAST_LSN..], page[PAST_LSN..]);
+    assert_eq!(
+        pages[0].1[PAST_LSN..],
+        in_memory(&db.bpm, rid.page_id)[PAST_LSN..]
+    );
+
+    let before = in_memory(&db.bpm, rid.page_id);
+    let next = db.bpm.log().end();
+    heap.insert(&TupleMeta::new(3), &row(b"third")).unwrap();
+    let after = in_memory(&db.bpm, rid.page_id);
+    assert_logged_as_ops(&db.bpm, next, rid.page_id, &before, &after);
+}
+
+#[test]
+fn a_page_changed_raw_after_its_ops_is_logged_as_an_image() {
+    let db = setup(4);
+    let heap = TableHeap::create(Arc::clone(&db.bpm)).unwrap();
+    let page_id = heap.first_page_id();
+    let mtr = db.bpm.mtr(Logged::System);
+    let mut page = mtr.write_page(page_id).unwrap();
+    let insert = PageOp::HeapInsert {
+        slot: 0,
+        meta: TupleMeta::new(1),
+        payload: b"op",
+    };
+    page.apply(insert).unwrap();
+    TablePage::new(page.raw_mut())
+        .unwrap()
+        .insert(&TupleMeta::new(2), b"raw")
+        .unwrap();
+    drop(page);
+    let lsn = mtr.commit().unwrap();
+
+    let (pages, _) = logged(&db.bpm, lsn);
+    assert_eq!(
+        pages[0].1[PAST_LSN..],
+        in_memory(&db.bpm, page_id)[PAST_LSN..]
+    );
+}
+
+#[test]
+fn ops_larger_than_the_page_are_logged_as_an_image() {
+    let db = setup(4);
+    let heap = TableHeap::create(Arc::clone(&db.bpm)).unwrap();
+    let rid = heap.insert(&TupleMeta::new(1), &row(b"row")).unwrap();
+    let mtr = db.bpm.mtr(Logged::System);
+    let mut page = mtr.write_page(rid.page_id).unwrap();
+    for len in [MAX_PAYLOAD_SIZE, 1, MAX_PAYLOAD_SIZE] {
+        let set = PageOp::HeapSetTuple {
+            slot: rid.slot,
+            meta: TupleMeta::new(2),
+            payload: &vec![7; len],
+        };
+        page.apply(set).unwrap();
+    }
+    drop(page);
+    let lsn = mtr.commit().unwrap();
+
+    let (pages, _) = logged(&db.bpm, lsn);
+    assert_eq!(page_ids(&pages), [rid.page_id]);
+}
+
+#[test]
+fn an_op_that_fails_changes_and_logs_nothing() {
+    let db = setup(4);
+    let heap = TableHeap::create(Arc::clone(&db.bpm)).unwrap();
+    db.bpm.flush_page(heap.first_page_id()).unwrap();
+    let end = db.bpm.log().end();
+    let mtr = db.bpm.mtr(Logged::System);
+    let mut page = mtr.write_page(heap.first_page_id()).unwrap();
+    let missing = PageOp::HeapSetMeta {
+        slot: 3,
+        meta: TupleMeta::new(1),
+    };
+    assert!(matches!(
+        page.apply(missing),
+        Err(StorageError::InvalidSlot(3))
+    ));
+    assert!(!page.is_dirty());
+    drop(page);
+
+    assert_eq!(mtr.commit(), None);
+    assert_eq!(db.bpm.log().end(), end);
 }

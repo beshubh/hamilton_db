@@ -213,6 +213,17 @@ impl WritePageGuard {
         self.buf_mut()
     }
 
+    /// Runs `change` on the page bytes and marks the page dirty if it
+    /// succeeds. Only for `Mtr`, as `data_mut_for_mtr` is.
+    pub(crate) fn change_for_mtr(
+        &mut self,
+        change: impl FnOnce(&mut [u8; PAGE_SIZE]) -> Result<()>,
+    ) -> Result<()> {
+        change(self.latch.as_mut().expect("latch is held until drop"))?;
+        self.frame.mark_dirty();
+        Ok(())
+    }
+
     pub(crate) fn frame(&self) -> &FrameHeader {
         &self.frame
     }

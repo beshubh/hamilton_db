@@ -48,11 +48,12 @@ use crate::index::index_iter::IndexIterator;
 use crate::page::PAGE_SIZE;
 use crate::page::btree_header_page::BtreeHeaderPage;
 use crate::page::btree_internal_page::BtreeInternalPage;
-use crate::page::btree_leaf_page::BtreeLeafPage;
+use crate::page::btree_leaf_page::{BtreeLeafPage, InsertPosition};
 use crate::page::btree_page::{KeyComparator, check_key_size};
 use crate::page::page_guard::ReadPageGuard;
 use crate::page::page_header::{PageHeader, PageType};
 use crate::wal::mtr::{Logged, Mtr, MtrPage};
+use crate::wal::op::PageOp;
 
 type InternalPage<'a> = BtreeInternalPage<&'a [u8; PAGE_SIZE]>;
 type LeafPage<'a, const NUM_TOMBS: usize> = BtreeLeafPage<&'a [u8; PAGE_SIZE], NUM_TOMBS>;
@@ -233,7 +234,7 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
             Err(StorageError::PageFull) => return Ok(None),
             Err(e) => return Err(e),
         };
-        LeafPageMut::<NUM_TOMBS>::new(guard.raw_mut())?.insert_at(position, key, rid);
+        guard.apply(leaf_insert::<NUM_TOMBS>(position, key, rid))?;
         Ok(Some(true))
     }
 
@@ -280,7 +281,7 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
         let leaf = LeafPage::<NUM_TOMBS>::new(guard.data())?;
         match leaf.insert_position(key, &self.comparator) {
             Ok(position) => {
-                LeafPageMut::<NUM_TOMBS>::new(guard.raw_mut())?.insert_at(position, key, rid);
+                guard.apply(leaf_insert::<NUM_TOMBS>(position, key, rid))?;
                 return Ok(true);
             }
             Err(StorageError::DuplicateKey) => return Ok(false),
@@ -410,13 +411,16 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
             return Ok(Some(false));
         };
         let leaf = LeafPage::<NUM_TOMBS>::new(guard.data())?;
-        if leaf.lookup(key, &self.comparator).is_none() {
+        let Some(index) = leaf.live_index(key, &self.comparator) else {
             return Ok(Some(false));
-        }
+        };
         if !self.is_leaf_remove_safe(&leaf, key, is_root) {
             return Ok(None);
         }
-        LeafPageMut::<NUM_TOMBS>::new(guard.raw_mut())?.remove(key, &self.comparator);
+        guard.apply(PageOp::LeafRemove {
+            num_tombs: NUM_TOMBS,
+            index,
+        })?;
         Ok(Some(true))
     }
 
@@ -456,13 +460,20 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
         }
 
         if LeafPage::<NUM_TOMBS>::new(guard.data())?
-            .lookup(key, &self.comparator)
+            .live_index(key, &self.comparator)
             .is_none()
         {
             return Ok(false);
         }
         let (mut guard, left) = self.latch_left_sibling(&mtr, &ctx, guard)?;
-        LeafPageMut::<NUM_TOMBS>::new(guard.raw_mut())?.remove(key, &self.comparator);
+        // The parent's latch, or the leaf's own, kept `key` where it was.
+        let index = LeafPage::<NUM_TOMBS>::new(guard.data())?
+            .live_index(key, &self.comparator)
+            .expect("the key is still in its leaf");
+        guard.apply(PageOp::LeafRemove {
+            num_tombs: NUM_TOMBS,
+            index,
+        })?;
         finish_change(self.rebalance(&mtr, &mut ctx, guard, left));
         Ok(true)
     }
@@ -797,6 +808,19 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
             // taken.
             parent = guard;
         }
+    }
+}
+
+fn leaf_insert<const NUM_TOMBS: usize>(
+    position: InsertPosition,
+    key: &[u8],
+    rid: Rid,
+) -> PageOp<'_> {
+    PageOp::LeafInsert {
+        num_tombs: NUM_TOMBS,
+        position,
+        key,
+        rid,
     }
 }
 

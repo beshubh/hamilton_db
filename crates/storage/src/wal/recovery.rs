@@ -1,13 +1,13 @@
 //! Restart recovery: analysis, then redo, then a sharp checkpoint.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use common::{Lsn, PageId};
 
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::error::{Result, StorageError};
 use crate::wal::checkpoint::{self, Checkpoint};
-use crate::wal::record::{Kind, PageChanges, PageRedo, Record};
+use crate::wal::record::{Kind, PageChanges, Record};
 
 /// Brings every page up to date with the log, from the checkpoint in the
 /// `.meta` file on, then takes a sharp checkpoint, which needs no log
@@ -69,30 +69,41 @@ fn analyze(bpm: &BufferPoolManager, checkpoint: &Checkpoint) -> Result<HashMap<P
 }
 
 /// Applies, from `redo_lsn` on, every record to the pages in `dirty` it is
-/// not older than, and replays every free. The record at each page's first
-/// LSN holds its image, so redo never reads a page from disk.
+/// not older than, and replays every free. A page whose ops find its copy
+/// on disk unreadable waits for a record that replaces it; see "Redo reads
+/// a page from disk only for ops" in docs/internals/recovery.md.
 fn redo(bpm: &BufferPoolManager, redo_lsn: Lsn, mut dirty: HashMap<PageId, Lsn>) -> Result<()> {
+    let mut needs_image = HashSet::new();
     let mut scan = bpm.log().scan(redo_lsn);
     while let Some(record) = scan.next_record()? {
         let Some(changes) = page_changes(&record)? else {
             continue;
         };
         for (page_id, redo) in changes.pages() {
-            if dirty
-                .get(&page_id)
-                .is_some_and(|&first| first <= record.lsn)
-            {
-                match redo {
-                    PageRedo::Image(image) => bpm.redo_image(page_id, image, record.lsn)?,
-                }
+            if dirty.get(&page_id).is_none_or(|&first| first > record.lsn) {
+                continue;
+            }
+            if redo.replaces_page() {
+                needs_image.remove(&page_id);
+            } else if needs_image.contains(&page_id) {
+                continue;
+            }
+            if !bpm.redo(page_id, redo, record.lsn)? {
+                needs_image.insert(page_id);
             }
         }
         for page_id in changes.frees() {
             dirty.remove(&page_id);
+            needs_image.remove(&page_id);
             bpm.discard_page(page_id)?;
         }
     }
-    Ok(())
+    match needs_image.into_iter().min() {
+        Some(page_id) => Err(StorageError::CorruptLog(format!(
+            "page {page_id} cannot be read, and no record after it replaces the whole page"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// The page changes in `record`, if it is of a kind that has them.

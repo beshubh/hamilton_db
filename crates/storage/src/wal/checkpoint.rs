@@ -12,6 +12,14 @@ use parking_lot::{Condvar, Mutex};
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::error::{Result, StorageError};
 
+#[cfg(test)]
+thread_local! {
+    /// Runs in `take` after it reads the log's end and before it scans the
+    /// frames, so a test can change and write a page in between.
+    static AFTER_START: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// What recovery needs to know about the log as of a checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Checkpoint {
@@ -139,10 +147,13 @@ fn take(bpm: &BufferPoolManager, last_start: &mut Lsn) -> Result<Checkpoint> {
     let log = bpm.log();
     let disk = bpm.disk_manager();
     let start_lsn = log.end();
+    #[cfg(test)]
+    AFTER_START.with_borrow_mut(|hook| hook.as_mut().map(|hook| hook()));
     // Frames are scanned before the directory is copied. A page the scan
     // finds clean finished its write, and a first write's slot is in the
     // directory before the frame is marked clean, so the copy has it. A page
-    // still dirty is redone from its image.
+    // still dirty is redone from the record at its rec_lsn, which replaces
+    // all of it.
     let dirty = bpm.dirty_pages();
     // A free logged before `start_lsn` and applied after the copy is still
     // pending here, so redo reads from it.
@@ -252,8 +263,12 @@ mod tests {
     use super::*;
     use crate::buffer::arc_replacer::AccessType;
     use crate::disk::fs::OsFs;
+    use crate::page::PAGE_SIZE;
     use crate::page::page_header::PageHeader;
+    use crate::table::table_heap::TableHeap;
+    use crate::table::table_page::TupleMeta;
     use crate::wal::mtr::{BEFORE_FREES, Logged};
+    use common::{PageId, Rid, Tuple};
     use tempfile::TempDir;
 
     fn open(dir: &TempDir) -> crate::Storage {
@@ -286,5 +301,88 @@ mod tests {
         );
         let guard = storage.bpm.read_page(kept, AccessType::Unknown);
         assert_eq!(guard.get_data()[PageHeader::SIZE], 1);
+    }
+
+    fn row(bytes: &[u8]) -> Tuple {
+        Tuple::from_bytes(bytes.to_vec())
+    }
+
+    /// A heap with two rows, whose page a fuzzy checkpoint does not list
+    /// though the log changes it after the checkpoint began. The second
+    /// row's insert is logged as an op, and the page written, between the
+    /// checkpoint reading the log's end and scanning the frames.
+    fn heap_the_checkpoint_missed(storage: &crate::Storage) -> (TableHeap, Rid) {
+        let heap = TableHeap::create(Arc::clone(&storage.bpm)).unwrap();
+        heap.insert(&TupleMeta::new(1), &row(b"first")).unwrap();
+        let (bpm, first) = (Arc::clone(&storage.bpm), heap.first_page_id());
+        let inserted = Arc::new(parking_lot::Mutex::new(None));
+        let rid = Arc::clone(&inserted);
+        AFTER_START.set(Some(Box::new(move || {
+            let heap = TableHeap::open(Arc::clone(&bpm), first).unwrap();
+            let second = heap.insert(&TupleMeta::new(2), &row(b"second")).unwrap();
+            bpm.flush_page(second.page_id).unwrap();
+            *rid.lock() = Some(second);
+        })));
+        fuzzy(&storage.bpm).unwrap();
+        AFTER_START.set(None);
+        let rid = inserted.lock().expect("the checkpoint ran the hook");
+        (heap, rid)
+    }
+
+    #[test]
+    fn ops_a_page_has_on_disk_are_not_made_again() {
+        let dir = TempDir::new().unwrap();
+        let storage = open(&dir);
+        let (heap, rid) = heap_the_checkpoint_missed(&storage);
+        let first = heap.first_page_id();
+        drop((heap, storage));
+
+        let storage = open(&dir);
+        let heap = TableHeap::open(Arc::clone(&storage.bpm), first).unwrap();
+        let rows: Vec<_> = heap.iter().unwrap().map(|row| row.unwrap().1).collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(heap.get(rid).unwrap().0, TupleMeta::new(2));
+    }
+
+    /// Flips a byte of the page's copy on disk, as a torn write would.
+    fn tear(storage: &crate::Storage, page_id: PageId) {
+        let disk = storage.bpm.disk_manager();
+        let mut data = [0; PAGE_SIZE];
+        disk.read_page(page_id, &mut data).unwrap();
+        data[PAGE_SIZE / 2] ^= 0xff;
+        disk.write_page(page_id, &data).unwrap();
+    }
+
+    #[test]
+    fn ops_for_a_torn_page_wait_for_a_record_that_replaces_it() {
+        let dir = TempDir::new().unwrap();
+        let storage = open(&dir);
+        let (heap, rid) = heap_the_checkpoint_missed(&storage);
+        // The page is clean, so this change logs all of it.
+        heap.update_meta(rid, &TupleMeta::new(3)).unwrap();
+        storage.bpm.flush_page(rid.page_id).unwrap();
+        tear(&storage, rid.page_id);
+        let first = heap.first_page_id();
+        drop((heap, storage));
+
+        let storage = open(&dir);
+        let heap = TableHeap::open(Arc::clone(&storage.bpm), first).unwrap();
+        assert_eq!(heap.get(rid).unwrap().0, TupleMeta::new(3));
+    }
+
+    #[test]
+    fn a_torn_page_no_later_record_replaces_fails_the_open() {
+        let dir = TempDir::new().unwrap();
+        let storage = open(&dir);
+        let (heap, rid) = heap_the_checkpoint_missed(&storage);
+        tear(&storage, rid.page_id);
+        drop((heap, storage));
+
+        let path = dir.path().join("test.db");
+        let opened = crate::open_with(Arc::new(OsFs), path, 4, None, crate::wal::SEGMENT_SIZE);
+        let Err(StorageError::CorruptLog(msg)) = opened else {
+            panic!("the open did not fail");
+        };
+        assert!(msg.contains(&format!("page {}", rid.page_id)), "{msg}");
     }
 }

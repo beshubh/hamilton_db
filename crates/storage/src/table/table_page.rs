@@ -30,7 +30,7 @@
 use std::cmp::Reverse;
 use std::ops::{Deref, DerefMut};
 
-use common::{INVALID_PAGE_ID, PageId, SlotId};
+use common::{INVALID_PAGE_ID, PageId, SlotId, TXN_UNCOMMITTED_BIT};
 use zerocopy::byteorder::little_endian::{I32, U16, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -226,6 +226,13 @@ impl<B: Deref<Target = [u8; PAGE_SIZE]>> TablePage<B> {
         Ok(())
     }
 
+    /// The slot `insert` uses next: the first free one, or a new one.
+    pub fn insert_slot(&self) -> SlotId {
+        (0..self.slot_count())
+            .find(|&i| self.slot(i).is_free())
+            .unwrap_or(self.slot_count())
+    }
+
     /// Every tuple in slot order, deleted ones included. Free and dead slots
     /// are skipped.
     pub fn iter(&self) -> impl Iterator<Item = (SlotId, TupleMeta, &[u8])> {
@@ -273,8 +280,10 @@ impl<B: Deref<Target = [u8; PAGE_SIZE]>> TablePage<B> {
 }
 
 impl<B: DerefMut<Target = [u8; PAGE_SIZE]>> TablePage<B> {
-    /// Formats `data` as an empty table page and views it.
+    /// Formats `data` as an empty table page, whatever it held, and views
+    /// it.
     pub fn init(mut data: B) -> Self {
+        data.fill(0);
         PageHeader::init(&mut data, PageType::Table);
         let header = TableHeader {
             next_page_id: INVALID_PAGE_ID.into(),
@@ -294,14 +303,26 @@ impl<B: DerefMut<Target = [u8; PAGE_SIZE]>> TablePage<B> {
         self.header_mut().next_page_id = page_id.into();
     }
 
-    /// Stores a tuple and returns its slot, reusing a free slot if there is
-    /// one. Fails with `PageFull` if the page would end up past the insert
-    /// limit, or `TupleTooLarge` if no page could hold the tuple.
+    /// Stores a tuple in `insert_slot` and returns that slot. Fails as
+    /// `insert_at` does.
     pub fn insert(&mut self, meta: &TupleMeta, payload: &[u8]) -> Result<SlotId> {
+        let slot = self.insert_slot();
+        self.insert_at(slot, meta, payload)?;
+        Ok(slot)
+    }
+
+    /// Stores a tuple in `slot`, which must be free or the first past the
+    /// slot array. Fails with `InvalidSlot` if it is neither, `PageFull` if
+    /// the page would end up past the insert limit, or `TupleTooLarge` if no
+    /// page could hold the tuple.
+    pub fn insert_at(&mut self, slot: SlotId, meta: &TupleMeta, payload: &[u8]) -> Result<()> {
         check_payload_size(payload.len())?;
+        let reuse = slot < self.slot_count();
+        if (reuse && !self.slot(slot).is_free()) || slot > self.slot_count() {
+            return Err(StorageError::InvalidSlot(slot));
+        }
         let tuple_len = TUPLE_HEADER_SIZE + payload.len();
-        let reuse = (0..self.slot_count()).find(|&i| self.slot(i).is_free());
-        let slot_bytes = if reuse.is_some() { 0 } else { SLOT_SIZE };
+        let slot_bytes = if reuse { 0 } else { SLOT_SIZE };
         if self.used_bytes() + slot_bytes + tuple_len > INSERT_LIMIT {
             return Err(StorageError::PageFull);
         }
@@ -309,23 +330,18 @@ impl<B: DerefMut<Target = [u8; PAGE_SIZE]>> TablePage<B> {
             self.compact();
         }
 
-        let slot = match reuse {
-            Some(slot) => slot,
-            None => {
-                let h = self.header_mut();
-                let slot = h.slot_count.get();
-                h.slot_count += 1;
-                h.free_lower += SLOT_SIZE as u16;
-                slot
-            }
-        };
+        if !reuse {
+            let h = self.header_mut();
+            h.slot_count += 1;
+            h.free_lower += SLOT_SIZE as u16;
+        }
         let offset = self.write_tuple(meta, payload);
         *self.slot_mut(slot) = Slot {
             offset: offset.into(),
             len: (tuple_len as u16).into(),
             flags: SLOT_LIVE,
         };
-        Ok(slot)
+        Ok(())
     }
 
     /// Replaces the meta of the tuple in `slot`, leaving its data alone. A
@@ -368,6 +384,26 @@ impl<B: DerefMut<Target = [u8; PAGE_SIZE]>> TablePage<B> {
         let s = self.slot_mut(slot);
         s.offset = offset.into();
         s.len = (new_len as u16).into();
+        Ok(())
+    }
+
+    /// Commits the tuple in `slot`. Clears `TXN_UNCOMMITTED_BIT` from its
+    /// `ts` and gives up its payload past `keep_len` bytes, the padding a
+    /// shrinking locked update kept. Fails with `InvalidSlot` if the slot
+    /// holds no tuple or its payload is shorter than `keep_len`.
+    pub fn stamp(&mut self, slot: SlotId, keep_len: usize) -> Result<()> {
+        let s = self.live_slot(slot)?;
+        let (offset, len) = (s.offset.get() as usize, s.len.get() as usize);
+        let new_len = TUPLE_HEADER_SIZE + keep_len;
+        if new_len > len {
+            return Err(StorageError::InvalidSlot(slot));
+        }
+        let header =
+            TupleHeader::mut_from_bytes(&mut self.data[offset..offset + TUPLE_HEADER_SIZE])
+                .unwrap();
+        header.ts = (header.ts.get() & !TXN_UNCOMMITTED_BIT).into();
+        self.slot_mut(slot).len = (new_len as u16).into();
+        self.header_mut().hole_bytes += (len - new_len) as u16;
         Ok(())
     }
 

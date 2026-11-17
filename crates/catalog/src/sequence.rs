@@ -35,7 +35,7 @@ use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::page::PAGE_SIZE;
 use storage::table::table_heap::TableHeap;
 use storage::table::table_page::{TablePage, TupleMeta};
-use storage::wal::{Logged, MtrPage};
+use storage::wal::{Logged, MtrPage, PageOp};
 use zerocopy::byteorder::little_endian::{I32, I64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -216,7 +216,11 @@ impl Sequence {
         let mut page = mtr.write_page(self.page_id)?;
         let (meta, current) = self.read(page.data())?;
         if replace(&current) {
-            TablePage::new(page.raw_mut())?.update(SLOT, &meta, row.as_bytes())?;
+            page.apply(PageOp::HeapSetTuple {
+                slot: SLOT,
+                meta,
+                payload: row.as_bytes(),
+            })?;
         }
         Ok(())
     }
@@ -263,7 +267,11 @@ fn put(page: &mut MtrPage<'_>, meta: &TupleMeta, last_value: i64, log_cnt: i32) 
         log_cnt: log_cnt.into(),
         is_called: 1,
     };
-    TablePage::new(page.raw_mut())?.update(SLOT, meta, row.as_bytes())?;
+    page.apply(PageOp::HeapSetTuple {
+        slot: SLOT,
+        meta: *meta,
+        payload: row.as_bytes(),
+    })?;
     Ok(())
 }
 
