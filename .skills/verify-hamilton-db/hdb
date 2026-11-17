@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Runs a disposable hamilton-server for verification and drives it.
+# Usage is in SKILL.md next to this file; `hdb help` prints the commands.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+HOME_DIR="${HDB_HOME:-/tmp/hamilton-verify}"
+RUN="${HDB_RUN:-default}"
+PROFILE="${HDB_PROFILE:-debug}"
+DIR="$HOME_DIR/$RUN"
+DATA="$DIR/data"
+EVIDENCE="$DIR/evidence"
+DB="$DATA/verify.db"
+SERVER="$ROOT/target/$PROFILE/hamilton-server"
+CLI="$ROOT/target/$PROFILE/hamilton-cli"
+REPL_LABEL="hdb-$RUN"
+
+die() { echo "hdb: $*" >&2; exit 1; }
+sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+pid() { cat "$DIR/server.pid" 2>/dev/null || true; }
+port() { cat "$DIR/server.port" 2>/dev/null || true; }
+alive() { local p; p="$(pid)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+need_server() { alive || die "no server for run '$RUN'; run: hdb up"; }
+
+build() {
+    local flag=()
+    [ "$PROFILE" = release ] && flag=(--release)
+    (cd "$ROOT" && cargo build -q ${flag[@]+"${flag[@]}"} -p hamilton-server -p hamilton-cli)
+}
+
+start() {
+    alive && die "run '$RUN' already has a server (pid $(pid), port $(port)); use hdb stop or another HDB_RUN"
+    mkdir -p "$DATA" "$EVIDENCE"
+    local log="$EVIDENCE/server.log" before
+    touch "$log"
+    before="$(wc -l < "$log")"
+    nohup "$SERVER" --port 0 "$DB" >> "$log" 2>&1 &
+    local p=$! line=""
+    echo "$p" > "$DIR/server.pid"
+    for _ in $(seq 100); do
+        line="$(tail -n +"$((before + 1))" "$log" | grep -m1 'listening on' || true)"
+        [ -n "$line" ] && break
+        kill -0 "$p" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [ -z "$line" ]; then
+        rm -f "$DIR/server.pid"
+        die "server didn't start: $(tail -n +"$((before + 1))" "$log")"
+    fi
+    echo "$line" | sed -E 's/.*listening on [^ ]*:([0-9]+),.*/\1/' > "$DIR/server.port"
+    sha "$SERVER" > "$DIR/server.sha"
+    # Listening isn't usable: require a query to come back.
+    [ "$(echo 'SELECT 1;' | "$CLI" -h 127.0.0.1 -p "$(port)" 2>&1 | sed -n 3p | tr -d ' ')" = 1 ] \
+        || die "server listens on $(port) but SELECT 1 failed"
+    echo "up: run=$RUN pid=$p port=$(port) db=$DB profile=$PROFILE"
+}
+
+stop() {
+    local p; p="$(pid)"
+    [ -n "$p" ] || { echo "stop: no server recorded for run '$RUN'"; return 0; }
+    if kill -0 "$p" 2>/dev/null; then
+        kill -"${1:-TERM}" "$p"
+        for _ in $(seq 300); do kill -0 "$p" 2>/dev/null || break; sleep 0.1; done
+        kill -0 "$p" 2>/dev/null && die "pid $p still running 30s after SIG${1:-TERM}"
+    fi
+    rm -f "$DIR/server.pid" "$DIR/server.port" "$DIR/server.sha"
+    echo "stopped: pid $p (SIG${1:-TERM})"
+}
+
+# Closes the shell's Rex tab if this run opened one and it is still there.
+close_repl() {
+    local block; block="$(cat "$DIR/repl.block" 2>/dev/null || true)"
+    [ -n "$block" ] && rex block close -s "${REX_SESSION:-}" "$block" >/dev/null 2>&1 || true
+    rm -f "$DIR/repl.block"
+}
+
+doctor() {
+    local bad=0 p; p="$(pid)"
+    # check DESCRIPTION COMMAND...: set -e must not end the run at the first failed check.
+    check() { local what="$1"; shift; if "$@" >/dev/null 2>&1; then echo "ok    $what"; else echo "FAIL  $what"; bad=1; fi; }
+    is_ours() { ps -o command= -p "$p" | grep -qF "$SERVER --port 0 $DB"; }
+    owns_port() { lsof -nP -a -p "$p" -iTCP -sTCP:LISTEN | grep -q ":$(port) "; }
+    same_binary() { [ "$(sha "$SERVER")" = "$(cat "$DIR/server.sha")" ]; }
+    fresh_build() { [ -z "$(find "$ROOT/crates" "$ROOT/Cargo.lock" -newer "$SERVER" \( -name '*.rs' -o -name 'Cargo.*' \) -print -quit)" ]; }
+    answers() { [ "$(echo 'SELECT 1;' | "$CLI" -h 127.0.0.1 -p "$(port)" 2>&1 | sed -n 3p | tr -d ' ')" = 1 ]; }
+    echo "run=$RUN dir=$DIR profile=$PROFILE head=$(cd "$ROOT" && git rev-parse --short HEAD)"
+    check "server process alive (pid ${p:-none}; else: hdb up)" alive
+    if alive; then
+        check "pid $p is $SERVER serving $DB" is_ours
+        check "port $(port) is listened on by pid $p" owns_port
+        check "running server is the binary now in target/$PROFILE (else: hdb stop && hdb up)" same_binary
+        check "no source newer than the binary (else: hdb stop && hdb up)" fresh_build
+        check "SELECT 1 round trip through hamilton-cli" answers
+    fi
+    return $bad
+}
+
+# record LABEL CLIENT... : pipes stdin (or $HDB_INPUT) through the client and
+# writes input, output and exit code to the next numbered evidence file.
+record() {
+    local label="$1"; shift
+    need_server
+    local n input out code=0
+    n="$(printf '%02d' $(( $(find "$EVIDENCE" -name '[0-9][0-9]-*' | wc -l) + 1 )))"
+    out="$EVIDENCE/$n-$label.txt"
+    input="$(cat)"
+    {
+        echo "# $label  $(date -u +%Y-%m-%dT%H:%M:%SZ)  run=$RUN port=$(port)"
+        echo "# head=$(cd "$ROOT" && git rev-parse --short HEAD)$(cd "$ROOT" && git diff --quiet HEAD || echo '+dirty') server_sha=$(cut -c1-12 "$DIR/server.sha")"
+        echo "# client: $*"
+        echo "--- input ---"
+        echo "$input"
+        echo "--- output (stdout+stderr) ---"
+    } > "$out"
+    echo "$input" | "$@" >> "$out" 2>&1 || code=$?
+    echo "--- exit: $code ---" >> "$out"
+    sed -n '/^--- output/,$p' "$out"
+    echo "evidence: $out"
+}
+
+input_from() { if [ -n "${1:-}" ]; then cat "$1"; else cat; fi; }
+
+case "${1:-help}" in
+    up) build; start ;;
+    start) start ;;
+    stop) stop TERM ;;
+    crash) stop KILL ;;
+    restart) stop TERM; start ;;
+    doctor) doctor ;;
+    port) need_server; port ;;
+    sql)
+        [ -n "${2:-}" ] || die "usage: hdb sql LABEL [FILE]  (SQL on stdin if no FILE)"
+        input_from "${3:-}" | record "$2" "$CLI" -h 127.0.0.1 -p "$(port)" ;;
+    psql)
+        [ -n "${2:-}" ] || die "usage: hdb psql LABEL [FILE]"
+        input_from "${3:-}" | record "$2" psql -X -q -h 127.0.0.1 -p "$(port)" -U verify -d verify ;;
+    sessions)
+        [ -n "${2:-}" ] || die "usage: hdb sessions LABEL [FILE]"
+        input_from "${3:-}" | record "$2" python3 "$HERE/sessions.py" "$ROOT/sqltest" "$(port)" ;;
+    repl)
+        [ -n "${REX_SESSION:-}" ] || die "hdb repl needs Rex (REX_SESSION is unset)"
+        block="$(cat "$DIR/repl.block" 2>/dev/null || true)"
+        need_repl() { [ -n "$block" ] || die "no shell for run '$RUN'; run: hdb repl start"; }
+        case "${2:-}" in
+            start)
+                need_server
+                [ -z "$block" ] || die "run '$RUN' already has a shell ($block); hdb repl stop first"
+                rex run -s "$REX_SESSION" -c "$ROOT" --label "$REPL_LABEL" --focus=false --shell=none --json \
+                    -- "$CLI" -h 127.0.0.1 -p "$(port)" | jq -er '.block_ids[0]' > "$DIR/repl.block"
+                echo "repl: Rex tab $REPL_LABEL, $(cat "$DIR/repl.block")" ;;
+            type) need_repl; rex send -s "$REX_SESSION" -b "$block" "${3:-}" ;;
+            keys) need_repl; shift 2; rex send-key -s "$REX_SESSION" -b "$block" "$@" ;;
+            shot)
+                need_repl
+                [ -n "${3:-}" ] || die "usage: hdb repl shot LABEL [text|vt|html]"
+                rex capture -s "$REX_SESSION" -b "$block" --trim --format="${4:-text}" | record "$3" cat ;;
+            alive) need_repl; rex block inspect -s "$REX_SESSION" "$block" --json >/dev/null 2>&1 ;;
+            stop) close_repl ;;
+            *) die "usage: hdb repl start | type TEXT | keys KEY... | shot LABEL [text|vt|html] | alive | stop" ;;
+        esac ;;
+    down)
+        close_repl
+        stop TERM
+        rm -rf "$DATA"
+        echo "down: removed $DATA; evidence kept in $EVIDENCE" ;;
+    help | -h | --help)
+        cat <<EOF
+hdb up | start | stop | restart | crash | down     server lifecycle (up builds first; down deletes the database)
+hdb doctor                                         read-only health check, exit 1 if not worth driving
+hdb port                                           the server's port
+hdb sql LABEL [FILE]                               SQL through hamilton-cli, recorded as evidence
+hdb psql LABEL [FILE]                              SQL through psql, recorded as evidence
+hdb sessions LABEL [FILE]                          \\session script across several connections, recorded
+hdb repl start | type TEXT | keys KEY... | shot LABEL [text|vt|html] | alive | stop
+                                                   the interactive shell in a Rex tab (keys: enter tab up ctrl+c ctrl+d)
+
+env: HDB_RUN (default "default")  HDB_PROFILE (debug|release)  HDB_HOME (default /tmp/hamilton-verify)
+     HAMILTON_LOG=debug hdb up logs the server to evidence/server.log
+EOF
+        ;;
+    *) die "unknown command $1; try hdb help" ;;
+esac
