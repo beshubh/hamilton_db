@@ -18,13 +18,12 @@
 //! out (`log_ahead`), so a crash skips up to LOG_VALS values rather than
 //! handing any out again.
 //!
-//! `TRUNCATE ... RESTART IDENTITY` (`restart`) belongs to a transaction. It
-//! must not reach disk before the truncate does, or a crash would bring
-//! back rows whose ids the sequence hands out again. So until the
-//! transaction ends, the restarted sequence counts in memory and the row
-//! keeps its old value. The truncate's commit puts the restarted value in
-//! the row once the empty table is on disk; anything else only ever moves
-//! the row forward.
+//! `TRUNCATE ... RESTART IDENTITY` (`restart`) is a change of the
+//! truncate's transaction, so its abort, or a crash before its commit,
+//! puts the row back as it was before the restart, as Postgres does. That
+//! also takes back every `nextval` since, which is right only because the
+//! truncate holds the table locked: its own inserts are the only ones that
+//! took values meanwhile, and they are undone too.
 
 use std::fmt;
 use std::sync::{Arc, LazyLock};
@@ -70,17 +69,23 @@ struct SequenceRow {
     is_called: u8,
 }
 
+impl SequenceRow {
+    /// The row of a sequence that hands out 1 next.
+    fn first() -> Self {
+        Self {
+            null_bitmap: 0,
+            last_value: 1.into(),
+            log_cnt: 0.into(),
+            is_called: 0,
+        }
+    }
+}
+
 /// Creates a sequence's heap, holding the row of a sequence that hands out
 /// 1 first.
 pub(crate) fn create_heap(bpm: &Arc<BufferPoolManager>) -> Result<TableHeap> {
     let heap = TableHeap::create(Arc::clone(bpm))?;
-    let row = SequenceRow {
-        null_bitmap: 0,
-        last_value: 1.into(),
-        log_cnt: 0.into(),
-        is_called: 0,
-    };
-    let tuple = Tuple::from_bytes(row.as_bytes().to_vec());
+    let tuple = Tuple::from_bytes(SequenceRow::first().as_bytes().to_vec());
     let rid = heap.insert(Logged::System, &TupleMeta::new(CATALOG_TS), &tuple)?;
     debug_assert_eq!((rid.page_id, rid.slot), (heap.first_page_id(), SLOT));
     Ok(heap)
@@ -104,10 +109,8 @@ pub struct Sequence {
     bpm: Arc<BufferPoolManager>,
     page_id: PageId,
     max: i64,
-    /// The value a restart whose transaction hasn't ended handed out last,
-    /// or 0 for none, as values start at 1. `nextval` takes values from it
-    /// rather than from the row.
-    restart: Mutex<Option<i64>>,
+    /// Serializes changes to the row made here: `next_value` makes two.
+    changing: Mutex<()>,
 }
 
 impl Sequence {
@@ -126,20 +129,14 @@ impl Sequence {
             bpm,
             page_id,
             max,
-            restart: Mutex::new(None),
+            changing: Mutex::new(()),
         }
     }
 
     /// Hands out the next value, as Postgres's `nextval` does with the
     /// default options: INCREMENT 1, CACHE 1, NO CYCLE.
     pub fn next_value(&self) -> Result<i64> {
-        // Held throughout, so a restart can't end between the check and the
-        // row change.
-        let mut restart = self.restart.lock();
-        if let Some(last) = restart.as_mut() {
-            *last = self.after(*last)?;
-            return Ok(*last);
-        }
+        let _changing = self.changing.lock();
         let mtr = self.bpm.mtr(Logged::System);
         let mut page = mtr.write_page(self.page_id)?;
         let (meta, row) = self.read(page.data())?;
@@ -169,31 +166,20 @@ impl Sequence {
         Ok(value)
     }
 
-    /// Makes the next value 1 again, until `end_restart`. The caller holds
-    /// the table locked, so only its transaction takes values meanwhile.
-    pub(crate) fn restart(&self) {
-        *self.restart.lock() = Some(0);
-    }
-
-    /// Puts the pending restart, if there is one, in the row: as it is if
-    /// the truncate is `durable`, else only if that moves the row forward,
-    /// so a rolled-back restart leaves a gap of the values it handed out.
-    pub(crate) fn end_restart(&self, durable: bool) {
-        let mut restart = self.restart.lock();
-        let Some(last) = restart.take() else {
-            return;
-        };
-        // A later `nextval` logs ahead from here.
-        let row = SequenceRow {
-            null_bitmap: 0,
-            last_value: last.max(1).into(),
-            log_cnt: 0.into(),
-            is_called: u8::from(last > 0),
-        };
-        let next = |row: &SequenceRow| i128::from(row.last_value.get()) + i128::from(row.is_called);
-        if let Err(e) = self.replace_if(&row, |now| durable || next(now) < next(&row)) {
-            log::error!("ending the restart of {}: {e}", self.name);
-        }
+    /// Makes the next value 1 again, as `by`'s change: a truncate's, whose
+    /// undo puts the row back (see the module docs).
+    pub(crate) fn restart(&self, by: Logged<'_>) -> Result<()> {
+        let _changing = self.changing.lock();
+        let mtr = self.bpm.mtr(by);
+        let mut page = mtr.write_page(self.page_id)?;
+        let (meta, _) = self.read(page.data())?;
+        page.apply(PageOp::HeapSetTuple {
+            slot: SLOT,
+            meta,
+            payload: SequenceRow::first().as_bytes(),
+            padded_to: size_of::<SequenceRow>(),
+        })?;
+        Ok(())
     }
 
     /// The value after `last`, if the sequence hasn't reached its maximum.
@@ -204,26 +190,6 @@ impl Sequence {
                 name: self.name.clone(),
                 max: self.max,
             })
-    }
-
-    /// Writes `row` over the current row if `replace(current)`.
-    fn replace_if(
-        &self,
-        row: &SequenceRow,
-        replace: impl FnOnce(&SequenceRow) -> bool,
-    ) -> Result<()> {
-        let mtr = self.bpm.mtr(Logged::System);
-        let mut page = mtr.write_page(self.page_id)?;
-        let (meta, current) = self.read(page.data())?;
-        if replace(&current) {
-            page.apply(PageOp::HeapSetTuple {
-                slot: SLOT,
-                meta,
-                payload: row.as_bytes(),
-                padded_to: size_of::<SequenceRow>(),
-            })?;
-        }
-        Ok(())
     }
 
     fn read(&self, data: &[u8; PAGE_SIZE]) -> Result<(TupleMeta, SequenceRow)> {

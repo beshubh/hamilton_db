@@ -270,11 +270,7 @@ impl ExecutionEngine {
             }
             (_, State::Idle) => Err(EngineError::NoTransaction),
             (TransactionCommand::Commit, State::InBlock(txn)) => {
-                if let Err(err) = self.commit(&txn) {
-                    // The commit's error is the one to report.
-                    let _ = self.txn_manager.abort(&txn);
-                    return Err(err);
-                }
+                self.commit(&txn)?;
                 Ok(Output::Done("COMMIT"))
             }
             (TransactionCommand::Rollback, State::InBlock(txn)) => {
@@ -356,13 +352,9 @@ impl ExecutionEngine {
         Instant::now() < deadline
     }
 
-    /// Readies the catalog changes `txn` made, then commits `txn`, which
-    /// survives a crash once this returns. If this fails, `txn` is still
-    /// running and must be aborted.
+    /// Commits `txn`, which survives a crash once this returns. Fails only
+    /// if `txn` has ended.
     fn commit(&self, txn: &Transaction) -> Result<()> {
-        self.catalog
-            .prepare_commit(txn)
-            .map_err(ExecutionError::from)?;
         self.txn_manager.commit(txn).map_err(ExecutionError::from)?;
         Ok(())
     }

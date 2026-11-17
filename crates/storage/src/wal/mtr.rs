@@ -147,6 +147,21 @@ impl<'a> Mtr<'a> {
         }
     }
 
+    /// For a transaction's mtr, logs that its change, a truncate's new
+    /// storage `new` in place of `old`, is undone by freeing `new`. Each is
+    /// a heap's first page, then its trees' header pages. Other mtrs log no
+    /// undo, so this does nothing for them.
+    pub(crate) fn undo_truncate(&self, old: &[PageId], new: &[PageId]) {
+        if let Logged::Txn(_) = self.by {
+            let mut state = self.state.borrow_mut();
+            assert!(
+                state.undo.is_empty(),
+                "a transaction's mtr undoes one change"
+            );
+            Undo::encode_truncate(&mut state.undo, old.iter().copied(), new.iter().copied());
+        }
+    }
+
     /// Write-latches `page_id` for this mtr. A page this mtr already changed
     /// comes back still latched. Fails with `InvalidPageId` for a temporary
     /// page, which is never logged.

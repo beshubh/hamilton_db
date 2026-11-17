@@ -130,13 +130,13 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
         comparator: CmpT,
     ) -> Result<Self> {
         {
-            let mut format = Vec::new();
-            comparator.describe(&mut format);
             let mtr = bpm.bpm().mtr(Logged::System);
             let mut header = bpm.write_page(&mtr, header_page_id)?;
             if page_type(header.data()) == Ok(PageType::Invalid) {
-                BtreeHeaderPage::init(header.raw_mut()).set_entry_format(NUM_TOMBS, &format);
+                Self::format_header(header.raw_mut(), &comparator);
             } else {
+                let mut format = Vec::new();
+                comparator.describe(&mut format);
                 let header = BtreeHeaderPage::new(header.data())?;
                 if header.num_tombs() != NUM_TOMBS || header.entry_format() != format {
                     return Err(StorageError::BtreeMismatch(header_page_id));
@@ -150,6 +150,14 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
             comparator,
             header_page_id,
         })
+    }
+
+    /// Formats `page` as the header page of an empty tree, recording how
+    /// `comparator` orders keys and `NUM_TOMBS`.
+    pub(crate) fn format_header(page: &mut [u8; PAGE_SIZE], comparator: &CmpT) {
+        let mut format = Vec::new();
+        comparator.describe(&mut format);
+        BtreeHeaderPage::init(page).set_entry_format(NUM_TOMBS, &format);
     }
 
     pub fn index_name(&self) -> &str {

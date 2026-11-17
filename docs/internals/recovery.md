@@ -67,7 +67,7 @@ The thread that `storage::open` starts takes a fuzzy checkpoint every 30 seconds
 5. Save the `.meta`, then release the slots that the copy no longer lists.
 6. Remove the log segments that the saved checkpoint no longer needs.
 
-A sharp checkpoint (`BufferPoolManager::checkpoint`) writes every dirty page first. `Storage::close` takes one. Recovery takes one when it ends, and TRUNCATE takes one before its commit. Dropping `Storage` without closing it is a crash, which is how tests crash a database.
+A sharp checkpoint (`BufferPoolManager::checkpoint`) writes every dirty page first. `Storage::close` takes one, and recovery takes one when it ends. Dropping `Storage` without closing it is a crash, which is how tests crash a database.
 
 ## Checkpoints remove the log they no longer need
 
@@ -91,11 +91,12 @@ The checkpoint scans the frames while appends are held off, at the moment it rea
 
 A transaction's change is logged as an `Update` record that says how to take it back ([`record.rs`](../../crates/storage/src/wal/record.rs)). Recovery runs before the catalog can be read, so undo needs nothing the catalog knows:
 
-- A heap change is undone by slot, to the tuple's meta and bytes from before it. The mtr reads them from the page when the transaction's op is made (`MtrPage::apply`), so callers never build undo. The transaction holds the tuple's lock until it ends, so nothing else changes the slot. A shrinking locked update keeps the tuple's length, so undoing a change never makes a tuple longer, and it always fits back in place ([Version storage](version-storage.md)).
+- A heap change is undone by slot, to the tuple's meta and bytes from before it. The mtr reads them from the page when the transaction's op is made (`MtrPage::apply`), so callers never build undo. The transaction holds the tuple's lock until it ends, so nothing else changes the slot; for the catalog rows a truncate changes, its table lock does that. A shrinking locked update keeps the tuple's length, so undoing a change never makes a tuple longer, and it always fits back in place ([Version storage](version-storage.md)).
 - An index insert is undone by removing its entry by key, since splits move entries between pages. The B+ tree header records how the tree orders its keys, as its comparator describes them (`KeyComparator::describe`), so undo opens the tree from its header alone. Opening a tree with a comparator that orders keys another way fails with `BtreeMismatch`.
+- A truncate's new storage is undone by freeing all of it, as [TRUNCATE](#truncate-is-a-change-of-its-transaction) describes.
 - The `Update` of a heap insert or tuple change also holds the payload length that its commit keeps, which is shorter than the tuple when the update padded it. Recovery stamps from it, as it cannot decode the tuple without a schema.
 
-Writes that no transaction undoes are logged as `System` records: garbage collection, index builds, catalog rows, sequences, and an index entry that a unique check takes back at once.
+Writes that no transaction undoes are logged as `System` records: garbage collection, index builds, the catalog rows of CREATE TABLE and CREATE INDEX, `nextval`, and an index entry that a unique check takes back at once.
 
 ## Undo logs a compensation for each change
 
@@ -112,22 +113,32 @@ A `Transaction` dropped while running, which debug builds refuse, never logs `En
 
 ## Commit logs `Commit` before the stamps
 
-A transaction that wrote anything commits by logging `Commit` and waiting for it to be durable (group commit). Only then does it stamp its tuples, one `Completion` record per page in page order, run its `on_end` hooks, and log `End` without waiting. A stamp makes a version visible, so a reader never sees a commit that a crash can lose. A reader that meets a tuple during the sync gets `Conflict`, as for any locked tuple. A transaction that wrote nothing logs nothing.
+A transaction that wrote anything commits by logging `Commit` and waiting for it to be durable (group commit). Only then does it stamp its tuples, one `Completion` record per page in page order, run its `on_end` hooks, and log `End` without waiting, or, after a truncate, once it has freed the old storage. A stamp makes a version visible, so a reader never sees a commit that a crash can lose. A reader that meets a tuple during the sync gets `Conflict`, as for any locked tuple. A transaction that wrote nothing logs nothing.
 
 Once `Commit` is logged, the transaction has committed. A failure after it, or during undo, stops the process instead of returning: the caller would otherwise abort a durable commit, or leave a half-undone transaction running. Recovery finishes either from the log.
 
-CREATE TABLE, CREATE INDEX and TRUNCATE write catalog rows outside any transaction's records, so the catalog syncs the log after them.
+CREATE TABLE and CREATE INDEX write catalog rows outside any transaction's records, so the catalog syncs the log after them.
 
 ## Recovery finishes the transactions a crash cut off
 
 Analysis starts from the checkpoint's transaction table and follows the log, with the same rules that keep the log's own table ([`txn_log.rs`](../../crates/storage/src/wal/txn_log.rs)), and checks that each record's `prev_lsn` is its transaction's previous record. After redo:
 
-- A transaction whose `Commit` is in the log but whose `End` is not gets the rest of its stamps: every tuple its `Update`s name that it still holds. Then its `End`.
+- A transaction whose `Commit` is in the log but whose `End` is not gets the rest of its stamps: every tuple its `Update`s name that it still holds. A truncate's old storage is freed. Then its `End`.
 - Every other transaction in the table is undone, the newest record of any of them first, and gets its `End`.
 
 No tuple stays locked. The next Tid comes from the catalog header, which each statement that can write raises before its first record, so it is above every Tid in the log. The undo log, the read timestamps, and the watermark restart empty, as [Restart and crashes in MVTO](mvto.md#restart-and-crashes) describes. Tuples that recovery's undo leaves deleted, and the garbage of transactions that ended before the crash, stay until a cleanup reclaims them.
 
-A crash during a TRUNCATE's commit can still leave the table on its new heap: TRUNCATE points the catalog rows at the new heap outside the transaction's records.
+## TRUNCATE is a change of its transaction
+
+TRUNCATE gives a table a new heap and a new tree for each index ([`Transaction::truncate`](../../crates/storage/src/concurrency/transaction.rs)). One `Update` record makes all of the new storage, and its undo, `Undo::Truncate`, names the first page of the old and of the new heap and trees. So no crash leaves new storage that no transaction will free, and analysis raises the next page id past it. The catalog rows that point the table and its indexes at the new storage, and the sequence row that RESTART IDENTITY resets, are the transaction's own changes, logged after that record (`Transaction::undoable`). A commit keeps all of it, and an abort or a crash before the commit takes all of it back.
+
+Undo runs newest first, so it puts the rows back before it frees the new storage. It frees the storage whole, walking the heap and trees as they are then, so the pages the transaction's own inserts added go too. A runtime abort drops the transaction's garbage in that storage, as nothing is left to collect.
+
+The rows a truncate changes have no tuple lock. Its exclusive table lock keeps every other transaction off them until it ends, and that is what makes undoing them by their old bytes safe. For the sequence it means more: undoing the restart also takes back every `nextval` since, which is right only because the table lock keeps other transactions from inserting meanwhile. A way to call `nextval` that skips the table lock would break this.
+
+A commit frees the old storage during garbage collection, once every transaction running when it ended has ended and their garbage, which may point into it, is collected. It logs `End` only after the free, so until then the transaction stays in the transaction table and holds back log removal. Recovery frees the old storage of a committed truncate without `End`. Each storage goes in one record, so the transaction's own records show recovery whether it went, and which pages need no stamp because they are gone.
+
+Recovery finishes committed transactions in Tid order. Table locks make a truncate newer than every transaction that wrote the storage it replaces, so their stamps come before its free.
 
 ## The log decides what a crash test expects
 
@@ -136,3 +147,5 @@ A crash during a TRUNCATE's commit can still leave the table on its new heap: TR
 [`txn_recovery.rs`](../../crates/storage/tests/txn_recovery.rs) does the same with transactions that commit, abort, and are left open. The rows after recovery must be exactly what the transactions whose `Commit` is in the log wrote, and each commit acknowledged before the crash must be among them. No tuple may stay locked, and every row must have its index entries. Undo is idempotent, so a crash test alone does not show a missing `Clr`. A concurrent test writes a row that a rollback gave back, and checks that a crash during the rollback keeps that commit.
 
 A crash sweep must also start from a recovered database, because recovery leaves states a first crash never meets: pages last logged before the log's first segment, and free slots rebuilt from the `.meta`.
+
+A page that no one frees leaves every row right, so row checks miss it. [`truncate_recovery.rs`](../../crates/catalog/tests/truncate_recovery.rs) also checks that the pages the db file holds are exactly the catalog's and those the table, its indexes and its sequence reach.

@@ -86,14 +86,7 @@ impl TableHeap {
 
     /// Every page of the heap, in list order.
     pub fn page_ids(&self) -> Result<Vec<PageId>> {
-        let mut pages = Vec::new();
-        let mut page_id = self.first_page_id;
-        while page_id != INVALID_PAGE_ID {
-            pages.push(page_id);
-            let guard = self.bpm.checked_read_page(page_id, AccessType::Scan)?;
-            page_id = TablePage::new(guard.get_data())?.next_page_id();
-        }
-        Ok(pages)
+        page_ids(&self.bpm, self.first_page_id)
     }
 
     /// Appends a tuple to the last page, starting a new page when that one is
@@ -166,11 +159,18 @@ impl TableHeap {
         })
     }
 
-    /// Replaces the tuple at `rid`, keeping its `Rid`. Fails with `PageFull`
-    /// if the new version does not fit on the tuple's page; the caller then
-    /// deletes it and inserts the new version elsewhere.
-    pub fn update_in_place(&self, rid: Rid, meta: &TupleMeta, tuple: &Tuple) -> Result<()> {
-        let mtr = self.mtr();
+    /// Replaces the tuple at `rid`, keeping its `Rid`, logged as `by`'s
+    /// change. Fails with `PageFull` if the new version does not fit on the
+    /// tuple's page; the caller then deletes it and inserts the new version
+    /// elsewhere.
+    pub fn update_in_place(
+        &self,
+        by: Logged<'_>,
+        rid: Rid,
+        meta: &TupleMeta,
+        tuple: &Tuple,
+    ) -> Result<()> {
+        let mtr = self.bpm.mtr(by);
         let mut guard = mtr.write_page(rid.page_id)?;
         guard.apply(PageOp::HeapSetTuple {
             slot: rid.slot,
@@ -408,6 +408,18 @@ impl TableHeap {
     }
 }
 
+/// Every page of the heap whose first page is `first`, in list order.
+pub(crate) fn page_ids(bpm: &BufferPoolManager, first: PageId) -> Result<Vec<PageId>> {
+    let mut pages = Vec::new();
+    let mut page_id = first;
+    while page_id != INVALID_PAGE_ID {
+        pages.push(page_id);
+        let guard = bpm.checked_read_page(page_id, AccessType::Scan)?;
+        page_id = TablePage::new(guard.get_data())?.next_page_id();
+    }
+    Ok(pages)
+}
+
 /// The head of the tuple at `rid`, for a versioned write. A reclaimed tuple
 /// was deleted, so it fails with `TupleDeleted`.
 fn head_to_write<B: Deref<Target = [u8; PAGE_SIZE]>>(
@@ -575,8 +587,13 @@ mod tests {
         let rid = heap
             .insert(Logged::System, &TupleMeta::new(1), &tuple(b"short"))
             .unwrap();
-        heap.update_in_place(rid, &TupleMeta::new(2), &tuple(b"a much longer row"))
-            .unwrap();
+        heap.update_in_place(
+            Logged::System,
+            rid,
+            &TupleMeta::new(2),
+            &tuple(b"a much longer row"),
+        )
+        .unwrap();
         assert_eq!(
             get(&heap, rid),
             (TupleMeta::new(2), b"a much longer row".to_vec())
@@ -593,7 +610,7 @@ mod tests {
         heap.insert(Logged::System, &TupleMeta::new(1), &tuple([2u8; 1500]))
             .unwrap();
         assert!(matches!(
-            heap.update_in_place(rid, &TupleMeta::new(2), &tuple([3u8; 3000])),
+            heap.update_in_place(Logged::System, rid, &TupleMeta::new(2), &tuple([3u8; 3000])),
             Err(StorageError::PageFull)
         ));
         assert_eq!(get(&heap, rid).1, vec![1u8; 1500]);

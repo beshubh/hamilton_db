@@ -13,6 +13,7 @@ use crate::buffer::traced_buffer_pool_manager::TracedBufferPoolManager;
 use crate::error::{Result, StorageError};
 use crate::index::btree::Btree;
 use crate::index::{IndexMetadata, IndexTrait, LocatorKind, RowLocator};
+use crate::page::PAGE_SIZE;
 use crate::page::btree_header_page::BtreeHeaderPage;
 use crate::page::btree_page::{KeyComparator, check_key_size};
 use crate::wal::Logged;
@@ -166,6 +167,14 @@ impl EntryComparator {
             keys: KeySchemaComparator::new(key_schema),
             layout,
         }
+    }
+
+    /// The comparator of the index `metadata` describes.
+    fn of(metadata: &IndexMetadata) -> Self {
+        Self::new(
+            Arc::clone(metadata.key_schema()),
+            EntryLayout::of(metadata.locator()),
+        )
     }
 
     /// The comparator whose `describe` gave `format`, with a key schema of
@@ -379,17 +388,19 @@ impl BtreeIndex {
         header_page_id: PageId,
         bpm: Arc<BufferPoolManager>,
     ) -> Result<Self> {
-        let comparator = EntryComparator::new(
-            Arc::clone(metadata.key_schema()),
-            EntryLayout::of(metadata.locator()),
-        );
         let tree = Tree::new(
             metadata.name(),
             header_page_id,
             Arc::new(TracedBufferPoolManager::new(bpm)),
-            comparator,
+            EntryComparator::of(&metadata),
         )?;
         Ok(Self { metadata, tree })
+    }
+
+    /// Formats `page` as the header page of an empty tree for an index
+    /// `metadata` describes, which `new` then opens.
+    pub(crate) fn format_header(page: &mut [u8; PAGE_SIZE], metadata: &IndexMetadata) {
+        Tree::format_header(page, &EntryComparator::of(metadata));
     }
 
     /// Opens the tree of the index whose header page is `header_page_id`,

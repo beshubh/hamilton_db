@@ -61,7 +61,7 @@ Opening a database replays the log, finishes the commits a crash cut off between
 
 `nextval` changes a sequence row in place, outside any transaction, at `ts` 0. It writes the row to disk 32 values ahead before it hands those values out ([`sequence.rs`](../../crates/catalog/src/sequence.rs)). The write syncs the log through that change first, so after a crash the sequence skips up to 32 values and never repeats one.
 
-`TRUNCATE ... RESTART IDENTITY` is the only change that moves a sequence back. The row therefore does not change until the truncate is on disk, as the next section explains.
+`TRUNCATE ... RESTART IDENTITY` is the only change that moves a sequence back. It is a change of the truncate's transaction, so an abort, or a crash before the commit, puts the row back ([Recovery](recovery.md#truncate-is-a-change-of-its-transaction)).
 
 ## Table locks and TRUNCATE
 
@@ -70,20 +70,11 @@ TRUNCATE does not delete rows. It gives the table a new, empty heap and new inde
 - Each statement locks the tables that its plan uses before it runs (`lock_tables` in [`executors.rs`](../../crates/execution/src/executors.rs)). Reads, writes, and CREATE INDEX take modes that conflict only with TRUNCATE's exclusive mode. A transaction holds its locks until it ends.
 - A lock never waits. A conflict fails the statement with `LockConflict`. Outside a block, the engine retries after the holder ends, whether the holder is older or newer. In a block, the block fails. No transaction waits while it holds a lock, so there are no deadlocks to detect. The cost is that an exclusive request can keep failing while readers keep arriving.
 - Locks also do the job of the timestamps that MVTO keeps on rows, and fail with `ChangedSince`. A transaction older than a committed truncate cannot use the table, because it comes first in Tid order and should still see the rows. A truncate cannot run in a transaction older than one that has used the table, because it would remove rows that the newer transaction wrote or read. Postgres has neither check. There, older snapshots see an empty table.
-- Garbage collection frees the replaced pages through `after_readers` work, after it has handled any garbage that still points into them.
+- Garbage collection frees the replaced pages after it has handled any garbage that still points into them.
 
-A commit that truncated costs a checkpoint. The engine prepares the commit first (`prepare_commit`):
-
-1. A sharp checkpoint writes every page and saves the page directory.
-2. The catalog rows are pointed at the new pages in memory. A failure up to here aborts the transaction.
-3. The transaction commits.
-4. The new heap is written again, with its rows now stamped committed. Then the pages that hold the catalog rows are written.
-5. The restarted sequence is written, and the old pages are freed.
-
-A crash before the log holds the catalog rows' new page ids finds the old table, complete.
+The new storage, and the catalog rows that point at it, are changes of the truncate's transaction, so they commit or roll back with it, across a crash too ([Recovery](recovery.md#truncate-is-a-change-of-its-transaction)).
 
 ## Known gaps
 
 - **Phantoms.** Read timestamps guard tuples that exist. If an older transaction inserts a row that a newer transaction's scan should have seen, nothing detects it. Schedules with inserts are therefore not serializable.
 - **The catalog is not transactional.** CREATE TABLE and CREATE INDEX are rejected inside a block.
-- **A crash during a TRUNCATE's commit** can leave the table on its new heap: step 2 logs the catalog rows outside the transaction.

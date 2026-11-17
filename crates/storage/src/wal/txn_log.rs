@@ -1,16 +1,19 @@
 //! Transactions in the log: the active transaction table, the records
-//! that end a transaction, and commit stamping, which runtime commits and
+//! that end a transaction, and the work after a `Commit`, stamping and
+//! freeing the storage a truncate replaced, which runtime commits and
 //! recovery share.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::hash::IntKeys;
-use common::{INVALID_LSN, Lsn, Rid, TXN_UNCOMMITTED_BIT, TxnId};
+use common::{INVALID_LSN, Lsn, PageId, Rid, TXN_UNCOMMITTED_BIT, TxnId};
 
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::error::{Result, StorageError};
+use crate::index::btree_index::BtreeIndex;
+use crate::table::table_heap;
 use crate::table::table_page::TablePage;
 use crate::wal::mtr::Logged;
 use crate::wal::op::PageOp;
@@ -258,27 +261,65 @@ pub(crate) fn stamp(
     Ok(())
 }
 
-/// Finishes the commit of a transaction whose `Commit` is in the log but
-/// whose `End` is not: stamps every tuple its `Update` records name that it
-/// still holds, keeping the payload length of its newest record that set
-/// one, then logs its `End`.
+/// Finishes a commit whose `End` the log lacks: stamps the tuples it still
+/// holds, frees the storage its truncates replaced, and logs `End`. Its
+/// logged frees came after its stamps, and each storage went in one record,
+/// so a heap's first page shows whether that storage was freed.
 pub(crate) fn complete(txn: &TxnLog, last_lsn: Lsn) -> Result<()> {
     let log = txn.bpm.log();
     let mut writes: BTreeMap<Rid, Option<usize>> = BTreeMap::new();
+    let mut replaced: Vec<Vec<PageId>> = Vec::new();
+    let mut freed: HashSet<PageId, IntKeys> = HashSet::default();
     let mut buf = Vec::new();
     let mut lsn = last_lsn;
     while lsn != INVALID_LSN {
         let record = log.read(lsn, &mut buf)?;
-        if record.kind == Kind::Update
-            && let Undo::Heap { rid, keep_len, .. } = record.undo()?
-        {
-            let kept = writes.entry(rid).or_insert(keep_len);
-            *kept = kept.or(keep_len);
+        match record.kind {
+            Kind::Update => match record.undo()? {
+                Undo::Heap { rid, keep_len, .. } => {
+                    let kept = writes.entry(rid).or_insert(keep_len);
+                    *kept = kept.or(keep_len);
+                }
+                Undo::Truncate { old, .. } => replaced.push(old.iter().collect()),
+                Undo::IndexEntry { .. } => {}
+            },
+            Kind::Completion => {
+                let changes = record.page_changes()?.expect("a completion changes pages");
+                freed.extend(changes.frees());
+            }
+            _ => {}
         }
         lsn = record.prev_lsn;
     }
-    let writes: Vec<_> = writes.into_iter().collect();
+    let writes: Vec<_> = writes
+        .into_iter()
+        .filter(|(rid, _)| !freed.contains(&rid.page_id))
+        .collect();
     stamp(txn, &writes, |_| {})?;
+    for old in replaced.iter().filter(|old| !freed.contains(&old[0])) {
+        free_storage(&txn.bpm, Logged::Completion(txn), old)?;
+    }
     txn.end();
+    Ok(())
+}
+
+/// Frees every page of a table's storage, given by `roots`: its heap's
+/// first page, then its trees' header pages. One record logged as `by`'s
+/// frees them all, so a crash leaves all of them or none.
+pub(crate) fn free_storage(
+    bpm: &Arc<BufferPoolManager>,
+    by: Logged<'_>,
+    roots: &[PageId],
+) -> Result<()> {
+    let (&heap, trees) = roots.split_first().expect("a table has a heap");
+    let mut pages = when_a_frame_is_free(|| table_heap::page_ids(bpm, heap))?;
+    for &header in trees {
+        let tree = when_a_frame_is_free(|| BtreeIndex::open_tree(Arc::clone(bpm), header))?;
+        pages.extend(when_a_frame_is_free(|| tree.page_ids())?);
+    }
+    let mtr = bpm.mtr(by);
+    for page_id in pages {
+        mtr.free_page(page_id);
+    }
     Ok(())
 }

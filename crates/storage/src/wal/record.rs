@@ -255,6 +255,24 @@ pub enum Undo<'a> {
     /// Remove `entry`, if it is there, from the B+ tree whose header page
     /// is `header`.
     IndexEntry { header: PageId, entry: &'a [u8] },
+    /// A truncate gave a table the storage `new` in place of `old`. Undo
+    /// frees every page of `new`; finishing the commit frees `old`'s.
+    Truncate { old: Roots<'a>, new: Roots<'a> },
+}
+
+/// Where a table's storage starts: the first page of its heap, then the
+/// header page of each of its indexes' B+ trees. The rest of its pages
+/// are reached from these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Roots<'a>(&'a [u8]);
+
+impl<'a> Roots<'a> {
+    /// The heap's first page, then the trees' header pages.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = PageId> + 'a {
+        self.0
+            .chunks_exact(size_of::<PageId>())
+            .map(|id| PageId::from_le_bytes(id.try_into().unwrap()))
+    }
 }
 
 /// A heap tuple before the change an `Undo::Heap` takes back.
@@ -270,6 +288,7 @@ pub enum Before<'a> {
 
 const UNDO_HEAP: u8 = 1;
 const UNDO_INDEX_ENTRY: u8 = 2;
+const UNDO_TRUNCATE: u8 = 3;
 const BEFORE_INSERTED: u8 = 1;
 const BEFORE_META: u8 = 2;
 const BEFORE_TUPLE: u8 = 3;
@@ -281,6 +300,7 @@ impl<'a> Undo<'a> {
     /// ```text
     /// heap          1 | page_id i32 | slot u16 | keep_len u16 | before
     /// index entry   2 | header i32 | len u16 | entry
+    /// truncate      3 | num u16 | old page_id i32 * num | new page_id i32 * num
     ///
     /// before: 1 (inserted) | 2 meta | 3 meta len u16 payload
     /// ```
@@ -319,6 +339,29 @@ impl<'a> Undo<'a> {
                 buf.extend_from_slice(&u16_of(entry.len()).to_le_bytes());
                 buf.extend_from_slice(entry);
             }
+            Self::Truncate { old, new } => Self::encode_truncate(buf, old.iter(), new.iter()),
+        }
+    }
+
+    /// Appends a `Truncate` from `old` to `new`, each the heap's first page
+    /// and then the trees' header pages.
+    ///
+    /// # Panics
+    /// If `old` and `new` differ in length, or are empty.
+    pub(crate) fn encode_truncate(
+        buf: &mut Vec<u8>,
+        old: impl ExactSizeIterator<Item = PageId>,
+        new: impl ExactSizeIterator<Item = PageId>,
+    ) {
+        assert!(
+            old.len() > 0 && old.len() == new.len(),
+            "a truncate replaces a heap and each of its trees"
+        );
+        buf.push(UNDO_TRUNCATE);
+        let num = u16::try_from(old.len()).expect("a table has few indexes");
+        buf.extend_from_slice(&num.to_le_bytes());
+        for page_id in old.chain(new) {
+            buf.extend_from_slice(&page_id.to_le_bytes());
         }
     }
 
@@ -357,6 +400,16 @@ impl<'a> Undo<'a> {
                 Self::IndexEntry {
                     header,
                     entry: r.bytes(len)?,
+                }
+            }
+            UNDO_TRUNCATE => {
+                let len = usize::from(r.u16()?) * size_of::<PageId>();
+                if len == 0 {
+                    return Err(corrupt_undo(UNDO_TRUNCATE));
+                }
+                Self::Truncate {
+                    old: Roots(r.bytes(len)?),
+                    new: Roots(r.bytes(len)?),
                 }
             }
             other => return Err(corrupt_undo(other)),

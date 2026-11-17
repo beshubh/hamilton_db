@@ -126,6 +126,9 @@ fn finish_transactions(bpm: &Arc<BufferPoolManager>, att: Att) -> Result<()> {
     // Their records chain onto the ones analysis found.
     bpm.log().restore_att(att);
     let mut losers = Vec::new();
+    // In Tid order: a truncate is newer than every transaction that wrote
+    // the storage it frees, so their stamps come first. Runtime frees are
+    // logged in commit order for the same reason.
     for (tid, entry) in entries {
         let txn = TxnLog::new(tid, Arc::clone(bpm));
         match entry.status {
