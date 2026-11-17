@@ -857,6 +857,7 @@ dependencies = [
  "catalog",
  "common",
  "execution",
+ "parking_lot",
  "parser",
  "storage",
  "tempfile",

@@ -36,11 +36,14 @@ class HamiltonTestRunner(DiscoverRunner):
             stderr=subprocess.PIPE,
             text=True,
         )
-        line = self.server.stderr.readline()
-        match = re.search(r"listening on [\d.]+:(\d+)", line)
-        if not match:
+        lines = []
+        for line in self.server.stderr:
+            lines.append(line)
+            if match := re.search(r"listening on [\d.]+:(\d+)", line):
+                break
+        else:
             self.stop_server()
-            raise RuntimeError(f"hamilton-server didn't start: {line!r}")
+            raise RuntimeError(f"hamilton-server didn't start: {''.join(lines)!r}")
         connections["default"].settings_dict["PORT"] = match.group(1)
         return super().setup_databases(**kwargs)
 

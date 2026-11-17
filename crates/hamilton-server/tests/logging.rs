@@ -9,7 +9,7 @@ use wire::Client;
 
 /// Runs the server binary with HAMILTON_LOG set to `log`, or unset, inserts
 /// a row that takes its id from a sequence, and returns what the server
-/// wrote to stderr after its startup line.
+/// wrote to stderr after the line saying where it listens.
 fn stderr_after_an_insert(log: Option<&str>) -> String {
     let dir = TempDir::new().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_hamilton-server"));
@@ -24,7 +24,11 @@ fn stderr_after_an_insert(log: Option<&str>) -> String {
     let mut server = command.spawn().unwrap();
     let mut stderr = BufReader::new(server.stderr.take().unwrap());
     let mut startup = String::new();
-    stderr.read_line(&mut startup).unwrap();
+    while !startup.contains("listening on") {
+        startup.clear();
+        let read = stderr.read_line(&mut startup).unwrap();
+        assert!(read > 0, "the server stopped before listening");
+    }
     let addr: SocketAddr = startup
         .split_whitespace()
         .find_map(|word| word.trim_end_matches(',').parse().ok())

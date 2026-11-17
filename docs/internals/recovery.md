@@ -128,7 +128,7 @@ Analysis starts from the checkpoint's transaction table and follows the log, wit
 - A transaction whose `Commit` is in the log but whose `End` is not gets the rest of its stamps: every tuple its `Update`s name that it still holds. A truncate's old storage is freed. Then its `End`.
 - Every other transaction in the table is undone, the newest record of any of them first, and gets its `End`.
 
-No tuple stays locked. The undo log, the read timestamps, and the watermark restart empty, as [Restart and crashes in MVTO](mvto.md#restart-and-crashes) describes. Tuples that recovery's undo leaves deleted, and the garbage of transactions that ended before the crash, stay until a cleanup reclaims them.
+No tuple stays locked. The undo log, the read timestamps, and the watermark restart empty, as [Restart and crashes in MVTO](mvto.md#restart-and-crashes) describes. The tuples undo leaves deleted, and the garbage of transactions that ended before the crash, wait for [the sweep that ends every open](#opening-the-database-ends-with-a-sweep).
 
 ## New storage is a change of its transaction
 
@@ -146,6 +146,16 @@ A commit frees the old storage during garbage collection, once every transaction
 
 Recovery finishes committed transactions in Tid order. Table locks make a truncate newer than every transaction that wrote the storage it replaces, so their stamps come before its free.
 
+## Opening the database ends with a sweep
+
+Garbage collection queues each ended transaction's garbage in memory, so a crash loses the queue. Some garbage never joins it at all: the inserts that recovery's undo leaves deleted at `ts` 0, and the catalog rows that an aborted create wrote (`Transaction::undoable`), which are not in its write set. So [`Database::open`](../../crates/hamilton-server/src/database.rs) runs `Catalog::sweep` after recovery and before the server takes connections. It finds garbage by scanning every heap and index, and collects it with garbage collection's own code, so the two cannot disagree about what is garbage ([Index management](index-management.md)). It must run before any transaction begins: the watermark is then above every `ts` on disk, so every committed delete and every `ts` 0 mark is garbage.
+
+The sweep needs the catalog: whether an entry is still needed depends on the row's key, which only the schema decodes. That is why recovery, which runs before the catalog can be read, cannot do it.
+
+Its changes are the collector's redo-only records, and each one leaves a state that needs no other: a reclaimed slot that an entry still names reads as no row, and an entry whose row is gone leads nowhere. A crash during the sweep keeps a prefix of its changes, and the next open's sweep finds the rest by scanning again.
+
+It reads every page of every heap and index, and checks each entry as the collector checks a retired one, which for an index that stores primary keys means a lookup in the primary key index. Opening therefore takes time in proportion to the database. Its memory must not grow with the garbage, so it holds one heap page's tuples or a fixed batch of entries at a time: an open that ran out of memory before its first removal would fail the same way on every retry.
+
 ## The log decides what a crash test expects
 
 [`recovery.rs`](../../crates/storage/tests/recovery.rs) runs a workload on [`CrashFs`](../../crates/storage/tests/util/crash_fs.rs), which records every write, sync, rename, and removal. The test then recovers the files that a crash after each of those events would leave, with none, all, or a random part of the unsynced writes lost or torn. Every page must equal what the records that survived leave, which is its last image with the ops logged after it made on it. The workload changes raw pages, table pages, and leaves, and the test checks that the log holds both forms. `CrashFs` keeps every segment a checkpoint removed, and the oracle reads those too, so a page whose last record left the log is still checked against it. A new redo form needs a matching change to that oracle.
@@ -155,3 +165,5 @@ Recovery finishes committed transactions in Tid order. Table locks make a trunca
 A crash sweep must also start from a recovered database, because recovery leaves states a first crash never meets: pages last logged before the log's first segment, and free slots rebuilt from the `.meta`.
 
 A page that no one frees leaves every row right, so row checks miss it. [`truncate_recovery.rs`](../../crates/catalog/tests/truncate_recovery.rs) and [`ddl_recovery.rs`](../../crates/catalog/tests/ddl_recovery.rs) also check that the pages the db file holds are exactly those the catalog reaches. The second crashes during creates that commit, fail, and are left open, and checks that each is whole or gone.
+
+Garbage leaves every row right too. [`sweep.rs`](../../crates/planner/tests/sweep.rs) crashes the sweep after each fs event and cuts its log after each record, and after the next open's sweep no heap may hold a deleted tuple, and each index must hold exactly one entry per live row.

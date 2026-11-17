@@ -5,10 +5,10 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use catalog::Catalog;
+use catalog::{Catalog, SWEEP_BATCH};
 use planner::{EngineError, ExecutionEngine, Output, TransactionStatus};
 use storage::Storage;
 use storage::buffer::buffer_pool_manager::DEFAULT_POOL_SIZE;
@@ -23,12 +23,22 @@ pub struct Database {
 
 impl Database {
     /// Opens the database stored at `path`, creating it if there is none,
-    /// and recovers what a crash left behind. Its `.meta` file and log
-    /// segments sit next to it. Fails if another process has it open.
+    /// recovers what a crash left behind, and collects the garbage that
+    /// garbage collection lost with the restart (`Catalog::sweep`). Its
+    /// `.meta` file and log segments sit next to it. Fails if another
+    /// process has it open.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let storage = storage::open(path, DEFAULT_POOL_SIZE)?;
         let catalog = Arc::new(Catalog::open(Arc::clone(&storage.bpm))?);
         let root = ExecutionEngine::new(Arc::clone(&catalog));
+        let started = Instant::now();
+        let swept = catalog.sweep(root.transaction_manager(), SWEEP_BATCH)?;
+        log::info!(
+            "swept {} dead tuples and {} index entries in {} ms",
+            swept.tuples,
+            swept.entries,
+            started.elapsed().as_millis()
+        );
         Ok(Self {
             storage,
             catalog,

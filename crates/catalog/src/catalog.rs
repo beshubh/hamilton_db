@@ -7,7 +7,9 @@ use parking_lot::{RwLock, RwLockReadGuard};
 use storage::StorageError;
 use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
+use storage::concurrency::index_versions::IndexedTable;
 use storage::concurrency::transaction::{Transaction, TransactionState};
+use storage::concurrency::transaction_manager::TransactionManager;
 use storage::index::btree_index::BtreeIndex;
 use storage::index::{Index, IndexMetadata, LocatorKind};
 use storage::table::table_heap::TableHeap;
@@ -30,6 +32,18 @@ pub const MAX_NAME_LEN: u32 = 128;
 
 /// Holds off index creation on a table; see [`TableInfo::lock_writes`].
 pub type TableWriteGuard<'a> = RwLockReadGuard<'a, ()>;
+
+/// The index entries [`Catalog::sweep`] holds at a time when opening the
+/// database: a few MB at most, with the longest keys, and enough that each
+/// batch's descent of the tree costs little.
+pub const SWEEP_BATCH: usize = 1024;
+
+/// What [`Catalog::sweep`] collected.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Swept {
+    pub tuples: usize,
+    pub entries: usize,
+}
 
 /// What a relation is, as Postgres's `relkind`. Tables and sequences share
 /// one namespace.
@@ -900,6 +914,33 @@ impl Catalog {
             state.indexes.insert(index.oid, index);
         }
         Ok(())
+    }
+
+    /// Collects, through `tm`, the garbage a restart left where no queue
+    /// holds it: every deleted tuple no transaction can see, in the system
+    /// tables and in every table, and every index entry that no version
+    /// needs. Sequences are left alone: their row is rewritten in place and
+    /// never deleted. Holds a page's tuples or `batch` entries at a time.
+    /// For opening the database, before any transaction begins.
+    pub fn sweep(&self, tm: &TransactionManager, batch: usize) -> Result<Swept> {
+        debug_assert_eq!(tm.watermark(), tm.next_tid(), "a transaction is running");
+        let mut swept = Swept::default();
+        for heap in self.system.heaps() {
+            swept.tuples += tm.sweep_heap(heap)?;
+        }
+        for table in self.tables() {
+            swept.tuples += tm.sweep_heap(&table.heap)?;
+            let primary_key = self.primary_key_index(table.oid);
+            let indexed = Arc::new(IndexedTable::new(
+                Arc::clone(&table.heap),
+                table.schema.clone(),
+                primary_key.map(|index| Arc::clone(&index.index)),
+            ));
+            for index in self.table_indexes(&table.name) {
+                swept.entries += tm.sweep_index(&indexed, &index.index, batch)?;
+            }
+        }
+        Ok(swept)
     }
 
     /// Writes each sequence's row as the last value it handed out, so the

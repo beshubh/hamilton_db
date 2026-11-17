@@ -34,11 +34,14 @@ class Server:
         self.proc = subprocess.Popen(
             [SERVER, "--port", "0", self.db], stderr=subprocess.PIPE, text=True
         )
-        line = self.proc.stderr.readline()
-        match = LISTENING.search(line)
-        if not match:
+        lines = []
+        for line in self.proc.stderr:
+            lines.append(line)
+            if match := LISTENING.search(line):
+                break
+        else:
             self.proc.kill()
-            raise RuntimeError(f"hamilton-server didn't start: {line}{self.proc.stderr.read()}")
+            raise RuntimeError(f"hamilton-server didn't start: {''.join(lines)}")
         self.port = int(match[1])
         # Drained so the server never blocks on a full pipe.
         self.drain = threading.Thread(target=lambda: self.log.extend(self.proc.stderr), daemon=True)

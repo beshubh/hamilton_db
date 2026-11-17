@@ -1,6 +1,11 @@
+use std::sync::Arc;
+
+use catalog::Catalog;
 use common::{Column, DataType, Value};
 use hamilton_server::{Database, Session};
 use planner::{Output, TransactionStatus};
+use storage::buffer::arc_replacer::AccessType;
+use storage::table::table_page::TablePage;
 use tempfile::TempDir;
 
 fn run(session: &mut Session, sql: &str) -> Result<Vec<Output>, String> {
@@ -26,6 +31,33 @@ fn rows(session: &mut Session, sql: &str) -> Vec<Vec<Value>> {
 
 fn open(dir: &TempDir) -> Database {
     Database::open(dir.path().join("test.db")).unwrap()
+}
+
+/// The files as a crash of the process now would leave them: a copy of
+/// what the open database has written.
+fn crash_copy(dir: &TempDir) -> TempDir {
+    let copy = TempDir::new().unwrap();
+    for file in std::fs::read_dir(dir.path()).unwrap() {
+        let path = file.unwrap().path();
+        std::fs::copy(&path, copy.path().join(path.file_name().unwrap())).unwrap();
+    }
+    copy
+}
+
+/// The deleted tuples that still hold space in table `name`'s heap.
+fn deleted_tuples(catalog: &Catalog, name: &str) -> usize {
+    let heap = Arc::clone(&catalog.get_table(name).unwrap().heap);
+    let pages = heap.page_ids().unwrap().into_iter();
+    pages
+        .map(|page_id| {
+            let guard = catalog
+                .bpm()
+                .checked_read_page(page_id, AccessType::Unknown);
+            let guard = guard.unwrap();
+            let page = TablePage::new(guard.get_data()).unwrap();
+            page.iter().filter(|(_, meta, _)| meta.is_deleted).count()
+        })
+        .sum()
 }
 
 #[test]
@@ -212,4 +244,37 @@ fn a_second_open_is_refused() {
     assert!(err.to_string().contains("already open"), "{err}");
     drop(db);
     open(&dir);
+}
+
+/// Garbage collection waits for the older block to reclaim the rows the
+/// DELETE left, and the crash loses that work. Opening the files collects
+/// it before any session runs.
+#[test]
+fn opening_collects_the_garbage_a_crash_left() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    let (s, older) = (&mut db.session(), &mut db.session());
+    run(s, "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(8))").unwrap();
+    run(
+        s,
+        "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
+    )
+    .unwrap();
+    run(older, "BEGIN").unwrap();
+    run(s, "DELETE FROM t WHERE id > 2").unwrap();
+    let copy = crash_copy(&dir);
+    let path = copy.path().join("test.db");
+    {
+        let storage = storage::open(&path, 64).unwrap();
+        let catalog = Catalog::open(Arc::clone(&storage.bpm)).unwrap();
+        assert_eq!(deleted_tuples(&catalog, "t"), 2, "recovered, not swept");
+        storage.close().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    assert_eq!(deleted_tuples(db.catalog(), "t"), 0);
+    assert_eq!(
+        rows(&mut db.session(), "SELECT id FROM t ORDER BY id"),
+        [[Value::Int(1)], [Value::Int(2)]]
+    );
 }

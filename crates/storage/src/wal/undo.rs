@@ -26,8 +26,9 @@ use crate::wal::when_a_frame_is_free;
 /// Rolls back a running transaction: logs its `Abort`, undoes its changes,
 /// newest first, and logs its `End`. Returns the tuples of its write set
 /// it inserted, now deleted at `ts` 0 for garbage collection to reclaim.
-/// Catalog rows it wrote (`undoable`) are not among them. A transaction with
-/// no records logs nothing.
+/// Catalog rows it wrote (`undoable`) are not among them: they wait for the
+/// sweep at the next open (`TransactionManager::sweep_heap`). A transaction
+/// with no records logs nothing.
 pub(crate) fn rollback(txn: &TxnLog) -> Result<Vec<Rid>> {
     let mut walk = Walk::default();
     if !txn.has_records() {
@@ -43,8 +44,8 @@ pub(crate) fn rollback(txn: &TxnLog) -> Result<Vec<Rid>> {
 
 /// Rolls back every transaction in `losers`, each given with its last
 /// record, taking the newest record of any of them next, and logs each
-/// one's `End`. The tuples their inserts leave deleted stay until a
-/// cleanup reclaims them.
+/// one's `End`. The sweep that follows recovery reclaims the tuples their
+/// inserts leave deleted (`TransactionManager::sweep_heap`).
 pub(crate) fn undo_losers(losers: &[(TxnLog, Lsn)]) -> Result<()> {
     let mut to_undo: BinaryHeap<(Lsn, usize)> = losers
         .iter()

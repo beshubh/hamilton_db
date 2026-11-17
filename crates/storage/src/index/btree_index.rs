@@ -362,6 +362,16 @@ impl KeyComparator for PrefixProbe<'_> {
     }
 }
 
+/// Places an entry among an index's entries, for `Btree::begin_at_by`,
+/// after itself.
+struct After<'a>(&'a EntryComparator);
+
+impl KeyComparator for After<'_> {
+    fn compare(&self, entry: &[u8], target: &[u8]) -> Ordering {
+        self.0.compare(entry, target).then(Ordering::Less)
+    }
+}
+
 /// An index stored in a B+tree, with keys that are key tuples as
 /// `Tuple::to_key` encodes them.
 ///
@@ -444,6 +454,30 @@ impl BtreeIndex {
         upper: Bound<&[Value]>,
     ) -> Result<impl Iterator<Item = Result<RowLocator>>> {
         self.scan(self.prefix_bound(lower)?, self.prefix_bound(upper)?)
+    }
+
+    /// The entries after the one for `after`, a key and the locator of its
+    /// row, or every entry for `None`, as their keys and locators, in
+    /// `EntryComparator` order. The entry for `after` need not be in the
+    /// tree. The leaf being read stays read-latched until the iterator moves
+    /// past it or is dropped.
+    pub(crate) fn entries_after(
+        &self,
+        after: Option<(&Tuple, &RowLocator)>,
+    ) -> Result<impl Iterator<Item = Result<(Tuple, RowLocator)>>> {
+        let cmp = self.tree.comparator();
+        let iter = match after {
+            Some((key, locator)) => {
+                let entry = cmp.entry(key.data(), locator);
+                self.tree.begin_at_by(&entry, &After(cmp))?
+            }
+            None => self.tree.begin()?,
+        };
+        Ok(iter.map(move |entry| {
+            let (entry, rid) = entry?;
+            let key = Tuple::from_bytes(cmp.key_of(&entry).to_vec());
+            Ok((key, cmp.locator(&entry, rid)))
+        }))
     }
 
     fn check_locator(&self, locator: &RowLocator) {

@@ -141,6 +141,15 @@ impl SystemTables {
         })
     }
 
+    pub fn heaps(&self) -> [&TableHeap; 4] {
+        [
+            &self.tables,
+            &self.columns,
+            &self.indexes,
+            &self.index_columns,
+        ]
+    }
+
     pub fn roots(&self) -> SystemTableRoots {
         SystemTableRoots {
             tables: self.tables.first_page_id(),

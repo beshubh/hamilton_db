@@ -364,23 +364,42 @@ impl TableHeap {
 
     /// Frees the bytes of the tuple at `rid` if no reader at or above
     /// `watermark` can see it: its head is a delete committed below
-    /// `watermark`, or an aborted insert. Its slot is left dead, never
-    /// reused. Returns whether it reclaimed the tuple; a tuple that is
-    /// already reclaimed, or not dead, is left alone.
+    /// `watermark`, or an undone insert, which undo leaves deleted at `ts`
+    /// 0. Its slot is left dead, never reused. Returns whether it reclaimed
+    /// the tuple; a tuple that is already reclaimed, or not dead, is left
+    /// alone.
     pub fn reclaim(&self, rid: Rid, watermark: TxnId) -> Result<bool> {
         let mtr = self.mtr();
         let mut guard = mtr.write_page(rid.page_id)?;
         let page = TablePage::new(guard.data())?;
-        if page.is_dead(rid.slot) {
-            return Ok(false);
-        }
-        let (head, _) = page.get(rid.slot)?;
-        let committed = head.ts & TXN_UNCOMMITTED_BIT == 0;
-        if !(head.is_deleted && committed && head.ts < watermark) {
+        if page.is_dead(rid.slot) || !is_reclaimable(&page.get(rid.slot)?.0, watermark) {
             return Ok(false);
         }
         guard.apply(PageOp::HeapMarkDead { slot: rid.slot })?;
         Ok(true)
+    }
+
+    /// The tuples `reclaim` would reclaim at `watermark`, a page's at a
+    /// time, in rid order. No page stays latched between items.
+    pub fn reclaimable(&self, watermark: TxnId) -> impl Iterator<Item = Result<Vec<Rid>>> + '_ {
+        let read = move |page_id| -> Result<(Vec<Rid>, PageId)> {
+            let guard = self.bpm.checked_read_page(page_id, AccessType::Scan)?;
+            let page = TablePage::new(guard.get_data())?;
+            let rids = (page.iter())
+                .filter(|(_, head, _)| is_reclaimable(head, watermark))
+                .map(|(slot, _, _)| Rid::new(page_id, slot))
+                .collect();
+            Ok((rids, page.next_page_id()))
+        };
+        let mut next = self.first_page_id;
+        std::iter::from_fn(move || {
+            if next == INVALID_PAGE_ID {
+                return None;
+            }
+            let page = read(next);
+            next = page.as_ref().map_or(INVALID_PAGE_ID, |&(_, next)| next);
+            Some(page.map(|(rids, _)| rids))
+        })
     }
 
     /// Iterates over the live rows of the table. See `TableIterator`.
@@ -418,6 +437,10 @@ pub(crate) fn page_ids(bpm: &BufferPoolManager, first: PageId) -> Result<Vec<Pag
         page_id = TablePage::new(guard.get_data())?.next_page_id();
     }
     Ok(pages)
+}
+
+fn is_reclaimable(head: &TupleMeta, watermark: TxnId) -> bool {
+    head.is_deleted && head.ts & TXN_UNCOMMITTED_BIT == 0 && head.ts < watermark
 }
 
 /// The head of the tuple at `rid`, for a versioned write. A reclaimed tuple

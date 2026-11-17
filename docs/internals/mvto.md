@@ -54,10 +54,11 @@ One collector thread in [`TransactionManager`](../../crates/storage/src/concurre
 
 ## Restart and crashes
 
-Opening a database replays the log, finishes the commits a crash cut off between their stamps, and undoes the transactions it cut off before they committed, so no tuple stays locked ([Recovery](recovery.md#recovery-finishes-the-transactions-a-crash-cut-off)). A commit survives a crash once `TransactionManager::commit` returns, and a reader never sees one that a crash can lose. The log does not hold what MVTO keeps in memory. A restart, clean or not, loses the undo log, the read timestamps, and the watermark. That does no harm:
+Opening a database replays the log, finishes the commits a crash cut off between their stamps, and undoes the transactions it cut off before they committed, so no tuple stays locked ([Recovery](recovery.md#recovery-finishes-the-transactions-a-crash-cut-off)). A commit survives a crash once `TransactionManager::commit` returns, and a reader never sees one that a crash can lose. The log does not hold what MVTO keeps in memory. A restart, clean or not, loses the undo log, the read timestamps, and the watermark, and a crash also loses the garbage collector's queue. That does no harm:
 
 - The new Tid counter starts above every Tid in the log. New readers therefore see the committed versions as committed.
 - No reader is older than the versions on disk, so no reader walks an undo chain. Stale `undo_ptr`s are still on disk. `older_record` rejects them, because it requires the record's `rid` and `writer_ts` to match.
+- Opening ends with a sweep of every table and index, which collects what the queue held ([Recovery](recovery.md#opening-the-database-ends-with-a-sweep)).
 
 `nextval` hands values out from a counter in memory, outside any transaction ([`sequence.rs`](../../crates/catalog/src/sequence.rs)). When the sequence's row stops covering the next value, `nextval` first writes it 32 values ahead, a redo-only record that nothing syncs. A value reaches a committed row only through an insert whose transaction logs `Commit` after that record, and the commit's sync makes the record durable too. So a crash skips up to 32 values and never repeats one that a committed row holds. A clean shutdown writes each row back to the last value handed out (`Catalog::save_sequences`), so only a crash skips. A way to hand a value out with no commit after it, such as `SELECT nextval(...)`, would need its own sync.
 
