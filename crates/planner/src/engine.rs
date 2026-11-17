@@ -18,9 +18,11 @@
 //!   either one ends the block, reporting ROLLBACK.
 //! - BEGIN in a block, and COMMIT or ROLLBACK outside one, are errors that
 //!   change nothing. (Postgres only warns.)
-//! - CREATE TABLE and CREATE INDEX are rejected in a block, failing it: the
-//!   catalog isn't transactional. Outside a block they run as other
-//!   statements do.
+//! - CREATE TABLE and CREATE INDEX are rejected in a block, failing it.
+//!   Outside a block each runs in a transaction of its own, as other
+//!   statements do, and takes all of its changes back if it fails. Other
+//!   sessions see what it made as soon as the statement ends, so it must
+//!   commit then (MySQL 8's atomic DDL).
 //! - Dropping the engine with a block open rolls it back.
 //! - A statement outside a block that fails with a storage `Conflict` is
 //!   run again in a new transaction, until it gets past the conflict or the
@@ -29,21 +31,14 @@
 //!   failed statement may have written rows, which only aborting the whole
 //!   transaction undoes, so the block fails and the client retries it.
 //!   A statement that can't get a table lock (`LockConflict`) is retried
-//!   the same way, once the holder ends.
-//!   CREATE TABLE is never retried, as the catalog isn't transactional
-//!   (see `retryable`). CREATE INDEX is: a failed build records nothing,
-//!   and a unique index's conflicts come before it adds an entry, so the
-//!   catalog frees each attempt's empty tree. It waits out writers that
-//!   haven't committed.
+//!   the same way, once the holder ends. CREATE INDEX is retried like any
+//!   other: it waits out writers that haven't committed.
 //!
 //! [`ExecutionEngine::session`] opens another session on the same database.
 //! Sessions share one `TransactionManager`, so their transactions are
 //! ordered against each other by Tid as MVTO requires.
 //!
-//! Every statement that can write first records the next Tid in the catalog
-//! header, so that a restarted session never starts below a Tid in the log
-//! (see `storage::concurrency::watermark`). A commit that wrote rows returns
-//! once its `Commit` record is durable.
+//! A commit that wrote rows returns once its `Commit` record is durable.
 
 use std::mem;
 use std::sync::Arc;
@@ -149,19 +144,18 @@ enum State {
 }
 
 impl ExecutionEngine {
-    /// A session on the database `catalog` describes. Its first transaction
-    /// gets the Tid the catalog header recorded.
-    pub fn new(catalog: Arc<Catalog>) -> Result<Self> {
-        let next_tid = catalog.next_tid().map_err(ExecutionError::from)?;
-        let txn_manager = TransactionManager::new(Arc::clone(catalog.bpm()), next_tid);
-        Ok(Self {
+    /// A session on the database `catalog` describes, with a transaction
+    /// manager of its own.
+    pub fn new(catalog: Arc<Catalog>) -> Self {
+        let txn_manager = TransactionManager::new(Arc::clone(catalog.bpm()));
+        Self {
             catalog,
             txn_manager: Arc::new(txn_manager),
             settings: ExecutionSettings::default(),
             batch_size: DEFAULT_BATCH_SIZE,
             conflict_timeout: DEFAULT_CONFLICT_TIMEOUT,
             state: State::Idle,
-        })
+        }
     }
 
     /// Another session on the same database, sharing this one's
@@ -309,8 +303,8 @@ impl ExecutionEngine {
                 return result;
             }
             let conflict = match &result {
-                Err(err) if retryable(bound) => conflict(err),
-                _ => None,
+                Err(err) => conflict(err),
+                Ok(_) => None,
             };
             match conflict {
                 Some(conflict) if self.wait_to_retry(txn.tid(), conflict, attempt, deadline) => {
@@ -366,17 +360,6 @@ impl ExecutionEngine {
         plan: &AbstractPlanNode,
         bound: &BoundStatement,
     ) -> Result<Output> {
-        // Recorded before the statement writes anything, so whatever of it
-        // a crash keeps, the catalog header that recovery brings back is
-        // past its Tid, and a restart never hands that Tid out again.
-        if !matches!(
-            bound,
-            BoundStatement::Select(_) | BoundStatement::Explain(_)
-        ) {
-            self.catalog
-                .set_next_tid(self.txn_manager.next_tid())
-                .map_err(ExecutionError::from)?;
-        }
         let ctx = Arc::new(ExecutionContext::new(
             Arc::clone(&self.catalog),
             Arc::clone(txn),
@@ -452,23 +435,6 @@ impl ExecutionEngine {
 impl Drop for ExecutionEngine {
     fn drop(&mut self) {
         let _ = self.close();
-    }
-}
-
-/// Whether `bound`, run outside a block, may run again after a `Conflict`.
-/// Every statement must answer: running one again must not repeat
-/// anything the failed attempt left in the catalog.
-fn retryable(bound: &BoundStatement) -> bool {
-    match bound {
-        BoundStatement::CreateTable(_) => false,
-        BoundStatement::CreateIndex(_)
-        | BoundStatement::Insert(_)
-        | BoundStatement::Select(_)
-        | BoundStatement::Update(_)
-        | BoundStatement::Delete(_)
-        | BoundStatement::Truncate(_)
-        | BoundStatement::Explain(_) => true,
-        BoundStatement::Transaction(_) => unreachable!("transaction commands are not run here"),
     }
 }
 

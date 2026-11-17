@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use common::{Lsn, TxnId};
+use common::{FIRST_TXN_ID, Lsn, TxnId};
 use parking_lot::{Mutex, RwLock};
 
 use crate::disk::fs::{Fs, FsFile};
@@ -32,7 +32,8 @@ pub const FIRST_LSN: Lsn = FILE_HEADER_SIZE;
 
 const MAGIC: u64 = u64::from_le_bytes(*b"HAMDBWAL");
 /// 2: `Update` and `Clr` records carry undo, and `HeapSetTuple` its padding.
-const VERSION: u32 = 2;
+/// 3: an `Update` can carry a create's undo.
+const VERSION: u32 = 3;
 
 /// Appends stop to flush once the tail holds this much. A record larger
 /// than this still goes in, alone.
@@ -70,6 +71,8 @@ struct Tail {
     buf: Vec<u8>,
     /// Changed only as records are appended, so it always agrees with them.
     att: Att,
+    /// See `next_tid`.
+    next_tid: TxnId,
 }
 
 struct Io {
@@ -143,6 +146,7 @@ impl Log {
                 start: end,
                 buf: Vec::with_capacity(BUFFER_SIZE),
                 att: Att::default(),
+                next_tid: FIRST_TXN_ID,
             }),
             io: Mutex::new(Io {
                 batch: Vec::with_capacity(BUFFER_SIZE),
@@ -179,6 +183,7 @@ impl Log {
             let at = tail.buf.len();
             tail.buf.extend_from_slice(record.bytes());
             let prev_lsn = tail.att.link(record.tid(), record.kind(), lsn);
+            tail.next_tid = tail.next_tid.max(record.tid() + 1);
             on_append(lsn);
             seal(&mut tail.buf[at..], lsn, prev_lsn, record.tail_crc());
             return Ok(lsn);
@@ -253,11 +258,18 @@ impl Log {
         tail.start + tail.buf.len() as Lsn
     }
 
-    /// Runs `f` with the LSN the next record will get and the active
-    /// transaction table, holding off appends meanwhile.
-    pub(crate) fn at_end<R>(&self, f: impl FnOnce(Lsn, &Att) -> R) -> R {
+    /// Runs `f` with the LSN the next record will get, the active
+    /// transaction table and `next_tid`, holding off appends meanwhile.
+    pub(crate) fn at_end<R>(&self, f: impl FnOnce(Lsn, &Att, TxnId) -> R) -> R {
         let tail = self.tail.lock();
-        f(tail.start + tail.buf.len() as Lsn, &tail.att)
+        f(tail.start + tail.buf.len() as Lsn, &tail.att, tail.next_tid)
+    }
+
+    /// A Tid above that of every record the log holds or held, which a
+    /// restart hands out first. A transaction that logs nothing leaves no
+    /// trace, so after a crash its Tid may be handed out again.
+    pub fn next_tid(&self) -> TxnId {
+        self.tail.lock().next_tid
     }
 
     /// The last record of transaction `tid`, unless it has none or has
@@ -266,10 +278,13 @@ impl Log {
         self.tail.lock().att.get(tid).map(|entry| entry.last_lsn)
     }
 
-    /// Makes `att`, which recovery rebuilt, the active transaction table,
-    /// so the records that finish its transactions chain onto theirs.
-    pub(crate) fn restore_att(&self, att: Att) {
-        self.tail.lock().att = att;
+    /// Makes `att` and `next_tid`, which recovery rebuilt from the
+    /// checkpoint and the records after it, the log's own, so the records
+    /// that finish its transactions chain onto theirs.
+    pub(crate) fn restore(&self, att: Att, next_tid: TxnId) {
+        let mut tail = self.tail.lock();
+        tail.att = att;
+        tail.next_tid = tail.next_tid.max(next_tid);
     }
 
     /// One past the last durable byte.

@@ -119,22 +119,31 @@ impl Db {
             by_v,
         };
         drop(heap);
-        (Self::open_on(storage, layout, 1), layout)
+        (Self::open_on(storage, layout), layout)
     }
 
-    /// Opens the database in `fs`, recovering it, with Tids from `next_tid`.
-    fn open(fs: &CrashFs, frames: usize, layout: Layout, next_tid: TxnId) -> Self {
+    /// Opens the database in `fs`, recovering it, and checks that its Tids
+    /// start above every Tid the log ever held: a new transaction must not
+    /// take a crashed one's rows for its own.
+    fn open(fs: &CrashFs, frames: usize, layout: Layout) -> Self {
         let storage = storage::open_with(Arc::new(fs.clone()), DB, frames, None, SEGMENT)
             .unwrap_or_else(|e| panic!("recovery failed: {e}"));
-        Self::open_on(storage, layout, next_tid)
+        let db = Self::open_on(storage, layout);
+        let (_, max_tid) = commits_in(fs);
+        let next_tid = db.tm.next_tid();
+        assert!(
+            next_tid > max_tid,
+            "Tids start at {next_tid}, but the log holds {max_tid}"
+        );
+        db
     }
 
-    fn open_on(storage: Storage, layout: Layout, next_tid: TxnId) -> Self {
+    fn open_on(storage: Storage, layout: Layout) -> Self {
         let pk = index(&storage, "t_pkey", 0, IndexKind::PrimaryKey, layout.pk);
         let by_v = index(&storage, "t_v", 1, IndexKind::Plain, layout.by_v);
         let heap = TableHeap::open(Arc::clone(&storage.bpm), layout.heap).unwrap();
         let table = IndexedTable::new(Arc::new(heap), schema(), Some(Arc::clone(&pk)));
-        let tm = TransactionManager::new(Arc::clone(&storage.bpm), next_tid);
+        let tm = TransactionManager::new(Arc::clone(&storage.bpm));
         Self {
             storage,
             tm,
@@ -413,7 +422,7 @@ fn recover_and_check(
     write_all: bool,
     at: &str,
 ) {
-    let (commits, max_tid) = commits_in(image);
+    let (commits, _) = commits_in(image);
     let survived: HashSet<_> = commits.iter().copied().collect();
     for &(tid, acked_at) in &expect.acked {
         assert!(
@@ -421,7 +430,7 @@ fn recover_and_check(
             "{at}: transaction {tid}, acknowledged after event {acked_at}, is lost"
         );
     }
-    let db = Db::open(image, 4, layout, max_tid + 1);
+    let db = Db::open(image, 4, layout);
     check(&db, &rows_after(expect, &commits), at);
     if write_all {
         let txn = db.tm.begin();
@@ -570,14 +579,13 @@ fn a_crash_during_recovery_recovers_the_same_transactions() {
         let image = fs.crash_after(fs.num_events(), lost);
         let (commits, _) = commits_in(&image);
         let rows = rows_after(&expect, &commits);
-        drop(Db::open(&image, 4, layout, u64::MAX >> 2));
+        drop(Db::open(&image, 4, layout));
         let recovering = image.num_events();
         assert!(recovering > 5, "recovery wrote only {recovering} events");
         image.for_each_moment(|n, moment| {
             for again in [Lost::Nothing, Lost::Everything, Lost::Some(n as u64)] {
                 let crashed = moment.crash(again);
-                let (_, max_tid) = commits_in(&crashed);
-                let db = Db::open(&crashed, 4, layout, max_tid + 1);
+                let db = Db::open(&crashed, 4, layout);
                 let at = format!("{lost:?}, then a crash after event {n} of {recovering} in recovery, losing {again:?}");
                 check(&db, &rows, &at);
             }
@@ -640,8 +648,8 @@ fn every_prefix_of_the_log_keeps_the_commits_below_the_cut() {
     assert!(cuts.len() > 100, "{} records", cuts.len());
     for cut in cuts {
         let image = fs.with_contents(&segment, &bytes[..cut as usize]);
-        let (commits, max_tid) = commits_in(&image);
-        let db = Db::open(&image, 64, layout, max_tid + 1);
+        let (commits, _) = commits_in(&image);
+        let db = Db::open(&image, 64, layout);
         check(
             &db,
             &rows_after(&expect, &commits),
@@ -699,8 +707,8 @@ fn a_commit_a_reader_sees_survives_a_crash() {
         }
         last = v;
         let image = fs.crash_after(fs.num_events(), Lost::Everything);
-        let (commits, max_tid) = commits_in(&image);
-        let recovered = Db::open(&image, 16, layout, max_tid + 1);
+        let (commits, _) = commits_in(&image);
+        let recovered = Db::open(&image, 16, layout);
         let txn = recovered.tm.begin();
         let rows = visible(&recovered, &txn);
         recovered.tm.commit(&txn).unwrap();
@@ -803,8 +811,7 @@ fn a_crash_during_a_rollback_keeps_a_commit_to_a_row_it_gave_back() {
             "the rollback ended before the crash, so the crash tests nothing"
         );
     }
-    let (_, max_tid) = commits_in(&image);
-    let recovered = Db::open(&image, 4, layout, max_tid + 1);
+    let recovered = Db::open(&image, 4, layout);
     let txn = recovered.tm.begin();
     let rows = visible(&recovered, &txn);
     recovered.tm.commit(&txn).unwrap();

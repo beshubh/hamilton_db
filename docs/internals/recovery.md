@@ -48,7 +48,7 @@ A batch goes whole into one segment, and a new segment starts only once every re
 
 ## The `.meta` file is the checkpoint
 
-The log has no checkpoint records. A checkpoint saves its record in the `.meta` file, next to the page directory. The record holds where analysis starts, where redo starts, the next page id, the dirty pages, and the transactions that have records but no `End`. One atomic rename publishes the record and the directory together, so recovery always starts from a directory that matches its checkpoint. Only [`checkpoint.rs`](../../crates/storage/src/wal/checkpoint.rs) reads the record.
+The log has no checkpoint records. A checkpoint saves its record in the `.meta` file, next to the page directory. The record holds where analysis starts, where redo starts, the next page id, the next Tid, the dirty pages, and the transactions that have records but no `End`. One atomic rename publishes the record and the directory together, so recovery always starts from a directory that matches its checkpoint. Only [`checkpoint.rs`](../../crates/storage/src/wal/checkpoint.rs) reads the record.
 
 A saved directory never maps a page to bytes that another page wrote:
 
@@ -83,6 +83,10 @@ Redo replays every free from the checkpoint's redo start, not only those after a
 
 Redo appends nothing to the log. Finishing transactions after redo does, so a crash in the middle of it leaves records that the next recovery redoes, and that recovery goes on where they stop. Recovery ends with a sharp checkpoint. A log that lacks a record the checkpoint needs makes the open fail. A `.meta` with no checkpoint belongs to a database whose first open never finished, so records in the log next to it are left from other files, and recovery skips them.
 
+## Tids come from the log
+
+A Tid that wrote anything must never be handed out again. A new transaction with that Tid would take the crashed one's rows for its own, and one below it would read committed rows as newer than itself. The log keeps a Tid above every record it appends (`Log::next_tid`), each checkpoint saves it, and analysis raises it past every record it reads, so a restart hands out Tids above every Tid the log ever held, those in removed segments included. A transaction that logs nothing, such as a read-only one, leaves nothing on disk, so its Tid may come again after a crash. The `TransactionManager` starts from the log's.
+
 ## Redo never reads a page from disk
 
 The checkpoint scans the frames while appends are held off, at the moment it reads the log's end. A page it finds clean takes its next change after that moment, and a change to a clean page logs all of it. So the first record that redo applies to every page replaces the page, and redo never trusts a page's copy on disk, which may be torn, stale, or another page's bytes. Redo fails the open with `CorruptLog` if a page's first record does not replace it ([`recovery.rs`](../../crates/storage/src/wal/recovery.rs)). Scanning the frames outside the lock would let a page take an op and be written in between, and then redo would have to read that page and trust its checksum.
@@ -93,10 +97,10 @@ A transaction's change is logged as an `Update` record that says how to take it 
 
 - A heap change is undone by slot, to the tuple's meta and bytes from before it. The mtr reads them from the page when the transaction's op is made (`MtrPage::apply`), so callers never build undo. The transaction holds the tuple's lock until it ends, so nothing else changes the slot; for the catalog rows a truncate changes, its table lock does that. A shrinking locked update keeps the tuple's length, so undoing a change never makes a tuple longer, and it always fits back in place ([Version storage](version-storage.md)).
 - An index insert is undone by removing its entry by key, since splits move entries between pages. The B+ tree header records how the tree orders its keys, as its comparator describes them (`KeyComparator::describe`), so undo opens the tree from its header alone. Opening a tree with a comparator that orders keys another way fails with `BtreeMismatch`.
-- A truncate's new storage is undone by freeing all of it, as [TRUNCATE](#truncate-is-a-change-of-its-transaction) describes.
+- New storage, which a create or a truncate makes, is undone by freeing all of it, as [New storage](#new-storage-is-a-change-of-its-transaction) describes.
 - The `Update` of a heap insert or tuple change also holds the payload length that its commit keeps, which is shorter than the tuple when the update padded it. Recovery stamps from it, as it cannot decode the tuple without a schema.
 
-Writes that no transaction undoes are logged as `System` records: garbage collection, index builds, the catalog rows of CREATE TABLE and CREATE INDEX, `nextval`, and an index entry that a unique check takes back at once.
+Writes that no transaction undoes are logged as `System` records: garbage collection, `nextval` logging a sequence ahead, and an index entry that a unique check takes back at once. So are writes into storage that a transaction made and has not committed, such as an index build's entries: undo frees that storage whole.
 
 ## Undo logs a compensation for each change
 
@@ -117,8 +121,6 @@ A transaction that wrote anything commits by logging `Commit` and waiting for it
 
 Once `Commit` is logged, the transaction has committed. A failure after it, or during undo, stops the process instead of returning: the caller would otherwise abort a durable commit, or leave a half-undone transaction running. Recovery finishes either from the log.
 
-CREATE TABLE and CREATE INDEX write catalog rows outside any transaction's records, so the catalog syncs the log after them.
-
 ## Recovery finishes the transactions a crash cut off
 
 Analysis starts from the checkpoint's transaction table and follows the log, with the same rules that keep the log's own table ([`txn_log.rs`](../../crates/storage/src/wal/txn_log.rs)), and checks that each record's `prev_lsn` is its transaction's previous record. After redo:
@@ -126,15 +128,19 @@ Analysis starts from the checkpoint's transaction table and follows the log, wit
 - A transaction whose `Commit` is in the log but whose `End` is not gets the rest of its stamps: every tuple its `Update`s name that it still holds. A truncate's old storage is freed. Then its `End`.
 - Every other transaction in the table is undone, the newest record of any of them first, and gets its `End`.
 
-No tuple stays locked. The next Tid comes from the catalog header, which each statement that can write raises before its first record, so it is above every Tid in the log. The undo log, the read timestamps, and the watermark restart empty, as [Restart and crashes in MVTO](mvto.md#restart-and-crashes) describes. Tuples that recovery's undo leaves deleted, and the garbage of transactions that ended before the crash, stay until a cleanup reclaims them.
+No tuple stays locked. The undo log, the read timestamps, and the watermark restart empty, as [Restart and crashes in MVTO](mvto.md#restart-and-crashes) describes. Tuples that recovery's undo leaves deleted, and the garbage of transactions that ended before the crash, stay until a cleanup reclaims them.
 
-## TRUNCATE is a change of its transaction
+## New storage is a change of its transaction
 
-TRUNCATE gives a table a new heap and a new tree for each index ([`Transaction::truncate`](../../crates/storage/src/concurrency/transaction.rs)). One `Update` record makes all of the new storage, and its undo, `Undo::Truncate`, names the first page of the old and of the new heap and trees. So no crash leaves new storage that no transaction will free, and analysis raises the next page id past it. The catalog rows that point the table and its indexes at the new storage, and the sequence row that RESTART IDENTITY resets, are the transaction's own changes, logged after that record (`Transaction::undoable`). A commit keeps all of it, and an abort or a crash before the commit takes all of it back.
+CREATE TABLE, CREATE INDEX and TRUNCATE make new storage, heaps and B+ trees ([`transaction.rs`](../../crates/storage/src/concurrency/transaction.rs)). One `Update` record makes each relation's new storage. Its mtr allocates and formats the pages, and its undo frees them: `Undo::Create` for a create, `Undo::Truncate` for a truncate, which also names the storage it replaces. So no crash leaves new storage that no transaction will free, and analysis raises the next page id past it. Allocating the pages in one record and logging their undo in another would leak them if a crash came in between.
 
-Undo runs newest first, so it puts the rows back before it frees the new storage. It frees the storage whole, walking the heap and trees as they are then, so the pages the transaction's own inserts added go too. A runtime abort drops the transaction's garbage in that storage, as nothing is left to collect.
+Writes into the new storage before the commit need no undo of their own, so they are `System` records: a new sequence's row, and the entries an index build adds. Undo frees the storage whole, walking its heap and trees as they are then, so the pages those writes and the transaction's own inserts added go too. A runtime abort drops the transaction's garbage in that storage, an index build's entries included, as nothing is left to collect.
 
-The rows a truncate changes have no tuple lock. Its exclusive table lock keeps every other transaction off them until it ends, and that is what makes undoing them by their old bytes safe. For the sequence it means more: undoing the restart also takes back every `nextval` since, which is right only because the table lock keeps other transactions from inserting meanwhile. A way to call `nextval` that skips the table lock would break this.
+The catalog rows come after the storage, as the transaction's own changes (`Transaction::undoable`): a create's new rows, and the rows a truncate points at its new storage. Catalog rows carry `ts` 0 and are read without a snapshot, so undo leaves a new row deleted, and every scan of the system tables skips it. Undo runs newest first, so it takes the rows back before it frees the storage they name. A commit keeps all of it, and an abort or a crash before the commit takes all of it back.
+
+The catalog in memory shows a create to every session once its statement ends ([`Catalog::create_table_with_constraints`](../../crates/catalog/src/catalog.rs)), and other transactions then plan on its index and add entries to its tree. An undo that freed the tree after that would leave their own undo nothing to remove its entries from. So a create commits when its statement ends: it changes the catalog in memory after everything that can fail, and CREATE TABLE and CREATE INDEX are rejected in a transaction block. A new table stays locked exclusively by its create until the create ends, so no other transaction puts rows in a heap that the create's undo would free.
+
+The rows a truncate changes have no tuple lock. Its exclusive table lock keeps every other transaction off them until it ends, and that is what makes undoing them by their old bytes safe. For the sequence it means more: undoing the restart also takes back every `nextval` since, which is right only because the table lock keeps other transactions from inserting meanwhile. An abort puts back the counter that `nextval` keeps in memory as well. A way to call `nextval` that skips the table lock would break this.
 
 A commit frees the old storage during garbage collection, once every transaction running when it ended has ended and their garbage, which may point into it, is collected. It logs `End` only after the free, so until then the transaction stays in the transaction table and holds back log removal. Recovery frees the old storage of a committed truncate without `End`. Each storage goes in one record, so the transaction's own records show recovery whether it went, and which pages need no stamp because they are gone.
 
@@ -148,4 +154,4 @@ Recovery finishes committed transactions in Tid order. Table locks make a trunca
 
 A crash sweep must also start from a recovered database, because recovery leaves states a first crash never meets: pages last logged before the log's first segment, and free slots rebuilt from the `.meta`.
 
-A page that no one frees leaves every row right, so row checks miss it. [`truncate_recovery.rs`](../../crates/catalog/tests/truncate_recovery.rs) also checks that the pages the db file holds are exactly the catalog's and those the table, its indexes and its sequence reach.
+A page that no one frees leaves every row right, so row checks miss it. [`truncate_recovery.rs`](../../crates/catalog/tests/truncate_recovery.rs) and [`ddl_recovery.rs`](../../crates/catalog/tests/ddl_recovery.rs) also check that the pages the db file holds are exactly those the catalog reaches. The second crashes during creates that commit, fail, and are left open, and checks that each is whole or gone.

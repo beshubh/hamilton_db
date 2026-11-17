@@ -28,7 +28,7 @@ fn setup(num_frames: usize) -> Db {
     Db {
         _dir: dir,
         heap,
-        tm: TransactionManager::new(bpm, 1),
+        tm: TransactionManager::new(bpm),
     }
 }
 

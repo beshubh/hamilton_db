@@ -255,9 +255,7 @@ mod tests {
     /// `ids`, in that order.
     fn with_ids(ids: &[i32]) -> Db {
         let db = Db::new();
-        db.catalog()
-            .create_index("users_id", "users", &["id"])
-            .unwrap();
+        db.create_index("users_id", "users", &["id"]);
         let names: Vec<String> = ids.iter().map(|id| format!("user {id}")).collect();
         let rows: Vec<_> = ids
             .iter()
@@ -309,9 +307,7 @@ mod tests {
     #[test]
     fn a_point_reads_every_row_with_its_key() {
         let db = Db::new();
-        db.catalog()
-            .create_index("users_name", "users", &["name"])
-            .unwrap();
+        db.create_index("users_name", "users", &["name"]);
         db.insert(&[(1, Some("a")), (2, Some("b")), (3, Some("a"))]);
         let points = IndexScanRange::Points(vec![vec![text("a")]]);
         let rows = db.run(scan(&db, "users_name", points, None)).unwrap();
@@ -508,9 +504,7 @@ mod tests {
     #[test]
     fn ranges_on_a_key_prefix() {
         let db = Db::new();
-        db.catalog()
-            .create_index("users_name_id", "users", &["name", "id"])
-            .unwrap();
+        db.create_index("users_name_id", "users", &["name", "id"]);
         db.insert(&[
             (4, Some("b")),
             (1, Some("a")),

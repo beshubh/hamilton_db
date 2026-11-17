@@ -28,7 +28,7 @@ impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let storage = storage::open(path, DEFAULT_POOL_SIZE)?;
         let catalog = Arc::new(Catalog::open(Arc::clone(&storage.bpm))?);
-        let root = ExecutionEngine::new(Arc::clone(&catalog))?;
+        let root = ExecutionEngine::new(Arc::clone(&catalog));
         Ok(Self {
             storage,
             catalog,
@@ -57,13 +57,15 @@ impl Database {
         }
     }
 
-    /// Takes a checkpoint and closes the files, so the next open has
-    /// nothing to recover. Every session has been dropped by now, rolling
-    /// back the blocks they had open.
+    /// Saves the sequences, takes a checkpoint and closes the files, so the
+    /// next open has nothing to recover and skips no identity value. Every
+    /// session has been dropped by now, rolling back the blocks they had
+    /// open.
     pub fn close(self) -> Result<()> {
         // Dropping the last engine stops the garbage collector, which
         // writes pages.
         drop(self.root);
+        self.catalog.save_sequences()?;
         self.storage.close()?;
         Ok(())
     }

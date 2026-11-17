@@ -39,7 +39,7 @@ impl Hamilton {
         let catalog = Arc::new(Catalog::open(Arc::clone(&storage.bpm))?);
         Ok(Self {
             storage,
-            engine: ExecutionEngine::new(catalog)?,
+            engine: ExecutionEngine::new(catalog),
             _dir: dir,
         })
     }

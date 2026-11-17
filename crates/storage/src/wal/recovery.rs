@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use common::{Lsn, PageId};
+use common::{Lsn, PageId, TxnId};
 
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::error::{Result, StorageError};
@@ -35,9 +35,9 @@ pub(crate) fn recover(bpm: &Arc<BufferPoolManager>) -> Result<()> {
             in_log.end(),
         )));
     }
-    let (dirty, att) = analyze(bpm, &checkpoint)?;
+    let (dirty, att, next_tid) = analyze(bpm, &checkpoint)?;
     redo(bpm, checkpoint.redo_lsn, dirty)?;
-    finish_transactions(bpm, att)?;
+    finish_transactions(bpm, att, next_tid)?;
     let saved = checkpoint::sharp(bpm)?;
     if !saved.dirty.is_empty() || saved.redo_lsn != saved.start_lsn || !saved.att.is_empty() {
         return Err(StorageError::CorruptLog(format!(
@@ -53,18 +53,21 @@ pub(crate) fn recover(bpm: &Arc<BufferPoolManager>) -> Result<()> {
 /// after it began, less the ones it frees. Finds the transactions without
 /// an `End`, starting from those the checkpoint saved, and checks that each
 /// record's `prev_lsn` is its transaction's record before it. Raises the
-/// next page id past every page the log names.
+/// next page id past every page the log names, and returns a Tid above
+/// every one the checkpoint and the log name.
 fn analyze(
     bpm: &BufferPoolManager,
     checkpoint: &Checkpoint,
-) -> Result<(HashMap<PageId, Lsn>, Att)> {
+) -> Result<(HashMap<PageId, Lsn>, Att, TxnId)> {
     let mut dirty: HashMap<PageId, Lsn> = checkpoint.dirty.iter().copied().collect();
     let mut att = checkpoint.att.clone();
+    let mut next_tid = checkpoint.next_tid;
     let mut next_page_id = checkpoint
         .next_page_id
         .max(bpm.disk_manager().next_page_id());
     let mut scan = bpm.log().scan(checkpoint.start_lsn);
     while let Some(record) = scan.next_record()? {
+        next_tid = next_tid.max(record.tid + 1);
         let prev_lsn = att.link(record.tid, record.kind, record.lsn);
         if prev_lsn != record.prev_lsn {
             return Err(StorageError::CorruptLog(format!(
@@ -85,7 +88,7 @@ fn analyze(
         }
     }
     bpm.raise_next_page_id(next_page_id);
-    Ok((dirty, att))
+    Ok((dirty, att, next_tid))
 }
 
 /// Applies, from `redo_lsn` on, every record to the pages in `dirty` it is
@@ -121,10 +124,10 @@ fn redo(bpm: &BufferPoolManager, redo_lsn: Lsn, mut dirty: HashMap<PageId, Lsn>)
 
 /// Finishes each transaction in `att`: stamps a committed one's tuples,
 /// and undoes the others. Each then gets its `End`.
-fn finish_transactions(bpm: &Arc<BufferPoolManager>, att: Att) -> Result<()> {
+fn finish_transactions(bpm: &Arc<BufferPoolManager>, att: Att, next_tid: TxnId) -> Result<()> {
     let entries = att.entries();
     // Their records chain onto the ones analysis found.
-    bpm.log().restore_att(att);
+    bpm.log().restore(att, next_tid);
     let mut losers = Vec::new();
     // In Tid order: a truncate is newer than every transaction that wrote
     // the storage it frees, so their stamps come first. Runtime frees are

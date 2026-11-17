@@ -15,7 +15,8 @@ pub mod value;
 
 pub use error::{Result, ValueError};
 pub use ids::{
-    FrameId, INVALID_LSN, INVALID_PAGE_ID, INVALID_TXN_ID, Lsn, PageId, TXN_UNCOMMITTED_BIT, TxnId,
+    FIRST_TXN_ID, FrameId, INVALID_LSN, INVALID_PAGE_ID, INVALID_TXN_ID, Lsn, PageId,
+    TXN_UNCOMMITTED_BIT, TxnId,
 };
 pub use index_kind::{IndexKind, UniqueKey};
 pub use rid::{Rid, SlotId};

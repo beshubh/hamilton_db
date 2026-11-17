@@ -120,9 +120,7 @@ mod tests {
     #[test]
     fn removes_the_rows_from_the_indexes() {
         let db = Db::new();
-        db.catalog()
-            .create_index("users_name", "users", &["name"])
-            .unwrap();
+        db.create_index("users_name", "users", &["name"]);
         db.insert_numbered(5);
         let older = db.tm.begin();
         let id_above_2 = compare(ComparisonOp::Gt, column(0), int(2));

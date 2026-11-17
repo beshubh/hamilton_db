@@ -10,10 +10,9 @@
 //! ```
 //!
 //! Each is an ordinary table heap whose first page is recorded on page 0.
-//! A table's or index's own row is inserted after the rows that describe it
-//! (its columns, its key columns, its identity columns' sequences), so a
-//! crash part way through a create leaves only rows nothing points to,
-//! which loading ignores.
+//! A DDL statement writes its rows as its transaction's changes, so one
+//! that does not commit leaves none: undo leaves them deleted, and scans
+//! skip deleted rows.
 
 use std::sync::{Arc, LazyLock};
 
@@ -27,8 +26,9 @@ use crate::catalog::{IndexOid, MAX_NAME_LEN, RelationKind, TableOid};
 use crate::error::{CatalogError, Result};
 use crate::header_page::SystemTableRoots;
 
-/// Catalog rows are written outside of any transaction, as if committed at
-/// the start of time, so every snapshot sees them.
+/// Catalog rows are read without a snapshot, so they carry `ts` 0, as if
+/// committed at the start of time, even when a transaction writes them: its
+/// commit has nothing to stamp, and its undo leaves them deleted.
 pub(crate) const CATALOG_TS: u64 = 0;
 
 fn name_column(name: &str) -> Column {
@@ -150,17 +150,17 @@ impl SystemTables {
         }
     }
 
-    pub fn insert_table(&self, row: &TableRow) -> Result<()> {
+    pub fn insert_table(&self, by: Logged<'_>, row: &TableRow) -> Result<()> {
         let values = [
             oid_value(row.oid),
             Value::Varchar(row.name.clone()),
             Value::Int(row.first_page_id),
             Value::Int(encode_relation_kind(row.kind)),
         ];
-        insert(&self.tables, &TABLES_SCHEMA, &values)
+        insert(by, &self.tables, &TABLES_SCHEMA, &values)
     }
 
-    pub fn insert_column(&self, row: &ColumnRow) -> Result<()> {
+    pub fn insert_column(&self, by: Logged<'_>, row: &ColumnRow) -> Result<()> {
         let (type_id, max_len) = encode_type(row.column.data_type);
         let values = [
             oid_value(row.table_oid),
@@ -171,10 +171,10 @@ impl SystemTables {
             Value::Bool(row.column.nullable),
             row.sequence.map_or(Value::Null, oid_value),
         ];
-        insert(&self.columns, &COLUMNS_SCHEMA, &values)
+        insert(by, &self.columns, &COLUMNS_SCHEMA, &values)
     }
 
-    pub fn insert_index(&self, row: &IndexRow) -> Result<()> {
+    pub fn insert_index(&self, by: Logged<'_>, row: &IndexRow) -> Result<()> {
         let values = [
             oid_value(row.oid),
             Value::Varchar(row.name.clone()),
@@ -182,16 +182,16 @@ impl SystemTables {
             Value::Int(row.header_page_id),
             Value::Int(encode_kind(row.kind)),
         ];
-        insert(&self.indexes, &INDEXES_SCHEMA, &values)
+        insert(by, &self.indexes, &INDEXES_SCHEMA, &values)
     }
 
-    pub fn insert_index_column(&self, row: &IndexColumnRow) -> Result<()> {
+    pub fn insert_index_column(&self, by: Logged<'_>, row: &IndexColumnRow) -> Result<()> {
         let values = [
             oid_value(row.index_oid),
             int_value(row.position),
             int_value(row.column),
         ];
-        insert(&self.index_columns, &INDEX_COLUMNS_SCHEMA, &values)
+        insert(by, &self.index_columns, &INDEX_COLUMNS_SCHEMA, &values)
     }
 
     /// Points the `tables` row of `oid` at a new first page, as `by`'s
@@ -286,9 +286,9 @@ fn find_row(heap: &TableHeap, schema: &Schema, oid: u32) -> Result<(Rid, TupleMe
     )))
 }
 
-fn insert(heap: &TableHeap, schema: &Schema, values: &[Value]) -> Result<()> {
+fn insert(by: Logged<'_>, heap: &TableHeap, schema: &Schema, values: &[Value]) -> Result<()> {
     let tuple = Tuple::encode(schema, values)?;
-    heap.insert(Logged::System, &TupleMeta::new(CATALOG_TS), &tuple)?;
+    heap.insert(by, &TupleMeta::new(CATALOG_TS), &tuple)?;
     Ok(())
 }
 

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use common::{Column, DataType, IndexKind, PageId, Schema, TxnId, UniqueKey, ValueError};
+use common::{Column, DataType, IndexKind, PageId, Schema, UniqueKey, ValueError};
 use parking_lot::{RwLock, RwLockReadGuard};
 use storage::StorageError;
 use storage::buffer::arc_replacer::AccessType;
@@ -14,15 +14,15 @@ use storage::table::table_heap::TableHeap;
 use storage::wal::Logged;
 
 use crate::error::{CatalogError, Result};
-use crate::header_page::{CATALOG_PAGE_ID, SystemTableRoots, read_next_tid, write_next_tid};
+use crate::header_page::{CATALOG_PAGE_ID, SystemTableRoots};
 use crate::locks::{LockMode, TableLocks};
 use crate::sequence::{self, Sequence};
 use crate::system_tables::{ColumnRow, IndexColumnRow, IndexRow, SystemTables, TableRow};
 
-/// Identifies a table or sequence. Never reused.
+/// Identifies a table or sequence. Not reused while the catalog is open.
 pub type TableOid = u32;
 
-/// Identifies an index. Never reused.
+/// Identifies an index. Not reused while the catalog is open.
 pub type IndexOid = u32;
 
 /// Longest table, column or index name, in bytes.
@@ -178,8 +178,9 @@ impl fmt::Debug for IndexInfo {
 /// The catalog is stored in system tables (see `system_tables`) whose first
 /// pages are recorded on page 0, and is loaded into memory when opened.
 /// Lookups are served from memory; creates write through to the system
-/// tables. Like every other page, catalog pages reach disk when the buffer
-/// pool flushes them.
+/// tables, as changes of the creating transaction (see
+/// `create_table_with_constraints`). Like every other page, catalog pages
+/// reach disk when the buffer pool flushes them.
 pub struct Catalog {
     bpm: Arc<BufferPoolManager>,
     system: SystemTables,
@@ -226,6 +227,33 @@ impl CatalogState {
     fn table(&self, name: &str) -> Option<&Arc<TableInfo>> {
         self.tables.get(self.table_names.get(name)?)
     }
+
+    /// Takes out table `oid`, with its sequences and indexes.
+    fn remove_table(&mut self, oid: TableOid) {
+        let Some(table) = self.tables.remove(&oid) else {
+            return;
+        };
+        self.table_names.remove(&table.name);
+        for sequence in table.sequences() {
+            self.tables.remove(&sequence.oid);
+            self.table_names.remove(&sequence.name);
+        }
+        for index in self.table_indexes.remove(&oid).unwrap_or_default() {
+            if let Some(index) = self.indexes.remove(&index) {
+                self.index_names.remove(&index.name);
+            }
+        }
+    }
+
+    fn remove_index(&mut self, oid: IndexOid) {
+        let Some(index) = self.indexes.remove(&oid) else {
+            return;
+        };
+        self.index_names.remove(&index.name);
+        if let Some(indexes) = self.table_indexes.get_mut(&index.table_oid) {
+            indexes.retain(|&other| other != oid);
+        }
+    }
 }
 
 impl Catalog {
@@ -265,33 +293,7 @@ impl Catalog {
         &self.bpm
     }
 
-    /// The Tid to start the transaction manager at, as last recorded with
-    /// `set_next_tid`.
-    pub fn next_tid(&self) -> Result<TxnId> {
-        let guard = self
-            .bpm
-            .checked_read_page(CATALOG_PAGE_ID, AccessType::Lookup)?;
-        Ok(read_next_tid(guard.get_data()))
-    }
-
-    /// Records `tid` as the next Tid in the header page, unless a larger one
-    /// is recorded already.
-    ///
-    /// Statements call this with a `tid` read before they take the page, so
-    /// one that is slow to get here must not undo a later one's record.
-    pub fn set_next_tid(&self, tid: TxnId) -> Result<()> {
-        let mtr = self.bpm.mtr(Logged::System);
-        let mut page = mtr.write_page(CATALOG_PAGE_ID)?;
-        if tid > read_next_tid(page.data()) {
-            write_next_tid(page.raw_mut(), tid);
-        }
-        Ok(())
-    }
-
-    /// Reads the system tables into memory. Rows left by a create that did
-    /// not finish (columns of a table with no `tables` row, sequences no
-    /// column points to, and so on) are skipped, but their oids are not
-    /// reused.
+    /// Reads the system tables into memory.
     fn load(bpm: Arc<BufferPoolManager>, roots: SystemTableRoots) -> Result<Self> {
         let system = SystemTables::open(&bpm, roots)?;
         let mut state = CatalogState::default();
@@ -376,7 +378,8 @@ impl Catalog {
                 CatalogError::Corrupt(format!("index {} has a bad key column", row.name))
             })?;
             let locator = locator_kind(row.kind, with_primary_key.contains(&table.oid));
-            let metadata = index_metadata(table, &row.name, row.kind, &key, &key_schema, locator);
+            let metadata =
+                index_metadata(&table.name, &row.name, row.kind, &key, &key_schema, locator);
             let index = open_index(&bpm, metadata, row.header_page_id)?;
             let info = IndexInfo {
                 oid: row.oid,
@@ -401,19 +404,21 @@ impl Catalog {
         })
     }
 
-    /// Creates a table with an empty heap. Column names must be unique.
+    /// Creates a table with an empty heap in `txn`. Column names must be
+    /// unique.
     ///
     /// A non-empty `primary_key` names the table's primary key columns, in
     /// key order, which must be NOT NULL. The table is then created with a
     /// primary key index on them, named `<name>_pkey` unless that is taken
     /// or too long (`choose_name`).
     pub fn create_table(
-        &self,
+        self: &Arc<Self>,
+        txn: &Transaction,
         name: &str,
         schema: Schema,
         primary_key: &[&str],
     ) -> Result<Arc<TableInfo>> {
-        self.create_table_with_constraints(name, schema, primary_key, &[], &[])
+        self.create_table_with_constraints(txn, name, schema, primary_key, &[], &[])
     }
 
     /// [`Catalog::create_table`], with `identity` naming the columns that are
@@ -423,8 +428,16 @@ impl Catalog {
     /// else is named as Postgres names it (`choose_name`). Each identity
     /// column gets a sequence, named as Postgres names it:
     /// `<table>_<column>_seq`.
+    ///
+    /// The storage and the catalog rows are all `txn`'s changes, so an
+    /// abort, or a crash before the commit, leaves nothing of the table.
+    /// It is in the catalog once this returns, locked by `txn` until that
+    /// ends (`LockMode::AccessExclusive`), so no other transaction puts
+    /// rows in storage an abort would free. If this fails, `txn` must
+    /// abort.
     pub fn create_table_with_constraints(
-        &self,
+        self: &Arc<Self>,
+        txn: &Transaction,
         name: &str,
         schema: Schema,
         primary_key: &[&str],
@@ -553,14 +566,13 @@ impl Catalog {
             let sequence_name = choose_name(name, Some(column), "seq", taken);
             sequence_names.push(sequence_name);
         }
-        // Taken before writing any rows, so a failed create's rows are never
-        // mistaken for a later table's.
         let oid = state.next_table_oid;
         state.next_table_oid += 1;
 
         let mut sequences = Vec::with_capacity(identity.len());
         for (&column, sequence_name) in identity.iter().zip(sequence_names) {
-            let heap = sequence::create_heap(&self.bpm)?;
+            let (heap, _) = txn.create_table(&[])?;
+            sequence::init(&heap)?;
             let row = TableRow {
                 oid: state.next_table_oid,
                 name: sequence_name,
@@ -568,35 +580,76 @@ impl Catalog {
                 kind: RelationKind::Sequence,
             };
             state.next_table_oid += 1;
-            self.system.insert_table(&row)?;
             let max = sequence::max_value(schema.columns()[column].data_type)
                 .expect("identity columns were checked");
-            sequences.push((column, sequence_relation(&self.bpm, row, heap, max)));
+            sequences.push((column, row, heap, max));
         }
+        let has_primary_key = !primary_key.is_empty();
+        let planned: Vec<IndexPlan> = planned
+            .into_iter()
+            .zip(index_names)
+            .map(|(index, index_name)| {
+                IndexPlan::new(
+                    name,
+                    &schema,
+                    index_name,
+                    index.key,
+                    index.kind,
+                    has_primary_key,
+                )
+            })
+            .collect();
+        let metadata: Vec<&IndexMetadata> = planned.iter().map(|plan| &plan.metadata).collect();
+        let (heap, trees) = txn.create_table(&metadata)?;
+        let indexes: Vec<Arc<IndexInfo>> = planned
+            .into_iter()
+            .zip(trees)
+            .map(|(plan, tree)| {
+                let index_oid = state.next_index_oid;
+                state.next_index_oid += 1;
+                Arc::new(plan.into_info(index_oid, oid, name, tree))
+            })
+            .collect();
 
-        let heap = TableHeap::create(Arc::clone(&self.bpm))?;
-        for (position, column) in schema.columns().iter().enumerate() {
-            let sequence = sequences
+        txn.undoable(|by| {
+            for (_, row, _, _) in &sequences {
+                self.system.insert_table(by, row)?;
+            }
+            for (position, column) in schema.columns().iter().enumerate() {
+                let sequence = sequences
+                    .iter()
+                    .find(|(identity, ..)| *identity == position)
+                    .map(|(_, row, ..)| row.oid);
+                self.system.insert_column(
+                    by,
+                    &ColumnRow {
+                        table_oid: oid,
+                        position,
+                        column: column.clone(),
+                        sequence,
+                    },
+                )?;
+            }
+            self.system.insert_table(
+                by,
+                &TableRow {
+                    oid,
+                    name: name.to_owned(),
+                    first_page_id: heap.first_page_id(),
+                    kind: RelationKind::Table,
+                },
+            )?;
+            indexes
                 .iter()
-                .find(|(identity, _)| *identity == position)
-                .map(|(_, (_, sequence))| sequence.oid);
-            self.system.insert_column(&ColumnRow {
-                table_oid: oid,
-                position,
-                column: column.clone(),
-                sequence,
-            })?;
-        }
-        self.system.insert_table(&TableRow {
-            oid,
-            name: name.to_owned(),
-            first_page_id: heap.first_page_id(),
-            kind: RelationKind::Table,
+                .try_for_each(|index| self.insert_index_rows(by, index))
         })?;
 
+        // Into memory last, so a create that fails changes nothing there.
+        let mut relations = Vec::with_capacity(sequences.len());
         let mut identity = Vec::with_capacity(sequences.len());
-        for (column, (relation, sequence)) in sequences {
-            state.add_table(relation)?;
+        for (column, row, heap, max) in sequences {
+            let (relation, sequence) = sequence_relation(&self.bpm, row, heap, max);
+            relations.push(relation);
             identity.push((column, sequence));
         }
         let info = Arc::new(TableInfo::new(
@@ -607,13 +660,20 @@ impl Catalog {
             RelationKind::Table,
             identity,
         ));
-        state.add_table(Arc::clone(&info))?;
-        for (index, index_name) in planned.into_iter().zip(index_names) {
-            let index = self.new_index(&state, &index_name, &info, index.key, index.kind)?;
-            self.add_index(&mut state, &info, index)?;
+        info.locks.lock(txn, name, LockMode::AccessExclusive)?;
+        let catalog = Arc::clone(self);
+        txn.on_end(move |outcome| {
+            if outcome == TransactionState::Aborted {
+                catalog.state.write().remove_table(oid);
+            }
+        })?;
+        for relation in relations {
+            state.add_table(relation)?;
         }
-        // No transaction's commit covers these records.
-        self.bpm.log().flush_all()?;
+        state.add_table(Arc::clone(&info))?;
+        for index in indexes {
+            state.add_index(index)?;
+        }
         Ok(info)
     }
 
@@ -639,31 +699,41 @@ impl Catalog {
         tables
     }
 
-    /// Records an empty index on `key_columns` of `table_name`; see
-    /// `create_index_with`. For a table with no rows yet: CREATE INDEX fills
-    /// the index from the table's rows.
+    /// Creates an empty index on `key_columns` of `table_name` in `txn`;
+    /// see `create_index_with`. For a table with no rows yet: CREATE INDEX
+    /// fills the index from the table's rows.
     pub fn create_index(
-        &self,
+        self: &Arc<Self>,
+        txn: &Transaction,
         name: &str,
         table_name: &str,
         key_columns: &[&str],
     ) -> Result<Arc<IndexInfo>> {
-        self.create_index_with(name, table_name, key_columns, IndexKind::Plain, |_, _| {
-            Ok(())
-        })
+        self.create_index_with(
+            txn,
+            name,
+            table_name,
+            key_columns,
+            IndexKind::Plain,
+            |_, _| Ok(()),
+        )
     }
 
-    /// Creates an index of `kind` on `key_columns` of `table_name`, calls
-    /// `fill` with the table and the index's B+ tree to add the entries of
-    /// the rows already there, and records the index. Index names are unique
-    /// across the database. `kind` must not be a primary key: a table gets
-    /// that only when it is created.
+    /// Creates an index of `kind` on `key_columns` of `table_name` in
+    /// `txn`, calls `fill` with the table and the index's B+ tree to add the
+    /// entries of the rows already there, and records the index. Index
+    /// names are unique across the database. `kind` must not be a primary
+    /// key: a table gets that only when it is created.
     ///
     /// Writes to the table wait while `fill` runs (`TableInfo::lock_writes`),
-    /// and no statement is planned on the index until it is recorded. If
-    /// `fill` fails, nothing is recorded; the tree's pages are left unused.
+    /// and no statement is planned on the index until it is recorded. The
+    /// tree and the catalog rows are `txn`'s changes, so if `fill` fails,
+    /// or `txn` aborts or a crash comes before its commit, nothing of the
+    /// index is left: undo frees the tree with every page `fill` gave it.
+    /// If this fails, `txn` must abort.
     pub fn create_index_with<E: From<CatalogError>>(
-        &self,
+        self: &Arc<Self>,
+        txn: &Transaction,
         name: &str,
         table_name: &str,
         key_columns: &[&str],
@@ -672,7 +742,7 @@ impl Catalog {
     ) -> Result<Arc<IndexInfo>, E> {
         assert!(!kind.is_primary_key(), "a primary key comes with its table");
         check_name(name)?;
-        let (table, index) = {
+        let (table, plan, index) = {
             let state = self.state.write();
             check_index_name_free(&state, name)?;
             let table = state
@@ -683,113 +753,64 @@ impl Catalog {
                 return Err(CatalogError::NotATable(table_name.to_owned()).into());
             }
             let key = resolve_key(table_name, &table.schema, key_columns)?;
-            let index = self.new_index(&state, name, &table, key, kind)?;
-            (table, index)
+            let has_primary_key = primary_key_index(&state, table.oid).is_some();
+            let plan = IndexPlan::new(
+                &table.name,
+                &table.schema,
+                name.to_owned(),
+                key,
+                kind,
+                has_primary_key,
+            );
+            let index = txn
+                .create_index(&plan.metadata)
+                .map_err(CatalogError::from)?;
+            (table, plan, index)
         };
+        let index = Arc::new(index);
         // Taken without holding `state`: a writer holding the table's lock
         // may still look something up in the catalog.
         let _writes = table.writes.write();
-        if let Err(err) = fill(&table, &index.index) {
-            self.discard_if_empty(&index);
-            return Err(err);
-        }
+        fill(&table, &index)?;
         let mut state = self.state.write();
         // Another create may have taken the name meanwhile.
         check_index_name_free(&state, name)?;
-        let index = self.add_index(&mut state, &table, index)?;
-        // No transaction's commit covers the build's records.
-        self.bpm.log().flush_all().map_err(CatalogError::from)?;
-        Ok(index)
-    }
-
-    /// Opens the B+ tree of a new index named `name` on the `key` columns of
-    /// `table`. Nothing is recorded yet, and the index has no oid.
-    fn new_index(
-        &self,
-        state: &CatalogState,
-        name: &str,
-        table: &TableInfo,
-        key: Vec<usize>,
-        kind: IndexKind,
-    ) -> Result<NewIndex> {
-        let key_schema = key_schema(&table.schema, &key).expect("key columns were resolved");
-        let table_has_primary_key =
-            kind.is_primary_key() || primary_key_index(state, table.oid).is_some();
-        let locator = locator_kind(kind, table_has_primary_key);
-        let header_page_id = self.bpm.new_page();
-        // Opening the tree formats its header page, which dirties it, so it
-        // is written out and keeps its id across a restart.
-        let metadata = index_metadata(table, name, kind, &key, &key_schema, locator);
-        let index = open_index(&self.bpm, metadata, header_page_id)?;
-        Ok(NewIndex {
-            name: name.to_owned(),
-            header_page_id,
-            kind,
-            key,
-            key_schema,
-            locator,
-            index,
-        })
-    }
-
-    /// Frees the header page of `index`, a new index that won't be recorded,
-    /// if its tree is still empty: then the header is its only page and
-    /// nothing else holds it. A tree with entries keeps its pages, unused.
-    fn discard_if_empty(&self, index: &NewIndex) {
-        let Index::BtreeIndex(btree) = &*index.index;
-        if btree.tree().is_empty().unwrap_or(false) {
-            self.bpm.mtr(Logged::System).free_page(index.header_page_id);
-        }
-    }
-
-    /// Writes out `index`, a new index on `table` whose name the caller has
-    /// checked is free, and adds it to the catalog, giving it its oid.
-    fn add_index(
-        &self,
-        state: &mut CatalogState,
-        table: &TableInfo,
-        index: NewIndex,
-    ) -> Result<Arc<IndexInfo>> {
-        let NewIndex {
-            name,
-            header_page_id,
-            kind,
-            key,
-            key_schema,
-            locator,
-            index,
-        } = index;
-        let row = IndexRow {
-            oid: state.next_index_oid,
-            name,
-            table_oid: table.oid,
-            header_page_id,
-            kind,
-        };
+        let oid = state.next_index_oid;
         state.next_index_oid += 1;
-        for (position, &column) in key.iter().enumerate() {
-            self.system.insert_index_column(&IndexColumnRow {
-                index_oid: row.oid,
-                position,
-                column,
-            })?;
-        }
-        self.system.insert_index(&row)?;
-
-        let info = Arc::new(IndexInfo {
-            oid: row.oid,
-            name: row.name,
-            table_oid: table.oid,
-            table_name: table.name.clone(),
-            key_columns: key,
-            key_schema,
-            header_page_id: row.header_page_id,
-            kind: row.kind,
-            locator,
-            index,
-        });
+        let info = Arc::new(plan.into_info(oid, table.oid, &table.name, index));
+        txn.undoable(|by| self.insert_index_rows(by, &info))?;
+        let catalog = Arc::clone(self);
+        txn.on_end(move |outcome| {
+            if outcome == TransactionState::Aborted {
+                catalog.state.write().remove_index(oid);
+            }
+        })
+        .map_err(CatalogError::from)?;
         state.add_index(Arc::clone(&info))?;
         Ok(info)
+    }
+
+    /// Writes the rows of `index`, its key columns' first, as `by`'s
+    /// changes.
+    fn insert_index_rows(&self, by: Logged<'_>, index: &IndexInfo) -> Result<()> {
+        for (position, &column) in index.key_columns.iter().enumerate() {
+            let row = IndexColumnRow {
+                index_oid: index.oid,
+                position,
+                column,
+            };
+            self.system.insert_index_column(by, &row)?;
+        }
+        self.system.insert_index(
+            by,
+            &IndexRow {
+                oid: index.oid,
+                name: index.name.clone(),
+                table_oid: index.table_oid,
+                header_page_id: index.header_page_id,
+                kind: index.kind,
+            },
+        )
     }
 
     /// Locks table `oid` in `mode` until `txn` ends, failing at once if
@@ -845,17 +866,17 @@ impl Catalog {
             .collect();
         // The table lock keeps every other writer off these rows until `txn`
         // ends, so its undo puts back exactly what it overwrote.
-        txn.undoable(|by| {
+        let restarted = txn.undoable(|by| {
             self.system
                 .set_first_page_id(by, oid, new.first_page_id())?;
             for index in &new_indexes {
                 self.system
                     .set_header_page_id(by, index.oid, index.header_page_id)?;
             }
-            if restart_identity {
-                new.sequences().try_for_each(|s| s.restart(by))?;
-            }
-            Ok::<_, CatalogError>(())
+            let restart = new.sequences().filter(|_| restart_identity);
+            restart
+                .map(|sequence| Ok((Arc::clone(sequence), sequence.restart(by)?)))
+                .collect::<Result<Vec<_>>>()
         })?;
 
         let tid = txn.tid();
@@ -863,6 +884,10 @@ impl Catalog {
         txn.on_end(move |outcome| {
             if outcome == TransactionState::Committed {
                 return old.locks.truncated(tid);
+            }
+            // Undo has put the sequences' rows back.
+            for (sequence, saved) in restarted {
+                sequence.restore(saved);
             }
             let mut state = catalog.state.write();
             state.tables.insert(oid, old);
@@ -873,6 +898,17 @@ impl Catalog {
         state.tables.insert(oid, new);
         for index in new_indexes {
             state.indexes.insert(index.oid, index);
+        }
+        Ok(())
+    }
+
+    /// Writes each sequence's row as the last value it handed out, so the
+    /// next open goes on from there instead of past the values logged ahead
+    /// (see `sequence`). For a clean shutdown, before the storage closes.
+    pub fn save_sequences(&self) -> Result<()> {
+        let state = self.state.read();
+        for table in state.tables.values() {
+            table.sequences().try_for_each(|sequence| sequence.save())?;
         }
         Ok(())
     }
@@ -975,15 +1011,64 @@ fn generated_name(name1: &str, name2: Option<&str>, label: &str) -> String {
     name
 }
 
-/// An index whose B+ tree is open but which is not in the catalog yet.
-struct NewIndex {
+/// An index of a table, named and keyed, before its B+ tree is made.
+struct IndexPlan {
     name: String,
-    header_page_id: PageId,
     kind: IndexKind,
     key: Vec<usize>,
     key_schema: Schema,
     locator: LocatorKind,
-    index: Arc<Index>,
+    metadata: IndexMetadata,
+}
+
+impl IndexPlan {
+    /// An index named `name` of `kind` on the `key` columns of table
+    /// `table`, whose schema is `schema`.
+    fn new(
+        table: &str,
+        schema: &Schema,
+        name: String,
+        key: Vec<usize>,
+        kind: IndexKind,
+        table_has_primary_key: bool,
+    ) -> Self {
+        let key_schema = key_schema(schema, &key).expect("key columns were resolved");
+        let locator = locator_kind(kind, table_has_primary_key);
+        let metadata = index_metadata(table, &name, kind, &key, &key_schema, locator);
+        Self {
+            name,
+            kind,
+            key,
+            key_schema,
+            locator,
+            metadata,
+        }
+    }
+
+    /// The index, as `oid`, of table `table_oid` named `table_name`, on
+    /// `index`, its tree.
+    fn into_info(
+        self,
+        oid: IndexOid,
+        table_oid: TableOid,
+        table_name: &str,
+        index: impl Into<Arc<Index>>,
+    ) -> IndexInfo {
+        let index = index.into();
+        let Index::BtreeIndex(btree) = &*index;
+        IndexInfo {
+            oid,
+            name: self.name,
+            table_oid,
+            table_name: table_name.to_owned(),
+            key_columns: self.key,
+            key_schema: self.key_schema,
+            header_page_id: btree.tree().header_page_id(),
+            kind: self.kind,
+            locator: self.locator,
+            index,
+        }
+    }
 }
 
 fn check_index_name_free(state: &CatalogState, name: &str) -> Result<()> {
@@ -1022,7 +1107,7 @@ fn locator_kind(kind: IndexKind, table_has_primary_key: bool) -> LocatorKind {
 /// The metadata of an index named `name` on the `key` columns of `table`,
 /// storing `locator`s.
 fn index_metadata(
-    table: &TableInfo,
+    table: &str,
     name: &str,
     kind: IndexKind,
     key: &[usize],
@@ -1031,7 +1116,7 @@ fn index_metadata(
 ) -> IndexMetadata {
     IndexMetadata::new(
         name,
-        table.name.clone(),
+        table.to_owned(),
         key.to_vec(),
         Arc::new(key_schema.clone()),
         kind,
@@ -1129,6 +1214,7 @@ mod tests {
     use super::*;
     use common::{Tuple, Value};
     use storage::Storage;
+    use storage::concurrency::transaction_manager::TransactionManager;
     use storage::index::IndexTrait;
     use storage::page::page_header::PageType;
     use storage::table::table_page::{TablePage, TupleMeta};
@@ -1137,7 +1223,8 @@ mod tests {
     struct Db {
         dir: TempDir,
         storage: Storage,
-        catalog: Catalog,
+        catalog: Arc<Catalog>,
+        tm: TransactionManager,
     }
 
     impl Db {
@@ -1147,16 +1234,85 @@ mod tests {
 
         fn open(dir: TempDir, num_frames: usize) -> Self {
             let storage = storage::open(dir.path().join("test.db"), num_frames).unwrap();
-            let catalog = Catalog::open(Arc::clone(&storage.bpm)).unwrap();
+            let catalog = Arc::new(Catalog::open(Arc::clone(&storage.bpm)).unwrap());
+            let tm = TransactionManager::new(Arc::clone(&storage.bpm));
             Self {
                 dir,
                 storage,
                 catalog,
+                tm,
             }
         }
 
         fn checkpoint(&self) {
             self.storage.bpm.checkpoint().unwrap();
+        }
+
+        /// Runs `ddl` in a transaction of its own, committed if it succeeds
+        /// and aborted if it fails, as a DDL statement runs.
+        fn ddl<T, E>(&self, ddl: impl FnOnce(&Transaction) -> Result<T, E>) -> Result<T, E> {
+            let txn = self.tm.begin();
+            let result = ddl(&txn);
+            match result {
+                Ok(_) => self.tm.commit(&txn).unwrap(),
+                Err(_) => self.tm.abort(&txn).unwrap(),
+            }
+            result
+        }
+
+        fn create_table(
+            &self,
+            name: &str,
+            schema: Schema,
+            primary_key: &[&str],
+        ) -> Result<Arc<TableInfo>> {
+            self.ddl(|txn| self.catalog.create_table(txn, name, schema, primary_key))
+        }
+
+        fn create_table_with_constraints(
+            &self,
+            name: &str,
+            schema: Schema,
+            primary_key: &[&str],
+            identity: &[&str],
+            unique: &[UniqueKey],
+        ) -> Result<Arc<TableInfo>> {
+            self.ddl(|txn| {
+                self.catalog.create_table_with_constraints(
+                    txn,
+                    name,
+                    schema,
+                    primary_key,
+                    identity,
+                    unique,
+                )
+            })
+        }
+
+        fn create_index(
+            &self,
+            name: &str,
+            table_name: &str,
+            key_columns: &[&str],
+        ) -> Result<Arc<IndexInfo>> {
+            self.ddl(|txn| {
+                self.catalog
+                    .create_index(txn, name, table_name, key_columns)
+            })
+        }
+
+        fn create_index_with(
+            &self,
+            name: &str,
+            table_name: &str,
+            key_columns: &[&str],
+            kind: IndexKind,
+            fill: impl FnOnce(&TableInfo, &Arc<Index>) -> Result<()>,
+        ) -> Result<Arc<IndexInfo>> {
+            self.ddl(|txn| {
+                self.catalog
+                    .create_index_with(txn, name, table_name, key_columns, kind, fill)
+            })
         }
 
         /// Drops everything and opens the files again, as after a crash:
@@ -1167,9 +1323,21 @@ mod tests {
                 dir,
                 storage,
                 catalog,
+                tm,
             } = self;
-            drop((catalog, storage));
+            drop((catalog, tm, storage));
             Self::open(dir, 8)
+        }
+
+        /// The database as a crash now would leave it, from a copy of its
+        /// files, while this one runs on.
+        fn crash_copy(&self) -> Self {
+            let copy = TempDir::new().unwrap();
+            for file in std::fs::read_dir(self.dir.path()).unwrap() {
+                let path = file.unwrap().path();
+                std::fs::copy(&path, copy.path().join(path.file_name().unwrap())).unwrap();
+            }
+            Self::open(copy, 16)
         }
 
         /// Closes the files and opens them again.
@@ -1178,7 +1346,10 @@ mod tests {
                 dir,
                 storage,
                 catalog,
+                tm,
             } = self;
+            drop(tm);
+            catalog.save_sequences().unwrap();
             drop(catalog);
             storage.close().unwrap();
             Self::open(dir, 8)
@@ -1220,7 +1391,7 @@ mod tests {
     #[test]
     fn create_and_get_table() {
         let db = Db::new(8);
-        let created = db.catalog.create_table("users", users(), &[]).unwrap();
+        let created = db.create_table("users", users(), &[]).unwrap();
         let got = db.catalog.get_table("users").unwrap();
         assert!(Arc::ptr_eq(&created, &got));
         assert!(Arc::ptr_eq(
@@ -1239,7 +1410,7 @@ mod tests {
         drop(guard);
         assert_eq!(got.heap.iter().unwrap().count(), 0);
 
-        let other = db.catalog.create_table("orders", users(), &[]).unwrap();
+        let other = db.create_table("orders", users(), &[]).unwrap();
         assert_ne!(other.oid, created.oid);
         assert_ne!(other.first_page_id(), created.first_page_id());
 
@@ -1251,9 +1422,9 @@ mod tests {
     #[test]
     fn create_table_rejects_bad_definitions() {
         let db = Db::new(8);
-        db.catalog.create_table("users", users(), &[]).unwrap();
+        db.create_table("users", users(), &[]).unwrap();
         assert!(matches!(
-            db.catalog.create_table("users", users(), &[]),
+            db.create_table("users", users(), &[]),
             Err(CatalogError::TableExists(name)) if name == "users"
         ));
 
@@ -1262,26 +1433,26 @@ mod tests {
             Column::new("a", DataType::Bool, false),
         ]);
         assert!(matches!(
-            db.catalog.create_table("t", dup, &[]),
+            db.create_table("t", dup, &[]),
             Err(CatalogError::DuplicateColumn(name)) if name == "a"
         ));
         assert!(matches!(
-            db.catalog.create_table("", users(), &[]),
+            db.create_table("", users(), &[]),
             Err(CatalogError::InvalidName(_))
         ));
         let long = "x".repeat(MAX_NAME_LEN as usize + 1);
         assert!(matches!(
-            db.catalog.create_table(&long, users(), &[]),
+            db.create_table(&long, users(), &[]),
             Err(CatalogError::InvalidName(_))
         ));
         let long_column = Schema::new(vec![Column::new(&long, DataType::Int, false)]);
         assert!(matches!(
-            db.catalog.create_table("t", long_column, &[]),
+            db.create_table("t", long_column, &[]),
             Err(CatalogError::InvalidName(_))
         ));
         let array = Schema::new(vec![Column::new("xs", DataType::Array, false)]);
         assert!(matches!(
-            db.catalog.create_table("t", array, &[]),
+            db.create_table("t", array, &[]),
             Err(CatalogError::Value(ValueError::NotStorable { .. }))
         ));
         assert!(db.catalog.get_table("t").is_none());
@@ -1290,9 +1461,8 @@ mod tests {
     #[test]
     fn create_and_get_index() {
         let db = Db::new(8);
-        let table = db.catalog.create_table("users", users(), &[]).unwrap();
+        let table = db.create_table("users", users(), &[]).unwrap();
         let index = db
-            .catalog
             .create_index("users_name_id", "users", &["name", "id"])
             .unwrap();
         assert_eq!(index.table_oid, table.oid);
@@ -1319,19 +1489,18 @@ mod tests {
     #[test]
     fn writes_to_the_table_wait_while_an_index_is_filled() {
         let db = Db::new(8);
-        let table = db.catalog.create_table("users", users(), &[]).unwrap();
-        db.catalog
-            .create_index_with(
-                "users_name",
-                "users",
-                &["name"],
-                IndexKind::Plain,
-                |table, _| {
-                    assert!(table.writes.try_read().is_none());
-                    Ok::<_, CatalogError>(())
-                },
-            )
-            .unwrap();
+        let table = db.create_table("users", users(), &[]).unwrap();
+        db.create_index_with(
+            "users_name",
+            "users",
+            &["name"],
+            IndexKind::Plain,
+            |table, _| {
+                assert!(table.writes.try_read().is_none());
+                Ok(())
+            },
+        )
+        .unwrap();
         assert!(table.writes.try_read().is_some());
     }
 
@@ -1342,11 +1511,11 @@ mod tests {
     #[test]
     fn a_fill_that_fails_on_an_empty_tree_keeps_no_page_or_oid() {
         let db = Db::new(8);
-        db.catalog.create_table("users", users(), &[]).unwrap();
+        db.create_table("users", users(), &[]).unwrap();
         db.catalog.bpm.flush_all_pages().unwrap();
         let writes = db.storage.bpm.disk_manager().num_writes();
         for _ in 0..3 {
-            let failed = db.catalog.create_index_with(
+            let failed = db.create_index_with(
                 "users_name",
                 "users",
                 &["name"],
@@ -1358,8 +1527,8 @@ mod tests {
         // The header pages left the pool unwritten.
         db.catalog.bpm.flush_all_pages().unwrap();
         assert_eq!(db.storage.bpm.disk_manager().num_writes(), writes);
-        let first = db.catalog.create_index("a", "users", &["id"]).unwrap();
-        let second = db.catalog.create_index("b", "users", &["id"]).unwrap();
+        let first = db.create_index("a", "users", &["id"]).unwrap();
+        let second = db.create_index("b", "users", &["id"]).unwrap();
         assert_eq!(second.oid, first.oid + 1);
         assert_eq!(first.oid, 0);
     }
@@ -1367,8 +1536,8 @@ mod tests {
     #[test]
     fn an_index_that_fails_to_fill_is_not_created() {
         let db = Db::new(8);
-        db.catalog.create_table("users", users(), &[]).unwrap();
-        let failed = db.catalog.create_index_with(
+        db.create_table("users", users(), &[]).unwrap();
+        let failed = db.create_index_with(
             "users_name",
             "users",
             &["name"],
@@ -1381,9 +1550,7 @@ mod tests {
 
         let db = db.restart();
         assert!(db.catalog.table_indexes("users").is_empty());
-        db.catalog
-            .create_index("users_name", "users", &["name"])
-            .unwrap();
+        db.create_index("users_name", "users", &["name"]).unwrap();
         let db = db.restart();
         let names: Vec<_> = db
             .catalog
@@ -1397,28 +1564,26 @@ mod tests {
     #[test]
     fn create_index_rejects_bad_definitions() {
         let db = Db::new(8);
-        db.catalog.create_table("users", users(), &[]).unwrap();
-        db.catalog
-            .create_index("users_id", "users", &["id"])
-            .unwrap();
+        db.create_table("users", users(), &[]).unwrap();
+        db.create_index("users_id", "users", &["id"]).unwrap();
         assert!(matches!(
-            db.catalog.create_index("users_id", "users", &["name"]),
+            db.create_index("users_id", "users", &["name"]),
             Err(CatalogError::IndexExists(name)) if name == "users_id"
         ));
         assert!(matches!(
-            db.catalog.create_index("i", "missing", &["id"]),
+            db.create_index("i", "missing", &["id"]),
             Err(CatalogError::TableNotFound(name)) if name == "missing"
         ));
         assert!(matches!(
-            db.catalog.create_index("i", "users", &["nope"]),
+            db.create_index("i", "users", &["nope"]),
             Err(CatalogError::ColumnNotFound { column, .. }) if column == "nope"
         ));
         assert!(matches!(
-            db.catalog.create_index("i", "users", &["id", "id"]),
+            db.create_index("i", "users", &["id", "id"]),
             Err(CatalogError::DuplicateColumn(name)) if name == "id"
         ));
         assert!(matches!(
-            db.catalog.create_index("i", "users", &[]),
+            db.create_index("i", "users", &[]),
             Err(CatalogError::EmptyIndexKey)
         ));
         assert!(db.catalog.get_index("i").is_none());
@@ -1427,20 +1592,14 @@ mod tests {
     #[test]
     fn create_table_with_primary_key() {
         let db = Db::new(8);
-        let table = db
-            .catalog
-            .create_table("users", users(), &["score", "id"])
-            .unwrap();
+        let table = db.create_table("users", users(), &["score", "id"]).unwrap();
         let [pkey] = db.catalog.table_indexes("users").try_into().unwrap();
         assert_eq!(pkey.name, "users_pkey");
         assert_eq!(pkey.kind, IndexKind::PrimaryKey);
         assert_eq!(pkey.table_oid, table.oid);
         assert_eq!(pkey.key_columns, vec![2, 0]);
 
-        let index = db
-            .catalog
-            .create_index("users_name", "users", &["name"])
-            .unwrap();
+        let index = db.create_index("users_name", "users", &["name"]).unwrap();
         assert_eq!(index.kind, IndexKind::Plain);
 
         let (pkey_before, index_before) = (described(&pkey), described(&index));
@@ -1464,9 +1623,8 @@ mod tests {
     fn create_table_with_unique_constraints() {
         let db = Db::new(8);
         // Taken already, so the first constraint's index gets a number.
-        db.catalog.create_table("other", users(), &[]).unwrap();
-        db.catalog
-            .create_index("users_name_key", "other", &["name"])
+        db.create_table("other", users(), &[]).unwrap();
+        db.create_index("users_name_key", "other", &["name"])
             .unwrap();
         let named = UniqueKey {
             name: Some("users_by_score".into()),
@@ -1477,8 +1635,7 @@ mod tests {
             unique(&["score", "id"], false),
             named,
         ];
-        db.catalog
-            .create_table_with_constraints("users", users(), &["id"], &[], &constraints)
+        db.create_table_with_constraints("users", users(), &["id"], &[], &constraints)
             .unwrap();
         let indexes = db.catalog.table_indexes("users");
         assert_eq!(
@@ -1537,8 +1694,7 @@ mod tests {
             unique(&["score", "name"], true),
             unique(&["name", "score"], true),
         ];
-        db.catalog
-            .create_table_with_constraints("users", users(), &["id"], &[], &constraints)
+        db.create_table_with_constraints("users", users(), &["id"], &[], &constraints)
             .unwrap();
         let indexes = db.catalog.table_indexes("users");
         assert_eq!(
@@ -1597,14 +1753,7 @@ mod tests {
             Column::new("id", DataType::Int, false),
             Column::new(&column, DataType::Int, false),
         ]);
-        db.catalog
-            .create_table_with_constraints(
-                &table,
-                schema,
-                &["id"],
-                &[],
-                &[unique(&[&column], true)],
-            )
+        db.create_table_with_constraints(&table, schema, &["id"], &[], &[unique(&[&column], true)])
             .unwrap();
         let indexes = db.catalog.table_indexes(&table);
         assert_eq!(
@@ -1619,10 +1768,8 @@ mod tests {
     #[test]
     fn create_table_rejects_bad_unique_constraints() {
         let db = Db::new(8);
-        let create = |constraint| {
-            db.catalog
-                .create_table_with_constraints("t", users(), &[], &[], &[constraint])
-        };
+        let create =
+            |constraint| db.create_table_with_constraints("t", users(), &[], &[], &[constraint]);
         assert!(matches!(
             create(unique(&["nope"], true)),
             Err(CatalogError::ColumnNotFound { column, .. }) if column == "nope"
@@ -1631,7 +1778,7 @@ mod tests {
             create(unique(&["id", "id"], true)),
             Err(CatalogError::DuplicateColumn(name)) if name == "id"
         ));
-        db.catalog.create_table("other", users(), &["id"]).unwrap();
+        db.create_table("other", users(), &["id"]).unwrap();
         let named = UniqueKey {
             name: Some("other_pkey".into()),
             ..unique(&["id"], true)
@@ -1646,15 +1793,12 @@ mod tests {
     #[test]
     fn create_unique_index() {
         let db = Db::new(8);
-        db.catalog.create_table("users", users(), &[]).unwrap();
+        db.create_table("users", users(), &[]).unwrap();
         let kind = IndexKind::Unique {
             nulls_distinct: false,
         };
         let index = db
-            .catalog
-            .create_index_with("users_name", "users", &["name"], kind, |_, _| {
-                Ok::<_, CatalogError>(())
-            })
+            .create_index_with("users_name", "users", &["name"], kind, |_, _| Ok(()))
             .unwrap();
         assert_eq!(index.kind, kind);
         assert_eq!(index.index.metadata().kind(), kind);
@@ -1667,11 +1811,8 @@ mod tests {
     fn identity_columns_get_sequences() {
         let db = Db::new(16);
         // Taken already, so the sequence of `id` gets a number.
-        db.catalog
-            .create_table("users_id_seq", users(), &[])
-            .unwrap();
+        db.create_table("users_id_seq", users(), &[]).unwrap();
         let table = db
-            .catalog
             .create_table_with_constraints("users", users(), &["id"], &["score", "id"], &[])
             .unwrap();
         let (id, score) = (table.identity(0).unwrap(), table.identity(2).unwrap());
@@ -1692,10 +1833,10 @@ mod tests {
         let names: Vec<_> = tables.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["users", "users_id_seq"]);
         assert!(matches!(
-            db.catalog.create_index("i", "users_score_seq", &["last_value"]),
+            db.create_index("i", "users_score_seq", &["last_value"]),
             Err(CatalogError::NotATable(name)) if name == "users_score_seq"
         ));
-        let plain = db.catalog.create_table("plain", users(), &[]).unwrap();
+        let plain = db.create_table("plain", users(), &[]).unwrap();
         assert!(plain.identity.is_empty());
     }
 
@@ -1703,7 +1844,6 @@ mod tests {
     fn sequences_pick_up_where_they_left_off_after_a_restart() {
         let db = Db::new(8);
         let table = db
-            .catalog
             .create_table_with_constraints("users", users(), &[], &["id"], &[])
             .unwrap();
         for expected in 1..=3 {
@@ -1734,46 +1874,57 @@ mod tests {
         let relation = db.catalog.get_table("users_id_seq").unwrap();
         assert_eq!(relation.oid, sequence_oid);
         assert_eq!(relation.kind, RelationKind::Sequence);
-        // Shutdown wrote the row as it was, so the first value after the
-        // restart was written ahead again.
+        // The first value after the restart was logged ahead again.
         let (_, row) = relation.heap.iter().unwrap().next().unwrap().unwrap();
         assert_eq!(
             row.decode(&relation.schema).unwrap(),
-            [Value::BigInt(4), Value::Int(32), Value::Bool(true)]
+            [Value::BigInt(36), Value::Int(0), Value::Bool(true)]
         );
     }
 
-    /// A crash loses the sequence's latest changes, but the values it handed
-    /// out were on disk first, so it skips values rather than reuse them.
+    /// A value reaches a committed row only after the record that logged
+    /// it ahead, so a crash skips values rather than hand out one that a
+    /// committed row holds.
     #[test]
-    fn a_crash_skips_sequence_values_rather_than_reusing_them() {
+    fn a_crash_never_hands_out_a_value_a_committed_row_holds() {
         let db = Db::new(8);
         let table = db
-            .catalog
             .create_table_with_constraints("users", users(), &[], &["id"], &[])
             .unwrap();
-        db.checkpoint();
         let next = |table: &TableInfo| table.identity(0).unwrap().next_value().unwrap();
+        let insert = |db: &Db, table: &TableInfo, id: i64| {
+            let row = [
+                Value::Int(id as i32),
+                Value::Null,
+                Value::BigInt(0),
+                Value::Bool(true),
+            ];
+            let txn = db.tm.begin();
+            txn.insert(
+                &table.heap,
+                &table.schema,
+                &Tuple::encode(&users(), &row).unwrap(),
+            )
+            .unwrap();
+            db.tm.commit(&txn).unwrap();
+        };
         for expected in 1..=5 {
             assert_eq!(next(&table), expected);
         }
+        insert(&db, &table, 5);
         drop(table);
         let db = db.crash();
         let table = db.catalog.get_table("users").unwrap();
-        // 1 went to disk as if 1 through 33 had been handed out.
+        // 1 was logged as if 1 through 33 had been handed out.
         assert_eq!(next(&table), 34);
-
-        // A checkpoint writes the row as it is, 37, and the next value goes
-        // to disk ahead again.
-        for expected in 35..=37 {
+        for expected in 35..=70 {
             assert_eq!(next(&table), expected);
         }
-        db.checkpoint();
-        assert_eq!(next(&table), 38);
+        insert(&db, &table, 70);
         drop(table);
         let db = db.crash();
         let table = db.catalog.get_table("users").unwrap();
-        assert_eq!(next(&table), 71);
+        assert_eq!(next(&table), 100);
     }
 
     #[test]
@@ -1786,18 +1937,16 @@ mod tests {
         ]);
         for column in ["maybe", "name"] {
             assert!(matches!(
-                db.catalog.create_table_with_constraints("t", schema.clone(), &[], &[column], &[]),
+                db.create_table_with_constraints("t", schema.clone(), &[], &[column], &[]),
                 Err(CatalogError::InvalidIdentity(name)) if name == column
             ));
         }
         assert!(matches!(
-            db.catalog
-                .create_table_with_constraints("t", schema.clone(), &[], &["nope"], &[]),
+            db.create_table_with_constraints("t", schema.clone(), &[], &["nope"], &[]),
             Err(CatalogError::ColumnNotFound { .. })
         ));
         assert!(matches!(
-            db.catalog
-                .create_table_with_constraints("t", schema, &[], &["id", "id"], &[]),
+            db.create_table_with_constraints("t", schema, &[], &["id", "id"], &[]),
             Err(CatalogError::DuplicateColumn(_))
         ));
     }
@@ -1806,15 +1955,15 @@ mod tests {
     fn create_table_rejects_bad_primary_keys() {
         let db = Db::new(8);
         assert!(matches!(
-            db.catalog.create_table("t", users(), &["nope"]),
+            db.create_table("t", users(), &["nope"]),
             Err(CatalogError::ColumnNotFound { column, .. }) if column == "nope"
         ));
         assert!(matches!(
-            db.catalog.create_table("t", users(), &["id", "id"]),
+            db.create_table("t", users(), &["id", "id"]),
             Err(CatalogError::DuplicateColumn(name)) if name == "id"
         ));
         assert!(matches!(
-            db.catalog.create_table("t", users(), &["name"]),
+            db.create_table("t", users(), &["name"]),
             Err(CatalogError::NullablePrimaryKey(name)) if name == "name"
         ));
         // Nothing was created by the failed attempts.
@@ -1824,33 +1973,27 @@ mod tests {
     #[test]
     fn a_taken_primary_key_name_gets_a_number() {
         let db = Db::new(8);
-        db.catalog.create_table("other", users(), &[]).unwrap();
-        db.catalog.create_index("t_pkey", "other", &["id"]).unwrap();
-        db.catalog.create_table("t", users(), &["id"]).unwrap();
+        db.create_table("other", users(), &[]).unwrap();
+        db.create_index("t_pkey", "other", &["id"]).unwrap();
+        db.create_table("t", users(), &["id"]).unwrap();
         assert_eq!(names(&db.catalog.table_indexes("t")), ["t_pkey1"]);
     }
 
     #[test]
     fn lists_indexes_of_a_table() {
         let db = Db::new(8);
-        db.catalog.create_table("users", users(), &[]).unwrap();
-        db.catalog.create_table("orders", users(), &[]).unwrap();
-        db.catalog
-            .create_index("users_id", "users", &["id"])
-            .unwrap();
-        db.catalog
-            .create_index("orders_id", "orders", &["id"])
-            .unwrap();
-        db.catalog
-            .create_index("users_name", "users", &["name"])
-            .unwrap();
+        db.create_table("users", users(), &[]).unwrap();
+        db.create_table("orders", users(), &[]).unwrap();
+        db.create_index("users_id", "users", &["id"]).unwrap();
+        db.create_index("orders_id", "orders", &["id"]).unwrap();
+        db.create_index("users_name", "users", &["name"]).unwrap();
 
         assert_eq!(
             names(&db.catalog.table_indexes("users")),
             ["users_id", "users_name"]
         );
         assert_eq!(names(&db.catalog.table_indexes("orders")), ["orders_id"]);
-        db.catalog.create_table("empty", users(), &[]).unwrap();
+        db.create_table("empty", users(), &[]).unwrap();
         assert!(db.catalog.table_indexes("empty").is_empty());
         assert!(db.catalog.table_indexes("missing").is_empty());
     }
@@ -1860,18 +2003,10 @@ mod tests {
     #[test]
     fn indexes_point_by_primary_key_on_tables_with_one() {
         let db = Db::new(16);
-        let users_oid = db
-            .catalog
-            .create_table("users", users(), &["id"])
-            .unwrap()
-            .oid;
-        let logs_oid = db.catalog.create_table("logs", users(), &[]).unwrap().oid;
-        db.catalog
-            .create_index("users_name", "users", &["name"])
-            .unwrap();
-        db.catalog
-            .create_index("logs_name", "logs", &["name"])
-            .unwrap();
+        let users_oid = db.create_table("users", users(), &["id"]).unwrap().oid;
+        let logs_oid = db.create_table("logs", users(), &[]).unwrap().oid;
+        db.create_index("users_name", "users", &["name"]).unwrap();
+        db.create_index("logs_name", "logs", &["name"]).unwrap();
 
         let check = |db: &Db| {
             let locator = |name| {
@@ -1891,36 +2026,12 @@ mod tests {
     }
 
     #[test]
-    fn next_tid_survives_restart() {
-        let db = Db::new(8);
-        assert_eq!(db.catalog.next_tid().unwrap(), 1);
-        db.catalog.set_next_tid(17).unwrap();
-        let db = db.restart();
-        assert_eq!(db.catalog.next_tid().unwrap(), 17);
-    }
-
-    #[test]
-    fn next_tid_never_goes_down() {
-        let db = Db::new(8);
-        db.catalog.set_next_tid(17).unwrap();
-        db.catalog.set_next_tid(12).unwrap();
-        assert_eq!(db.catalog.next_tid().unwrap(), 17);
-    }
-
-    #[test]
     fn survives_restart() {
         let db = Db::new(8);
-        let users_info = db.catalog.create_table("users", users(), &[]).unwrap();
-        let empty = db
-            .catalog
-            .create_table("empty", Schema::default(), &[])
-            .unwrap();
-        let users_id = db
-            .catalog
-            .create_index("users_id", "users", &["id"])
-            .unwrap();
+        let users_info = db.create_table("users", users(), &[]).unwrap();
+        let empty = db.create_table("empty", Schema::default(), &[]).unwrap();
+        let users_id = db.create_index("users_id", "users", &["id"]).unwrap();
         let users_name = db
-            .catalog
             .create_index("users_name_active", "users", &["name", "active"])
             .unwrap();
         let row = Tuple::encode(
@@ -1965,13 +2076,10 @@ mod tests {
         );
 
         // New objects get fresh oids and pages after the restart.
-        let orders = db.catalog.create_table("orders", users(), &[]).unwrap();
+        let orders = db.create_table("orders", users(), &[]).unwrap();
         assert!(orders.oid > empty_oid);
         assert!(orders.first_page_id() > users_name_page);
-        let orders_id = db
-            .catalog
-            .create_index("orders_id", "orders", &["id"])
-            .unwrap();
+        let orders_id = db.create_index("orders_id", "orders", &["id"]).unwrap();
         assert!(orders_id.oid > users_name_oid);
 
         let (orders_oid, orders_id_before) = (orders.oid, described(&orders_id));
@@ -1989,9 +2097,8 @@ mod tests {
         let db = Db::new(4);
         for i in 0..200 {
             let name = format!("table_{i}");
-            db.catalog.create_table(&name, users(), &[]).unwrap();
-            db.catalog
-                .create_index(&format!("{name}_id"), &name, &["id"])
+            db.create_table(&name, users(), &[]).unwrap();
+            db.create_index(&format!("{name}_id"), &name, &["id"])
                 .unwrap();
         }
         let db = db.restart();
@@ -2006,46 +2113,141 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rows_of_unfinished_creates_are_skipped() {
-        let db = Db::new(8);
-        // A create that wrote its columns but crashed before its table row.
-        let orphan_oid = db.catalog.state.read().next_table_oid;
-        db.catalog
-            .system
-            .insert_column(&ColumnRow {
-                table_oid: orphan_oid,
-                position: 0,
-                column: Column::new("x", DataType::Int, false),
-                sequence: None,
-            })
-            .unwrap();
-        // One that wrote an identity column's sequence but no table row.
-        let heap = sequence::create_heap(&db.catalog.bpm).unwrap();
-        db.catalog
-            .system
-            .insert_table(&TableRow {
-                oid: orphan_oid + 1,
-                name: "users_id_seq".into(),
-                first_page_id: heap.first_page_id(),
-                kind: RelationKind::Sequence,
-            })
-            .unwrap();
-        drop(heap);
+    /// Every page with a place in the db file, after writing every page.
+    fn allocated(db: &Db) -> std::collections::BTreeSet<PageId> {
+        db.checkpoint();
+        let disk = db.storage.bpm.disk_manager();
+        (0..disk.next_page_id())
+            .filter(|&page_id| disk.has_page(page_id))
+            .collect()
+    }
 
+    fn with_everything(db: &Db, txn: &Transaction, name: &str) -> Result<Arc<TableInfo>> {
+        let unique = [unique(&["name"], true)];
+        let schema = users();
+        db.catalog
+            .create_table_with_constraints(txn, name, schema, &["id"], &["score"], &unique)
+    }
+
+    /// An abort takes back a create whole: its rows, its storage, and its
+    /// entries in memory, so its names are free again.
+    #[test]
+    fn a_create_that_aborts_leaves_nothing() {
+        let db = Db::new(16);
+        let before = allocated(&db);
+        let txn = db.tm.begin();
+        let table = with_everything(&db, &txn, "users").unwrap();
+        assert!(db.catalog.get_table("users_score_seq").is_some());
+        db.tm.abort(&txn).unwrap();
+        drop((table, txn));
+        assert!(db.catalog.get_table("users").is_none());
+        assert!(db.catalog.get_table("users_score_seq").is_none());
+        assert!(db.catalog.get_index("users_pkey").is_none());
+        assert!(db.catalog.get_index("users_name_key").is_none());
+        assert_eq!(allocated(&db), before, "pages the abort did not free");
+
+        let txn = db.tm.begin();
+        let table = with_everything(&db, &txn, "users").unwrap();
+        db.tm.commit(&txn).unwrap();
+        let oid = table.oid;
+        drop((table, txn));
         let db = db.restart();
-        assert!(db.catalog.get_table_by_oid(orphan_oid).is_none());
-        assert!(db.catalog.get_table("users_id_seq").is_none());
+        let table = db.catalog.get_table("users").unwrap();
+        assert_eq!(table.oid, oid);
+        assert_eq!(table.identity(2).unwrap().next_value().unwrap(), 1);
+        assert_eq!(
+            names(&db.catalog.table_indexes("users")),
+            ["users_pkey", "users_name_key"]
+        );
+    }
+
+    /// A create whose commit is not in the log when a crash comes leaves
+    /// nothing after recovery, though its records are.
+    #[test]
+    fn a_crash_before_a_creates_commit_leaves_nothing() {
+        let db = Db::new(16);
+        let before = allocated(&db);
+        db.create_table("t", users(), &[]).unwrap();
+        let txn = db.tm.begin();
+        drop(with_everything(&db, &txn, "users").unwrap());
+        db.catalog
+            .create_index(&txn, "t_name", "t", &["name"])
+            .unwrap();
+        db.storage.bpm.log().flush_all().unwrap();
+        let crashed = db.crash_copy();
+        db.tm.abort(&txn).unwrap();
+        let db = crashed;
+        assert!(db.catalog.get_table("users").is_none());
+        assert!(db.catalog.get_table("users_score_seq").is_none());
+        assert!(db.catalog.table_indexes("t").is_empty());
+        let t = db.catalog.get_table("t").unwrap();
+        let mut expected = before;
+        expected.extend(t.heap.page_ids().unwrap());
+        drop(t);
+        assert_eq!(allocated(&db), expected, "pages recovery did not free");
+        db.create_table_with_constraints("users", users(), &["id"], &["score"], &[])
+            .unwrap();
+        db.create_index("t_name", "t", &["name"]).unwrap();
+    }
+
+    /// A build that fails after splitting its tree frees every page of it.
+    #[test]
+    fn a_fill_that_fails_frees_the_tree_it_grew() {
+        let db = Db::new(16);
+        db.create_table("users", users(), &[]).unwrap();
+        let before = allocated(&db);
+        let failed = db.create_index_with(
+            "users_id",
+            "users",
+            &["id"],
+            IndexKind::Plain,
+            |_, index| {
+                for id in 0..2000 {
+                    let key = Tuple::encode(
+                        &Schema::new(vec![users().columns()[0].clone()]),
+                        &[Value::Int(id)],
+                    )?;
+                    let rid = common::Rid::new(0, id as u16);
+                    index.insert_entry(
+                        &key,
+                        &storage::index::RowLocator::Rid(rid),
+                        Logged::System,
+                    )?;
+                }
+                let Index::BtreeIndex(btree) = &**index;
+                assert!(
+                    btree.tree().page_ids().unwrap().len() > 3,
+                    "the tree never split"
+                );
+                Err(CatalogError::Corrupt("fill failed".to_owned()))
+            },
+        );
+        assert!(failed.is_err());
+        assert_eq!(allocated(&db), before, "pages of the failed build");
+    }
+
+    /// A rolled-back RESTART IDENTITY puts the sequence back, and the next
+    /// value goes on past every row's, not from what the truncate's own
+    /// inserts took.
+    #[test]
+    fn a_rolled_back_restart_goes_on_past_every_row() {
+        let db = Db::new(16);
         let table = db
-            .catalog
             .create_table_with_constraints("users", users(), &[], &["id"], &[])
             .unwrap();
-        assert!(table.oid > orphan_oid + 1);
-        assert_eq!(table.identity(0).unwrap().name, "users_id_seq");
-
-        drop(table);
-        let db = db.restart();
-        assert_eq!(db.catalog.get_table("users").unwrap().schema, users());
+        let sequence = Arc::clone(table.identity(0).unwrap());
+        for expected in 1..=10 {
+            assert_eq!(sequence.next_value().unwrap(), expected);
+        }
+        let txn = db.tm.begin();
+        db.catalog
+            .lock_table(&txn, table.oid, LockMode::AccessExclusive)
+            .unwrap();
+        db.catalog.truncate(&txn, table.oid, true).unwrap();
+        assert_eq!(sequence.next_value().unwrap(), 1);
+        assert_eq!(sequence.next_value().unwrap(), 2);
+        db.tm.abort(&txn).unwrap();
+        assert!(sequence.next_value().unwrap() > 10);
     }
 
     #[test]

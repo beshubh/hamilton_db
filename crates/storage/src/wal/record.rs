@@ -255,19 +255,21 @@ pub enum Undo<'a> {
     /// Remove `entry`, if it is there, from the B+ tree whose header page
     /// is `header`.
     IndexEntry { header: PageId, entry: &'a [u8] },
-    /// A truncate gave a table the storage `new` in place of `old`. Undo
-    /// frees every page of `new`; finishing the commit frees `old`'s.
+    /// A truncate gave a table the storage `new` in place of `old`, each
+    /// its heap's first page, then its trees' header pages. Undo frees
+    /// every page of `new`; finishing the commit frees `old`'s.
     Truncate { old: Roots<'a>, new: Roots<'a> },
+    /// A create made new heaps and trees, given by their first and header
+    /// pages. Undo frees every page of them.
+    Create { heaps: Roots<'a>, trees: Roots<'a> },
 }
 
-/// Where a table's storage starts: the first page of its heap, then the
-/// header page of each of its indexes' B+ trees. The rest of its pages
-/// are reached from these.
+/// Pages that some storage starts at: the first page of a heap or the
+/// header page of a B+ tree. The rest of its pages are reached from these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Roots<'a>(&'a [u8]);
 
 impl<'a> Roots<'a> {
-    /// The heap's first page, then the trees' header pages.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = PageId> + 'a {
         self.0
             .chunks_exact(size_of::<PageId>())
@@ -289,6 +291,7 @@ pub enum Before<'a> {
 const UNDO_HEAP: u8 = 1;
 const UNDO_INDEX_ENTRY: u8 = 2;
 const UNDO_TRUNCATE: u8 = 3;
+const UNDO_CREATE: u8 = 4;
 const BEFORE_INSERTED: u8 = 1;
 const BEFORE_META: u8 = 2;
 const BEFORE_TUPLE: u8 = 3;
@@ -301,6 +304,7 @@ impl<'a> Undo<'a> {
     /// heap          1 | page_id i32 | slot u16 | keep_len u16 | before
     /// index entry   2 | header i32 | len u16 | entry
     /// truncate      3 | num u16 | old page_id i32 * num | new page_id i32 * num
+    /// create        4 | num_heaps u16 | num_trees u16 | page_id i32 * (num_heaps + num_trees)
     ///
     /// before: 1 (inserted) | 2 meta | 3 meta len u16 payload
     /// ```
@@ -340,6 +344,28 @@ impl<'a> Undo<'a> {
                 buf.extend_from_slice(entry);
             }
             Self::Truncate { old, new } => Self::encode_truncate(buf, old.iter(), new.iter()),
+            Self::Create { heaps, trees } => Self::encode_create(buf, heaps.iter(), trees.iter()),
+        }
+    }
+
+    /// Appends a `Create` of the heaps starting at `heaps` and the trees
+    /// whose header pages are `trees`.
+    ///
+    /// # Panics
+    /// If both are empty.
+    pub(crate) fn encode_create(
+        buf: &mut Vec<u8>,
+        heaps: impl ExactSizeIterator<Item = PageId>,
+        trees: impl ExactSizeIterator<Item = PageId>,
+    ) {
+        assert!(heaps.len() + trees.len() > 0, "a create makes storage");
+        buf.push(UNDO_CREATE);
+        for num in [heaps.len(), trees.len()] {
+            let num = u16::try_from(num).expect("a create makes few pages");
+            buf.extend_from_slice(&num.to_le_bytes());
+        }
+        for page_id in heaps.chain(trees) {
+            buf.extend_from_slice(&page_id.to_le_bytes());
         }
     }
 
@@ -410,6 +436,17 @@ impl<'a> Undo<'a> {
                 Self::Truncate {
                     old: Roots(r.bytes(len)?),
                     new: Roots(r.bytes(len)?),
+                }
+            }
+            UNDO_CREATE => {
+                let heaps = usize::from(r.u16()?) * size_of::<PageId>();
+                let trees = usize::from(r.u16()?) * size_of::<PageId>();
+                if heaps + trees == 0 {
+                    return Err(corrupt_undo(UNDO_CREATE));
+                }
+                Self::Create {
+                    heaps: Roots(r.bytes(heaps)?),
+                    trees: Roots(r.bytes(trees)?),
                 }
             }
             other => return Err(corrupt_undo(other)),

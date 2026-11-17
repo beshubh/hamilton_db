@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use common::{Lsn, PageId};
+use common::{FIRST_TXN_ID, Lsn, PageId, TxnId};
 use parking_lot::{Condvar, Mutex};
 
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
@@ -25,6 +25,8 @@ pub(crate) struct Checkpoint {
     /// Above every page id the saved directory and the log before
     /// `start_lsn` name.
     pub next_page_id: PageId,
+    /// Above the Tid of every record before `start_lsn`.
+    pub next_tid: TxnId,
     /// Pages whose changes may not be on disk, each with the first record
     /// that changed it since it was last written.
     pub dirty: Vec<(PageId, Lsn)>,
@@ -52,14 +54,15 @@ impl Checkpoint {
                 start_lsn: end,
                 redo_lsn: end,
                 next_page_id: 0,
+                next_tid: FIRST_TXN_ID,
                 dirty: Vec::new(),
                 att: Att::default(),
             });
         }
         let corrupt = || StorageError::CorruptMetadata("bad checkpoint".into());
-        let (head, rest) = bytes.split_at_checked(24).ok_or_else(corrupt)?;
+        let (head, rest) = bytes.split_at_checked(HEAD).ok_or_else(corrupt)?;
         let u64_at = |at: usize| u64::from_le_bytes(head[at..at + 8].try_into().unwrap());
-        let num_dirty = u32::from_le_bytes(head[20..24].try_into().unwrap()) as usize;
+        let num_dirty = u32::from_le_bytes(head[28..32].try_into().unwrap()) as usize;
         let (entries, rest) = rest
             .split_at_checked(num_dirty * DIRTY_ENTRY)
             .ok_or_else(corrupt)?;
@@ -77,20 +80,22 @@ impl Checkpoint {
         Ok(Self {
             start_lsn: u64_at(0),
             redo_lsn: u64_at(8),
-            next_page_id: PageId::from_le_bytes(head[16..20].try_into().unwrap()),
+            next_tid: u64_at(16),
+            next_page_id: PageId::from_le_bytes(head[24..28].try_into().unwrap()),
             dirty,
             att,
         })
     }
 
     /// Lays the checkpoint out as `start_lsn: u64, redo_lsn: u64,
-    /// next_page_id: i32, num_dirty: u32, (page_id: i32, rec_lsn: u64)*,
-    /// att`, all little-endian, the transaction table as `Att::encode` lays
-    /// it out.
+    /// next_tid: u64, next_page_id: i32, num_dirty: u32, (page_id: i32,
+    /// rec_lsn: u64)*, att`, all little-endian, the transaction table as
+    /// `Att::encode` lays it out.
     fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(24 + self.dirty.len() * DIRTY_ENTRY);
+        let mut bytes = Vec::with_capacity(HEAD + self.dirty.len() * DIRTY_ENTRY);
         bytes.extend_from_slice(&self.start_lsn.to_le_bytes());
         bytes.extend_from_slice(&self.redo_lsn.to_le_bytes());
+        bytes.extend_from_slice(&self.next_tid.to_le_bytes());
         bytes.extend_from_slice(&self.next_page_id.to_le_bytes());
         bytes.extend_from_slice(&(self.dirty.len() as u32).to_le_bytes());
         for &(page_id, rec_lsn) in &self.dirty {
@@ -102,6 +107,8 @@ impl Checkpoint {
     }
 }
 
+/// Bytes before the dirty pages.
+const HEAD: usize = 32;
 const DIRTY_ENTRY: usize = 12;
 
 /// What checkpoints keep between them. The buffer pool holds it.
@@ -155,9 +162,9 @@ fn take(bpm: &BufferPoolManager, last_start: &mut Lsn) -> Result<Checkpoint> {
     // change after `start_lsn`, logged whole: redo never reads a page from
     // disk. A free logged before `start_lsn` and applied after the
     // directory copy is still pending, so redo reads from it.
-    let (start_lsn, att, dirty, pending_free) = log.at_end(|end, att| {
+    let (start_lsn, att, next_tid, dirty, pending_free) = log.at_end(|end, att, next_tid| {
         let pending_free = bpm.checkpoints().oldest_pending_free();
-        (end, att.clone(), bpm.dirty_pages(), pending_free)
+        (end, att.clone(), next_tid, bpm.dirty_pages(), pending_free)
     });
     // Frames are scanned before the directory is copied. A page the scan
     // finds clean finished its write, and a first write's slot is in the
@@ -179,6 +186,7 @@ fn take(bpm: &BufferPoolManager, last_start: &mut Lsn) -> Result<Checkpoint> {
         start_lsn,
         redo_lsn,
         next_page_id,
+        next_tid,
         dirty,
         att,
     };

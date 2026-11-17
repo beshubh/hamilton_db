@@ -24,8 +24,9 @@ use crate::wal::txn_log::{self, TxnLog};
 use crate::wal::when_a_frame_is_free;
 
 /// Rolls back a running transaction: logs its `Abort`, undoes its changes,
-/// newest first, and logs its `End`. Returns the tuples it inserted, now
-/// deleted at `ts` 0 for garbage collection to reclaim. A transaction with
+/// newest first, and logs its `End`. Returns the tuples of its write set
+/// it inserted, now deleted at `ts` 0 for garbage collection to reclaim.
+/// Catalog rows it wrote (`undoable`) are not among them. A transaction with
 /// no records logs nothing.
 pub(crate) fn rollback(txn: &TxnLog) -> Result<Vec<Rid>> {
     let mut walk = Walk::default();
@@ -104,10 +105,12 @@ impl Walk {
                     }
                     Undo::Truncate { new, .. } => {
                         let new: Vec<PageId> = new.iter().collect();
-                        for header in &new[1..] {
-                            self.trees.remove(header);
-                        }
-                        txn_log::free_storage(txn.bpm(), by, &new)?;
+                        free(&mut self.trees, txn, by, &new[..1], &new[1..])?;
+                    }
+                    Undo::Create { heaps, trees } => {
+                        let heaps: Vec<PageId> = heaps.iter().collect();
+                        let trees: Vec<PageId> = trees.iter().collect();
+                        free(&mut self.trees, txn, by, &heaps, &trees)?;
                     }
                 }
                 Ok(record.prev_lsn)
@@ -118,6 +121,20 @@ impl Walk {
             }
         }
     }
+}
+
+/// Frees new storage that `txn` made, closing its trees among `open`.
+fn free(
+    open: &mut HashMap<PageId, Btree<EntryComparator>, IntKeys>,
+    txn: &TxnLog,
+    by: Logged<'_>,
+    heaps: &[PageId],
+    trees: &[PageId],
+) -> Result<()> {
+    for header in trees {
+        open.remove(header);
+    }
+    txn_log::free_storage(txn.bpm(), by, heaps, trees)
 }
 
 /// The tree whose header page is `header`, opened from its header alone.

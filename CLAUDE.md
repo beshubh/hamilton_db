@@ -10,7 +10,7 @@ Hamilton DB is a relational OLTP DBMS built in rust, that speaks postgres dialec
 
 # How does it works  
 - `hamilton-server` owns the database files and serves them on port 6942; `hamilton-cli` is only a client and never opens files. Only one process can have a database open: a second gets "already open in another process".
-- To start the server fresh (or after bumping the catalog `VERSION`), stop it and delete all the database files: `<name>.db`, `<name>.meta` and the log segments `<name>.log.*`. Deleting only the `.db` leaves a stale `.meta` that claims pages exist, and opening fails with "page 0 is not a catalog header page".
+- To start the server fresh (or after bumping a format version: the catalog's `VERSION`, the `.meta` file's `META_VERSION` or the log's `VERSION`), stop it and delete all the database files: `<name>.db`, `<name>.meta` and the log segments `<name>.log.*`. Deleting only the `.db` leaves a stale `.meta` that claims pages exist, and opening fails with "page 0 is not a catalog header page".
 
 ## A small glossary
  - **you** means the agent reading this file and chaning HamiltonDB

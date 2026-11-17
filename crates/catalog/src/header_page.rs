@@ -1,12 +1,11 @@
-//! Page 0 of the database, which locates the system catalog and keeps the
-//! next transaction id.
+//! Page 0 of the database, which locates the system catalog.
 //!
 //! ```text
 //! +----------------------------------------------------------------+
 //! | PageHeader (lsn, checksum, page_type)                     16 B |
 //! | CatalogHeader (magic, version, first page of each system       |
-//! |                table: tables, columns, indexes, index_columns, |
-//! |                next_tid)                                  36 B |
+//! |                table: tables, columns, indexes,                |
+//! |                index_columns)                             28 B |
 //! +----------------------------------------------------------------+
 //! |                            unused                              |
 //! +----------------------------------------------------------------+
@@ -14,7 +13,7 @@
 //!
 //! All multi-byte fields are little-endian and unaligned.
 
-use common::{PageId, TxnId};
+use common::PageId;
 use storage::page::PAGE_SIZE;
 use storage::page::page_header::{PageHeader, PageType};
 use zerocopy::byteorder::little_endian::{I32, U32, U64};
@@ -34,11 +33,9 @@ const MAGIC: u64 = u64::from_le_bytes(*b"HAMDBCAT");
 /// they are identity columns. 7: indexes record their kind, which says
 /// whether they are unique. 8: sequences are relations, and identity columns
 /// record theirs. 9: B+ tree headers record how their keys are ordered.
-const VERSION: u32 = 9;
-
-/// The Tid a new database's first transaction gets. 0 is `INVALID_TXN_ID`,
-/// the `ts` of rows written outside transactions.
-const FIRST_TID: TxnId = 1;
+/// 10: the next transaction id moved to the checkpoint, and a sequence's
+/// row holds the value it logged ahead.
+const VERSION: u32 = 10;
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
@@ -49,11 +46,9 @@ struct CatalogHeader {
     columns: I32,
     indexes: I32,
     index_columns: I32,
-    /// Above the `ts` of every committed version on disk; see `watermark`.
-    next_tid: U64,
 }
 
-const _: () = assert!(size_of::<CatalogHeader>() == 36);
+const _: () = assert!(size_of::<CatalogHeader>() == 28);
 
 /// The first page of each system table's heap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +71,6 @@ impl SystemTableRoots {
             columns: self.columns.into(),
             indexes: self.indexes.into(),
             index_columns: self.index_columns.into(),
-            next_tid: FIRST_TID.into(),
         };
         header
             .write_to_prefix(&mut data[PageHeader::SIZE..])
@@ -108,19 +102,6 @@ impl SystemTableRoots {
     }
 }
 
-/// The next Tid recorded in `data`, a catalog header page `read_from` has
-/// accepted.
-pub fn read_next_tid(data: &[u8; PAGE_SIZE]) -> TxnId {
-    let (header, _) = CatalogHeader::ref_from_prefix(&data[PageHeader::SIZE..]).unwrap();
-    header.next_tid.get()
-}
-
-/// Records `tid` as the next Tid in `data`, a catalog header page.
-pub fn write_next_tid(data: &mut [u8; PAGE_SIZE], tid: TxnId) {
-    let (header, _) = CatalogHeader::mut_from_prefix(&mut data[PageHeader::SIZE..]).unwrap();
-    header.next_tid = tid.into();
-}
-
 fn corrupt(msg: impl Into<String>) -> CatalogError {
     CatalogError::Corrupt(msg.into())
 }
@@ -140,11 +121,6 @@ mod tests {
         };
         let mut buf = PageBuf::zeroed();
         roots.write_to(&mut buf);
-        assert_eq!(SystemTableRoots::read_from(&buf).unwrap(), roots);
-        assert_eq!(read_next_tid(&buf), FIRST_TID);
-
-        write_next_tid(&mut buf, 42);
-        assert_eq!(read_next_tid(&buf), 42);
         assert_eq!(SystemTableRoots::read_from(&buf).unwrap(), roots);
     }
 

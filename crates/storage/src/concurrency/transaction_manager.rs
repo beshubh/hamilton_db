@@ -76,10 +76,12 @@ struct Passes {
 }
 
 impl TransactionManager {
-    /// A manager of transactions on the database behind `bpm`, whose first
-    /// gets Tid `next_tid`, with its collector thread started. `next_tid`
-    /// must be above every Tid in the log. See `Watermark::new`.
-    pub fn new(bpm: Arc<BufferPoolManager>, next_tid: TxnId) -> Self {
+    /// A manager of transactions on the database behind `bpm`, with its
+    /// collector thread started. Its first Tid is above every Tid in the
+    /// log (`Log::next_tid`), so it never takes a crashed transaction's rows
+    /// for its own.
+    pub fn new(bpm: Arc<BufferPoolManager>) -> Self {
+        let next_tid = bpm.log().next_tid();
         let shared = Arc::new(Shared {
             bpm,
             watermark: Arc::new(Watermark::new(next_tid)),
@@ -180,8 +182,7 @@ impl TransactionManager {
         garbage.values().map(|garbage| garbage.tuples.len()).sum()
     }
 
-    /// The Tid the next transaction will get. Saved across restarts so that
-    /// it never goes below a committed `ts` on disk; see `watermark`.
+    /// The Tid the next transaction will get.
     pub fn next_tid(&self) -> TxnId {
         self.shared.watermark.next()
     }

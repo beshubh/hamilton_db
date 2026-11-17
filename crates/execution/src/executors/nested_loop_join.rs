@@ -541,10 +541,7 @@ mod tests {
             Column::new("id", DataType::Int, false),
             Column::new("label", DataType::Varchar(32), false),
         ]);
-        let items = db
-            .catalog()
-            .create_table("items", schema.clone(), &[])
-            .unwrap();
+        let items = db.create_table("items", schema.clone(), &[]);
         let rows = (1..=n)
             .map(|id| {
                 let label = format!("{id:0>32}");

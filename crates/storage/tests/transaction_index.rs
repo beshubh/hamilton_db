@@ -64,7 +64,7 @@ fn setup_with(by_name: IndexKind) -> Db {
     );
     let heap = Arc::new(TableHeap::create(Arc::clone(&bpm)).unwrap());
     let table = Arc::new(IndexedTable::new(heap, schema(), Some(Arc::clone(&pkey))));
-    let tm = TransactionManager::new(Arc::clone(&bpm), 1);
+    let tm = TransactionManager::new(Arc::clone(&bpm));
     Db {
         _dir: dir,
         bpm,

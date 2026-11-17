@@ -213,12 +213,9 @@ mod tests {
     /// An `orders (user_id INT, item VARCHAR(32))` table with an index
     /// `orders_<key>` on the `key` columns, holding `rows`.
     fn create_orders(db: &Db, key: &[&str], rows: &[(Option<i32>, &str)]) -> Inner {
-        let table = db
-            .catalog()
-            .create_table("orders", orders_schema(), &[])
-            .unwrap();
+        let table = db.create_table("orders", orders_schema(), &[]);
         let name = format!("orders_{}", key.join("_"));
-        let index = db.catalog().create_index(&name, "orders", key).unwrap();
+        let index = db.create_index(&name, "orders", key);
         let rows = rows
             .iter()
             .map(|&(user_id, item)| {

@@ -45,6 +45,7 @@ impl Executor for CreateTableExecutor {
                 self.plan.primary_key().iter().map(String::as_str).collect();
             let identity: Vec<&str> = self.plan.identity().iter().map(String::as_str).collect();
             self.ctx.catalog().create_table_with_constraints(
+                self.ctx.txn(),
                 self.plan.table_name(),
                 self.plan.table_schema().clone(),
                 &primary_key,

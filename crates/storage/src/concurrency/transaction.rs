@@ -18,9 +18,10 @@
 //! or `Abort` is logged, a failure stops the process, and recovery
 //! finishes the transaction from the log.
 //!
-//! A truncate gives a table new storage in the transaction (`truncate`).
-//! Its abort frees the new storage; its commit frees the old once no
-//! reader needs it, and logs `End` only then.
+//! A truncate gives a table new storage in the transaction (`truncate`),
+//! and CREATE TABLE and CREATE INDEX make theirs in it (`create_table`,
+//! `create_index`). An abort frees the new storage; a truncate's commit
+//! frees the old once no reader needs it, and logs `End` only then.
 //!
 //! Index entries are added at once and never removed by a write: the
 //! entries a transaction's writes leave behind are retired, and garbage
@@ -46,13 +47,13 @@ use crate::concurrency::read_ts::ReadTimestamps;
 use crate::concurrency::watermark::Watermark;
 use crate::error::{Result, StorageError};
 use crate::index::btree_index::BtreeIndex;
-use crate::index::{Index, IndexTrait, LocatorKind, RowLocator};
+use crate::index::{Index, IndexMetadata, IndexTrait, LocatorKind, RowLocator};
 use crate::table::table_heap::TableHeap;
 use crate::table::table_iterator::{TableIterator, TableRow};
 use crate::table::table_page::TupleMeta;
 use crate::table::undo_log::UndoLog;
 use crate::wal::txn_log::{self, TxnLog};
-use crate::wal::{Logged, MtrPage, NoUnwind, PageOp, fatal, undo};
+use crate::wal::{Logged, Mtr, MtrPage, NoUnwind, PageOp, fatal, undo};
 
 /// What an ended transaction leaves for garbage collection: the tuples it
 /// left deleted and the index entries it retired. `built` holds the entries
@@ -125,18 +126,15 @@ pub struct Transaction {
     built: Mutex<Vec<TableEntry>>,
     /// See `on_end`.
     on_end: Mutex<Vec<EndHook>>,
-    /// See `truncate`.
-    truncates: Mutex<Vec<Truncated>>,
+    /// The storage each truncate replaced, its heap's first page, then its
+    /// trees' header pages, which the commit frees.
+    replaced: Mutex<Vec<Vec<PageId>>>,
+    /// The first page of each heap and the header page of each tree this
+    /// transaction made, which an abort frees.
+    made: Mutex<Vec<PageId>>,
 }
 
 type EndHook = Box<dyn FnOnce(TransactionState) + Send>;
-
-/// A table's storage before and after one of the transaction's truncates,
-/// each its heap's first page, then its trees' header pages.
-struct Truncated {
-    old: Vec<PageId>,
-    new: Vec<PageId>,
-}
 
 /// The tuples a transaction wrote in one table, keyed by the table's first
 /// page, each with the payload length its commit keeps: the length of the
@@ -168,7 +166,8 @@ impl Transaction {
             retired: Mutex::new(Vec::new()),
             built: Mutex::new(Vec::new()),
             on_end: Mutex::new(Vec::new()),
-            truncates: Mutex::new(Vec::new()),
+            replaced: Mutex::new(Vec::new()),
+            made: Mutex::new(Vec::new()),
         }
     }
 
@@ -212,37 +211,75 @@ impl Transaction {
         indexes: &[Arc<Index>],
     ) -> Result<(TableHeap, Vec<Index>)> {
         let _running = self.running()?;
-        let bpm = self.log.bpm();
-        let header = |index: &Index| {
-            let Index::BtreeIndex(btree) = index;
-            btree.tree().header_page_id()
-        };
         let old: Vec<PageId> = std::iter::once(heap.first_page_id())
-            .chain(indexes.iter().map(|index| header(index)))
+            .chain(indexes.iter().map(|index| header_page_id(index)))
             .collect();
+        let metadata: Vec<&IndexMetadata> = indexes.iter().map(|index| index.metadata()).collect();
+        let (heap, trees) = self.make(true, &metadata, |mtr, new| mtr.undo_truncate(&old, new))?;
+        self.replaced.lock().push(old);
+        Ok((heap.expect("made with a heap"), trees))
+    }
+
+    /// Makes the storage of a new table in this transaction: an empty heap
+    /// and an empty tree for each of `indexes`, in one record so none is
+    /// left without a transaction to free it. An abort, or a crash before
+    /// the commit, frees all of it.
+    pub fn create_table(&self, indexes: &[&IndexMetadata]) -> Result<(TableHeap, Vec<Index>)> {
+        let _running = self.running()?;
+        let (heap, trees) = self.make(true, indexes, |mtr, new| {
+            mtr.undo_create(&new[..1], &new[1..]);
+        })?;
+        Ok((heap.expect("made with a heap"), trees))
+    }
+
+    /// Makes an empty tree for a new index in this transaction, which an
+    /// abort, or a crash before the commit, frees with every page it grew.
+    pub fn create_index(&self, metadata: &IndexMetadata) -> Result<Index> {
+        let _running = self.running()?;
+        let (_, mut trees) = self.make(false, &[metadata], |mtr, new| mtr.undo_create(&[], new))?;
+        Ok(trees.remove(0))
+    }
+
+    /// Makes an empty heap, if `heap`, and an empty tree for each of
+    /// `indexes`, in one mtr whose undo `undo` logs, given the new roots,
+    /// the heap's first page first. The caller holds `running`.
+    fn make(
+        &self,
+        heap: bool,
+        indexes: &[&IndexMetadata],
+        undo: impl FnOnce(&Mtr<'_>, &[PageId]),
+    ) -> Result<(Option<TableHeap>, Vec<Index>)> {
+        let bpm = self.log.bpm();
+        let heaps = usize::from(heap);
         let new = {
             let mtr = bpm.mtr(self.logged());
             // Latched before any change: the record has all of the new
             // storage or none.
-            let mut pages = (0..old.len())
+            let mut pages = (0..heaps + indexes.len())
                 .map(|_| mtr.new_page())
                 .collect::<Result<Vec<_>>>()?;
             let new: Vec<PageId> = pages.iter().map(MtrPage::page_id).collect();
-            mtr.undo_truncate(&old, &new);
-            let (heap_page, headers) = pages.split_first_mut().expect("a table has a heap");
-            heap_page.apply(PageOp::HeapInit)?;
-            for (page, index) in headers.iter_mut().zip(indexes) {
-                BtreeIndex::format_header(page.raw_mut(), index.metadata());
+            undo(&mtr, &new);
+            let (heap_pages, headers) = pages.split_at_mut(heaps);
+            for page in heap_pages {
+                page.apply(PageOp::HeapInit)?;
+            }
+            for (page, metadata) in headers.iter_mut().zip(indexes) {
+                BtreeIndex::format_header(page.raw_mut(), metadata);
             }
             new
         };
-        let heap = TableHeap::open(Arc::clone(bpm), new[0]);
-        let trees = indexes.iter().zip(&new[1..]).map(|(index, &header)| {
-            BtreeIndex::new(index.metadata().clone(), header, Arc::clone(bpm)).map(Index::from)
-        });
-        let trees = trees.collect::<Result<Vec<_>>>();
-        self.truncates.lock().push(Truncated { old, new });
-        Ok((heap?, trees?))
+        self.made.lock().extend_from_slice(&new);
+        let heap = heap
+            .then(|| TableHeap::open(Arc::clone(bpm), new[0]))
+            .transpose()?;
+        let trees = indexes
+            .iter()
+            .zip(&new[heaps..])
+            .map(|(metadata, &header)| {
+                BtreeIndex::new((*metadata).clone(), header, Arc::clone(bpm)).map(Index::from)
+            });
+        Ok((heap, trees.collect::<Result<_>>()?))
     }
 
     /// Inserts `tuple`, locked until the transaction ends, and returns its
@@ -473,13 +510,12 @@ impl Transaction {
         // running for a caller to end the other way.
         let _ending = NoUnwind("ending a transaction");
         let mut garbage = Garbage::default();
-        garbage.built.append(&mut self.built.lock());
         let write_set = mem::take(&mut *self.write_set.lock());
-        let truncates = mem::take(&mut *self.truncates.lock());
+        let replaced = mem::take(&mut *self.replaced.lock());
         let committed = match outcome {
             TransactionState::Committed => self.commit_writes(write_set, &mut garbage),
             TransactionState::Aborted => {
-                self.roll_back_writes(write_set, &truncates, &mut garbage);
+                self.roll_back_writes(write_set, &mut garbage);
                 false
             }
             TransactionState::Running => unreachable!("a transaction ends running"),
@@ -487,9 +523,9 @@ impl Transaction {
         let hooks = mem::take(&mut *self.on_end.lock());
         hooks.into_iter().rev().for_each(|hook| hook(outcome));
         if committed {
-            match truncates.is_empty() {
+            match replaced.is_empty() {
                 true => self.log.end(),
-                false => garbage.deferred.push(self.free_replaced(truncates)),
+                false => garbage.deferred.push(self.free_replaced(replaced)),
             }
         }
         *state = outcome;
@@ -499,14 +535,14 @@ impl Transaction {
     /// The end of a commit that truncated, for once no reader needs the
     /// storage its truncates replaced: frees that storage, then logs `End`.
     /// If freeing fails, the pages stay until recovery frees them.
-    fn free_replaced(&self, truncates: Vec<Truncated>) -> Box<dyn FnOnce() + Send> {
+    fn free_replaced(&self, replaced: Vec<Vec<PageId>>) -> Box<dyn FnOnce() + Send> {
         let txn = TxnLog::new(self.tid, Arc::clone(self.log.bpm()));
         Box::new(move || {
-            for Truncated { old, .. } in &truncates {
+            for old in &replaced {
                 let by = Logged::Completion(&txn);
                 // Recovery frees it instead. Returning would leave the frees
                 // out of commit order, which recovery's stamping relies on.
-                if let Err(e) = txn_log::free_storage(txn.bpm(), by, old) {
+                if let Err(e) = txn_log::free_storage(txn.bpm(), by, &old[..1], &old[1..]) {
                     fatal(format_args!(
                         "cannot free the storage transaction {} truncated: {e}",
                         txn.tid()
@@ -527,6 +563,7 @@ impl Transaction {
     ) -> bool {
         self.found.lock().clear();
         garbage.entries.append(&mut self.retired.lock());
+        garbage.built.append(&mut self.built.lock());
         if !self.log.commit() {
             debug_assert!(write_set.is_empty(), "writes that logged nothing");
             return false;
@@ -547,19 +584,25 @@ impl Transaction {
 
     /// Takes back every write the log holds, including the index entries
     /// added. The ones found already there may still be needed by others,
-    /// so they become garbage, unless they are in storage of `truncates`,
-    /// which undo frees whole.
+    /// so they become garbage, as do an index build's, unless they are in
+    /// storage this transaction made, which undo frees whole.
     fn roll_back_writes(
         &self,
         write_set: HashMap<PageId, TableWrites, IntKeys>,
-        truncates: &[Truncated],
         garbage: &mut Garbage,
     ) {
-        let freed = |heap: &TableHeap| truncates.iter().any(|t| t.new[0] == heap.first_page_id());
+        let made = mem::take(&mut *self.made.lock());
+        let freed = |heap: &TableHeap| made.contains(&heap.first_page_id());
         let found = mem::take(&mut *self.found.lock());
         garbage
             .entries
             .extend(found.into_iter().filter(|entry| !freed(&entry.table.heap)));
+        let built = mem::take(&mut *self.built.lock());
+        garbage.built.extend(
+            built
+                .into_iter()
+                .filter(|entry| !made.contains(&header_page_id(&entry.index))),
+        );
         self.retired.lock().clear();
         let inserted: HashSet<Rid, IntKeys> = match undo::rollback(&self.log) {
             Ok(inserted) => inserted.into_iter().collect(),
@@ -763,6 +806,11 @@ impl Transaction {
         let kept = table.rids.entry(rid).or_insert(keep_len);
         *kept = keep_len.or(*kept);
     }
+}
+
+fn header_page_id(index: &Index) -> PageId {
+    let Index::BtreeIndex(btree) = index;
+    btree.tree().header_page_id()
 }
 
 impl Drop for Transaction {

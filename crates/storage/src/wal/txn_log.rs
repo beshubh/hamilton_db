@@ -281,7 +281,7 @@ pub(crate) fn complete(txn: &TxnLog, last_lsn: Lsn) -> Result<()> {
                     *kept = kept.or(keep_len);
                 }
                 Undo::Truncate { old, .. } => replaced.push(old.iter().collect()),
-                Undo::IndexEntry { .. } => {}
+                Undo::IndexEntry { .. } | Undo::Create { .. } => {}
             },
             Kind::Completion => {
                 let changes = record.page_changes()?.expect("a completion changes pages");
@@ -297,22 +297,25 @@ pub(crate) fn complete(txn: &TxnLog, last_lsn: Lsn) -> Result<()> {
         .collect();
     stamp(txn, &writes, |_| {})?;
     for old in replaced.iter().filter(|old| !freed.contains(&old[0])) {
-        free_storage(&txn.bpm, Logged::Completion(txn), old)?;
+        free_storage(&txn.bpm, Logged::Completion(txn), &old[..1], &old[1..])?;
     }
     txn.end();
     Ok(())
 }
 
-/// Frees every page of a table's storage, given by `roots`: its heap's
-/// first page, then its trees' header pages. One record logged as `by`'s
-/// frees them all, so a crash leaves all of them or none.
+/// Frees every page of the heaps starting at `heaps` and of the trees whose
+/// header pages are `trees`. One record logged as `by`'s frees them all, so
+/// a crash leaves all of them or none.
 pub(crate) fn free_storage(
     bpm: &Arc<BufferPoolManager>,
     by: Logged<'_>,
-    roots: &[PageId],
+    heaps: &[PageId],
+    trees: &[PageId],
 ) -> Result<()> {
-    let (&heap, trees) = roots.split_first().expect("a table has a heap");
-    let mut pages = when_a_frame_is_free(|| table_heap::page_ids(bpm, heap))?;
+    let mut pages = Vec::new();
+    for &heap in heaps {
+        pages.extend(when_a_frame_is_free(|| table_heap::page_ids(bpm, heap))?);
+    }
     for &header in trees {
         let tree = when_a_frame_is_free(|| BtreeIndex::open_tree(Arc::clone(bpm), header))?;
         pages.extend(when_a_frame_is_free(|| tree.page_ids())?);

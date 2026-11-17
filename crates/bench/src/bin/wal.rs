@@ -1,7 +1,6 @@
 //! Measures the log each kind of row change writes: single-row INSERT,
 //! UPDATE and DELETE statements, each its own transaction, on a table with
-//! a primary key and a secondary index. Every statement also logs page 0,
-//! where the engine keeps the next Tid, so its images are counted apart.
+//! a primary key and a secondary index.
 //!
 //! ```sh
 //! cargo run --release -p bench --bin wal -- [--rows N] [--frames N]
@@ -15,7 +14,7 @@ use common::Lsn;
 use planner::ExecutionEngine;
 use storage::buffer::buffer_pool_manager::DEFAULT_POOL_SIZE;
 use storage::disk::fs::OsFs;
-use storage::wal::record::{Kind, PageChanges, PageRedo};
+use storage::wal::record::PageRedo;
 use tempfile::TempDir;
 
 /// Bytes of log over a run of statements, by what they hold.
@@ -23,7 +22,6 @@ use tempfile::TempDir;
 struct Volume {
     records: usize,
     total: u64,
-    page0_images: usize,
     images: usize,
     ops_entries: usize,
 }
@@ -51,7 +49,7 @@ fn main() -> Result<()> {
         storage::wal::SEGMENT_SIZE,
     )?;
     let catalog = Arc::new(Catalog::open(Arc::clone(&storage.bpm))?);
-    let mut engine = ExecutionEngine::new(catalog)?;
+    let mut engine = ExecutionEngine::new(catalog);
     let mut run = |sql: &str| -> Result<()> {
         engine
             .execute_sql(sql)
@@ -63,8 +61,8 @@ fn main() -> Result<()> {
 
     println!("{rows} statements per kind, {frames} frames");
     println!(
-        "{:<12}{:>12}{:>10}{:>12}{:>12}{:>12}",
-        "statement", "bytes/stmt", "records", "page 0 img", "other img", "op entries"
+        "{:<12}{:>12}{:>10}{:>12}{:>12}",
+        "statement", "bytes/stmt", "records", "images", "op entries"
     );
     let log = Arc::clone(storage.bpm.log());
     for name in ["insert", "update body", "update key", "delete"] {
@@ -76,10 +74,9 @@ fn main() -> Result<()> {
         let volume = measure(&log, start)?;
         let per = |n: usize| n as f64 / rows as f64;
         println!(
-            "{name:<12}{:>12.0}{:>10.2}{:>12.2}{:>12.2}{:>12.2}",
+            "{name:<12}{:>12.0}{:>10.2}{:>12.2}{:>12.2}",
             volume.total as f64 / rows as f64,
             per(volume.records),
-            per(volume.page0_images),
             per(volume.images),
             per(volume.ops_entries),
         );
@@ -111,15 +108,11 @@ fn measure(log: &storage::wal::log::Log, start: Lsn) -> Result<Volume> {
     let mut scan = log.scan(start);
     while let Some(record) = scan.next_record()? {
         volume.records += 1;
-        if !matches!(
-            record.kind,
-            Kind::Update | Kind::Clr | Kind::Completion | Kind::System
-        ) {
+        let Some(changes) = record.page_changes()? else {
             continue;
-        }
-        for (page_id, redo) in PageChanges::decode(record.body)?.pages() {
+        };
+        for (_, redo) in changes.pages() {
             match redo {
-                PageRedo::Image(_) if page_id == 0 => volume.page0_images += 1,
                 PageRedo::Image(_) => volume.images += 1,
                 PageRedo::Ops(_) => volume.ops_entries += 1,
             }

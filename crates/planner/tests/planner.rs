@@ -6,6 +6,7 @@ use execution::expressions::{AbstractExpr, Expr};
 use execution::plans::{
     AbstractPlanNode, Aggregate, HashJoinPlan, JoinType, PlanNode, WindowColumn, WindowFunctionKind,
 };
+use storage::concurrency::transaction_manager::TransactionManager;
 use tempfile::TempDir;
 
 use planner::bound::BoundStatement;
@@ -18,38 +19,53 @@ use planner::{Binder, Planner};
 /// - `orders (id INT NOT NULL, user_id INT, total BIGINT)`
 struct Db {
     _dir: TempDir,
-    catalog: Catalog,
+    catalog: Arc<Catalog>,
+    tm: TransactionManager,
 }
 
 impl Db {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
         let bpm = storage::open(dir.path().join("test.db"), 16).unwrap().bpm;
-        let catalog = Catalog::open(bpm).unwrap();
-        catalog
-            .create_table(
-                "users",
-                Schema::new(vec![
-                    Column::new("id", DataType::Int, false),
-                    Column::new("name", DataType::Varchar(32), true),
-                    Column::new("score", DataType::BigInt, false),
-                    Column::new("active", DataType::Bool, true),
-                ]),
-                &[],
-            )
-            .unwrap();
-        catalog
-            .create_table(
-                "orders",
-                Schema::new(vec![
-                    Column::new("id", DataType::Int, false),
-                    Column::new("user_id", DataType::Int, true),
-                    Column::new("total", DataType::BigInt, true),
-                ]),
-                &[],
-            )
-            .unwrap();
-        Self { _dir: dir, catalog }
+        let catalog = Arc::new(Catalog::open(Arc::clone(&bpm)).unwrap());
+        let tm = TransactionManager::new(bpm);
+        let db = Self {
+            _dir: dir,
+            catalog,
+            tm,
+        };
+        db.create_table(
+            "users",
+            Schema::new(vec![
+                Column::new("id", DataType::Int, false),
+                Column::new("name", DataType::Varchar(32), true),
+                Column::new("score", DataType::BigInt, false),
+                Column::new("active", DataType::Bool, true),
+            ]),
+        );
+        db.create_table(
+            "orders",
+            Schema::new(vec![
+                Column::new("id", DataType::Int, false),
+                Column::new("user_id", DataType::Int, true),
+                Column::new("total", DataType::BigInt, true),
+            ]),
+        );
+        db
+    }
+
+    /// Creates table `name` in a transaction of its own.
+    fn create_table(&self, name: &str, schema: Schema) {
+        let txn = self.tm.begin();
+        self.catalog.create_table(&txn, name, schema, &[]).unwrap();
+        self.tm.commit(&txn).unwrap();
+    }
+
+    /// Creates an empty index in a transaction of its own.
+    fn create_index(&self, name: &str, table: &str, key: &[&str]) {
+        let txn = self.tm.begin();
+        self.catalog.create_index(&txn, name, table, key).unwrap();
+        self.tm.commit(&txn).unwrap();
     }
 
     fn bind(&self, sql: &str) -> BoundStatement {
@@ -345,9 +361,7 @@ fn explain_sits_above_the_plan() {
 #[test]
 fn explain_shows_the_optimized_plan() {
     let db = Db::new();
-    db.catalog
-        .create_index("users_id", "users", &["id"])
-        .unwrap();
+    db.create_index("users_id", "users", &["id"]);
     let plan = db.optimized("EXPLAIN SELECT name FROM users WHERE id = 1");
     assert_eq!(shape(&plan), "Explain(Projection(IndexScan))");
     assert_eq!(

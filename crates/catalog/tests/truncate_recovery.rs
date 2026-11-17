@@ -71,12 +71,16 @@ impl Db {
     fn create(fs: &CrashFs, frames: usize, segment: u64) -> Self {
         let storage = storage::open_with(Arc::new(fs.clone()), DB, frames, None, segment).unwrap();
         let catalog = Arc::new(Catalog::open(Arc::clone(&storage.bpm)).unwrap());
+        let tm = TransactionManager::new(Arc::clone(&storage.bpm));
+        let txn = tm.begin();
         catalog
-            .create_table_with_constraints("t", schema(), &["id"], &["id"], &[])
+            .create_table_with_constraints(&txn, "t", schema(), &["id"], &["id"], &[])
             .unwrap();
-        catalog.create_index("t_v", "t", &["v"]).unwrap();
+        tm.commit(&txn).unwrap();
+        let txn = tm.begin();
+        catalog.create_index(&txn, "t_v", "t", &["v"]).unwrap();
+        tm.commit(&txn).unwrap();
         storage.bpm.checkpoint().unwrap();
-        let tm = TransactionManager::new(Arc::clone(&storage.bpm), 1);
         Self {
             storage,
             catalog,
@@ -84,12 +88,19 @@ impl Db {
         }
     }
 
-    /// Opens the database in `fs`, recovering it, with Tids from `next_tid`.
-    fn open(fs: &CrashFs, frames: usize, next_tid: TxnId) -> Self {
+    /// Opens the database in `fs`, recovering it, and checks that its Tids
+    /// start above every Tid the log ever held.
+    fn open(fs: &CrashFs, frames: usize) -> Self {
         let storage = storage::open_with(Arc::new(fs.clone()), DB, frames, None, SEGMENT)
             .unwrap_or_else(|e| panic!("recovery failed: {e}"));
         let catalog = Arc::new(Catalog::open(Arc::clone(&storage.bpm)).unwrap());
-        let tm = TransactionManager::new(Arc::clone(&storage.bpm), next_tid);
+        let tm = TransactionManager::new(Arc::clone(&storage.bpm));
+        let (_, max_tid) = commits_in(fs);
+        let next_tid = tm.next_tid();
+        assert!(
+            next_tid > max_tid,
+            "Tids start at {next_tid}, but the log holds {max_tid}"
+        );
         Self {
             storage,
             catalog,
@@ -483,7 +494,7 @@ fn rows_after(expect: &Expect, commits: &[TxnId]) -> BTreeMap<i64, Row> {
 /// Recovers `image`, a crash after `events` fs events, and checks it
 /// against what the workload did.
 fn recover_and_check(image: &CrashFs, events: usize, expect: &Expect, at: &str) {
-    let (commits, max_tid) = commits_in(image);
+    let (commits, _) = commits_in(image);
     let survived: HashSet<_> = commits.iter().copied().collect();
     for &(tid, acked_at) in &expect.acked {
         assert!(
@@ -491,7 +502,7 @@ fn recover_and_check(image: &CrashFs, events: usize, expect: &Expect, at: &str) 
             "{at}: transaction {tid}, acknowledged after event {acked_at}, is lost"
         );
     }
-    let db = Db::open(image, 6, max_tid + 1);
+    let db = Db::open(image, 6);
     check(&db, &rows_after(expect, &commits), &expect.system, at);
 }
 
@@ -621,7 +632,7 @@ fn fill(workload: &mut Workload) {
 fn every_crash_point_keeps_exactly_the_committed_truncates() {
     let fs = CrashFs::new();
     let mut workload = Workload::new(&fs, 8, 0x7c0f);
-    workload.run(220);
+    workload.run(240);
     // A truncate left running at the crash, after one that committed.
     while !workload.open.is_empty() {
         workload.commit(0);
@@ -771,16 +782,15 @@ fn a_crash_during_recovery_finishes_the_truncates_the_same_way() {
     let expect = workload.crash();
 
     let image = fs.crash_after(fs.num_events(), Lost::Everything);
-    let (commits, max_tid) = commits_in(&image);
+    let (commits, _) = commits_in(&image);
     let rows = rows_after(&expect, &commits);
-    drop(Db::open(&image, 6, max_tid + 1));
+    drop(Db::open(&image, 6));
     let recovering = image.num_events();
     assert!(recovering > 5, "recovery wrote only {recovering} events");
     image.for_each_moment(|n, moment| {
         for again in [Lost::Nothing, Lost::Everything, Lost::Some(n as u64)] {
             let crashed = moment.crash(again);
-            let (_, max_tid) = commits_in(&crashed);
-            let db = Db::open(&crashed, 6, max_tid + 1);
+            let db = Db::open(&crashed, 6);
             let at = format!("crash after event {n} of {recovering} in recovery, losing {again:?}");
             check(&db, &rows, &expect.system, &at);
         }
@@ -868,8 +878,8 @@ fn every_prefix_of_the_log_keeps_the_truncates_below_the_cut() {
     assert!(cuts.len() > 100, "{} records", cuts.len());
     for cut in cuts {
         let image = fs.with_contents(&segment, &bytes[..cut as usize]);
-        let (commits, max_tid) = commits_in(&image);
-        let db = Db::open(&image, 64, max_tid + 1);
+        let (commits, _) = commits_in(&image);
+        let db = Db::open(&image, 64);
         let at = format!("log cut at {cut}");
         check(&db, &rows_after(&expect, &commits), &expect.system, &at);
     }

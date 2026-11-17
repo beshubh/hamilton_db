@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use catalog::{Catalog, TableInfo};
+use catalog::{Catalog, IndexInfo, TableInfo};
 use common::{Column, DataType, PageId, Rid, Schema, Tuple, Value};
 use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
@@ -51,8 +51,12 @@ impl Db {
             .bpm;
         let disk = Arc::clone(bpm.disk_manager());
         let catalog = Arc::new(Catalog::open(Arc::clone(&bpm)).unwrap());
-        let users = catalog.create_table("users", users_schema(), &[]).unwrap();
-        let tm = TransactionManager::new(Arc::clone(&bpm), 1);
+        let tm = TransactionManager::new(Arc::clone(&bpm));
+        let txn = tm.begin();
+        let users = catalog
+            .create_table(&txn, "users", users_schema(), &[])
+            .unwrap();
+        tm.commit(&txn).unwrap();
         Self {
             _dir: dir,
             disk,
@@ -81,6 +85,27 @@ impl Db {
 
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Creates table `name` in a transaction of its own, as CREATE TABLE
+    /// does.
+    pub fn create_table(&self, name: &str, schema: Schema, primary_key: &[&str]) -> Arc<TableInfo> {
+        let txn = self.tm.begin();
+        let table = self
+            .catalog
+            .create_table(&txn, name, schema, primary_key)
+            .unwrap();
+        self.tm.commit(&txn).unwrap();
+        table
+    }
+
+    /// Creates an empty index on `key` of `table` in a transaction of its
+    /// own. Rows inserted before it are not in it.
+    pub fn create_index(&self, name: &str, table: &str, key: &[&str]) -> Arc<IndexInfo> {
+        let txn = self.tm.begin();
+        let index = self.catalog.create_index(&txn, name, table, key).unwrap();
+        self.tm.commit(&txn).unwrap();
+        index
     }
 
     /// A context for building executors by hand, in a new transaction that
@@ -241,13 +266,8 @@ impl Db {
     /// primary key and an index `accounts_name` on `name`, which stores
     /// primary keys. Inserts `rows`, as `(id, name, balance)`.
     pub fn create_accounts(&self, rows: &[(i32, Option<&str>, i32)]) -> Arc<TableInfo> {
-        let table = self
-            .catalog()
-            .create_table("accounts", accounts_schema(), &["id"])
-            .unwrap();
-        self.catalog()
-            .create_index("accounts_name", "accounts", &["name"])
-            .unwrap();
+        let table = self.create_table("accounts", accounts_schema(), &["id"]);
+        self.create_index("accounts_name", "accounts", &["name"]);
         let rows = rows
             .iter()
             .map(|&(id, name, balance)| {

@@ -50,7 +50,7 @@ Preconditions:
 
 - **Crash.** Run `hdb sql persist-precrash` with `INSERT INTO ps_notes (body) VALUES ('doomed'); SELECT count(*) FROM ps_notes;`, then `hdb crash`, `hdb start`, and `hdb sql persist-postcrash` with `SELECT * FROM ps_notes ORDER BY id;`. The server must start and answer with every committed row, `doomed` included.
 
-- **Log stays bounded.** Keep inserts going for a few minutes (every insert logs about 5 KB, 4 KB of it the image of page 0) and run `ls -l /tmp/hamilton-verify/$HDB_RUN/data` every few seconds. Segment numbers keep rising, each segment stops at about 64 MiB, and the oldest ones disappear once a checkpoint runs (every 30 s, or after 64 MiB of log), so only a handful are ever listed. After `hdb crash` and `hdb start`, one segment is left.
+- **Log stays bounded.** Keep inserts going for a few minutes (a single-row insert logs about 700 bytes) and run `ls -l /tmp/hamilton-verify/$HDB_RUN/data` every few seconds. Segment numbers keep rising, each segment stops at about 64 MiB, and the oldest ones disappear once a checkpoint runs (every 30 s, or after 64 MiB of log), so only a handful are ever listed. After `hdb crash` and `hdb start`, one segment is left.
 
 ## Gotchas
 

@@ -191,13 +191,13 @@ fn transaction_ids_continue_after_reopening() {
     for id in 1..=5 {
         run(s, &format!("INSERT INTO t VALUES ({id})")).unwrap();
     }
-    let next_tid = db.catalog().next_tid().unwrap();
-    assert!(next_tid > 5);
+    let next_tid = db.catalog().bpm().log().next_tid();
+    assert!(next_tid > 6);
     drop(session);
     db.close().unwrap();
 
     let db = open(&dir);
-    assert_eq!(db.catalog().next_tid().unwrap(), next_tid);
+    assert_eq!(db.catalog().bpm().log().next_tid(), next_tid);
     let s = &mut db.session();
     assert_eq!(rows(s, "SELECT * FROM t").len(), 5);
     run(s, "UPDATE t SET id = id * 10 WHERE id = 5").unwrap();

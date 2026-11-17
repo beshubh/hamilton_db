@@ -162,6 +162,21 @@ impl<'a> Mtr<'a> {
         }
     }
 
+    /// For a transaction's mtr, logs that its change, new heaps starting at
+    /// `heaps` and new trees whose header pages are `trees`, is undone by
+    /// freeing them. Other mtrs log no undo, so this does nothing for them.
+    pub(crate) fn undo_create(&self, heaps: &[PageId], trees: &[PageId]) {
+        if let Logged::Txn(_) = self.by {
+            let mut state = self.state.borrow_mut();
+            assert!(
+                state.undo.is_empty(),
+                "a transaction's mtr undoes one change"
+            );
+            let (heaps, trees) = (heaps.iter().copied(), trees.iter().copied());
+            Undo::encode_create(&mut state.undo, heaps, trees);
+        }
+    }
+
     /// Write-latches `page_id` for this mtr. A page this mtr already changed
     /// comes back still latched. Fails with `InvalidPageId` for a temporary
     /// page, which is never logged.

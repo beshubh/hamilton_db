@@ -33,7 +33,7 @@ impl Db {
         Self {
             _dir: dir,
             disk: dm,
-            engine: ExecutionEngine::new(catalog).unwrap(),
+            engine: ExecutionEngine::new(catalog),
         }
     }
 
@@ -344,13 +344,13 @@ fn dropping_the_engine_rolls_back_an_open_block() {
     let bpm = storage::open(dir.path().join("test.db"), 16).unwrap().bpm;
     let catalog = Arc::new(Catalog::open(bpm).unwrap());
 
-    let mut engine = ExecutionEngine::new(Arc::clone(&catalog)).unwrap();
+    let mut engine = ExecutionEngine::new(Arc::clone(&catalog));
     engine
         .execute_sql("CREATE TABLE t (a INT); BEGIN; INSERT INTO t VALUES (1)")
         .unwrap();
     drop(engine);
 
-    let mut engine = ExecutionEngine::new(catalog).unwrap();
+    let mut engine = ExecutionEngine::new(catalog);
     let outputs = engine.execute_sql("SELECT * FROM t").unwrap();
     assert_eq!(
         outputs,
@@ -362,18 +362,17 @@ fn dropping_the_engine_rolls_back_an_open_block() {
     );
 }
 
-/// The next Tid is recorded before each statement that can write, so a new
-/// engine on the same catalog starts above every committed row.
+/// A new engine on the same database starts above every Tid in the log, so
+/// it sees every committed row as committed.
 #[test]
 fn a_new_engine_starts_above_committed_tids() {
     let mut db = Db::with_tables();
     db.ok("UPDATE accounts SET balance = 0");
-    let next_tid = db.engine.transaction_manager().next_tid();
+    let update = db.engine.transaction_manager().next_tid() - 1;
     let catalog = Arc::clone(db.engine.catalog());
-    assert_eq!(catalog.next_tid().unwrap(), next_tid);
 
-    let mut engine = ExecutionEngine::new(catalog).unwrap();
-    assert_eq!(engine.transaction_manager().next_tid(), next_tid);
+    let mut engine = ExecutionEngine::new(catalog);
+    assert!(engine.transaction_manager().next_tid() > update);
     let outputs = engine.execute_sql("SELECT balance FROM accounts").unwrap();
     assert!(matches!(
         &outputs[0],

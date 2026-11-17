@@ -5,31 +5,40 @@
 //! heap holds a single row:
 //!
 //! ```text
-//! last_value BIGINT   the value handed out last, or the first one to hand
-//!                     out while is_called is false
-//! log_cnt    INT      values left before nextval must log ahead again,
-//!                     covering the LOG_VALS values after the one it hands
-//!                     out
-//! is_called  BOOL     whether last_value has been handed out
+//! last_value BIGINT   the last value the row covers: every value up to it
+//!                     may have been handed out; or, while is_called is
+//!                     false, the first value to hand out
+//! log_cnt    INT      0, as in the row Postgres logs ahead
+//! is_called  BOOL     whether last_value counts as handed out
 //! ```
 //!
-//! `nextval` changes the row in place, outside any transaction, so a
-//! rolled-back INSERT leaves a gap. Values reach disk before they are handed
-//! out (`log_ahead`), so a crash skips up to LOG_VALS values rather than
-//! handing any out again.
+//! `nextval` hands values out from a counter in memory, outside any
+//! transaction, so a rolled-back INSERT leaves a gap. When the row no
+//! longer covers the next value, it is first written LOG_VALS values past
+//! it (`log_ahead`), a redo-only change that is not synced. A value reaches
+//! a committed row only through a transaction that logs its `Commit` after
+//! that record, and the commit's sync makes the record durable too. So a
+//! crash skips up to LOG_VALS values, and never hands out
+//! one a committed row holds. SELECT reads the row, so it shows the value
+//! logged ahead.
 //!
 //! `TRUNCATE ... RESTART IDENTITY` (`restart`) is a change of the
 //! truncate's transaction, so its abort, or a crash before its commit,
 //! puts the row back as it was before the restart, as Postgres does. That
 //! also takes back every `nextval` since, which is right only because the
 //! truncate holds the table locked: its own inserts are the only ones that
-//! took values meanwhile, and they are undone too.
+//! took values meanwhile, and they are undone too. An abort then puts back
+//! the counter from before the restart (`restore`).
+//!
+//! A clean shutdown writes the row as the last value handed out (`save`),
+//! so only a crash skips values.
 
 use std::fmt;
 use std::sync::{Arc, LazyLock};
 
 use common::{Column, DataType, PageId, Schema, SlotId, Tuple};
 use parking_lot::Mutex;
+use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::page::PAGE_SIZE;
 use storage::table::table_heap::TableHeap;
@@ -81,14 +90,14 @@ impl SequenceRow {
     }
 }
 
-/// Creates a sequence's heap, holding the row of a sequence that hands out
-/// 1 first.
-pub(crate) fn create_heap(bpm: &Arc<BufferPoolManager>) -> Result<TableHeap> {
-    let heap = TableHeap::create(Arc::clone(bpm))?;
+/// Puts the row of a sequence that hands out 1 first on `heap`, a new
+/// sequence's empty heap. Redo-only: the heap is storage its create's
+/// transaction made, which an abort frees whole.
+pub(crate) fn init(heap: &TableHeap) -> Result<()> {
     let tuple = Tuple::from_bytes(SequenceRow::first().as_bytes().to_vec());
     let rid = heap.insert(Logged::System, &TupleMeta::new(CATALOG_TS), &tuple)?;
     debug_assert_eq!((rid.page_id, rid.slot), (heap.first_page_id(), SLOT));
-    Ok(heap)
+    Ok(())
 }
 
 /// The largest value a sequence for a column of `data_type` hands out, or
@@ -109,8 +118,23 @@ pub struct Sequence {
     bpm: Arc<BufferPoolManager>,
     page_id: PageId,
     max: i64,
-    /// Serializes changes to the row made here: `next_value` makes two.
-    changing: Mutex<()>,
+    /// `None` until read from the row. Held while the row changes, too.
+    counter: Mutex<Option<Counter>>,
+}
+
+/// A sequence's counter from before a restart; see `Sequence::restore`.
+pub(crate) struct Saved(Option<Counter>);
+
+/// Where `nextval` is.
+#[derive(Clone, Copy)]
+struct Counter {
+    /// The last value handed out, or the first to hand out until
+    /// `is_called`.
+    last_value: i64,
+    is_called: bool,
+    /// The row's `last_value`, once it covers values: up to it, values go
+    /// out without writing the row.
+    logged: Option<i64>,
 }
 
 impl Sequence {
@@ -129,47 +153,38 @@ impl Sequence {
             bpm,
             page_id,
             max,
-            changing: Mutex::new(()),
+            counter: Mutex::new(None),
         }
     }
 
     /// Hands out the next value, as Postgres's `nextval` does with the
     /// default options: INCREMENT 1, CACHE 1, NO CYCLE.
     pub fn next_value(&self) -> Result<i64> {
-        let _changing = self.changing.lock();
-        let mtr = self.bpm.mtr(Logged::System);
-        let mut page = mtr.write_page(self.page_id)?;
-        let (meta, row) = self.read(page.data())?;
-
-        let is_called = row.is_called == 1;
-        let value = if is_called {
-            self.after(row.last_value.get())?
-        } else {
-            row.last_value.get()
-        };
-        let log_cnt = row.log_cnt.get();
-        // A clean page was just written as it is, by a checkpoint or an
-        // eviction, so disk no longer covers the values after it.
-        if is_called && log_cnt > 0 && page.is_dirty() {
-            put(&mut page, &meta, value, log_cnt - 1)?;
-            return Ok(value);
+        let mut counter = self.counter.lock();
+        if counter.is_none() {
+            *counter = Some(self.read_counter()?);
         }
-        drop(page);
-        drop(mtr);
-
-        let logged = value.saturating_add(LOG_VALS.into()).min(self.max);
-        self.log_ahead(&meta, logged)?;
-        let mtr = self.bpm.mtr(Logged::System);
-        // At most LOG_VALS.
-        let log_cnt = (logged - value) as i32;
-        put(&mut mtr.write_page(self.page_id)?, &meta, value, log_cnt)?;
+        let counter = counter.as_mut().expect("read above");
+        let value = if counter.is_called {
+            self.after(counter.last_value)?
+        } else {
+            counter.last_value
+        };
+        if counter.logged.is_none_or(|logged| value > logged) {
+            let logged = value.saturating_add(LOG_VALS.into()).min(self.max);
+            self.cover(logged)?;
+            counter.logged = Some(logged);
+        }
+        counter.last_value = value;
+        counter.is_called = true;
         Ok(value)
     }
 
     /// Makes the next value 1 again, as `by`'s change: a truncate's, whose
-    /// undo puts the row back (see the module docs).
-    pub(crate) fn restart(&self, by: Logged<'_>) -> Result<()> {
-        let _changing = self.changing.lock();
+    /// undo puts the row back (see the module docs). Returns the counter
+    /// from before, for `restore`.
+    pub(crate) fn restart(&self, by: Logged<'_>) -> Result<Saved> {
+        let mut counter = self.counter.lock();
         let mtr = self.bpm.mtr(by);
         let mut page = mtr.write_page(self.page_id)?;
         let (meta, _) = self.read(page.data())?;
@@ -179,6 +194,27 @@ impl Sequence {
             payload: SequenceRow::first().as_bytes(),
             padded_to: size_of::<SequenceRow>(),
         })?;
+        Ok(Saved(counter.take()))
+    }
+
+    /// Puts back the counter a restart replaced, once undo has put back the
+    /// row: it covers what that counter handed out.
+    pub(crate) fn restore(&self, saved: Saved) {
+        *self.counter.lock() = saved.0;
+    }
+
+    /// Writes the row as the last value handed out, so a handle opened on
+    /// it next goes on right after that value rather than past the ones
+    /// logged ahead. Later values are logged ahead again.
+    pub(crate) fn save(&self) -> Result<()> {
+        let mut counter = self.counter.lock();
+        let Some(counter) = counter.as_mut().filter(|counter| counter.is_called) else {
+            return Ok(());
+        };
+        if counter.logged != Some(counter.last_value) {
+            self.cover(counter.last_value)?;
+            counter.logged = Some(counter.last_value);
+        }
         Ok(())
     }
 
@@ -192,6 +228,19 @@ impl Sequence {
             })
     }
 
+    fn read_counter(&self) -> Result<Counter> {
+        let guard = self
+            .bpm
+            .checked_read_page(self.page_id, AccessType::Lookup)?;
+        let (_, row) = self.read(guard.get_data())?;
+        let is_called = row.is_called == 1;
+        Ok(Counter {
+            last_value: row.last_value.get(),
+            is_called,
+            logged: is_called.then(|| row.last_value.get()),
+        })
+    }
+
     fn read(&self, data: &[u8; PAGE_SIZE]) -> Result<(TupleMeta, SequenceRow)> {
         let page = TablePage::new(data)?;
         let (meta, payload) = page.get(SLOT)?;
@@ -202,23 +251,17 @@ impl Sequence {
         Ok((meta, row))
     }
 
-    /// Writes the row to disk as if every value through `last_value` had
-    /// been handed out, for the caller to overwrite with the real one.
-    fn log_ahead(&self, meta: &TupleMeta, last_value: i64) -> Result<()> {
+    /// Writes the row as if every value through `last_value` had been
+    /// handed out. The caller holds `counter`.
+    fn cover(&self, last_value: i64) -> Result<()> {
         log::debug!(
-            "sequence {}: WAL record would cover values through {last_value}",
+            "sequence {}: the row covers values through {last_value}",
             self.name
         );
-        put(
-            &mut self.bpm.mtr(Logged::System).write_page(self.page_id)?,
-            meta,
-            last_value,
-            0,
-        )?;
-        // Writing the page syncs the log through this record first, which is
-        // what makes the values survive a crash. TODO(wal): sync only the log.
-        self.bpm.flush_page(self.page_id)?;
-        Ok(())
+        let mtr = self.bpm.mtr(Logged::System);
+        let mut page = mtr.write_page(self.page_id)?;
+        let (meta, _) = self.read(page.data())?;
+        put(&mut page, &meta, last_value)
     }
 
     fn corrupt(&self) -> CatalogError {
@@ -226,12 +269,12 @@ impl Sequence {
     }
 }
 
-/// Writes a handed-out `last_value` with `log_cnt` over the row on `page`.
-fn put(page: &mut MtrPage<'_>, meta: &TupleMeta, last_value: i64, log_cnt: i32) -> Result<()> {
+/// Writes `last_value`, handed out, over the row on `page`.
+fn put(page: &mut MtrPage<'_>, meta: &TupleMeta, last_value: i64) -> Result<()> {
     let row = SequenceRow {
         null_bitmap: 0,
         last_value: last_value.into(),
-        log_cnt: log_cnt.into(),
+        log_cnt: 0.into(),
         is_called: 1,
     };
     page.apply(PageOp::HeapSetTuple {
@@ -269,20 +312,20 @@ mod tests {
     use super::*;
     use common::Value;
     use storage::buffer::arc_replacer::AccessType;
-    use storage::disk::disk_manager::DiskManager;
     use tempfile::TempDir;
 
     fn sequence(dir: &TempDir, max: i64) -> (Sequence, TableHeap) {
-        let (seq, heap, _) = sequence_on_disk(dir, max);
+        let bpm = storage::open(dir.path().join("test.db"), 4).unwrap().bpm;
+        let heap = TableHeap::create(Arc::clone(&bpm)).unwrap();
+        init(&heap).unwrap();
+        let seq = Sequence::new(7, "t_id_seq".into(), bpm, heap.first_page_id(), max);
         (seq, heap)
     }
 
-    fn sequence_on_disk(dir: &TempDir, max: i64) -> (Sequence, TableHeap, Arc<DiskManager>) {
-        let bpm = storage::open(dir.path().join("test.db"), 4).unwrap().bpm;
-        let dm = Arc::clone(bpm.disk_manager());
-        let heap = create_heap(&bpm).unwrap();
-        let seq = Sequence::new(7, "t_id_seq".into(), bpm, heap.first_page_id(), max);
-        (seq, heap, dm)
+    /// Another handle on `seq`'s row, as a restart opens it.
+    fn reopened(seq: &Sequence) -> Sequence {
+        let bpm = Arc::clone(&seq.bpm);
+        Sequence::new(seq.oid, seq.name.clone(), bpm, seq.page_id, seq.max)
     }
 
     fn row(heap: &TableHeap) -> Vec<Value> {
@@ -290,10 +333,10 @@ mod tests {
         tuple.decode(&SCHEMA).unwrap()
     }
 
-    fn values(last_value: i64, log_cnt: i32, is_called: bool) -> Vec<Value> {
+    fn values(last_value: i64, is_called: bool) -> Vec<Value> {
         vec![
             Value::BigInt(last_value),
-            Value::Int(log_cnt),
+            Value::Int(0),
             Value::Bool(is_called),
         ]
     }
@@ -306,49 +349,59 @@ mod tests {
             log_cnt: 31.into(),
             is_called: 1,
         };
-        let encoded = Tuple::encode(&SCHEMA, &values(-2, 31, true)).unwrap();
-        assert_eq!(row.as_bytes(), encoded.data());
+        let encoded = Tuple::encode(&SCHEMA, &[Value::BigInt(-2), Value::Int(31), true.into()]);
+        assert_eq!(row.as_bytes(), encoded.unwrap().data());
     }
 
-    /// As Postgres: the first value is 1, and a WAL record is due when the
-    /// values the last one covered run out.
+    /// As Postgres: the first value is 1, and the row is logged
+    /// LOG_VALS values ahead whenever the values it covers run out.
     #[test]
-    fn hands_out_values_and_counts_down_to_the_next_log() {
+    fn hands_out_values_and_logs_ahead_when_they_run_out() {
         let dir = TempDir::new().unwrap();
         let (seq, heap) = sequence(&dir, i64::MAX);
-        assert_eq!(row(&heap), values(1, 0, false));
+        assert_eq!(row(&heap), values(1, false));
         assert_eq!(seq.next_value().unwrap(), 1);
-        assert_eq!(row(&heap), values(1, 32, true));
-        assert_eq!(seq.next_value().unwrap(), 2);
-        assert_eq!(row(&heap), values(2, 31, true));
-        for expected in 3..=33 {
-            assert_eq!(seq.next_value().unwrap(), expected);
-        }
-        assert_eq!(row(&heap), values(33, 0, true));
-        assert_eq!(seq.next_value().unwrap(), 34);
-        assert_eq!(row(&heap), values(34, 32, true));
-    }
-
-    #[test]
-    fn writes_its_page_once_per_log_vals_values() {
-        let dir = TempDir::new().unwrap();
-        let (seq, _heap, dm) = sequence_on_disk(&dir, i64::MAX);
-        let writes = dm.num_writes();
-        assert_eq!(seq.next_value().unwrap(), 1);
-        assert_eq!(dm.num_writes(), writes + 1);
+        assert_eq!(row(&heap), values(33, true));
         for expected in 2..=33 {
             assert_eq!(seq.next_value().unwrap(), expected);
         }
-        assert_eq!(dm.num_writes(), writes + 1);
+        assert_eq!(row(&heap), values(33, true));
         assert_eq!(seq.next_value().unwrap(), 34);
-        assert_eq!(dm.num_writes(), writes + 2);
+        assert_eq!(row(&heap), values(66, true));
+    }
 
-        // Once a flush has written the page as it is, the next value is
-        // written ahead again.
-        seq.bpm.flush_all_pages().unwrap();
-        let writes = dm.num_writes();
-        assert_eq!(seq.next_value().unwrap(), 35);
-        assert_eq!(dm.num_writes(), writes + 1);
+    #[test]
+    fn logs_once_per_log_vals_values_and_never_syncs() {
+        let dir = TempDir::new().unwrap();
+        let (seq, _heap) = sequence(&dir, i64::MAX);
+        let log = Arc::clone(seq.bpm.log());
+        let (end, syncs) = (log.end(), log.num_syncs());
+        assert_eq!(seq.next_value().unwrap(), 1);
+        let logged = log.end();
+        assert!(logged > end);
+        for expected in 2..=33 {
+            assert_eq!(seq.next_value().unwrap(), expected);
+        }
+        assert_eq!(log.end(), logged);
+        assert_eq!(seq.next_value().unwrap(), 34);
+        assert!(log.end() > logged);
+        assert_eq!(log.num_syncs(), syncs);
+    }
+
+    /// The row covers every value handed out, so a handle opened on it
+    /// later, as after a crash, skips the rest of them.
+    #[test]
+    fn a_new_handle_goes_on_past_the_values_logged_ahead() {
+        let dir = TempDir::new().unwrap();
+        let (seq, _heap) = sequence(&dir, i64::MAX);
+        for expected in 1..=5 {
+            assert_eq!(seq.next_value().unwrap(), expected);
+        }
+        assert_eq!(reopened(&seq).next_value().unwrap(), 34);
+        for expected in 6..=33 {
+            assert_eq!(seq.next_value().unwrap(), expected);
+        }
+        assert_eq!(reopened(&seq).next_value().unwrap(), 67);
     }
 
     #[test]
@@ -357,7 +410,7 @@ mod tests {
         let (seq, heap) = sequence(&dir, 3);
         assert_eq!(seq.next_value().unwrap(), 1);
         // The log covers no values past the maximum.
-        assert_eq!(row(&heap), values(1, 2, true));
+        assert_eq!(row(&heap), values(3, true));
         assert_eq!(seq.next_value().unwrap(), 2);
         assert_eq!(seq.next_value().unwrap(), 3);
         seq.bpm.flush_all_pages().unwrap();
@@ -367,13 +420,15 @@ mod tests {
                 Err(CatalogError::SequenceExhausted { name, max: 3 }) if name == "t_id_seq"
             ));
         }
-        assert_eq!(row(&heap), values(3, 0, true));
-        // Failing left the page as it was, so it has nothing to write.
+        assert!(matches!(
+            reopened(&seq).next_value(),
+            Err(CatalogError::SequenceExhausted { .. })
+        ));
         let guard = seq
             .bpm
             .checked_read_page(seq.page_id, AccessType::Lookup)
             .unwrap();
-        assert!(!guard.is_dirty());
+        assert!(!guard.is_dirty(), "failing changed the row");
     }
 
     #[test]
@@ -397,5 +452,45 @@ mod tests {
         });
         got.sort_unstable();
         assert_eq!(got, (1..=400).collect::<Vec<_>>());
+    }
+
+    /// A restart takes effect at once, and once its undo has put the row
+    /// back, `restore` goes on from the value before it.
+    #[test]
+    fn restore_goes_on_from_before_the_restart() {
+        let dir = TempDir::new().unwrap();
+        let (seq, heap) = sequence(&dir, i64::MAX);
+        for expected in 1..=5 {
+            assert_eq!(seq.next_value().unwrap(), expected);
+        }
+        let saved = seq.restart(Logged::System).unwrap();
+        assert_eq!(row(&heap), values(1, false));
+        assert_eq!(seq.next_value().unwrap(), 1);
+        assert_eq!(seq.next_value().unwrap(), 2);
+        // As the undo of the restart would.
+        {
+            let mtr = seq.bpm.mtr(Logged::System);
+            let mut page = mtr.write_page(seq.page_id).unwrap();
+            let (meta, _) = seq.read(page.data()).unwrap();
+            put(&mut page, &meta, 33).unwrap();
+        }
+        seq.restore(saved);
+        assert_eq!(seq.next_value().unwrap(), 6);
+    }
+
+    /// `save` leaves the row covering only what went out, so a handle
+    /// opened on it next, as after a clean restart, skips nothing.
+    #[test]
+    fn a_saved_sequence_goes_on_without_a_gap() {
+        let dir = TempDir::new().unwrap();
+        let (seq, heap) = sequence(&dir, i64::MAX);
+        for expected in 1..=5 {
+            assert_eq!(seq.next_value().unwrap(), expected);
+        }
+        seq.save().unwrap();
+        assert_eq!(row(&heap), values(5, true));
+        assert_eq!(reopened(&seq).next_value().unwrap(), 6);
+        assert_eq!(seq.next_value().unwrap(), 6);
+        assert_eq!(row(&heap), values(38, true));
     }
 }

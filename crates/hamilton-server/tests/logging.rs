@@ -46,11 +46,11 @@ fn stderr_after_an_insert(log: Option<&str>) -> String {
 }
 
 #[test]
-fn the_mock_wal_record_of_a_sequence_is_logged_at_debug() {
+fn a_sequence_logging_ahead_is_logged_at_debug() {
     let logged = stderr_after_an_insert(Some("debug"));
     assert!(
         logged.contains(
-            "DEBUG catalog::sequence: sequence t_id_seq: WAL record would cover values through 33"
+            "DEBUG catalog::sequence: sequence t_id_seq: the row covers values through 33"
         ),
         "{logged}"
     );

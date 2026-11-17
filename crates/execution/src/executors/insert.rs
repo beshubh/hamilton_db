@@ -145,9 +145,7 @@ mod tests {
     #[test]
     fn adds_the_rows_to_the_indexes() {
         let db = Db::new();
-        db.catalog()
-            .create_index("users_name", "users", &["name"])
-            .unwrap();
+        db.create_index("users_name", "users", &["name"]);
         db.insert(&[(1, Some("a")), (2, Some("b")), (3, Some("a"))]);
         assert_eq!(db.index_lookup("users_name", &["a".into()]).len(), 2);
         assert_eq!(db.index_lookup("users_name", &["b".into()]).len(), 1);

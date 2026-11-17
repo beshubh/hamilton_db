@@ -34,7 +34,7 @@ fn setup(num_frames: usize) -> Db {
         .unwrap()
         .bpm;
     let heap = Arc::new(TableHeap::create(Arc::clone(&bpm)).unwrap());
-    let tm = TransactionManager::new(Arc::clone(&bpm), 1);
+    let tm = TransactionManager::new(Arc::clone(&bpm));
     Db {
         _dir: dir,
         bpm,

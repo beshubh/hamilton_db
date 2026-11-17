@@ -14,8 +14,9 @@ use crate::page::{PAGE_SIZE, TEMP_PAGE_BASE};
 pub const DEFAULT_DB_IO_SIZE: usize = 16;
 
 const META_MAGIC: u64 = u64::from_le_bytes(*b"HAMDBMET");
-/// 3: the checkpoint holds the active transaction table.
-const META_VERSION: u32 = 3;
+/// 3: the checkpoint holds the active transaction table. 4: and the next
+/// Tid.
+const META_VERSION: u32 = 4;
 
 /// Handles allocating and freeing pages in the database file, and reading and
 /// writing them.
