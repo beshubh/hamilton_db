@@ -365,14 +365,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = open(&dir);
         let log = storage.bpm.log();
-        let (running, done) = (TxnLog::new(7, Arc::clone(&storage.bpm)), 8);
+        let running = TxnLog::new(7, Arc::clone(&storage.bpm));
         let heap = TableHeap::create(Arc::clone(&storage.bpm)).unwrap();
         heap.insert(Logged::Txn(&running), &TupleMeta::new(7), &row(b"r"))
             .unwrap();
-        let ended = TxnLog::new(done, Arc::clone(&storage.bpm));
+        let ended = TxnLog::new(8, Arc::clone(&storage.bpm));
         heap.insert(Logged::Txn(&ended), &TupleMeta::new(8), &row(b"e"))
             .unwrap();
-        ended.end();
+        ended.commit().expect("it inserted a tuple").end();
         let checkpoint = sharp(&storage.bpm).unwrap();
         let entries = checkpoint.att.entries();
         assert_eq!(entries.len(), 1, "{entries:?}");

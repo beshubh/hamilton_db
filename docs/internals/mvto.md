@@ -11,7 +11,7 @@ The tuple header in the heap page is on disk. It holds:
 - The deleted flag.
 - The write lock, which is not a separate field. While the writer is running, `ts` holds the writer's Tid with `TXN_UNCOMMITTED_BIT` set. There is no lock table.
 
-The next Tid is not stored on its own: the log holds every Tid that wrote anything, and a restart starts above them ([Recovery](recovery.md#tids-come-from-the-log)).
+The next Tid is not stored on its own: the log holds every Tid that wrote anything, and a restart starts above them ([Recovery](recovery.md#analysis-analyze)).
 
 The rest is in memory only, and a restart loses it:
 
@@ -54,15 +54,15 @@ One collector thread in [`TransactionManager`](../../crates/storage/src/concurre
 
 ## Restart and crashes
 
-Opening a database replays the log, finishes the commits a crash cut off between their stamps, and undoes the transactions it cut off before they committed, so no tuple stays locked ([Recovery](recovery.md#recovery-finishes-the-transactions-a-crash-cut-off)). A commit survives a crash once `TransactionManager::commit` returns, and a reader never sees one that a crash can lose. The log does not hold what MVTO keeps in memory. A restart, clean or not, loses the undo log, the read timestamps, and the watermark, and a crash also loses the garbage collector's queue. That does no harm:
+Opening a database replays the log, finishes the commits a crash cut off between their stamps, and undoes the transactions it cut off before they committed, so no tuple stays locked ([Recovery](recovery.md#undo-finish_transactions)). A commit survives a crash once `TransactionManager::commit` returns, and a reader never sees one that a crash can lose. The log does not hold what MVTO keeps in memory. A restart, clean or not, loses the undo log, the read timestamps, and the watermark, and a crash also loses the garbage collector's queue. That does no harm:
 
 - The new Tid counter starts above every Tid in the log. New readers therefore see the committed versions as committed.
 - No reader is older than the versions on disk, so no reader walks an undo chain. Stale `undo_ptr`s are still on disk. `older_record` rejects them, because it requires the record's `rid` and `writer_ts` to match.
-- Opening ends with a sweep of every table and index, which collects what the queue held ([Recovery](recovery.md#opening-the-database-ends-with-a-sweep)).
+- Opening ends with a sweep of every table and index, which collects what the queue held ([Recovery](recovery.md#the-startup-sweep)).
 
 `nextval` hands values out from a counter in memory, outside any transaction ([`sequence.rs`](../../crates/catalog/src/sequence.rs)). When the sequence's row stops covering the next value, `nextval` first writes it 32 values ahead, a redo-only record that nothing syncs. A value reaches a committed row only through an insert whose transaction logs `Commit` after that record, and the commit's sync makes the record durable too. So a crash skips up to 32 values and never repeats one that a committed row holds. A clean shutdown writes each row back to the last value handed out (`Catalog::save_sequences`), so only a crash skips. A way to hand a value out with no commit after it, such as `SELECT nextval(...)`, would need its own sync.
 
-`TRUNCATE ... RESTART IDENTITY` is the only change that moves a sequence back. It is a change of the truncate's transaction, so an abort, or a crash before the commit, puts the row back ([Recovery](recovery.md#new-storage-is-a-change-of-its-transaction)).
+`TRUNCATE ... RESTART IDENTITY` is the only change that moves a sequence back. It is a change of the truncate's transaction, so an abort, or a crash before the commit, puts the row back ([Recovery](recovery.md#how-create-table-create-index-and-truncate-are-logged)).
 
 ## Table locks and TRUNCATE
 
@@ -73,9 +73,9 @@ TRUNCATE does not delete rows. It gives the table a new, empty heap and new inde
 - Locks also do the job of the timestamps that MVTO keeps on rows, and fail with `ChangedSince`. A transaction older than a committed truncate cannot use the table, because it comes first in Tid order and should still see the rows. A truncate cannot run in a transaction older than one that has used the table, because it would remove rows that the newer transaction wrote or read. Postgres has neither check. There, older snapshots see an empty table.
 - Garbage collection frees the replaced pages after it has handled any garbage that still points into them.
 
-The new storage, and the catalog rows that point at it, are changes of the truncate's transaction, so they commit or roll back with it, across a crash too ([Recovery](recovery.md#new-storage-is-a-change-of-its-transaction)).
+The new storage, and the catalog rows that point at it, are changes of the truncate's transaction, so they commit or roll back with it, across a crash too ([Recovery](recovery.md#how-create-table-create-index-and-truncate-are-logged)).
 
 ## Known gaps
 
 - **Phantoms.** Read timestamps guard tuples that exist. If an older transaction inserts a row that a newer transaction's scan should have seen, nothing detects it. Schedules with inserts are therefore not serializable.
-- **DDL is a transaction of its own.** CREATE TABLE and CREATE INDEX commit or roll back whole, but are rejected inside a block ([Recovery](recovery.md#new-storage-is-a-change-of-its-transaction)).
+- **DDL is a transaction of its own.** CREATE TABLE and CREATE INDEX commit or roll back whole, but are rejected inside a block ([Recovery](recovery.md#how-create-table-create-index-and-truncate-are-logged)).

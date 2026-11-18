@@ -16,9 +16,11 @@ use crate::table::table_page::TablePage;
 use crate::wal::fatal;
 use crate::wal::op::{Ops, PageOp};
 use crate::wal::record::{Before, Kind, PageChangesWriter, RecordBuf, Undo};
-use crate::wal::txn_log::TxnLog;
+use crate::wal::txn_log::{Aborting, Committed, Running, TxnLog};
 
 /// Who a change belongs to, which decides the kind of record that logs it.
+/// A transaction's change takes its log in the state that may log that
+/// kind.
 #[derive(Clone, Copy)]
 pub enum Logged<'a> {
     /// No transaction: redo-only.
@@ -26,12 +28,15 @@ pub enum Logged<'a> {
     /// A running transaction. Its record says how to undo the change: for a
     /// heap op, `MtrPage::apply` reads that from the page; a B+ tree insert
     /// sets it with `Mtr::undo_index_insert`.
-    Txn(&'a TxnLog),
-    /// The undo of one of the transaction's changes; the next of its
+    Txn(&'a TxnLog<Running>),
+    /// The undo of one of an aborting transaction's changes; the next of its
     /// records to undo is `undo_next`. Only `wal::undo` logs these.
-    Clr { txn: &'a TxnLog, undo_next: Lsn },
-    /// Work the transaction does once its `Commit` is durable. Redo-only.
-    Completion(&'a TxnLog),
+    Clr {
+        txn: &'a TxnLog<Aborting>,
+        undo_next: Lsn,
+    },
+    /// Work a transaction does once its `Commit` is durable. Redo-only.
+    Completion(&'a TxnLog<Committed>),
 }
 
 impl Logged<'_> {
@@ -44,15 +49,13 @@ impl Logged<'_> {
         }
     }
 
-    fn txn(&self) -> Option<&TxnLog> {
-        match *self {
-            Self::System => None,
-            Self::Txn(txn) | Self::Clr { txn, .. } | Self::Completion(txn) => Some(txn),
-        }
-    }
-
     fn tid(&self) -> TxnId {
-        self.txn().map_or(INVALID_TXN_ID, TxnLog::tid)
+        match *self {
+            Self::System => INVALID_TXN_ID,
+            Self::Txn(txn) => txn.tid(),
+            Self::Clr { txn, .. } => txn.tid(),
+            Self::Completion(txn) => txn.tid(),
+        }
     }
 }
 
@@ -326,7 +329,7 @@ impl<'a> Mtr<'a> {
             }
         });
         RECORD.set(record);
-        if let Some(txn) = self.by.txn() {
+        if let Logged::Txn(txn) = self.by {
             txn.note_logged();
         }
         // Unwinding would release latches on pages the log never got, and the

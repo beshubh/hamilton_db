@@ -123,11 +123,14 @@ fn records_are_read_back_from_memory_and_from_the_file() {
     );
 
     log.flush_to(a).unwrap();
-    let b = append(&log, Kind::Clr, 7, b"second");
+    let b = append(&log, Kind::Commit, 7, b"second");
     let r = log.read(a, &mut buf).unwrap();
     assert_eq!(r.body, b"first");
     let r = log.read(b, &mut buf).unwrap();
-    assert_eq!((r.kind, r.prev_lsn, r.body), (Kind::Clr, a, &b"second"[..]));
+    assert_eq!(
+        (r.kind, r.prev_lsn, r.body),
+        (Kind::Commit, a, &b"second"[..])
+    );
     assert!(r.has_prev());
 }
 
@@ -261,13 +264,13 @@ fn a_torn_record_ends_the_log_and_is_cut_off() {
     assert_eq!(log.end(), c);
     assert_eq!(file_len(&path), c);
 
-    let d = append(&log, Kind::Abort, 1, b"");
+    let d = append(&log, Kind::Update, 1, b"four");
     assert_eq!(d, c);
     log.flush_all().unwrap();
     drop(log);
     let log = open(&dir, ONE_SEGMENT).unwrap();
-    let kinds: Vec<_> = scan_all(&log).into_iter().map(|r| r.3).collect();
-    assert_eq!(kinds, [Kind::Update, Kind::Update, Kind::Abort]);
+    let bodies: Vec<_> = scan_all(&log).into_iter().map(|r| r.4).collect();
+    assert_eq!(bodies, [&b"one"[..], b"two", b"four"]);
 }
 
 #[test]
@@ -368,6 +371,24 @@ fn a_single_file_log_from_before_segments_is_refused() {
 }
 
 #[test]
+fn a_log_of_another_version_is_refused() {
+    let (dir, log) = setup();
+    let lsn = append(&log, Kind::System, 0, b"");
+    log.flush_to(lsn).unwrap();
+    drop(log);
+    let file = OpenOptions::new()
+        .write(true)
+        .open(segment(&dir, 1))
+        .unwrap();
+    file.write_all_at(&3u32.to_le_bytes(), 8).unwrap();
+    match open(&dir, ONE_SEGMENT) {
+        Err(StorageError::CorruptLog(msg)) => assert!(msg.contains("unsupported log version 3")),
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("opened a log of version 3"),
+    }
+}
+
+#[test]
 fn concurrent_appenders_and_flushers_lose_nothing() {
     let dir = TempDir::new().unwrap();
     let log = Arc::new(open(&dir, 4 << 10).unwrap());
@@ -441,7 +462,7 @@ fn a_full_segment_is_followed_by_a_new_one_and_reads_cross_them() {
     assert_eq!(log.end(), end);
     let tids: Vec<u64> = scan_all(&log).into_iter().map(|r| r.2).collect();
     assert_eq!(tids, (0..20).collect::<Vec<_>>());
-    let next = append(&log, Kind::Commit, 99, b"");
+    let next = append(&log, Kind::System, 99, b"");
     assert_eq!(next, end);
 }
 

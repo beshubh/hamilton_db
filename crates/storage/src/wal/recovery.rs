@@ -10,7 +10,7 @@ use common::{Lsn, PageId, TxnId};
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::error::{Result, StorageError};
 use crate::wal::checkpoint::{self, Checkpoint};
-use crate::wal::txn_log::{self, Att, TxnLog, TxnStatus};
+use crate::wal::txn_log::{self, Att, Resumed};
 use crate::wal::undo;
 
 /// Brings every page up to date with the log, from the checkpoint in the
@@ -52,7 +52,8 @@ pub(crate) fn recover(bpm: &Arc<BufferPoolManager>) -> Result<()> {
 /// it must apply: those dirty at the checkpoint, and those the log changes
 /// after it began, less the ones it frees. Finds the transactions without
 /// an `End`, starting from those the checkpoint saved, and checks that each
-/// record's `prev_lsn` is its transaction's record before it. Raises the
+/// record is one its transaction may log then (`TxnStatus::after`) and
+/// that its `prev_lsn` is its transaction's record before it. Raises the
 /// next page id past every page the log names, and returns a Tid above
 /// every one the checkpoint and the log name.
 fn analyze(
@@ -68,7 +69,9 @@ fn analyze(
     let mut scan = bpm.log().scan(checkpoint.start_lsn);
     while let Some(record) = scan.next_record()? {
         next_tid = next_tid.max(record.tid + 1);
-        let prev_lsn = att.link(record.tid, record.kind, record.lsn);
+        let prev_lsn = att
+            .link(record.tid, record.kind, record.lsn)
+            .map_err(|e| StorageError::CorruptLog(format!("the record at {}: {e}", record.lsn)))?;
         if prev_lsn != record.prev_lsn {
             return Err(StorageError::CorruptLog(format!(
                 "the record at {} follows {}, but its transaction's last record was {prev_lsn}",
@@ -123,7 +126,8 @@ fn redo(bpm: &BufferPoolManager, redo_lsn: Lsn, mut dirty: HashMap<PageId, Lsn>)
 }
 
 /// Finishes each transaction in `att`: stamps a committed one's tuples,
-/// and undoes the others. Each then gets its `End`.
+/// and undoes the others, first logging the `Abort` of one still running,
+/// as a runtime abort does. Each then gets its `End`.
 fn finish_transactions(bpm: &Arc<BufferPoolManager>, att: Att, next_tid: TxnId) -> Result<()> {
     let entries = att.entries();
     // Their records chain onto the ones analysis found.
@@ -133,11 +137,67 @@ fn finish_transactions(bpm: &Arc<BufferPoolManager>, att: Att, next_tid: TxnId) 
     // the storage it frees, so their stamps come first. Runtime frees are
     // logged in commit order for the same reason.
     for (tid, entry) in entries {
-        let txn = TxnLog::new(tid, Arc::clone(bpm));
-        match entry.status {
-            TxnStatus::Committed => txn_log::complete(&txn, entry.last_lsn)?,
-            TxnStatus::Running | TxnStatus::Aborting => losers.push((txn, entry.last_lsn)),
+        match txn_log::resume(tid, &entry, Arc::clone(bpm)) {
+            Resumed::Committed(txn, last_lsn) => txn_log::complete(txn, last_lsn)?,
+            Resumed::Aborting(txn, last_lsn) => losers.push((txn, last_lsn)),
         }
     }
-    undo::undo_losers(&losers)
+    undo::undo_losers(losers)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use common::{TXN_UNCOMMITTED_BIT, Tuple};
+    use tempfile::TempDir;
+
+    use crate::disk::fs::OsFs;
+    use crate::error::{Result, StorageError};
+    use crate::table::table_heap::TableHeap;
+    use crate::table::table_page::TupleMeta;
+    use crate::wal::record::Kind;
+    use crate::wal::txn_log::{Att, TxnLog};
+    use crate::wal::{Logged, SEGMENT_SIZE};
+
+    fn open(dir: &TempDir) -> Result<crate::Storage> {
+        let path = dir.path().join("test.db");
+        crate::open_with(Arc::new(OsFs), path, 4, None, SEGMENT_SIZE)
+    }
+
+    /// An `Update` after its transaction's `Commit`, chained to it, is
+    /// refused: recovering it as a loser would undo the commit too.
+    #[test]
+    fn analysis_refuses_an_update_after_its_transactions_commit() {
+        let dir = TempDir::new().unwrap();
+        let storage = open(&dir).unwrap();
+        let bpm = &storage.bpm;
+        let heap = TableHeap::create(Arc::clone(bpm)).unwrap();
+        let (tid, row) = (7, Tuple::from_bytes(b"row".to_vec()));
+        let meta = TupleMeta::new(tid | TXN_UNCOMMITTED_BIT);
+        let txn = TxnLog::new(tid, Arc::clone(bpm));
+        heap.insert(Logged::Txn(&txn), &meta, &row).unwrap();
+        let committed = txn.commit().unwrap();
+        let commit = bpm.log().last_lsn(tid).unwrap();
+        // A writer that missed the `Commit`: its table has the transaction
+        // still running, with the `Commit` as its last record.
+        let mut stale = Att::default();
+        stale.link(tid, Kind::Update, commit).unwrap();
+        bpm.log().restore(stale, tid + 1);
+        let again = TxnLog::new(tid, Arc::clone(bpm));
+        heap.insert(Logged::Txn(&again), &meta, &row).unwrap();
+        let update = bpm.log().last_lsn(tid).unwrap();
+        bpm.log().flush_all().unwrap();
+        drop((committed, again, heap, storage));
+
+        match open(&dir) {
+            Err(StorageError::CorruptLog(msg)) => {
+                for named in [&update.to_string(), "Update", "Committed"] {
+                    assert!(msg.contains(named), "{msg:?} does not name {named}");
+                }
+            }
+            Err(e) => panic!("{e}"),
+            Ok(_) => panic!("recovered an Update after its transaction's Commit"),
+        }
+    }
 }

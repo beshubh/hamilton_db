@@ -10,13 +10,12 @@ use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::concurrency::index_versions::{IndexedTable, TableEntry};
 use crate::concurrency::read_ts::ReadTimestamps;
-use crate::concurrency::transaction::{Garbage, Transaction, TransactionState};
+use crate::concurrency::transaction::{Garbage, Outcome, Transaction};
 use crate::concurrency::watermark::Watermark;
 use crate::error::Result;
 use crate::index::{Index, IndexTrait, RowLocator};
 use crate::table::table_heap::TableHeap;
 use crate::table::undo_log::UndoLog;
-use crate::wal::TxnLog;
 
 /// Begins and ends transactions. It owns the watermark, the one undo log
 /// every table's versions go into, and the read timestamps of every table's
@@ -116,7 +115,8 @@ impl TransactionManager {
     pub fn begin(&self) -> Arc<Transaction> {
         let tid = self.shared.watermark.begin();
         Arc::new(Transaction::new(
-            TxnLog::new(tid, Arc::clone(&self.shared.bpm)),
+            tid,
+            Arc::clone(&self.shared.bpm),
             Arc::clone(&self.shared.undo),
             Arc::clone(&self.shared.read_ts),
             Arc::clone(&self.shared.watermark),
@@ -130,13 +130,13 @@ impl TransactionManager {
     /// has already ended. Past the `Commit`, a failure stops the process,
     /// and recovery finishes the commit.
     pub fn commit(&self, txn: &Transaction) -> Result<()> {
-        self.end(txn, TransactionState::Committed)
+        self.end(txn, Outcome::Committed)
     }
 
     /// Aborts `txn`: puts back every tuple and index entry it wrote, as its
     /// records in the log say. Fails as `commit` does.
     pub fn abort(&self, txn: &Transaction) -> Result<()> {
-        self.end(txn, TransactionState::Aborted)
+        self.end(txn, Outcome::Aborted)
     }
 
     /// Runs a pass of garbage collection on the calling thread, alongside
@@ -259,7 +259,7 @@ impl TransactionManager {
         self.shared.watermark.get()
     }
 
-    fn end(&self, txn: &Transaction, outcome: TransactionState) -> Result<()> {
+    fn end(&self, txn: &Transaction, outcome: Outcome) -> Result<()> {
         debug_assert!(
             Arc::ptr_eq(txn.undo_log(), &self.shared.undo),
             "transaction {} was begun by another manager",

@@ -20,6 +20,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::disk::fs::{Fs, FsFile};
 use crate::error::{Result, StorageError};
+use crate::wal::fatal;
 use crate::wal::record::{HEADER_SIZE, Record, RecordBuf, record_len, seal};
 use crate::wal::txn_log::Att;
 
@@ -33,7 +34,8 @@ pub const FIRST_LSN: Lsn = FILE_HEADER_SIZE;
 const MAGIC: u64 = u64::from_le_bytes(*b"HAMDBWAL");
 /// 2: `Update` and `Clr` records carry undo, and `HeapSetTuple` its padding.
 /// 3: an `Update` can carry a create's undo.
-const VERSION: u32 = 3;
+/// 4: an `Abort` comes before every `Clr` of its transaction.
+const VERSION: u32 = 4;
 
 /// Appends stop to flush once the tail holds this much. A record larger
 /// than this still goes in, alone.
@@ -165,6 +167,10 @@ impl Log {
     /// `on_append(lsn)` runs inside the critical section: whatever it
     /// records about `lsn` is seen by anyone who appends after. Flushes
     /// first if the tail is full. Fails only if an earlier flush failed.
+    ///
+    /// Stops the process if the record's transaction may not log it now
+    /// (`TxnStatus::after`). `TxnLog` takes only the steps that table
+    /// allows, so only a bug appends such a record.
     pub fn append(&self, record: &RecordBuf, on_append: impl FnOnce(Lsn)) -> Result<Lsn> {
         debug_assert!(
             record.len() >= HEADER_SIZE,
@@ -180,9 +186,12 @@ impl Log {
                 continue;
             }
             let lsn = tail.start + tail.buf.len() as Lsn;
+            let prev_lsn = tail
+                .att
+                .link(record.tid(), record.kind(), lsn)
+                .unwrap_or_else(|e| fatal(format_args!("cannot log a record out of order: {e}")));
             let at = tail.buf.len();
             tail.buf.extend_from_slice(record.bytes());
-            let prev_lsn = tail.att.link(record.tid(), record.kind(), lsn);
             tail.next_tid = tail.next_tid.max(record.tid() + 1);
             on_append(lsn);
             seal(&mut tail.buf[at..], lsn, prev_lsn, record.tail_crc());

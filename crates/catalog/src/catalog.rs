@@ -8,7 +8,7 @@ use storage::StorageError;
 use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::concurrency::index_versions::IndexedTable;
-use storage::concurrency::transaction::{Transaction, TransactionState};
+use storage::concurrency::transaction::{Outcome, Transaction};
 use storage::concurrency::transaction_manager::TransactionManager;
 use storage::index::btree_index::BtreeIndex;
 use storage::index::{Index, IndexMetadata, LocatorKind};
@@ -677,7 +677,7 @@ impl Catalog {
         info.locks.lock(txn, name, LockMode::AccessExclusive)?;
         let catalog = Arc::clone(self);
         txn.on_end(move |outcome| {
-            if outcome == TransactionState::Aborted {
+            if outcome == Outcome::Aborted {
                 catalog.state.write().remove_table(oid);
             }
         })?;
@@ -795,7 +795,7 @@ impl Catalog {
         txn.undoable(|by| self.insert_index_rows(by, &info))?;
         let catalog = Arc::clone(self);
         txn.on_end(move |outcome| {
-            if outcome == TransactionState::Aborted {
+            if outcome == Outcome::Aborted {
                 catalog.state.write().remove_index(oid);
             }
         })
@@ -896,7 +896,7 @@ impl Catalog {
         let tid = txn.tid();
         let catalog = Arc::clone(self);
         txn.on_end(move |outcome| {
-            if outcome == TransactionState::Committed {
+            if outcome == Outcome::Committed {
                 return old.locks.truncated(tid);
             }
             // Undo has put the sequences' rows back.

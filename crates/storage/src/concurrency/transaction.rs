@@ -40,8 +40,9 @@ use std::thread;
 
 use common::hash::IntKeys;
 use common::{PageId, Rid, Schema, TXN_UNCOMMITTED_BIT, Tuple, TxnId};
-use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
 
+use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::concurrency::index_versions::{self, IndexedTable, TableEntry};
 use crate::concurrency::read_ts::ReadTimestamps;
 use crate::concurrency::watermark::Watermark;
@@ -93,6 +94,20 @@ pub enum TransactionState {
     Aborted,
 }
 
+/// How a transaction ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Committed,
+    Aborted,
+}
+
+/// A transaction's `TransactionState`, holding its log while it runs: only
+/// a running transaction logs its changes.
+enum State {
+    Running(TxnLog<txn_log::Running>),
+    Ended(Outcome),
+}
+
 /// A running or finished transaction, begun by a `TransactionManager`.
 ///
 /// Its methods read and write tables at its Tid and record every write.
@@ -104,11 +119,10 @@ pub enum TransactionState {
 /// Debug builds panic if that happens.
 pub struct Transaction {
     tid: TxnId,
-    log: TxnLog,
     /// Reads and writes hold this shared for their whole call, and commit
     /// and abort exclusively, so a transaction never ends halfway through a
     /// write and misses it.
-    state: RwLock<TransactionState>,
+    state: RwLock<State>,
     undo: Arc<UndoLog>,
     read_ts: Arc<ReadTimestamps>,
     watermark: Arc<Watermark>,
@@ -134,7 +148,7 @@ pub struct Transaction {
     made: Mutex<Vec<PageId>>,
 }
 
-type EndHook = Box<dyn FnOnce(TransactionState) + Send>;
+type EndHook = Box<dyn FnOnce(Outcome) + Send>;
 
 /// The tuples a transaction wrote in one table, keyed by the table's first
 /// page, each with the payload length its commit keeps: the length of the
@@ -146,16 +160,16 @@ struct TableWrites {
 
 impl Transaction {
     pub(crate) fn new(
-        log: TxnLog,
+        tid: TxnId,
+        bpm: Arc<BufferPoolManager>,
         undo: Arc<UndoLog>,
         read_ts: Arc<ReadTimestamps>,
         watermark: Arc<Watermark>,
         entry_lock: Arc<RwLock<()>>,
     ) -> Self {
         Self {
-            tid: log.tid(),
-            log,
-            state: RwLock::new(TransactionState::Running),
+            tid,
+            state: RwLock::new(State::Running(TxnLog::new(tid, bpm))),
             undo,
             read_ts,
             watermark,
@@ -176,14 +190,18 @@ impl Transaction {
     }
 
     pub fn state(&self) -> TransactionState {
-        *self.state.read()
+        match *self.state.read() {
+            State::Running(_) => TransactionState::Running,
+            State::Ended(Outcome::Committed) => TransactionState::Committed,
+            State::Ended(Outcome::Aborted) => TransactionState::Aborted,
+        }
     }
 
     /// Runs `hook` with the outcome once the transaction's writes are
     /// committed or rolled back, newest hook first, for state kept outside
     /// the log, such as the catalog's tables in memory. A hook runs with
     /// the state locked and must not use the transaction.
-    pub fn on_end(&self, hook: impl FnOnce(TransactionState) + Send + 'static) -> Result<()> {
+    pub fn on_end(&self, hook: impl FnOnce(Outcome) + Send + 'static) -> Result<()> {
         let _state = self.running()?;
         self.on_end.lock().push(Box::new(hook));
         Ok(())
@@ -197,8 +215,8 @@ impl Transaction {
         &self,
         change: impl FnOnce(Logged<'_>) -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
-        let _running = self.running()?;
-        change(self.logged())
+        let log = self.running()?;
+        change(Logged::Txn(&log))
     }
 
     /// Gives a table new, empty storage in this transaction: a heap for
@@ -210,12 +228,14 @@ impl Transaction {
         heap: &TableHeap,
         indexes: &[Arc<Index>],
     ) -> Result<(TableHeap, Vec<Index>)> {
-        let _running = self.running()?;
+        let log = self.running()?;
         let old: Vec<PageId> = std::iter::once(heap.first_page_id())
             .chain(indexes.iter().map(|index| header_page_id(index)))
             .collect();
         let metadata: Vec<&IndexMetadata> = indexes.iter().map(|index| index.metadata()).collect();
-        let (heap, trees) = self.make(true, &metadata, |mtr, new| mtr.undo_truncate(&old, new))?;
+        let (heap, trees) = self.make(&log, true, &metadata, |mtr, new| {
+            mtr.undo_truncate(&old, new);
+        })?;
         self.replaced.lock().push(old);
         Ok((heap.expect("made with a heap"), trees))
     }
@@ -225,8 +245,8 @@ impl Transaction {
     /// left without a transaction to free it. An abort, or a crash before
     /// the commit, frees all of it.
     pub fn create_table(&self, indexes: &[&IndexMetadata]) -> Result<(TableHeap, Vec<Index>)> {
-        let _running = self.running()?;
-        let (heap, trees) = self.make(true, indexes, |mtr, new| {
+        let log = self.running()?;
+        let (heap, trees) = self.make(&log, true, indexes, |mtr, new| {
             mtr.undo_create(&new[..1], &new[1..]);
         })?;
         Ok((heap.expect("made with a heap"), trees))
@@ -235,24 +255,27 @@ impl Transaction {
     /// Makes an empty tree for a new index in this transaction, which an
     /// abort, or a crash before the commit, frees with every page it grew.
     pub fn create_index(&self, metadata: &IndexMetadata) -> Result<Index> {
-        let _running = self.running()?;
-        let (_, mut trees) = self.make(false, &[metadata], |mtr, new| mtr.undo_create(&[], new))?;
+        let log = self.running()?;
+        let (_, mut trees) = self.make(&log, false, &[metadata], |mtr, new| {
+            mtr.undo_create(&[], new);
+        })?;
         Ok(trees.remove(0))
     }
 
     /// Makes an empty heap, if `heap`, and an empty tree for each of
-    /// `indexes`, in one mtr whose undo `undo` logs, given the new roots,
-    /// the heap's first page first. The caller holds `running`.
+    /// `indexes`, in one mtr logged as `log`'s whose undo `undo` logs, given
+    /// the new roots, the heap's first page first.
     fn make(
         &self,
+        log: &TxnLog<txn_log::Running>,
         heap: bool,
         indexes: &[&IndexMetadata],
         undo: impl FnOnce(&Mtr<'_>, &[PageId]),
     ) -> Result<(Option<TableHeap>, Vec<Index>)> {
-        let bpm = self.log.bpm();
+        let bpm = log.bpm();
         let heaps = usize::from(heap);
         let new = {
-            let mtr = bpm.mtr(self.logged());
+            let mtr = bpm.mtr(Logged::Txn(log));
             // Latched before any change: the record has all of the new
             // storage or none.
             let mut pages = (0..heaps + indexes.len())
@@ -285,8 +308,8 @@ impl Transaction {
     /// Inserts `tuple`, locked until the transaction ends, and returns its
     /// `Rid`.
     pub fn insert(&self, heap: &Arc<TableHeap>, schema: &Schema, tuple: &Tuple) -> Result<Rid> {
-        let _running = self.running()?;
-        self.insert_locked(heap, schema, tuple)
+        let log = self.running()?;
+        self.insert_locked(&log, heap, schema, tuple)
     }
 
     /// Replaces the tuple at `rid` with `new` and returns where `new` is. If
@@ -301,17 +324,17 @@ impl Transaction {
         rid: Rid,
         new: &Tuple,
     ) -> Result<Rid> {
-        let _running = self.running()?;
+        let log = self.running()?;
         let (ts, undo, read_ts) = (self.write_ts(), &*self.undo, &*self.read_ts);
-        match heap.update_versioned(self.logged(), rid, new, ts, schema, undo, read_ts) {
+        match heap.update_versioned(Logged::Txn(&log), rid, new, ts, schema, undo, read_ts) {
             Ok(()) => {
                 self.record_write(heap, rid, Some(new.len()));
                 Ok(rid)
             }
             Err(StorageError::PageFull) => {
-                heap.delete_versioned(self.logged(), rid, ts, undo, read_ts)?;
+                heap.delete_versioned(Logged::Txn(&log), rid, ts, undo, read_ts)?;
                 self.record_write(heap, rid, None);
-                self.insert_locked(heap, schema, new)
+                self.insert_locked(&log, heap, schema, new)
             }
             Err(e) => Err(e),
         }
@@ -319,9 +342,9 @@ impl Transaction {
 
     /// Deletes the tuple at `rid`. Fails as `update` does.
     pub fn delete(&self, heap: &Arc<TableHeap>, rid: Rid) -> Result<()> {
-        let _running = self.running()?;
+        let log = self.running()?;
         let ts = self.write_ts();
-        heap.delete_versioned(self.logged(), rid, ts, &self.undo, &self.read_ts)?;
+        heap.delete_versioned(Logged::Txn(&log), rid, ts, &self.undo, &self.read_ts)?;
         self.record_write(heap, rid, None);
         Ok(())
     }
@@ -343,10 +366,10 @@ impl Transaction {
         locator: &RowLocator,
         rid: Rid,
     ) -> Result<bool> {
-        let _running = self.running()?;
+        let log = self.running()?;
         let added = {
             let _entries = self.entry_lock.read();
-            index.insert_entry(key, locator, self.logged())?
+            index.insert_entry(key, locator, Logged::Txn(&log))?
         };
         let free = match index_versions::must_be_free(index, key) {
             Ok(true) => self.key_is_free(table, index, key, rid),
@@ -501,85 +524,67 @@ impl Transaction {
     /// entries retired by a commit or found already there by an abort, and
     /// either way the entries an index build added. The manager calls this
     /// before ending the Tid. Fails only if the transaction has ended.
-    pub(crate) fn finish(&self, outcome: TransactionState) -> Result<Garbage> {
+    pub(crate) fn finish(&self, outcome: Outcome) -> Result<Garbage> {
         let mut state = self.state.write();
-        if *state != TransactionState::Running {
-            return Err(StorageError::TransactionNotRunning(self.tid));
-        }
+        let log = match mem::replace(&mut *state, State::Ended(outcome)) {
+            State::Running(log) => log,
+            ended => {
+                *state = ended;
+                return Err(StorageError::TransactionNotRunning(self.tid));
+            }
+        };
         // Past `Commit` or `Abort`, unwinding would leave the transaction
-        // running for a caller to end the other way.
+        // half ended, its tuples still locked.
         let _ending = NoUnwind("ending a transaction");
         let mut garbage = Garbage::default();
         let write_set = mem::take(&mut *self.write_set.lock());
         let replaced = mem::take(&mut *self.replaced.lock());
         let committed = match outcome {
-            TransactionState::Committed => self.commit_writes(write_set, &mut garbage),
-            TransactionState::Aborted => {
-                self.roll_back_writes(write_set, &mut garbage);
-                false
+            Outcome::Committed => self.commit_writes(log, write_set, &mut garbage),
+            Outcome::Aborted => {
+                self.roll_back_writes(log, write_set, &mut garbage);
+                None
             }
-            TransactionState::Running => unreachable!("a transaction ends running"),
         };
         let hooks = mem::take(&mut *self.on_end.lock());
         hooks.into_iter().rev().for_each(|hook| hook(outcome));
-        if committed {
+        if let Some(log) = committed {
             match replaced.is_empty() {
-                true => self.log.end(),
-                false => garbage.deferred.push(self.free_replaced(replaced)),
+                true => log.end(),
+                false => garbage.deferred.push(free_replaced(log, replaced)),
             }
         }
-        *state = outcome;
         Ok(garbage)
     }
 
-    /// The end of a commit that truncated, for once no reader needs the
-    /// storage its truncates replaced: frees that storage, then logs `End`.
-    /// If freeing fails, the pages stay until recovery frees them.
-    fn free_replaced(&self, replaced: Vec<Vec<PageId>>) -> Box<dyn FnOnce() + Send> {
-        let txn = TxnLog::new(self.tid, Arc::clone(self.log.bpm()));
-        Box::new(move || {
-            for old in &replaced {
-                let by = Logged::Completion(&txn);
-                // Recovery frees it instead. Returning would leave the frees
-                // out of commit order, which recovery's stamping relies on.
-                if let Err(e) = txn_log::free_storage(txn.bpm(), by, &old[..1], &old[1..]) {
-                    fatal(format_args!(
-                        "cannot free the storage transaction {} truncated: {e}",
-                        txn.tid()
-                    ));
-                }
-            }
-            txn.end();
-        })
-    }
-
     /// Logs `Commit`, then stamps the tuples in `write_set`, in page order.
-    /// Returns whether `Commit` was logged: a transaction without records
-    /// logs none, and no `End` either.
+    /// Returns the committed log, or `None` for a transaction without
+    /// records, which logs no `Commit` and no `End` either.
     fn commit_writes(
         &self,
+        log: TxnLog<txn_log::Running>,
         write_set: HashMap<PageId, TableWrites, IntKeys>,
         garbage: &mut Garbage,
-    ) -> bool {
+    ) -> Option<TxnLog<txn_log::Committed>> {
         self.found.lock().clear();
         garbage.entries.append(&mut self.retired.lock());
         garbage.built.append(&mut self.built.lock());
-        if !self.log.commit() {
+        let Some(log) = log.commit() else {
             debug_assert!(write_set.is_empty(), "writes that logged nothing");
-            return false;
-        }
+            return None;
+        };
         for table in write_set.into_values() {
             let mut writes: Vec<_> = table.rids.into_iter().collect();
             writes.sort_unstable_by_key(|&(rid, _)| rid);
             let deleted = |rid| garbage.tuples.push((Arc::clone(&table.heap), rid));
-            if let Err(e) = txn_log::stamp(&self.log, &writes, deleted) {
+            if let Err(e) = txn_log::stamp(&log, &writes, deleted) {
                 fatal(format_args!(
                     "cannot stamp the commit of transaction {}: {e}",
                     self.tid
                 ));
             }
         }
-        true
+        Some(log)
     }
 
     /// Takes back every write the log holds, including the index entries
@@ -588,6 +593,7 @@ impl Transaction {
     /// storage this transaction made, which undo frees whole.
     fn roll_back_writes(
         &self,
+        log: TxnLog<txn_log::Running>,
         write_set: HashMap<PageId, TableWrites, IntKeys>,
         garbage: &mut Garbage,
     ) {
@@ -604,7 +610,7 @@ impl Transaction {
                 .filter(|entry| !made.contains(&header_page_id(&entry.index))),
         );
         self.retired.lock().clear();
-        let inserted: HashSet<Rid, IntKeys> = match undo::rollback(&self.log) {
+        let inserted: HashSet<Rid, IntKeys> = match undo::rollback(log) {
             Ok(inserted) => inserted.into_iter().collect(),
             Err(e) => fatal(format_args!(
                 "cannot roll back transaction {}: {e}",
@@ -623,13 +629,14 @@ impl Transaction {
         &self.undo
     }
 
-    /// Holds the state shared, failing if the transaction has ended.
-    fn running(&self) -> Result<RwLockReadGuard<'_, TransactionState>> {
-        let state = self.state.read();
-        if *state != TransactionState::Running {
-            return Err(StorageError::TransactionNotRunning(self.tid));
-        }
-        Ok(state)
+    /// The transaction's log, holding the state shared, failing if the
+    /// transaction has ended.
+    fn running(&self) -> Result<MappedRwLockReadGuard<'_, TxnLog<txn_log::Running>>> {
+        let running = RwLockReadGuard::try_map(self.state.read(), |state| match state {
+            State::Running(log) => Some(log),
+            State::Ended(_) => None,
+        });
+        running.map_err(|_| StorageError::TransactionNotRunning(self.tid))
     }
 
     /// Where this transaction's reads are recorded: nowhere once it is the
@@ -650,12 +657,14 @@ impl Transaction {
         self.tid | TXN_UNCOMMITTED_BIT
     }
 
-    fn logged(&self) -> Logged<'_> {
-        Logged::Txn(&self.log)
-    }
-
-    /// Inserts `tuple` locked and records it. The caller holds `running`.
-    fn insert_locked(&self, heap: &Arc<TableHeap>, schema: &Schema, tuple: &Tuple) -> Result<Rid> {
+    /// Inserts `tuple` locked, logged as `log`'s, and records it.
+    fn insert_locked(
+        &self,
+        log: &TxnLog<txn_log::Running>,
+        heap: &Arc<TableHeap>,
+        schema: &Schema,
+        tuple: &Tuple,
+    ) -> Result<Rid> {
         let mut has_nulls = false;
         for idx in 0..schema.len() {
             has_nulls |= tuple.is_null(schema, idx)?;
@@ -664,7 +673,7 @@ impl Transaction {
             has_nulls,
             ..TupleMeta::new(self.write_ts())
         };
-        let rid = heap.insert(self.logged(), &meta, tuple)?;
+        let rid = heap.insert(Logged::Txn(log), &meta, tuple)?;
         self.record_write(heap, rid, Some(tuple.len()));
         Ok(rid)
     }
@@ -808,6 +817,29 @@ impl Transaction {
     }
 }
 
+/// The end of a commit that truncated, for once no reader needs the storage
+/// its truncates replaced: frees that storage, then logs `End`. If freeing
+/// fails, the pages stay until recovery frees them.
+fn free_replaced(
+    log: TxnLog<txn_log::Committed>,
+    replaced: Vec<Vec<PageId>>,
+) -> Box<dyn FnOnce() + Send> {
+    Box::new(move || {
+        for old in &replaced {
+            let by = Logged::Completion(&log);
+            // Recovery frees it instead. Returning would leave the frees
+            // out of commit order, which recovery's stamping relies on.
+            if let Err(e) = txn_log::free_storage(log.bpm(), by, &old[..1], &old[1..]) {
+                fatal(format_args!(
+                    "cannot free the storage transaction {} truncated: {e}",
+                    log.tid()
+                ));
+            }
+        }
+        log.end();
+    })
+}
+
 fn header_page_id(index: &Index) -> PageId {
     let Index::BtreeIndex(btree) = index;
     btree.tree().header_page_id()
@@ -817,7 +849,7 @@ impl Drop for Transaction {
     fn drop(&mut self) {
         if cfg!(debug_assertions)
             && !thread::panicking()
-            && *self.state.get_mut() == TransactionState::Running
+            && matches!(self.state.get_mut(), State::Running(_))
         {
             panic!(
                 "transaction {} was dropped while running; commit or abort it",

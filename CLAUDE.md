@@ -33,7 +33,7 @@ Most code changes do not need an internal documentation change. Agents can read 
 # Taste
 ---
 - Default to no comment. Write one only for a constraint, an external quirk, or an invariant the code can't show, in one line where you can and four at most. Don't restate names or signatures, narrate steps, record history, or explain the fix you just made; the PR carries that.
-- Do not add complex state machinery for simple nitpick features, and prefer state machine where we would want to concretely remove the wrong state transformations.
+- Model anything with a lifecycle as a state machine: a transaction, a connection, a recovery step. Encode the states in types, so an invalid transition does not compile. A method that is legal only in one state lives on that state's type, and a transition consumes `self` and returns the next state. States read from disk or the network cannot be checked by the compiler, so check them in one transition table at the boundary.
 
 # Performance
 ---
