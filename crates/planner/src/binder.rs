@@ -48,6 +48,7 @@ impl<'a> Binder<'a> {
             Statement::Delete(delete) => self.bind_delete(delete),
             Statement::Truncate(truncate) => self.bind_truncate(truncate),
             Statement::DropTable(drop) => self.bind_drop_table(drop),
+            Statement::DropIndex(_) => Err(PlannerError::Unsupported("DROP INDEX".into())),
             Statement::Explain(stmt) => Ok(BoundStatement::Explain(Box::new(self.bind(stmt)?))),
             Statement::Begin => Ok(BoundStatement::Transaction(TransactionCommand::Begin)),
             Statement::Commit => Ok(BoundStatement::Transaction(TransactionCommand::Commit)),

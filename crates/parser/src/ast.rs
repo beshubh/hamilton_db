@@ -17,6 +17,7 @@ pub enum Statement {
     Delete(Delete),
     Truncate(Truncate),
     DropTable(DropTable),
+    DropIndex(DropIndex),
     /// `EXPLAIN stmt`: the plan of a SELECT, INSERT, UPDATE or DELETE,
     /// without running it.
     Explain(Box<Statement>),
@@ -116,6 +117,16 @@ pub struct Truncate {
 pub struct DropTable {
     /// In the order written, repeats included.
     pub tables: Vec<String>,
+    pub if_exists: bool,
+}
+
+/// `DROP INDEX [IF EXISTS] name, ... [CASCADE | RESTRICT]`. Nothing depends
+/// on an index but the constraint that made it, which even CASCADE leaves,
+/// so the two do the same.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropIndex {
+    /// In the order written, repeats included.
+    pub names: Vec<String>,
     pub if_exists: bool,
 }
 
