@@ -62,20 +62,21 @@ Opening a database replays the log, finishes the commits a crash cut off between
 
 `nextval` hands values out from a counter in memory, outside any transaction ([`sequence.rs`](../../crates/catalog/src/sequence.rs)). When the sequence's row stops covering the next value, `nextval` first writes it 32 values ahead, a redo-only record that nothing syncs. A value reaches a committed row only through an insert whose transaction logs `Commit` after that record, and the commit's sync makes the record durable too. So a crash skips up to 32 values and never repeats one that a committed row holds. A clean shutdown writes each row back to the last value handed out (`Catalog::save_sequences`), so only a crash skips. A way to hand a value out with no commit after it, such as `SELECT nextval(...)`, would need its own sync.
 
-`TRUNCATE ... RESTART IDENTITY` is the only change that moves a sequence back. It is a change of the truncate's transaction, so an abort, or a crash before the commit, puts the row back ([Recovery](recovery.md#how-create-table-create-index-and-truncate-are-logged)).
+`TRUNCATE ... RESTART IDENTITY` is the only change that moves a sequence back. It is a change of the truncate's transaction, so an abort, or a crash before the commit, puts the row back ([Recovery](recovery.md#how-ddl-is-logged)).
 
-## Table locks and TRUNCATE
+## Table locks, TRUNCATE and DROP TABLE
 
-TRUNCATE does not delete rows. It gives the table a new, empty heap and new indexes ([`Catalog::truncate`](../../crates/catalog/src/catalog.rs)), so every reader loses the old versions at the same moment. No row timestamp is left to check the truncate against other transactions. Table locks ([`locks.rs`](../../crates/catalog/src/locks.rs)) do that check:
+TRUNCATE does not delete rows. It gives the table a new, empty heap and new indexes ([`Catalog::truncate`](../../crates/catalog/src/catalog.rs)), and DROP TABLE takes the table away with its storage (`Catalog::drop_table`), so every reader loses the old versions at the same moment. No row timestamp is left to check either against other transactions. Table locks ([`locks.rs`](../../crates/catalog/src/locks.rs)) do that check:
 
-- Each statement locks the tables that its plan uses before it runs (`lock_tables` in [`executors.rs`](../../crates/execution/src/executors.rs)). Reads, writes, and CREATE INDEX take modes that conflict only with TRUNCATE's exclusive mode, which CREATE TABLE also holds on its new table until it ends. A transaction holds its locks until it ends.
+- Each statement locks the tables that its plan uses before it runs (`lock_tables` in [`executors.rs`](../../crates/execution/src/executors.rs)). Reads, writes, and CREATE INDEX take modes that conflict only with the exclusive mode of TRUNCATE and DROP TABLE, which CREATE TABLE also holds on its new table until it ends. A transaction holds its locks until it ends.
 - A lock never waits. A conflict fails the statement with `LockConflict`. Outside a block, the engine retries after the holder ends, whether the holder is older or newer. In a block, the block fails. No transaction waits while it holds a lock, so there are no deadlocks to detect. The cost is that an exclusive request can keep failing while readers keep arriving.
-- Locks also do the job of the timestamps that MVTO keeps on rows, and fail with `ChangedSince`. A transaction older than a committed truncate cannot use the table, because it comes first in Tid order and should still see the rows. A truncate cannot run in a transaction older than one that has used the table, because it would remove rows that the newer transaction wrote or read. Postgres has neither check. There, older snapshots see an empty table.
-- Garbage collection frees the replaced pages after it has handled any garbage that still points into them.
+- Locks also do the job of the timestamps that MVTO keeps on rows, and fail with `ChangedSince`. A transaction older than a committed truncate cannot use the table, because it comes first in Tid order and should still see the rows. A truncate or drop cannot run in a transaction older than one that has used the table, because it would remove rows that the newer transaction wrote or read. Postgres has neither check. There, older snapshots see an empty table.
+- Garbage collection frees the replaced or dropped pages after it has handled any garbage that still points into them.
 
-The new storage, and the catalog rows that point at it, are changes of the truncate's transaction, so they commit or roll back with it, across a crash too ([Recovery](recovery.md#how-create-table-create-index-and-truncate-are-logged)).
+A truncate's new storage and the catalog rows that point at it, and a drop's catalog deletes, are changes of their statement's transaction, so they commit or roll back with it, across a crash too ([Recovery](recovery.md#how-ddl-is-logged)).
 
 ## Known gaps
 
 - **Phantoms.** Read timestamps guard tuples that exist. If an older transaction inserts a row that a newer transaction's scan should have seen, nothing detects it. Schedules with inserts are therefore not serializable.
-- **DDL is a transaction of its own.** CREATE TABLE and CREATE INDEX commit or roll back whole, but are rejected inside a block ([Recovery](recovery.md#how-create-table-create-index-and-truncate-are-logged)).
+- **DDL is a transaction of its own.** CREATE TABLE, CREATE INDEX and DROP TABLE commit or roll back whole, but are rejected inside a block ([Recovery](recovery.md#how-ddl-is-logged)).
+- **The catalog has no versions.** A transaction older than a committed DROP TABLE finds the table gone, or, if its name was made again, the new table, where Tid order says it should still see the old rows. Table locks catch only a transaction that looked the table up before the drop removed it.
