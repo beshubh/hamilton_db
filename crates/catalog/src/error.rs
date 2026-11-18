@@ -24,6 +24,12 @@ pub enum CatalogError {
     #[error("index {0} already exists")]
     IndexExists(String),
 
+    #[error("index \"{0}\" does not exist")]
+    IndexNotFound(String),
+
+    #[error("cannot drop index {index} because constraint {index} on table {table} requires it")]
+    IndexRequiredByConstraint { index: String, table: String },
+
     #[error("column {column} does not exist in table {table}")]
     ColumnNotFound { table: String, column: String },
 

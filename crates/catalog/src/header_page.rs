@@ -34,8 +34,9 @@ const MAGIC: u64 = u64::from_le_bytes(*b"HAMDBCAT");
 /// whether they are unique. 8: sequences are relations, and identity columns
 /// record theirs. 9: B+ tree headers record how their keys are ordered.
 /// 10: the next transaction id moved to the checkpoint, and a sequence's
-/// row holds the value it logged ahead.
-const VERSION: u32 = 10;
+/// row holds the value it logged ahead. 11: indexes record whether a
+/// constraint made them.
+const VERSION: u32 = 11;
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]

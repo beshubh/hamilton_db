@@ -18,8 +18,8 @@ pub enum LockMode {
     AccessShare,
     /// Writing rows, or adding an index.
     RowExclusive,
-    /// Replacing or dropping the table's storage, as TRUNCATE and DROP
-    /// TABLE do.
+    /// Replacing or dropping storage of the table, as TRUNCATE, DROP TABLE
+    /// and DROP INDEX do.
     AccessExclusive,
 }
 
