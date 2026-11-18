@@ -262,6 +262,10 @@ pub enum Undo<'a> {
     /// A create made new heaps and trees, given by their first and header
     /// pages. Undo frees every page of them.
     Create { heaps: Roots<'a>, trees: Roots<'a> },
+    /// A drop gave up heaps and trees, given by their first and header
+    /// pages. Undo frees nothing; finishing the commit frees every page of
+    /// them.
+    Drop { heaps: Roots<'a>, trees: Roots<'a> },
 }
 
 /// Pages that some storage starts at: the first page of a heap or the
@@ -292,6 +296,7 @@ const UNDO_HEAP: u8 = 1;
 const UNDO_INDEX_ENTRY: u8 = 2;
 const UNDO_TRUNCATE: u8 = 3;
 const UNDO_CREATE: u8 = 4;
+const UNDO_DROP: u8 = 5;
 const BEFORE_INSERTED: u8 = 1;
 const BEFORE_META: u8 = 2;
 const BEFORE_TUPLE: u8 = 3;
@@ -305,6 +310,7 @@ impl<'a> Undo<'a> {
     /// index entry   2 | header i32 | len u16 | entry
     /// truncate      3 | num u16 | old page_id i32 * num | new page_id i32 * num
     /// create        4 | num_heaps u16 | num_trees u16 | page_id i32 * (num_heaps + num_trees)
+    /// drop          5 | num_heaps u16 | num_trees u16 | page_id i32 * (num_heaps + num_trees)
     ///
     /// before: 1 (inserted) | 2 meta | 3 meta len u16 payload
     /// ```
@@ -345,6 +351,7 @@ impl<'a> Undo<'a> {
             }
             Self::Truncate { old, new } => Self::encode_truncate(buf, old.iter(), new.iter()),
             Self::Create { heaps, trees } => Self::encode_create(buf, heaps.iter(), trees.iter()),
+            Self::Drop { heaps, trees } => Self::encode_drop(buf, heaps.iter(), trees.iter()),
         }
     }
 
@@ -359,9 +366,32 @@ impl<'a> Undo<'a> {
         trees: impl ExactSizeIterator<Item = PageId>,
     ) {
         assert!(heaps.len() + trees.len() > 0, "a create makes storage");
-        buf.push(UNDO_CREATE);
+        Self::encode_roots(buf, UNDO_CREATE, heaps, trees);
+    }
+
+    /// Appends a `Drop` of the heaps starting at `heaps` and the trees
+    /// whose header pages are `trees`.
+    ///
+    /// # Panics
+    /// If `heaps` is empty.
+    pub(crate) fn encode_drop(
+        buf: &mut Vec<u8>,
+        heaps: impl ExactSizeIterator<Item = PageId>,
+        trees: impl ExactSizeIterator<Item = PageId>,
+    ) {
+        assert!(heaps.len() > 0, "a drop gives up a table's heap");
+        Self::encode_roots(buf, UNDO_DROP, heaps, trees);
+    }
+
+    fn encode_roots(
+        buf: &mut Vec<u8>,
+        tag: u8,
+        heaps: impl ExactSizeIterator<Item = PageId>,
+        trees: impl ExactSizeIterator<Item = PageId>,
+    ) {
+        buf.push(tag);
         for num in [heaps.len(), trees.len()] {
-            let num = u16::try_from(num).expect("a create makes few pages");
+            let num = u16::try_from(num).expect("a table has few heaps and trees");
             buf.extend_from_slice(&num.to_le_bytes());
         }
         for page_id in heaps.chain(trees) {
@@ -439,19 +469,31 @@ impl<'a> Undo<'a> {
                 }
             }
             UNDO_CREATE => {
-                let heaps = usize::from(r.u16()?) * size_of::<PageId>();
-                let trees = usize::from(r.u16()?) * size_of::<PageId>();
-                if heaps + trees == 0 {
+                let (heaps, trees) = r.roots()?;
+                if heaps.0.is_empty() && trees.0.is_empty() {
                     return Err(corrupt_undo(UNDO_CREATE));
                 }
-                Self::Create {
-                    heaps: Roots(r.bytes(heaps)?),
-                    trees: Roots(r.bytes(trees)?),
+                Self::Create { heaps, trees }
+            }
+            UNDO_DROP => {
+                let (heaps, trees) = r.roots()?;
+                if heaps.0.is_empty() {
+                    return Err(corrupt_undo(UNDO_DROP));
                 }
+                Self::Drop { heaps, trees }
             }
             other => return Err(corrupt_undo(other)),
         };
         Ok((undo, r.0))
+    }
+}
+
+impl<'a> Reader<'a> {
+    /// `num_heaps u16 | num_trees u16 | page_id i32 * (num_heaps + num_trees)`.
+    fn roots(&mut self) -> Result<(Roots<'a>, Roots<'a>)> {
+        let heaps = usize::from(self.u16()?) * size_of::<PageId>();
+        let trees = usize::from(self.u16()?) * size_of::<PageId>();
+        Ok((Roots(self.bytes(heaps)?), Roots(self.bytes(trees)?)))
     }
 }
 
@@ -633,4 +675,31 @@ pub(crate) fn record_len(bytes: &[u8]) -> Option<usize> {
 
 fn read_u64(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UNDO_DROP, Undo};
+
+    #[test]
+    fn a_drop_reads_back_its_heaps_and_trees() {
+        let mut buf = Vec::new();
+        Undo::encode_drop(&mut buf, [7, 8].into_iter(), [9].into_iter());
+        let (undo, rest) = Undo::decode(&buf).unwrap();
+        let Undo::Drop { heaps, trees } = undo else {
+            panic!("read back {undo:?}");
+        };
+        assert_eq!(heaps.iter().collect::<Vec<_>>(), [7, 8]);
+        assert_eq!(trees.iter().collect::<Vec<_>>(), [9]);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn a_drop_without_a_heap_is_corrupt() {
+        let mut buf = vec![UNDO_DROP];
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&9i32.to_le_bytes());
+        assert!(Undo::decode(&buf).is_err());
+    }
 }
