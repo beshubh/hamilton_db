@@ -15,9 +15,9 @@ pub mod planner;
 pub use binder::Binder;
 pub use bound::{
     AggregateFunction, BoundAggregate, BoundCreateIndex, BoundCreateTable, BoundDelete,
-    BoundDropTable, BoundExpr, BoundExprKind, BoundFrom, BoundInsert, BoundOrderBy, BoundSelect,
-    BoundSelectItem, BoundStatement, BoundTable, BoundTruncate, BoundUpdate, BoundWindow,
-    BoundWindowFunction, Function, TransactionCommand,
+    BoundDropIndex, BoundDropTable, BoundExpr, BoundExprKind, BoundFrom, BoundIndex, BoundInsert,
+    BoundOrderBy, BoundSelect, BoundSelectItem, BoundStatement, BoundTable, BoundTruncate,
+    BoundUpdate, BoundWindow, BoundWindowFunction, Function, TransactionCommand,
 };
 pub use engine::{EngineError, ExecutionEngine, Output, TransactionStatus};
 pub use error::{PlannerError, Result};

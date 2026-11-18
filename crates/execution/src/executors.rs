@@ -13,11 +13,11 @@
 //! pulls as many batches from the children as it needs to produce one of its
 //! own.
 //!
-//! So far there are executors for CREATE TABLE, CREATE INDEX, INSERT ...
-//! VALUES, UPDATE, DELETE, SELECT ... WHERE through a table or an index
-//! scan, ORDER BY, LIMIT, nested loop, index nested loop and hash joins, and
-//! hash aggregation for GROUP BY and aggregates; other plans fail with
-//! [`ExecutionError::NoExecutor`].
+//! So far there are executors for CREATE TABLE, CREATE INDEX, DROP INDEX,
+//! INSERT ... VALUES, UPDATE, DELETE, SELECT ... WHERE through a table or an
+//! index scan, ORDER BY, LIMIT, nested loop, index nested loop and hash
+//! joins, and hash aggregation for GROUP BY and aggregates; other plans fail
+//! with [`ExecutionError::NoExecutor`].
 //!
 //! Executors read and write tables and indexes through the statement's
 //! transaction ([`ExecutionContext::txn`]). They never commit or abort it:
@@ -27,6 +27,7 @@
 mod create_index;
 mod create_table;
 mod delete;
+mod drop_index;
 mod drop_table;
 mod explain;
 mod filter;
@@ -51,6 +52,7 @@ mod values;
 pub use create_index::CreateIndexExecutor;
 pub use create_table::CreateTableExecutor;
 pub use delete::DeleteExecutor;
+pub use drop_index::DropIndexExecutor;
 pub use drop_table::DropTableExecutor;
 pub use explain::ExplainExecutor;
 pub use filter::FilterExecutor;
@@ -118,6 +120,7 @@ pub enum AbstractExecutor {
     DeleteExecutor,
     TruncateExecutor,
     DropTableExecutor,
+    DropIndexExecutor,
     FilterExecutor,
     ProjectionExecutor,
     SortExecutor,
@@ -165,6 +168,9 @@ pub fn create_executor(
         }
         AbstractPlanNode::DropTablePlan(plan) => {
             DropTableExecutor::new(Arc::clone(ctx), plan.clone()).into()
+        }
+        AbstractPlanNode::DropIndexPlan(plan) => {
+            DropIndexExecutor::new(Arc::clone(ctx), plan.clone()).into()
         }
         AbstractPlanNode::FilterPlan(plan) => {
             FilterExecutor::new(Arc::clone(ctx), plan.clone(), child(plan.child())?).into()
@@ -232,6 +238,11 @@ pub fn lock_tables(catalog: &Catalog, txn: &Transaction, plan: &AbstractPlanNode
         AbstractPlanNode::DropTablePlan(plan) => {
             for &oid in plan.tables() {
                 lock(oid, LockMode::AccessExclusive)?;
+            }
+        }
+        AbstractPlanNode::DropIndexPlan(plan) => {
+            for index in plan.indexes() {
+                lock(index.table_oid, LockMode::AccessExclusive)?;
             }
         }
         // These read only their children's rows.

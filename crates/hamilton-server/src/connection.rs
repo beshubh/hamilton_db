@@ -218,6 +218,11 @@ fn sqlstate(err: &Error) -> &'static str {
     {
         return "42P01"; // undefined_table
     }
+    if let EngineError::Planner(PlannerError::IndexNotFound(_))
+    | EngineError::Execution(ExecutionError::Catalog(CatalogError::IndexNotFound(_))) = err
+    {
+        return "42704"; // undefined_object
+    }
     match err {
         EngineError::Parse(_) => "42601",                 // syntax_error
         EngineError::Planner(_) => "42000",               // syntax_error_or_access_rule_violation
@@ -227,7 +232,11 @@ fn sqlstate(err: &Error) -> &'static str {
         EngineError::NotInTransactionBlock(_) => "25001", // active_sql_transaction
         EngineError::Execution(err) => match err {
             ExecutionError::Storage(StorageError::Conflict { .. })
-            | ExecutionError::Catalog(CatalogError::ChangedSince { .. }) => "40001", // serialization_failure
+            | ExecutionError::Catalog(CatalogError::ChangedSince { .. })
+            | ExecutionError::IndexNotFound(_) => "40001", // serialization_failure
+            ExecutionError::Catalog(CatalogError::IndexRequiredByConstraint { .. }) => {
+                "2BP01" // dependent_objects_still_exist
+            }
             ExecutionError::Catalog(CatalogError::LockConflict { .. }) => "55P03", // lock_not_available
             ExecutionError::DuplicateKey { .. }
             | ExecutionError::Storage(StorageError::DuplicateKey) => {
@@ -319,5 +328,14 @@ mod tests {
         };
         let err = Error::Engine(EngineError::Execution(ExecutionError::Catalog(exhausted)));
         assert_eq!(sqlstate(&err), "2200H");
+    }
+
+    #[test]
+    fn an_index_dropped_under_a_statement() {
+        let engine = |err| Error::Engine(EngineError::Execution(err));
+        let stale_plan = ExecutionError::IndexNotFound(7);
+        assert_eq!(sqlstate(&engine(stale_plan)), "40001");
+        let dropped_first = ExecutionError::Catalog(CatalogError::IndexNotFound("i".into()));
+        assert_eq!(sqlstate(&engine(dropped_first)), "42704");
     }
 }

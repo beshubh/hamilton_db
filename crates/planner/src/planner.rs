@@ -27,9 +27,9 @@ use execution::expressions::{AbstractExpr, ColumnValueExpr};
 use execution::optimizer::Optimizer;
 use execution::plans::{
     AbstractPlanNode, Aggregate, AggregationPlan, CreateIndexPlan, CreateTablePlan, DeletePlan,
-    DropTablePlan, ExplainPlan, FilterPlan, HashJoinPlan, InsertPlan, JoinType, LimitPlan, OrderBy,
-    PlanNode, ProjectionPlan, SeqScanPlan, SortPlan, TruncatePlan, UpdatePlan, ValuesPlan,
-    WindowColumn, WindowFunction, WindowFunctionKind, WindowPlan,
+    DropIndexPlan, DropTablePlan, DroppedIndex, ExplainPlan, FilterPlan, HashJoinPlan, InsertPlan,
+    JoinType, LimitPlan, OrderBy, PlanNode, ProjectionPlan, SeqScanPlan, SortPlan, TruncatePlan,
+    UpdatePlan, ValuesPlan, WindowColumn, WindowFunction, WindowFunctionKind, WindowPlan,
 };
 use parser::{BinaryOp, JoinKind};
 
@@ -88,6 +88,14 @@ impl<'a> Planner<'a> {
                 drop.if_exists,
             )
             .into(),
+            BoundStatement::DropIndex(drop) => {
+                let indexes = drop.indexes.iter().map(|index| DroppedIndex {
+                    name: index.name.clone(),
+                    oid: index.oid,
+                    table_oid: index.table_oid,
+                });
+                DropIndexPlan::new(indexes.collect(), drop.if_exists).into()
+            }
             BoundStatement::Explain(stmt) => {
                 ExplainPlan::new(Arc::new(self.plan_unoptimized(stmt)?)).into()
             }

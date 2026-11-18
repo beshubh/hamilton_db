@@ -15,17 +15,17 @@ use std::sync::Arc;
 use catalog::{Catalog, RelationKind, TableInfo};
 use common::{DataType, Schema, Value, ValueError};
 use parser::{
-    CreateIndex, CreateTable, Delete, DropTable, Expr, FromItem, Insert, JoinKind, OrderByItem,
-    Select, SelectItem, Statement, TableRef, Truncate, Update,
+    CreateIndex, CreateTable, Delete, DropIndex, DropTable, Expr, FromItem, Insert, JoinKind,
+    OrderByItem, Select, SelectItem, Statement, TableRef, Truncate, Update,
 };
 
 use self::aggregate::Rewriter;
 use self::expr::{UNNAMED_COLUMN, assign, forbid_calls, forbid_windows, null_for};
 use self::scope::Scope;
 use crate::bound::{
-    BoundCreateIndex, BoundCreateTable, BoundDelete, BoundDropTable, BoundExpr, BoundExprKind,
-    BoundFrom, BoundInsert, BoundOrderBy, BoundSelect, BoundSelectItem, BoundStatement, BoundTable,
-    BoundTruncate, BoundUpdate, TransactionCommand,
+    BoundCreateIndex, BoundCreateTable, BoundDelete, BoundDropIndex, BoundDropTable, BoundExpr,
+    BoundExprKind, BoundFrom, BoundIndex, BoundInsert, BoundOrderBy, BoundSelect, BoundSelectItem,
+    BoundStatement, BoundTable, BoundTruncate, BoundUpdate, TransactionCommand,
 };
 use crate::error::{PlannerError, Result};
 
@@ -48,7 +48,7 @@ impl<'a> Binder<'a> {
             Statement::Delete(delete) => self.bind_delete(delete),
             Statement::Truncate(truncate) => self.bind_truncate(truncate),
             Statement::DropTable(drop) => self.bind_drop_table(drop),
-            Statement::DropIndex(_) => Err(PlannerError::Unsupported("DROP INDEX".into())),
+            Statement::DropIndex(drop) => self.bind_drop_index(drop),
             Statement::Explain(stmt) => Ok(BoundStatement::Explain(Box::new(self.bind(stmt)?))),
             Statement::Begin => Ok(BoundStatement::Transaction(TransactionCommand::Begin)),
             Statement::Commit => Ok(BoundStatement::Transaction(TransactionCommand::Commit)),
@@ -415,6 +415,29 @@ impl<'a> Binder<'a> {
         }
         Ok(BoundStatement::DropTable(BoundDropTable {
             tables,
+            if_exists: drop.if_exists,
+        }))
+    }
+
+    fn bind_drop_index(&self, drop: &DropIndex) -> Result<BoundStatement> {
+        let mut indexes: Vec<BoundIndex> = Vec::with_capacity(drop.names.len());
+        for name in &drop.names {
+            let Some(info) = self.catalog.get_index_to_drop(name) else {
+                if drop.if_exists {
+                    continue;
+                }
+                return Err(PlannerError::IndexNotFound(name.clone()));
+            };
+            if !indexes.iter().any(|index| index.oid == info.oid) {
+                indexes.push(BoundIndex {
+                    oid: info.oid,
+                    name: info.name.clone(),
+                    table_oid: info.table_oid,
+                });
+            }
+        }
+        Ok(BoundStatement::DropIndex(BoundDropIndex {
+            indexes,
             if_exists: drop.if_exists,
         }))
     }
