@@ -25,8 +25,8 @@ use sqlparser::ast::{
 use sqlparser::parser::Parser;
 
 use crate::ast::{
-    self, BinaryOp, CreateIndex, CreateTable, Delete, FromItem, Insert, JoinKind, OrderByItem,
-    Select, Statement, TableRef, Truncate, UnaryOp, Update, WindowSpec,
+    self, BinaryOp, CreateIndex, CreateTable, Delete, DropTable, FromItem, Insert, JoinKind,
+    OrderByItem, Select, Statement, TableRef, Truncate, UnaryOp, Update, WindowSpec,
 };
 use crate::dialect::HamiltonDialect;
 use crate::error::{ParseError, Result};
@@ -90,6 +90,14 @@ fn convert_statement(stmt: &sql::Statement) -> Result<Statement> {
         sql::Statement::Update(update) => convert_update(stmt, update),
         sql::Statement::Delete(delete) => convert_delete(stmt, delete),
         sql::Statement::Truncate(truncate) => convert_truncate(stmt, truncate),
+        sql::Statement::Drop {
+            object_type: sql::ObjectType::Table,
+            if_exists,
+            names,
+            cascade,
+            restrict,
+            ..
+        } => convert_drop_table(stmt, names, *if_exists, *cascade, *restrict),
         sql::Statement::Explain { statement, .. } => convert_explain(stmt, statement),
         sql::Statement::StartTransaction { .. } => convert_begin(stmt),
         // Matched by field, not by rendering: the AST drops `TRANSACTION`
@@ -813,6 +821,32 @@ fn convert_truncate(stmt: &sql::Statement, truncate: &sql::Truncate) -> Result<S
             .map(|target| object_name(&target.name))
             .collect::<Result<_>>()?,
         restart_identity: truncate.identity == Some(TruncateIdentityOption::Restart),
+    }))
+}
+
+fn convert_drop_table(
+    stmt: &sql::Statement,
+    names: &[ObjectName],
+    if_exists: bool,
+    cascade: bool,
+    restrict: bool,
+) -> Result<Statement> {
+    let canonical = format!(
+        "DROP TABLE{} {}{}{}",
+        if if_exists { " IF EXISTS" } else { "" },
+        join(names.iter()),
+        if cascade { " CASCADE" } else { "" },
+        if restrict { " RESTRICT" } else { "" },
+    );
+    ensure_canonical(
+        stmt,
+        &canonical,
+        "DROP TABLE [IF EXISTS] <table>, ... [CASCADE | RESTRICT]",
+    )?;
+
+    Ok(Statement::DropTable(DropTable {
+        tables: names.iter().map(object_name).collect::<Result<_>>()?,
+        if_exists,
     }))
 }
 
@@ -2019,8 +2053,40 @@ mod tests {
     }
 
     #[test]
+    fn drop_table() {
+        let drop = |tables: &[&str], if_exists| {
+            Statement::DropTable(DropTable {
+                tables: tables.iter().map(|t| t.to_string()).collect(),
+                if_exists,
+            })
+        };
+        assert_eq!(parse_one("DROP TABLE t").unwrap(), drop(&["t"], false));
+        assert_eq!(parse_one("drop table T").unwrap(), drop(&["t"], false));
+        assert_eq!(
+            parse_one(r#"DROP TABLE IF EXISTS "Tweet", u, t"#).unwrap(),
+            drop(&["Tweet", "u", "t"], true)
+        );
+        assert_eq!(
+            parse_one("DROP TABLE a, a CASCADE").unwrap(),
+            drop(&["a", "a"], false)
+        );
+        assert_eq!(
+            parse_one("drop table if exists t restrict").unwrap(),
+            drop(&["t"], true)
+        );
+    }
+
+    #[test]
+    fn drop_table_rejects_unsupported_parts() {
+        assert!(parse_one("DROP TEMPORARY TABLE t").is_err());
+        assert_unsupported("DROP TABLE t PURGE");
+        assert_unsupported("DROP TABLE s.t");
+        assert_unsupported("DROP VIEW v");
+        assert_unsupported("EXPLAIN DROP TABLE t");
+    }
+
+    #[test]
     fn other_statements_are_unsupported() {
-        assert_unsupported("DROP TABLE t");
         assert_unsupported("DROP INDEX i");
     }
 

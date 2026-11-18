@@ -18,11 +18,11 @@
 //!   either one ends the block, reporting ROLLBACK.
 //! - BEGIN in a block, and COMMIT or ROLLBACK outside one, are errors that
 //!   change nothing. (Postgres only warns.)
-//! - CREATE TABLE and CREATE INDEX are rejected in a block, failing it.
-//!   Outside a block each runs in a transaction of its own, as other
-//!   statements do, and takes all of its changes back if it fails. Other
-//!   sessions see what it made as soon as the statement ends, so it must
-//!   commit then (MySQL 8's atomic DDL).
+//! - CREATE TABLE, CREATE INDEX and DROP TABLE are rejected in a block,
+//!   failing it. Outside a block each runs in a transaction of its own, as
+//!   other statements do, and takes all of its changes back if it fails.
+//!   Other sessions see its change as soon as the statement ends, so it
+//!   must commit then (MySQL 8's atomic DDL).
 //! - Dropping the engine with a block open rolls it back.
 //! - A statement outside a block that fails with a storage `Conflict` is
 //!   run again in a new transaction, until it gets past the conflict or the
@@ -280,6 +280,7 @@ impl ExecutionEngine {
         let ddl = match bound {
             BoundStatement::CreateTable(_) => Some("CREATE TABLE"),
             BoundStatement::CreateIndex(_) => Some("CREATE INDEX"),
+            BoundStatement::DropTable(_) => Some("DROP TABLE"),
             _ => None,
         };
         if let (Some(ddl), State::InBlock(_)) = (ddl, &self.state) {
@@ -388,6 +389,7 @@ impl ExecutionEngine {
             BoundStatement::Delete(_) => ("DELETE", false),
             // Postgres reports no count.
             BoundStatement::Truncate(_) => return Ok(Output::Done("TRUNCATE TABLE")),
+            BoundStatement::DropTable(_) => return Ok(Output::Done("DROP TABLE")),
             BoundStatement::Transaction(_) => unreachable!("transaction commands are not planned"),
         };
         if returns_rows {
