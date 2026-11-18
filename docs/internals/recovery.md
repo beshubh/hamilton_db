@@ -38,7 +38,7 @@ Nothing is logged at the SQL level. No record ever says "UPDATE users SET ...". 
 | A key inserted into or removed from a B+ tree leaf | **Physiological.** The page id plus "insert this key at position 5" or "remove the key at position 2". | **Logical.** "Remove this key from the tree whose header is page H", wherever splits have moved it since. |
 | A B+ tree split or merge, a new root, a tree header, catalog page 0 | **Physical.** A full 4 KiB image of every page it changed. | Not undone. See [B+ tree changes](#b-tree-changes-are-atomic). |
 | The first change to any page after that page was last written to disk | **Physical.** A full image, even for a row change. See [Redo never reads a page from disk](#redo-never-reads-a-page-from-disk). | As the row above. |
-| CREATE TABLE, CREATE INDEX, TRUNCATE, DROP TABLE | The new pages' images or ops. A drop changes no page. | **Logical.** "Free every page of the heap or tree that starts at page P." A drop's undo frees nothing. |
+| CREATE TABLE, CREATE INDEX, TRUNCATE, DROP TABLE, DROP INDEX | The new pages' images or ops. A drop changes no page. | **Logical.** "Free every page of the heap or tree that starts at page P." A drop's undo frees nothing. |
 
 The ops are the `PageOp` enum in [`op.rs`](../../crates/storage/src/wal/op.rs):
 
@@ -147,7 +147,7 @@ Transactions only ever add index entries. Entries are removed by garbage collect
 
 ## How DDL is logged
 
-CREATE TABLE, CREATE INDEX, TRUNCATE and DROP TABLE change storage, not rows. All but TRUNCATE run as a transaction of their own and are refused inside a `BEGIN` block. The code is in [`transaction.rs`](../../crates/storage/src/concurrency/transaction.rs) (`create_table`, `create_index`, `truncate`, `drop_storage`) and [`catalog.rs`](../../crates/catalog/src/catalog.rs).
+CREATE TABLE, CREATE INDEX, TRUNCATE, DROP TABLE and DROP INDEX change storage, not rows. TRUNCATE and DROP INDEX are changes of whatever transaction runs them; the others run as a transaction of their own and are refused inside a `BEGIN` block. The code is in [`transaction.rs`](../../crates/storage/src/concurrency/transaction.rs) (`create_table`, `create_index`, `truncate`, `drop_storage`) and [`catalog.rs`](../../crates/catalog/src/catalog.rs).
 
 `TRUNCATE users` in transaction 50, where `users` has a primary key index:
 
@@ -173,9 +173,9 @@ LSN 960  End     tid 50
 
 `TRUNCATE ... RESTART IDENTITY` also rewrites the sequence's row in the same transaction, so a rollback puts the counter back.
 
-DROP TABLE makes no storage. After deleting the catalog rows of the table, its indexes and its sequences, it logs one `Update` that changes no page, whose undo, `Undo::Drop{heaps, trees}`, names the storage it gives up. Undoing it frees nothing, so an abort or a crash before the commit keeps the table whole. The commit frees the storage the way it frees a truncate's old pages.
+DROP TABLE and DROP INDEX make no storage. After deleting the catalog rows of what they drop (for DROP TABLE, the table's, its indexes' and its sequences'), they log one `Update` that changes no page, whose undo, `Undo::Drop{heaps, trees}`, names the storage given up; DROP INDEX gives up a tree and no heap. Undoing it frees nothing, so an abort or a crash before the commit keeps what was dropped whole. The commit frees the storage the way it frees a truncate's old pages.
 
-A create appears in the in-memory catalog when its statement ends, and a dropped table leaves it only when the drop commits. A new table stays locked exclusively until the create ends, so no other transaction writes into storage that the create's undo might free.
+A create appears in the in-memory catalog when its statement ends. A new table stays locked exclusively until the create ends, so no other transaction writes into storage that the create's undo might free. A dropped table leaves the in-memory catalog only when the drop commits. A dropped index leaves it when its statement ends, so the rest of the transaction cannot use it, but its name stays taken until the drop commits: an index another transaction made with that name would clash with the one an abort puts back, and the next open would fail.
 
 **Sequences.** `nextval` counts in memory. Every 32 values, it logs the sequence row 32 ahead as a `System` record. That record is not synced on its own, but it is appended before the value is handed out, so the `Commit` of any transaction that stores the value syncs it too. A crash can skip up to 32 values and never reuses one. A clean shutdown saves the exact counter.
 
@@ -314,7 +314,7 @@ Breaking one of these makes some crash unrecoverable:
 
 - [`recovery.rs`](../../crates/storage/tests/recovery.rs) runs a workload on [`CrashFs`](../../crates/storage/tests/util/crash_fs.rs), which records every write, sync, rename and removal. It then recovers the files a crash after each event would leave, with unsynced writes kept, dropped or torn. Every page must equal what the surviving log records say. A new redo form needs a matching change to this test's oracle.
 - [`txn_recovery.rs`](../../crates/storage/tests/txn_recovery.rs) does the same with transactions that commit, abort or are left open. It checks the rows, the locks and the index entries.
-- [`truncate_recovery.rs`](../../crates/catalog/tests/truncate_recovery.rs), [`drop_recovery.rs`](../../crates/catalog/tests/drop_recovery.rs) and [`ddl_recovery.rs`](../../crates/catalog/tests/ddl_recovery.rs) also check that the pages in `app.db` are exactly those the catalog reaches, so no page leaks.
+- [`truncate_recovery.rs`](../../crates/catalog/tests/truncate_recovery.rs), [`drop_recovery.rs`](../../crates/catalog/tests/drop_recovery.rs), [`drop_index_recovery.rs`](../../crates/catalog/tests/drop_index_recovery.rs) and [`ddl_recovery.rs`](../../crates/catalog/tests/ddl_recovery.rs) also check that the pages in `app.db` are exactly those the catalog reaches, so no page leaks.
 - [`sweep.rs`](../../crates/planner/tests/sweep.rs) crashes the startup sweep at every step.
 
 `uv run sqltest/run.py recovery` ([`recovery.py`](../../sqltest/recovery.py)) kill -9s a real server while several clients write, restarts it, and checks what the clients saw acknowledged. SIGKILL keeps every write the OS accepted, so only the `CrashFs` tests cover torn pages and lost unsynced writes. `--seed N` replays a run.
