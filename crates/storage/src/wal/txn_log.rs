@@ -488,13 +488,19 @@ impl Released {
     pub(crate) fn free(&self, txn: &TxnLog<Committed>) -> Result<()> {
         free_storage(&txn.bpm, Logged::Completion(txn), &self.heaps, &self.trees)
     }
+
+    /// The page whose free shows that all of it was freed.
+    fn first(&self) -> PageId {
+        let first = self.heaps.first().or(self.trees.first());
+        *first.expect("a truncate or drop releases storage")
+    }
 }
 
 /// Finishes a commit whose `End` the log lacks: stamps the tuples it still
 /// holds, frees the storage its truncates replaced and its drops gave up,
 /// and logs `End`. Its logged frees came after its stamps, and each storage
-/// went in one record, so its first heap page shows whether that storage
-/// was freed.
+/// went in one record, so its first page shows whether that storage was
+/// freed.
 pub(crate) fn complete(txn: TxnLog<Committed>, last_lsn: Lsn) -> Result<()> {
     let log = txn.bpm.log();
     let mut writes: BTreeMap<Rid, Option<usize>> = BTreeMap::new();
@@ -536,7 +542,7 @@ pub(crate) fn complete(txn: TxnLog<Committed>, last_lsn: Lsn) -> Result<()> {
         .filter(|(rid, _)| !freed.contains(&rid.page_id))
         .collect();
     stamp(&txn, &writes, |_| {})?;
-    for storage in released.iter().filter(|s| !freed.contains(&s.heaps[0])) {
+    for storage in released.iter().filter(|s| !freed.contains(&s.first())) {
         storage.free(&txn)?;
     }
     txn.end();
