@@ -16,6 +16,7 @@ pub enum Statement {
     Update(Update),
     Delete(Delete),
     Truncate(Truncate),
+    DropTable(DropTable),
     /// `EXPLAIN stmt`: the plan of a SELECT, INSERT, UPDATE or DELETE,
     /// without running it.
     Explain(Box<Statement>),
@@ -107,6 +108,15 @@ pub struct Truncate {
     /// In the order written, repeats included.
     pub tables: Vec<String>,
     pub restart_identity: bool,
+}
+
+/// `DROP TABLE [IF EXISTS] table, ... [CASCADE | RESTRICT]`. With no
+/// foreign keys, CASCADE and RESTRICT do the same.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropTable {
+    /// In the order written, repeats included.
+    pub tables: Vec<String>,
+    pub if_exists: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

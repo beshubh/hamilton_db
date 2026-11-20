@@ -35,7 +35,7 @@ const MAGIC: u64 = u64::from_le_bytes(*b"HAMDBWAL");
 /// 2: `Update` and `Clr` records carry undo, and `HeapSetTuple` its padding.
 /// 3: an `Update` can carry a create's undo.
 /// 4: an `Abort` comes before every `Clr` of its transaction.
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 /// Appends stop to flush once the tail holds this much. A record larger
 /// than this still goes in, alone.

@@ -242,7 +242,8 @@ impl CatalogState {
         self.tables.get(self.table_names.get(name)?)
     }
 
-    /// Takes out table `oid`, with its sequences and indexes.
+    /// Takes out table `oid`, with its sequences and indexes, for an aborted
+    /// create or a committed drop.
     fn remove_table(&mut self, oid: TableOid) {
         let Some(table) = self.tables.remove(&oid) else {
             return;
@@ -913,6 +914,59 @@ impl Catalog {
         for index in new_indexes {
             state.indexes.insert(index.oid, index);
         }
+        Ok(())
+    }
+
+    /// Drops table `oid`, with its indexes and sequences, for `txn`, which
+    /// holds it in `AccessExclusive`. The commit takes it out of memory and
+    /// frees its storage once no reader needs it; an abort, or a crash
+    /// before the commit, keeps it whole. If this fails, `txn` must abort.
+    pub fn drop_table(self: &Arc<Self>, txn: &Transaction, oid: TableOid) -> Result<()> {
+        let state = self.state.write();
+        let table = state
+            .tables
+            .get(&oid)
+            .cloned()
+            .ok_or_else(|| CatalogError::TableNotFound(oid.to_string()))?;
+        if table.kind != RelationKind::Table {
+            return Err(CatalogError::NotATable(table.name.clone()));
+        }
+        let indexes = indexes_of(&state, oid);
+        let sequences: Vec<_> = table
+            .sequences()
+            .map(|sequence| Arc::clone(&state.tables[&sequence.oid]))
+            .collect();
+        txn.undoable(|by| {
+            // The table stays in memory until the commit, so `txn` may have
+            // dropped it already; dropping it twice would free it twice.
+            if !self.system.delete_table(by, oid)? {
+                return Err(CatalogError::TableNotFound(table.name.clone()));
+            }
+            self.system.delete_columns(by, oid)?;
+            for sequence in &sequences {
+                self.system.delete_table(by, sequence.oid)?;
+            }
+            for index in &indexes {
+                self.system.delete_index(by, index.oid)?;
+                self.system.delete_index_columns(by, index.oid)?;
+            }
+            Ok::<_, CatalogError>(())
+        })?;
+        let heaps: Vec<PageId> = std::iter::once(&table)
+            .chain(&sequences)
+            .map(|relation| relation.first_page_id())
+            .collect();
+        let trees: Vec<PageId> = indexes.iter().map(|index| index.header_page_id).collect();
+        txn.drop_storage(&heaps, &trees)?;
+
+        let tid = txn.tid();
+        let catalog = Arc::clone(self);
+        txn.on_end(move |outcome| {
+            if outcome == Outcome::Committed {
+                table.locks.truncated(tid);
+                catalog.state.write().remove_table(oid);
+            }
+        })?;
         Ok(())
     }
 
@@ -2289,6 +2343,146 @@ mod tests {
         assert_eq!(sequence.next_value().unwrap(), 2);
         db.tm.abort(&txn).unwrap();
         assert!(sequence.next_value().unwrap() > 10);
+    }
+
+    /// Drops table `oid` in a transaction of its own, as DROP TABLE does.
+    fn drop_table(db: &Db, oid: TableOid) -> Result<()> {
+        db.ddl(|txn| {
+            db.catalog.lock_table(txn, oid, LockMode::AccessExclusive)?;
+            db.catalog.drop_table(txn, oid)
+        })
+    }
+
+    fn assert_no_users(db: &Db) {
+        assert!(db.catalog.get_table("users").is_none());
+        assert!(db.catalog.get_table("users_score_seq").is_none());
+        assert!(db.catalog.get_index("users_pkey").is_none());
+        assert!(db.catalog.get_index("users_name_key").is_none());
+    }
+
+    /// A committed drop takes out the table with its indexes and sequences,
+    /// frees every page of them once garbage collection runs, and leaves
+    /// their names free, after a restart too.
+    #[test]
+    fn a_committed_drop_leaves_nothing() {
+        let db = Db::new(16);
+        let before = allocated(&db);
+        let table = db.ddl(|txn| with_everything(&db, txn, "users")).unwrap();
+        let oid = table.oid;
+        drop(table);
+        drop_table(&db, oid).unwrap();
+        assert_no_users(&db);
+        db.tm.wait_for_gc();
+        assert_eq!(allocated(&db), before, "pages the drop did not free");
+        assert!(matches!(
+            drop_table(&db, oid),
+            Err(CatalogError::TableNotFound(_))
+        ));
+
+        let db = db.restart();
+        assert_no_users(&db);
+        let table = db.ddl(|txn| with_everything(&db, txn, "users")).unwrap();
+        assert_eq!(table.identity(2).unwrap().next_value().unwrap(), 1);
+        assert_eq!(
+            names(&db.catalog.table_indexes("users")),
+            ["users_pkey", "users_name_key"]
+        );
+        drop(table);
+        let db = db.restart();
+        assert_eq!(db.catalog.tables().len(), 1);
+    }
+
+    /// A rolled-back drop leaves the table as it was: its rows, indexes,
+    /// sequence and pages, after a restart too.
+    #[test]
+    fn a_rolled_back_drop_keeps_the_table() {
+        let db = Db::new(16);
+        let table = db.ddl(|txn| with_everything(&db, txn, "users")).unwrap();
+        let row = Tuple::encode(
+            &users(),
+            &[1.into(), "ada".into(), Value::BigInt(1), true.into()],
+        )
+        .unwrap();
+        table
+            .heap
+            .insert(Logged::System, &TupleMeta::new(1), &row)
+            .unwrap();
+        let sequence = Arc::clone(table.identity(2).unwrap());
+        assert_eq!(sequence.next_value().unwrap(), 1);
+        let (oid, pages) = (table.oid, allocated(&db));
+        let indexes: Vec<_> = db
+            .catalog
+            .table_indexes("users")
+            .iter()
+            .map(|i| described(i))
+            .collect();
+        drop(table);
+
+        let txn = db.tm.begin();
+        db.catalog
+            .lock_table(&txn, oid, LockMode::AccessExclusive)
+            .unwrap();
+        db.catalog.drop_table(&txn, oid).unwrap();
+        assert!(
+            db.catalog.get_table("users").is_some(),
+            "gone before the commit"
+        );
+        db.tm.abort(&txn).unwrap();
+        db.tm.wait_for_gc();
+        assert_eq!(allocated(&db), pages);
+        assert_eq!(sequence.next_value().unwrap(), 2);
+        drop(sequence);
+
+        let db = db.restart();
+        let table = db.catalog.get_table("users").unwrap();
+        assert_eq!(table.oid, oid);
+        let rows: Vec<_> = table.heap.iter().unwrap().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].as_ref().unwrap().1.data(), row.data());
+        let after: Vec<_> = db
+            .catalog
+            .table_indexes("users")
+            .iter()
+            .map(|i| described(i))
+            .collect();
+        assert_eq!(after, indexes);
+        assert!(table.identity(2).unwrap().next_value().unwrap() > 1);
+        assert!(db.catalog.get_table("users_score_seq").is_some());
+    }
+
+    #[test]
+    fn a_table_is_dropped_once_per_transaction() {
+        let db = Db::new(16);
+        let before = allocated(&db);
+        let oid = db
+            .ddl(|txn| with_everything(&db, txn, "users"))
+            .unwrap()
+            .oid;
+        db.ddl(|txn| {
+            db.catalog.lock_table(txn, oid, LockMode::AccessExclusive)?;
+            db.catalog.drop_table(txn, oid)?;
+            assert!(matches!(
+                db.catalog.drop_table(txn, oid),
+                Err(CatalogError::TableNotFound(name)) if name == "users"
+            ));
+            Ok::<_, CatalogError>(())
+        })
+        .unwrap();
+        assert_no_users(&db);
+        db.tm.wait_for_gc();
+        assert_eq!(allocated(&db), before, "pages the drop did not free");
+        assert_no_users(&db.restart());
+    }
+
+    #[test]
+    fn a_sequence_is_not_dropped_as_a_table() {
+        let db = Db::new(16);
+        drop(db.ddl(|txn| with_everything(&db, txn, "users")).unwrap());
+        let sequence = db.catalog.get_table("users_score_seq").unwrap();
+        assert!(matches!(
+            drop_table(&db, sequence.oid),
+            Err(CatalogError::NotATable(_))
+        ));
     }
 
     #[test]

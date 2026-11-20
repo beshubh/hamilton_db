@@ -35,6 +35,7 @@ pub enum BoundStatement {
     Update(BoundUpdate),
     Delete(BoundDelete),
     Truncate(BoundTruncate),
+    DropTable(BoundDropTable),
     Explain(Box<BoundStatement>),
     /// BEGIN, COMMIT or ROLLBACK. These change the session's transaction
     /// state rather than data, so they are run by the `ExecutionEngine`
@@ -185,6 +186,14 @@ pub struct BoundTruncate {
     /// Each table once, in the order first written.
     pub tables: Vec<BoundTable>,
     pub restart_identity: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundDropTable {
+    /// Each table once, in the order first written, without the missing
+    /// ones IF EXISTS skips.
+    pub tables: Vec<BoundTable>,
+    pub if_exists: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

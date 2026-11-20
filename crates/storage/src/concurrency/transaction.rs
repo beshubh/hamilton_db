@@ -21,7 +21,9 @@
 //! A truncate gives a table new storage in the transaction (`truncate`),
 //! and CREATE TABLE and CREATE INDEX make theirs in it (`create_table`,
 //! `create_index`). An abort frees the new storage; a truncate's commit
-//! frees the old once no reader needs it, and logs `End` only then.
+//! frees the old once no reader needs it, and logs `End` only then. A drop
+//! gives up storage (`drop_storage`), which its commit frees the same way
+//! and an abort keeps.
 //!
 //! Index entries are added at once and never removed by a write: the
 //! entries a transaction's writes leave behind are retired, and garbage
@@ -53,15 +55,16 @@ use crate::table::table_heap::TableHeap;
 use crate::table::table_iterator::{TableIterator, TableRow};
 use crate::table::table_page::TupleMeta;
 use crate::table::undo_log::UndoLog;
-use crate::wal::txn_log::{self, TxnLog};
+use crate::wal::txn_log::{self, Released, TxnLog};
 use crate::wal::{Logged, Mtr, MtrPage, NoUnwind, PageOp, fatal, undo};
 
 /// What an ended transaction leaves for garbage collection: the tuples it
 /// left deleted and the index entries it retired. `built` holds the entries
 /// it added building an index, and `deferred` the freeing of the storage
-/// its truncates replaced; both wait for every transaction running when it
-/// ended rather than for its Tid (see `index_versions`), and `deferred`
-/// runs after the garbage those transactions left.
+/// its truncates replaced and its drops gave up; both wait for every
+/// transaction running when it ended rather than for its Tid (see
+/// `index_versions`), and `deferred` runs after the garbage those
+/// transactions left.
 #[derive(Default)]
 pub(crate) struct Garbage {
     pub tuples: Vec<(Arc<TableHeap>, Rid)>,
@@ -140,9 +143,9 @@ pub struct Transaction {
     built: Mutex<Vec<TableEntry>>,
     /// See `on_end`.
     on_end: Mutex<Vec<EndHook>>,
-    /// The storage each truncate replaced, its heap's first page, then its
-    /// trees' header pages, which the commit frees.
-    replaced: Mutex<Vec<Vec<PageId>>>,
+    /// The storage each truncate replaced and each drop gave up, which the
+    /// commit frees.
+    released: Mutex<Vec<Released>>,
     /// The first page of each heap and the header page of each tree this
     /// transaction made, which an abort frees.
     made: Mutex<Vec<PageId>>,
@@ -180,7 +183,7 @@ impl Transaction {
             retired: Mutex::new(Vec::new()),
             built: Mutex::new(Vec::new()),
             on_end: Mutex::new(Vec::new()),
-            replaced: Mutex::new(Vec::new()),
+            released: Mutex::new(Vec::new()),
             made: Mutex::new(Vec::new()),
         }
     }
@@ -236,8 +239,24 @@ impl Transaction {
         let (heap, trees) = self.make(&log, true, &metadata, |mtr, new| {
             mtr.undo_truncate(&old, new);
         })?;
-        self.replaced.lock().push(old);
+        self.released.lock().push(Released {
+            heaps: old[..1].to_vec(),
+            trees: old[1..].to_vec(),
+        });
         Ok((heap.expect("made with a heap"), trees))
+    }
+
+    /// Gives up, in this transaction, the heaps starting at `heaps` and the
+    /// trees whose header pages are `trees`. The commit frees them once no
+    /// reader needs them, then logs `End`; an abort keeps them.
+    pub fn drop_storage(&self, heaps: &[PageId], trees: &[PageId]) -> Result<()> {
+        let log = self.running()?;
+        let mtr = log.bpm().mtr(Logged::Txn(&log));
+        mtr.undo_drop(heaps, trees);
+        mtr.commit_always();
+        let (heaps, trees) = (heaps.to_vec(), trees.to_vec());
+        self.released.lock().push(Released { heaps, trees });
+        Ok(())
     }
 
     /// Makes the storage of a new table in this transaction: an empty heap
@@ -538,7 +557,7 @@ impl Transaction {
         let _ending = NoUnwind("ending a transaction");
         let mut garbage = Garbage::default();
         let write_set = mem::take(&mut *self.write_set.lock());
-        let replaced = mem::take(&mut *self.replaced.lock());
+        let released = mem::take(&mut *self.released.lock());
         let committed = match outcome {
             Outcome::Committed => self.commit_writes(log, write_set, &mut garbage),
             Outcome::Aborted => {
@@ -549,9 +568,9 @@ impl Transaction {
         let hooks = mem::take(&mut *self.on_end.lock());
         hooks.into_iter().rev().for_each(|hook| hook(outcome));
         if let Some(log) = committed {
-            match replaced.is_empty() {
+            match released.is_empty() {
                 true => log.end(),
-                false => garbage.deferred.push(free_replaced(log, replaced)),
+                false => garbage.deferred.push(free_released(log, released)),
             }
         }
         Ok(garbage)
@@ -817,21 +836,20 @@ impl Transaction {
     }
 }
 
-/// The end of a commit that truncated, for once no reader needs the storage
-/// its truncates replaced: frees that storage, then logs `End`. If freeing
+/// The end of a commit that truncated or dropped, for once no reader needs
+/// the storage it released: frees that storage, then logs `End`. If freeing
 /// fails, the pages stay until recovery frees them.
-fn free_replaced(
+fn free_released(
     log: TxnLog<txn_log::Committed>,
-    replaced: Vec<Vec<PageId>>,
+    released: Vec<Released>,
 ) -> Box<dyn FnOnce() + Send> {
     Box::new(move || {
-        for old in &replaced {
-            let by = Logged::Completion(&log);
+        for storage in &released {
             // Recovery frees it instead. Returning would leave the frees
             // out of commit order, which recovery's stamping relies on.
-            if let Err(e) = txn_log::free_storage(log.bpm(), by, &old[..1], &old[1..]) {
+            if let Err(e) = storage.free(&log) {
                 fatal(format_args!(
-                    "cannot free the storage transaction {} truncated: {e}",
+                    "cannot free the storage transaction {} released: {e}",
                     log.tid()
                 ));
             }

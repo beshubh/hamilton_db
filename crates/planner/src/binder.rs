@@ -15,16 +15,16 @@ use std::sync::Arc;
 use catalog::{Catalog, RelationKind, TableInfo};
 use common::{DataType, Schema, Value, ValueError};
 use parser::{
-    CreateIndex, CreateTable, Delete, Expr, FromItem, Insert, JoinKind, OrderByItem, Select,
-    SelectItem, Statement, TableRef, Truncate, Update,
+    CreateIndex, CreateTable, Delete, DropTable, Expr, FromItem, Insert, JoinKind, OrderByItem,
+    Select, SelectItem, Statement, TableRef, Truncate, Update,
 };
 
 use self::aggregate::Rewriter;
 use self::expr::{UNNAMED_COLUMN, assign, forbid_calls, forbid_windows, null_for};
 use self::scope::Scope;
 use crate::bound::{
-    BoundCreateIndex, BoundCreateTable, BoundDelete, BoundExpr, BoundExprKind, BoundFrom,
-    BoundInsert, BoundOrderBy, BoundSelect, BoundSelectItem, BoundStatement, BoundTable,
+    BoundCreateIndex, BoundCreateTable, BoundDelete, BoundDropTable, BoundExpr, BoundExprKind,
+    BoundFrom, BoundInsert, BoundOrderBy, BoundSelect, BoundSelectItem, BoundStatement, BoundTable,
     BoundTruncate, BoundUpdate, TransactionCommand,
 };
 use crate::error::{PlannerError, Result};
@@ -47,6 +47,7 @@ impl<'a> Binder<'a> {
             Statement::Update(update) => self.bind_update(update),
             Statement::Delete(delete) => self.bind_delete(delete),
             Statement::Truncate(truncate) => self.bind_truncate(truncate),
+            Statement::DropTable(drop) => self.bind_drop_table(drop),
             Statement::Explain(stmt) => Ok(BoundStatement::Explain(Box::new(self.bind(stmt)?))),
             Statement::Begin => Ok(BoundStatement::Transaction(TransactionCommand::Begin)),
             Statement::Commit => Ok(BoundStatement::Transaction(TransactionCommand::Commit)),
@@ -399,6 +400,24 @@ impl<'a> Binder<'a> {
         }))
     }
 
+    /// A table named twice is dropped once. IF EXISTS skips a missing one.
+    fn bind_drop_table(&self, drop: &DropTable) -> Result<BoundStatement> {
+        let mut tables: Vec<BoundTable> = Vec::with_capacity(drop.tables.len());
+        for name in &drop.tables {
+            let info = match self.table_to_change(name) {
+                Err(PlannerError::TableNotFound(_)) if drop.if_exists => continue,
+                info => info?,
+            };
+            if !tables.iter().any(|table| table.oid == info.oid) {
+                tables.push(bound_table(&info, None));
+            }
+        }
+        Ok(BoundStatement::DropTable(BoundDropTable {
+            tables,
+            if_exists: drop.if_exists,
+        }))
+    }
+
     fn bind_table(&self, table: &TableRef) -> Result<BoundTable> {
         let info = self.table_info(&table.name)?;
         Ok(bound_table(&info, table.alias.as_deref()))
@@ -410,7 +429,7 @@ impl<'a> Binder<'a> {
             .ok_or_else(|| PlannerError::TableNotFound(name.to_owned()))
     }
 
-    /// A table an INSERT, UPDATE, DELETE or TRUNCATE writes.
+    /// A table an INSERT, UPDATE, DELETE, TRUNCATE or DROP TABLE changes.
     fn table_to_change(&self, name: &str) -> Result<Arc<TableInfo>> {
         let info = self.table_info(name)?;
         if info.kind == RelationKind::Sequence {

@@ -103,6 +103,9 @@ impl Walk {
                             txn.bpm().mtr(by).commit_always();
                         }
                     }
+                    Undo::Drop { .. } => {
+                        txn.bpm().mtr(by).commit_always();
+                    }
                     Undo::Truncate { new, .. } => {
                         let new: Vec<PageId> = new.iter().collect();
                         free(&mut self.trees, txn, by, &new[..1], &new[1..])?;

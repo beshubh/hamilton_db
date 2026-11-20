@@ -211,6 +211,13 @@ fn sqlstate(err: &Error) -> &'static str {
             _ => {}
         }
     }
+    if let EngineError::Planner(PlannerError::TableNotFound(_))
+    | EngineError::Execution(
+        ExecutionError::TableNotFound(_) | ExecutionError::Catalog(CatalogError::TableNotFound(_)),
+    ) = err
+    {
+        return "42P01"; // undefined_table
+    }
     match err {
         EngineError::Parse(_) => "42601",                 // syntax_error
         EngineError::Planner(_) => "42000",               // syntax_error_or_access_rule_violation

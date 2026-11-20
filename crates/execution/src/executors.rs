@@ -27,6 +27,7 @@
 mod create_index;
 mod create_table;
 mod delete;
+mod drop_table;
 mod explain;
 mod filter;
 mod hash_aggregation;
@@ -50,6 +51,7 @@ mod values;
 pub use create_index::CreateIndexExecutor;
 pub use create_table::CreateTableExecutor;
 pub use delete::DeleteExecutor;
+pub use drop_table::DropTableExecutor;
 pub use explain::ExplainExecutor;
 pub use filter::FilterExecutor;
 pub use hash_aggregation::HashAggregationExecutor;
@@ -115,6 +117,7 @@ pub enum AbstractExecutor {
     UpdateExecutor,
     DeleteExecutor,
     TruncateExecutor,
+    DropTableExecutor,
     FilterExecutor,
     ProjectionExecutor,
     SortExecutor,
@@ -159,6 +162,9 @@ pub fn create_executor(
         }
         AbstractPlanNode::TruncatePlan(plan) => {
             TruncateExecutor::new(Arc::clone(ctx), plan.clone()).into()
+        }
+        AbstractPlanNode::DropTablePlan(plan) => {
+            DropTableExecutor::new(Arc::clone(ctx), plan.clone()).into()
         }
         AbstractPlanNode::FilterPlan(plan) => {
             FilterExecutor::new(Arc::clone(ctx), plan.clone(), child(plan.child())?).into()
@@ -219,6 +225,11 @@ pub fn lock_tables(catalog: &Catalog, txn: &Transaction, plan: &AbstractPlanNode
             }
         }
         AbstractPlanNode::TruncatePlan(plan) => {
+            for &oid in plan.tables() {
+                lock(oid, LockMode::AccessExclusive)?;
+            }
+        }
+        AbstractPlanNode::DropTablePlan(plan) => {
             for &oid in plan.tables() {
                 lock(oid, LockMode::AccessExclusive)?;
             }

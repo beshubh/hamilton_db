@@ -215,6 +215,28 @@ impl SystemTables {
         set_page_id(by, &self.indexes, &INDEXES_SCHEMA, oid, 3, page_id)
     }
 
+    /// Deletes the `tables` row of `oid`, as `by`'s change. Returns whether
+    /// there was one.
+    pub fn delete_table(&self, by: Logged<'_>, oid: TableOid) -> Result<bool> {
+        Ok(delete_rows(by, &self.tables, &TABLES_SCHEMA, oid)? > 0)
+    }
+
+    /// Deletes the `columns` rows of table `table_oid`, as `by`'s change.
+    pub fn delete_columns(&self, by: Logged<'_>, table_oid: TableOid) -> Result<()> {
+        delete_rows(by, &self.columns, &COLUMNS_SCHEMA, table_oid).map(drop)
+    }
+
+    /// Deletes the `indexes` row of `oid`, as `by`'s change.
+    pub fn delete_index(&self, by: Logged<'_>, oid: IndexOid) -> Result<()> {
+        delete_rows(by, &self.indexes, &INDEXES_SCHEMA, oid).map(drop)
+    }
+
+    /// Deletes the `index_columns` rows of index `index_oid`, as `by`'s
+    /// change.
+    pub fn delete_index_columns(&self, by: Logged<'_>, index_oid: IndexOid) -> Result<()> {
+        delete_rows(by, &self.index_columns, &INDEX_COLUMNS_SCHEMA, index_oid).map(drop)
+    }
+
     pub fn scan_tables(&self) -> Result<Vec<TableRow>> {
         scan(&self.tables, &TABLES_SCHEMA, |values| {
             Ok(TableRow {
@@ -293,6 +315,28 @@ fn find_row(heap: &TableHeap, schema: &Schema, oid: u32) -> Result<(Rid, TupleMe
     Err(CatalogError::Corrupt(format!(
         "no catalog row for oid {oid}"
     )))
+}
+
+/// Marks deleted every row whose first column is `oid`, as `by`'s change,
+/// and returns how many. Each keeps its payload, so undo puts it back whole.
+fn delete_rows(by: Logged<'_>, heap: &TableHeap, schema: &Schema, oid: u32) -> Result<usize> {
+    let mut matching = Vec::new();
+    for row in heap.iter()? {
+        let (meta, tuple) = row?;
+        if as_oid(&tuple.decode(schema)?[0])? == oid {
+            matching.push((meta, tuple));
+        }
+    }
+    let deleted = matching.len();
+    for (meta, tuple) in matching {
+        let rid = tuple.rid().expect("the heap's rows carry their rid");
+        let meta = TupleMeta {
+            is_deleted: true,
+            ..meta
+        };
+        heap.update_in_place(by, rid, &meta, &tuple)?;
+    }
+    Ok(deleted)
 }
 
 fn insert(by: Logged<'_>, heap: &TableHeap, schema: &Schema, values: &[Value]) -> Result<()> {

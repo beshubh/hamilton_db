@@ -38,7 +38,7 @@ Nothing is logged at the SQL level. No record ever says "UPDATE users SET ...". 
 | A key inserted into or removed from a B+ tree leaf | **Physiological.** The page id plus "insert this key at position 5" or "remove the key at position 2". | **Logical.** "Remove this key from the tree whose header is page H", wherever splits have moved it since. |
 | A B+ tree split or merge, a new root, a tree header, catalog page 0 | **Physical.** A full 4 KiB image of every page it changed. | Not undone. See [B+ tree changes](#b-tree-changes-are-atomic). |
 | The first change to any page after that page was last written to disk | **Physical.** A full image, even for a row change. See [Redo never reads a page from disk](#redo-never-reads-a-page-from-disk). | As the row above. |
-| CREATE TABLE, CREATE INDEX, TRUNCATE | The new pages' images or ops. | **Logical.** "Free every page of the heap or tree that starts at page P." |
+| CREATE TABLE, CREATE INDEX, TRUNCATE, DROP TABLE | The new pages' images or ops. A drop changes no page. | **Logical.** "Free every page of the heap or tree that starts at page P." A drop's undo frees nothing. |
 
 The ops are the `PageOp` enum in [`op.rs`](../../crates/storage/src/wal/op.rs):
 
@@ -65,7 +65,7 @@ There are seven kinds of record:
 |---|---|---|---|
 | `Update` | A transaction's change | Yes | how to undo it, then the page changes |
 | `Clr` | The undo of one `Update` (a compensation log record) | Never | `undo_next`, then the page changes |
-| `Completion` | Work after a commit: stamping rows, freeing a truncated table's old pages | No | page changes |
+| `Completion` | Work after a commit: stamping rows, freeing the pages a truncate replaced or a drop gave up | No | page changes |
 | `System` | A change that belongs to no transaction: garbage collection, a sequence logging ahead, an index build's entries | No | page changes |
 | `Commit`, `Abort`, `End` | Transaction status | | empty |
 
@@ -145,9 +145,9 @@ Either all three pages change or none do. Splits, merges and new roots move many
 
 Transactions only ever add index entries. Entries are removed by garbage collection, or by a unique check that takes back an entry it just added, and both are logged as `System` records.
 
-## How CREATE TABLE, CREATE INDEX and TRUNCATE are logged
+## How DDL is logged
 
-These change storage, not rows. Each is a transaction of its own, and runs as one statement. They are refused inside a `BEGIN` block. The code is in [`transaction.rs`](../../crates/storage/src/concurrency/transaction.rs) (`create_table`, `create_index`, `truncate`) and [`catalog.rs`](../../crates/catalog/src/catalog.rs).
+CREATE TABLE, CREATE INDEX, TRUNCATE and DROP TABLE change storage, not rows. All but TRUNCATE run as a transaction of their own and are refused inside a `BEGIN` block. The code is in [`transaction.rs`](../../crates/storage/src/concurrency/transaction.rs) (`create_table`, `create_index`, `truncate`, `drop_storage`) and [`catalog.rs`](../../crates/catalog/src/catalog.rs).
 
 `TRUNCATE users` in transaction 50, where `users` has a primary key index:
 
@@ -166,14 +166,16 @@ LSN 960  End     tid 50
 ```
 
 1. **New storage is made in one record that also says how to free it.** The mtr allocates and formats the new pages, and the record's undo names their root pages. A crash can never leave pages that nobody will free. CREATE TABLE and CREATE INDEX do the same with `Undo::Create{heaps, trees}`.
-2. **The catalog rows are ordinary undoable row changes** (`Transaction::undoable`): a create's new catalog rows, or a truncate pointing the table's rows at the new storage.
+2. **The catalog rows are ordinary undoable row changes** (`Transaction::undoable`): a create's new catalog rows, a truncate pointing the table's rows at the new storage, or a drop marking them deleted.
 3. **Writes into storage the transaction just made need no undo of their own,** so they are `System` records. An index build's entries and a new sequence's row are examples. Freeing the storage takes them away too.
-4. **At commit,** a create is done. A truncate's old pages are freed later, by garbage collection, once no reader can still see the old rows. The free is logged as a `Completion` record listing the pages, and only then is `End` logged.
+4. **At commit,** a create is done. A truncate's old pages, and a drop's, are freed later, by garbage collection, once no reader can still see the old rows. The free is logged as a `Completion` record listing the pages, and only then is `End` logged.
 5. **On abort or a crash before the commit,** undo runs newest first. It puts the catalog rows back first, then frees the new storage.
 
 `TRUNCATE ... RESTART IDENTITY` also rewrites the sequence's row in the same transaction, so a rollback puts the counter back.
 
-A create appears in the in-memory catalog when its statement ends. A new table stays locked exclusively until the create ends, so no other transaction writes into storage that the create's undo might free.
+DROP TABLE makes no storage. After deleting the catalog rows of the table, its indexes and its sequences, it logs one `Update` that changes no page, whose undo, `Undo::Drop{heaps, trees}`, names the storage it gives up. Undoing it frees nothing, so an abort or a crash before the commit keeps the table whole. The commit frees the storage the way it frees a truncate's old pages.
+
+A create appears in the in-memory catalog when its statement ends, and a dropped table leaves it only when the drop commits. A new table stays locked exclusively until the create ends, so no other transaction writes into storage that the create's undo might free.
 
 **Sequences.** `nextval` counts in memory. Every 32 values, it logs the sequence row 32 ahead as a `System` record. That record is not synced on its own, but it is appended before the value is handed out, so the `Commit` of any transaction that stores the value syncs it too. A crash can skip up to 32 values and never reuses one. A clean shutdown saves the exact counter.
 
@@ -276,7 +278,7 @@ The cost is one image each time a page changes after it was written, which is mo
 
 This step differs from textbook ARIES because of MVTO:
 
-- **Committed transactions without `End`** are finished, not undone (`txn_log::complete`). Rows whose stamps did not reach the log get stamped, and a truncate's old storage is freed. Then `End` is logged. In the example, T61's stamp at 1160 was redone, so there is nothing left to stamp, and T61 gets its `End`.
+- **Committed transactions without `End`** are finished, not undone (`txn_log::complete`). Rows whose stamps did not reach the log get stamped, and the storage their truncates replaced and their drops gave up is freed. Then `End` is logged. In the example, T61's stamp at 1160 was redone, so there is nothing left to stamp, and T61 gets its `End`.
 - **Every other transaction is a loser** and is undone (`undo::undo_losers`). A loser that was still running first gets its `Abort`, as a runtime abort does. Recovery keeps a to-undo list holding each loser's last LSN. It repeatedly takes the largest LSN, undoes that record and logs a `Clr`, then adds the record's `prev_lsn`, or the `Clr`'s `undo_next`, back to the list. A loser whose chain reaches the start gets its `End`. This is a single backward pass over all losers, using the same walk as a runtime abort. In the example, T60 gets its `Abort`, then its insert at 1200 is undone, then the one at 1000.
 
 Afterwards no row stays locked. MVTO's in-memory state (the version chain, read timestamps and watermark) starts empty, as [Restart and crashes in MVTO](mvto.md#restart-and-crashes) describes.
@@ -312,7 +314,7 @@ Breaking one of these makes some crash unrecoverable:
 
 - [`recovery.rs`](../../crates/storage/tests/recovery.rs) runs a workload on [`CrashFs`](../../crates/storage/tests/util/crash_fs.rs), which records every write, sync, rename and removal. It then recovers the files a crash after each event would leave, with unsynced writes kept, dropped or torn. Every page must equal what the surviving log records say. A new redo form needs a matching change to this test's oracle.
 - [`txn_recovery.rs`](../../crates/storage/tests/txn_recovery.rs) does the same with transactions that commit, abort or are left open. It checks the rows, the locks and the index entries.
-- [`truncate_recovery.rs`](../../crates/catalog/tests/truncate_recovery.rs) and [`ddl_recovery.rs`](../../crates/catalog/tests/ddl_recovery.rs) also check that the pages in `app.db` are exactly those the catalog reaches, so no page leaks.
+- [`truncate_recovery.rs`](../../crates/catalog/tests/truncate_recovery.rs), [`drop_recovery.rs`](../../crates/catalog/tests/drop_recovery.rs) and [`ddl_recovery.rs`](../../crates/catalog/tests/ddl_recovery.rs) also check that the pages in `app.db` are exactly those the catalog reaches, so no page leaks.
 - [`sweep.rs`](../../crates/planner/tests/sweep.rs) crashes the startup sweep at every step.
 
 `uv run sqltest/run.py recovery` ([`recovery.py`](../../sqltest/recovery.py)) kill -9s a real server while several clients write, restarts it, and checks what the clients saw acknowledged. SIGKILL keeps every write the OS accepted, so only the `CrashFs` tests cover torn pages and lost unsynced writes. `--seed N` replays a run.

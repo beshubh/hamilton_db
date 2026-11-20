@@ -27,9 +27,9 @@ use execution::expressions::{AbstractExpr, ColumnValueExpr};
 use execution::optimizer::Optimizer;
 use execution::plans::{
     AbstractPlanNode, Aggregate, AggregationPlan, CreateIndexPlan, CreateTablePlan, DeletePlan,
-    ExplainPlan, FilterPlan, HashJoinPlan, InsertPlan, JoinType, LimitPlan, OrderBy, PlanNode,
-    ProjectionPlan, SeqScanPlan, SortPlan, TruncatePlan, UpdatePlan, ValuesPlan, WindowColumn,
-    WindowFunction, WindowFunctionKind, WindowPlan,
+    DropTablePlan, ExplainPlan, FilterPlan, HashJoinPlan, InsertPlan, JoinType, LimitPlan, OrderBy,
+    PlanNode, ProjectionPlan, SeqScanPlan, SortPlan, TruncatePlan, UpdatePlan, ValuesPlan,
+    WindowColumn, WindowFunction, WindowFunctionKind, WindowPlan,
 };
 use parser::{BinaryOp, JoinKind};
 
@@ -81,6 +81,11 @@ impl<'a> Planner<'a> {
             BoundStatement::Truncate(truncate) => TruncatePlan::new(
                 truncate.tables.iter().map(|table| table.oid).collect(),
                 truncate.restart_identity,
+            )
+            .into(),
+            BoundStatement::DropTable(drop) => DropTablePlan::new(
+                drop.tables.iter().map(|table| table.oid).collect(),
+                drop.if_exists,
             )
             .into(),
             BoundStatement::Explain(stmt) => {

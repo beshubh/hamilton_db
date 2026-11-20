@@ -1,7 +1,7 @@
 //! Transactions in the log: the order of a transaction's records, the
 //! active transaction table, each transaction's handle on the log, and the
-//! work after a `Commit`, stamping and freeing the storage a truncate
-//! replaced, which runtime commits and recovery share.
+//! work after a `Commit`, stamping and freeing the storage truncates
+//! replaced and drops gave up, which runtime commits and recovery share.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -475,14 +475,30 @@ pub(crate) fn stamp(
     Ok(())
 }
 
+/// Storage a commit frees: the heaps starting at `heaps` and the trees
+/// whose header pages are `trees`. A truncate replaced it or a drop gave it
+/// up.
+pub(crate) struct Released {
+    pub heaps: Vec<PageId>,
+    pub trees: Vec<PageId>,
+}
+
+impl Released {
+    /// Frees all of it in one record, logged as `txn`'s completion.
+    pub(crate) fn free(&self, txn: &TxnLog<Committed>) -> Result<()> {
+        free_storage(&txn.bpm, Logged::Completion(txn), &self.heaps, &self.trees)
+    }
+}
+
 /// Finishes a commit whose `End` the log lacks: stamps the tuples it still
-/// holds, frees the storage its truncates replaced, and logs `End`. Its
-/// logged frees came after its stamps, and each storage went in one record,
-/// so a heap's first page shows whether that storage was freed.
+/// holds, frees the storage its truncates replaced and its drops gave up,
+/// and logs `End`. Its logged frees came after its stamps, and each storage
+/// went in one record, so its first heap page shows whether that storage
+/// was freed.
 pub(crate) fn complete(txn: TxnLog<Committed>, last_lsn: Lsn) -> Result<()> {
     let log = txn.bpm.log();
     let mut writes: BTreeMap<Rid, Option<usize>> = BTreeMap::new();
-    let mut replaced: Vec<Vec<PageId>> = Vec::new();
+    let mut released: Vec<Released> = Vec::new();
     let mut freed: HashSet<PageId, IntKeys> = HashSet::default();
     let mut buf = Vec::new();
     let mut lsn = last_lsn;
@@ -494,7 +510,17 @@ pub(crate) fn complete(txn: TxnLog<Committed>, last_lsn: Lsn) -> Result<()> {
                     let kept = writes.entry(rid).or_insert(keep_len);
                     *kept = kept.or(keep_len);
                 }
-                Undo::Truncate { old, .. } => replaced.push(old.iter().collect()),
+                Undo::Truncate { old, .. } => {
+                    let mut old = old.iter();
+                    released.push(Released {
+                        heaps: old.next().into_iter().collect(),
+                        trees: old.collect(),
+                    });
+                }
+                Undo::Drop { heaps, trees } => released.push(Released {
+                    heaps: heaps.iter().collect(),
+                    trees: trees.iter().collect(),
+                }),
                 Undo::IndexEntry { .. } | Undo::Create { .. } => {}
             },
             Kind::Completion => {
@@ -510,8 +536,8 @@ pub(crate) fn complete(txn: TxnLog<Committed>, last_lsn: Lsn) -> Result<()> {
         .filter(|(rid, _)| !freed.contains(&rid.page_id))
         .collect();
     stamp(&txn, &writes, |_| {})?;
-    for old in replaced.iter().filter(|old| !freed.contains(&old[0])) {
-        free_storage(&txn.bpm, Logged::Completion(&txn), &old[..1], &old[1..])?;
+    for storage in released.iter().filter(|s| !freed.contains(&s.heaps[0])) {
+        storage.free(&txn)?;
     }
     txn.end();
     Ok(())
