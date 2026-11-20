@@ -208,10 +208,7 @@ mod tests {
     /// A table `accounts`, laid out like `users` with `id` as its primary
     /// key, holding unnamed rows with `ids`.
     fn accounts(db: &Db, ids: &[i32]) -> Arc<TableInfo> {
-        let table = db
-            .catalog()
-            .create_table("accounts", users_schema(), &["id"])
-            .unwrap();
+        let table = db.create_table("accounts", users_schema(), &["id"]);
         let rows = ids
             .iter()
             .map(|&id| vec![int(id), constant(Value::Null, DataType::Varchar(32))])
@@ -289,11 +286,8 @@ mod tests {
     #[test]
     fn moves_the_index_entries() {
         let db = Db::new();
-        let catalog = db.catalog();
-        catalog.create_index("users_id", "users", &["id"]).unwrap();
-        catalog
-            .create_index("users_name", "users", &["name"])
-            .unwrap();
+        db.create_index("users_id", "users", &["id"]);
+        db.create_index("users_name", "users", &["name"]);
         db.insert_numbered(3);
         let child = matching(&db.users, compare(ComparisonOp::Eq, column(0), int(2)));
         update(&db, &db.users, vec![column(0), text("z")], child).unwrap();
@@ -447,13 +441,8 @@ mod tests {
             Column::new("tag", DataType::Int, true),
             Column::new("note", DataType::Varchar(2000), true),
         ]);
-        let table = db
-            .catalog()
-            .create_table("notes", schema.clone(), &["id"])
-            .unwrap();
-        db.catalog()
-            .create_index("notes_tag", "notes", &["tag"])
-            .unwrap();
+        let table = db.create_table("notes", schema.clone(), &["id"]);
+        db.create_index("notes_tag", "notes", &["tag"]);
         // Row 1 is short; the rest fill most of its page.
         let note = |len: usize| {
             constant(
@@ -604,9 +593,7 @@ mod tests {
     #[test]
     fn rows_moved_ahead_of_the_scan_are_not_updated_again() {
         let db = Db::new();
-        db.catalog()
-            .create_index("users_id", "users", &["id"])
-            .unwrap();
+        db.create_index("users_id", "users", &["id"]);
         db.insert_numbered(5);
         let index = db.catalog().get_index("users_id").unwrap();
         let range = IndexScanRange::Range {

@@ -4,14 +4,17 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use common::TxnId;
+use common::{Rid, Tuple, TxnId};
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 
+use crate::buffer::buffer_pool_manager::BufferPoolManager;
+use crate::concurrency::index_versions::{IndexedTable, TableEntry};
 use crate::concurrency::read_ts::ReadTimestamps;
-use crate::concurrency::transaction::{Garbage, Transaction, TransactionState};
+use crate::concurrency::transaction::{Garbage, Outcome, Transaction};
 use crate::concurrency::watermark::Watermark;
 use crate::error::Result;
-use crate::index::IndexTrait;
+use crate::index::{Index, IndexTrait, RowLocator};
+use crate::table::table_heap::TableHeap;
 use crate::table::undo_log::UndoLog;
 
 /// Begins and ends transactions. It owns the watermark, the one undo log
@@ -33,8 +36,12 @@ use crate::table::undo_log::UndoLog;
 /// was garbage stays garbage. Dropping the manager runs the pass still owed,
 /// then stops the thread.
 ///
-/// **Known gaps.** Tuples deleted outside a transaction are not collected,
-/// and reclaimed tuples keep their slots (see `table_page`).
+/// The queue is in memory, so a crash loses it, and some garbage never
+/// joins it, such as the catalog rows an undo leaves deleted. `sweep_heap`
+/// and `sweep_index` find garbage by scanning instead, and collect it as a
+/// pass does.
+///
+/// **Known gap.** Reclaimed tuples keep their slots (see `table_page`).
 pub struct TransactionManager {
     shared: Arc<Shared>,
     collector: Option<JoinHandle<()>>,
@@ -42,6 +49,8 @@ pub struct TransactionManager {
 
 /// What the manager shares with its collector thread.
 struct Shared {
+    /// The database whose log the transactions write.
+    bpm: Arc<BufferPoolManager>,
     watermark: Arc<Watermark>,
     undo: Arc<UndoLog>,
     read_ts: Arc<ReadTimestamps>,
@@ -72,10 +81,14 @@ struct Passes {
 }
 
 impl TransactionManager {
-    /// A manager whose first transaction gets Tid `next_tid`, with its
-    /// collector thread started. See `Watermark::new`.
-    pub fn new(next_tid: TxnId) -> Self {
+    /// A manager of transactions on the database behind `bpm`, with its
+    /// collector thread started. Its first Tid is above every Tid in the
+    /// log (`Log::next_tid`), so it never takes a crashed transaction's rows
+    /// for its own.
+    pub fn new(bpm: Arc<BufferPoolManager>) -> Self {
+        let next_tid = bpm.log().next_tid();
         let shared = Arc::new(Shared {
+            bpm,
             watermark: Arc::new(Watermark::new(next_tid)),
             undo: Arc::new(UndoLog::new()),
             read_ts: Arc::new(ReadTimestamps::new()),
@@ -103,6 +116,7 @@ impl TransactionManager {
         let tid = self.shared.watermark.begin();
         Arc::new(Transaction::new(
             tid,
+            Arc::clone(&self.shared.bpm),
             Arc::clone(&self.shared.undo),
             Arc::clone(&self.shared.read_ts),
             Arc::clone(&self.shared.watermark),
@@ -110,19 +124,19 @@ impl TransactionManager {
         ))
     }
 
-    /// Commits `txn`: unlocks the versions it wrote, which makes them
-    /// visible to newer transactions. Fails with `TransactionNotRunning` if
-    /// it has already ended. If unlocking a tuple fails, the error is
-    /// returned and `txn` stays running, partly committed; there is no log
-    /// to finish or undo it.
+    /// Commits `txn`: logs its `Commit` and returns once that is durable,
+    /// having unlocked the versions it wrote, which makes them visible to
+    /// newer transactions. Fails only with `TransactionNotRunning`, if it
+    /// has already ended. Past the `Commit`, a failure stops the process,
+    /// and recovery finishes the commit.
     pub fn commit(&self, txn: &Transaction) -> Result<()> {
-        self.end(txn, TransactionState::Committed)
+        self.end(txn, Outcome::Committed)
     }
 
-    /// Aborts `txn`: puts back every tuple it wrote as it was before. Fails
-    /// as `commit` does.
+    /// Aborts `txn`: puts back every tuple and index entry it wrote, as its
+    /// records in the log say. Fails as `commit` does.
     pub fn abort(&self, txn: &Transaction) -> Result<()> {
-        self.end(txn, TransactionState::Aborted)
+        self.end(txn, Outcome::Aborted)
     }
 
     /// Runs a pass of garbage collection on the calling thread, alongside
@@ -159,6 +173,61 @@ impl TransactionManager {
         }
     }
 
+    /// Reclaims every tuple of `heap` that a pass would, found by scanning
+    /// the heap rather than in the queue. Returns how many it reclaimed.
+    pub fn sweep_heap(&self, heap: &TableHeap) -> Result<usize> {
+        let watermark = self.shared.watermark.get();
+        let mut reclaimed = 0;
+        for rids in heap.reclaimable(watermark) {
+            for rid in rids? {
+                reclaimed += usize::from(self.shared.reclaim(heap, rid, watermark)?);
+            }
+        }
+        Ok(reclaimed)
+    }
+
+    /// Removes every entry of `index`, one of `table`'s, that a pass would
+    /// remove if it were retired: each one no version a reader at or above
+    /// the watermark might see needs. Holds at most `batch` entries at a
+    /// time. Returns how many it removed.
+    pub fn sweep_index(
+        &self,
+        table: &Arc<IndexedTable>,
+        index: &Arc<Index>,
+        batch: usize,
+    ) -> Result<usize> {
+        let watermark = self.shared.watermark.get();
+        let Index::BtreeIndex(btree) = &**index;
+        let mut removed = 0;
+        let mut entries = Vec::with_capacity(batch);
+        let mut after: Option<(Tuple, RowLocator)> = None;
+        loop {
+            // A removal may need the leaf the scan holds, so a batch's
+            // removals wait for its scan's end.
+            let scan = btree.entries_after(after.as_ref().map(|(key, locator)| (key, locator)))?;
+            for entry in scan.take(batch) {
+                let (key, locator) = entry?;
+                entries.push(TableEntry {
+                    table: Arc::clone(table),
+                    index: Arc::clone(index),
+                    key,
+                    locator,
+                });
+            }
+            let Some(last) = entries.last() else {
+                return Ok(removed);
+            };
+            after = Some((last.key.clone(), last.locator.clone()));
+            let full = entries.len() == batch;
+            for entry in entries.drain(..) {
+                removed += usize::from(self.shared.remove_entry(&entry, watermark)?);
+            }
+            if !full {
+                return Ok(removed);
+            }
+        }
+    }
+
     pub fn undo_log(&self) -> &Arc<UndoLog> {
         &self.shared.undo
     }
@@ -174,8 +243,7 @@ impl TransactionManager {
         garbage.values().map(|garbage| garbage.tuples.len()).sum()
     }
 
-    /// The Tid the next transaction will get. Saved across restarts so that
-    /// it never goes below a committed `ts` on disk; see `watermark`.
+    /// The Tid the next transaction will get.
     pub fn next_tid(&self) -> TxnId {
         self.shared.watermark.next()
     }
@@ -191,7 +259,7 @@ impl TransactionManager {
         self.shared.watermark.get()
     }
 
-    fn end(&self, txn: &Transaction, outcome: TransactionState) -> Result<()> {
+    fn end(&self, txn: &Transaction, outcome: Outcome) -> Result<()> {
         debug_assert!(
             Arc::ptr_eq(txn.undo_log(), &self.shared.undo),
             "transaction {} was begun by another manager",
@@ -281,23 +349,12 @@ impl Shared {
         let mut deferred = Vec::new();
         for mut garbage in dead.into_values() {
             deferred.append(&mut garbage.deferred);
-            for (heap, rid) in garbage.tuples {
-                match heap.reclaim(rid, watermark) {
-                    Ok(true) => self.read_ts.remove(rid),
-                    Ok(false) => {}
-                    Err(e) => {
-                        first_error.get_or_insert(e);
-                    }
-                }
-            }
-            for entry in garbage.entries.into_iter().chain(garbage.built) {
-                let _entries = self.entry_lock.write();
-                let removed = match entry.is_needed(watermark, &self.undo) {
-                    Ok(true) => Ok(false),
-                    Ok(false) => entry.index.delete_entry(&entry.key, &entry.locator),
-                    Err(e) => Err(e),
-                };
-                if let Err(e) = removed {
+            let tuples = garbage.tuples.iter();
+            let tuples = tuples.map(|(heap, rid)| self.reclaim(heap, *rid, watermark));
+            let entries = garbage.entries.iter().chain(&garbage.built);
+            let entries = entries.map(|entry| self.remove_entry(entry, watermark));
+            for result in tuples.chain(entries) {
+                if let Err(e) = result {
                     first_error.get_or_insert(e);
                 }
             }
@@ -308,5 +365,25 @@ impl Shared {
             deferred.into_iter().for_each(|work| work());
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Reclaims the tuple at `rid` of `heap` if no reader at or above
+    /// `watermark` can see it. Returns whether it did.
+    fn reclaim(&self, heap: &TableHeap, rid: Rid, watermark: TxnId) -> Result<bool> {
+        let reclaimed = heap.reclaim(rid, watermark)?;
+        if reclaimed {
+            self.read_ts.remove(rid);
+        }
+        Ok(reclaimed)
+    }
+
+    /// Removes `entry` from its index unless a reader at or above
+    /// `watermark` may need it. Returns whether it did.
+    fn remove_entry(&self, entry: &TableEntry, watermark: TxnId) -> Result<bool> {
+        let _entries = self.entry_lock.write();
+        if entry.is_needed(watermark, &self.undo)? {
+            return Ok(false);
+        }
+        entry.index.delete_entry(&entry.key, &entry.locator)
     }
 }

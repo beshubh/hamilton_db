@@ -60,6 +60,8 @@ pub struct PageHeader {
 
 const _: () = assert!(size_of::<PageHeader>() == PageHeader::SIZE);
 
+const LSN_OFFSET: usize = offset_of!(PageHeader, lsn);
+const LSN_END: usize = LSN_OFFSET + size_of::<Lsn>();
 const CHECKSUM_OFFSET: usize = offset_of!(PageHeader, checksum);
 const CHECKSUM_END: usize = CHECKSUM_OFFSET + size_of::<u32>();
 
@@ -109,6 +111,15 @@ fn compute_checksum(page_id: PageId, data: &[u8; PAGE_SIZE]) -> u32 {
     let crc = crc32c::crc32c(&page_id.to_le_bytes());
     let crc = crc32c::crc32c_append(crc, &data[..CHECKSUM_OFFSET]);
     crc32c::crc32c_append(crc, &data[CHECKSUM_END..])
+}
+
+/// The LSN in the header of `data`: the last record that changed the page.
+pub fn page_lsn(data: &[u8; PAGE_SIZE]) -> Lsn {
+    Lsn::read_from_bytes(&data[LSN_OFFSET..LSN_END]).unwrap()
+}
+
+pub(crate) fn set_page_lsn(data: &mut [u8; PAGE_SIZE], lsn: Lsn) {
+    data[LSN_OFFSET..LSN_END].copy_from_slice(lsn.as_bytes());
 }
 
 /// Sets the header's checksum. Call on the copy of the page that is about to

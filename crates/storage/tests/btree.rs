@@ -8,9 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use common::{INVALID_PAGE_ID, PageId, Rid};
 use storage::StorageError;
 use storage::buffer::arc_replacer::AccessType;
-use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::buffer::traced_buffer_pool_manager::{PageAccess, TracedBufferPoolManager};
-use storage::disk::disk_manager::DiskManager;
 use storage::index::btree::Btree;
 use storage::index::index_iter::IndexIterator;
 use storage::page::PAGE_SIZE;
@@ -19,6 +17,7 @@ use storage::page::btree_internal_page::BtreeInternalPage;
 use storage::page::btree_leaf_page::BtreeLeafPage;
 use storage::page::btree_page::{BytewiseComparator, KeyComparator};
 use storage::page::page_header::{PageHeader, PageType};
+use storage::wal::Logged;
 use tempfile::TempDir;
 use zerocopy::FromBytes;
 
@@ -76,6 +75,18 @@ fn shuffled(n: u64) -> Vec<u64> {
     keys
 }
 
+/// Runs `change` on the bytes of `page_id`, through a mini-transaction of
+/// its own.
+fn change<T>(
+    bpm: &TracedBufferPoolManager,
+    page_id: PageId,
+    change: impl FnOnce(&mut [u8; PAGE_SIZE]) -> T,
+) -> T {
+    let mtr = bpm.bpm().mtr(Logged::System);
+    let mut page = mtr.write_page(page_id).unwrap();
+    change(page.raw_mut())
+}
+
 /// An empty tree.
 fn setup() -> Fixture {
     setup_with_frames(16)
@@ -94,10 +105,11 @@ fn setup_no_tombs(frames: usize) -> Fixture<0> {
 
 fn setup_with<const NUM_TOMBS: usize>(frames: usize) -> Fixture<NUM_TOMBS> {
     let dir = TempDir::new().unwrap();
-    let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(TracedBufferPoolManager::new(Arc::new(
-        BufferPoolManager::new(frames, dm),
-    )));
+    let bpm = Arc::new(TracedBufferPoolManager::new(
+        storage::open(dir.path().join("test.db"), frames)
+            .unwrap()
+            .bpm,
+    ));
     let header_page_id = bpm.new_page();
     let tree = Btree::new("idx", header_page_id, Arc::clone(&bpm), CMP).unwrap();
     Fixture {
@@ -112,26 +124,20 @@ impl<const NUM_TOMBS: usize> Fixture<NUM_TOMBS> {
     /// Writes a leaf holding `keys` with their `rid`s, linked to `next`.
     fn leaf(&self, keys: &[u64], next: PageId) -> PageId {
         let page_id = self.bpm.new_page();
-        let mut guard = self
-            .bpm
-            .checked_write_page(page_id, AccessType::Unknown)
-            .unwrap();
-        let mut page = BtreeLeafPage::<_, NUM_TOMBS>::init(guard.get_data_mut());
-        for &k in keys {
-            page.insert(&key(k), rid(k), &CMP).unwrap();
-        }
-        page.set_next_page_id(next);
+        change(&self.bpm, page_id, |data| {
+            let mut page = BtreeLeafPage::<_, NUM_TOMBS>::init(data);
+            for &k in keys {
+                page.insert(&key(k), rid(k), &CMP).unwrap();
+            }
+            page.set_next_page_id(next);
+        });
         page_id
     }
 
     fn set_root(&self, root: PageId) {
-        let mut guard = self
-            .bpm
-            .checked_write_page(self.header_page_id, AccessType::Unknown)
-            .unwrap();
-        BtreeHeaderPage::new(guard.get_data_mut())
-            .unwrap()
-            .set_root_page_id(root);
+        change(&self.bpm, self.header_page_id, |data| {
+            BtreeHeaderPage::new(data).unwrap().set_root_page_id(root)
+        });
     }
 
     /// Builds this tree and returns its root and leaves:
@@ -146,28 +152,22 @@ impl<const NUM_TOMBS: usize> Fixture<NUM_TOMBS> {
         let l2 = self.leaf(&[40, 50], l3);
         let l1 = self.leaf(&[10, 20, 30], l2);
         let root = self.bpm.new_page();
-        {
-            let mut guard = self
-                .bpm
-                .checked_write_page(root, AccessType::Unknown)
-                .unwrap();
-            let mut page = Internal::init(guard.get_data_mut());
+        change(&self.bpm, root, |data| {
+            let mut page = Internal::init(data);
             page.populate_new_root(l1, &key(40), l2).unwrap();
             page.insert(&key(60), l3, &CMP).unwrap();
-        }
+        });
         self.set_root(root);
         (root, [l1, l2, l3])
     }
 
     fn remove(&self, leaf: PageId, k: u64) {
-        let mut guard = self
-            .bpm
-            .checked_write_page(leaf, AccessType::Unknown)
-            .unwrap();
-        BtreeLeafPage::<_, NUM_TOMBS>::new(guard.get_data_mut())
-            .unwrap()
-            .remove(&key(k), &CMP)
-            .unwrap();
+        change(&self.bpm, leaf, |data| {
+            BtreeLeafPage::<_, NUM_TOMBS>::new(data)
+                .unwrap()
+                .remove(&key(k), &CMP)
+                .unwrap()
+        });
     }
 
     fn get(&self, k: u64) -> Option<Rid> {
@@ -544,11 +544,6 @@ fn tree_orders_keys_with_its_comparator() {
     let header_page_id = f.bpm.new_page();
     let tree =
         Btree::<LittleEndian>::new("le", header_page_id, Arc::clone(&f.bpm), LittleEndian).unwrap();
-    let write = |page_id| {
-        f.bpm
-            .checked_write_page(page_id, AccessType::Unknown)
-            .unwrap()
-    };
 
     // By bytes, 256 ([0, 1, 0, 0]) sorts before 2 ([2, 0, 0, 0]).
     //
@@ -561,21 +556,24 @@ fn tree_orders_keys_with_its_comparator() {
         (right, [256u32, 300], INVALID_PAGE_ID),
         (left, [2, 1], right),
     ] {
-        let mut guard = write(page_id);
-        let mut page = BtreeLeafPage::<_, 0>::init(guard.get_data_mut());
-        for k in keys {
-            page.insert(&k.to_le_bytes(), rid(k.into()), &LittleEndian)
-                .unwrap();
-        }
-        page.set_next_page_id(next);
+        change(&f.bpm, page_id, |data| {
+            let mut page = BtreeLeafPage::<_, 0>::init(data);
+            for k in keys {
+                page.insert(&k.to_le_bytes(), rid(k.into()), &LittleEndian)
+                    .unwrap();
+            }
+            page.set_next_page_id(next);
+        });
     }
     let root = f.bpm.new_page();
-    BtreeInternalPage::init(write(root).get_data_mut())
-        .populate_new_root(left, &256u32.to_le_bytes(), right)
-        .unwrap();
-    BtreeHeaderPage::new(write(header_page_id).get_data_mut())
-        .unwrap()
-        .set_root_page_id(root);
+    change(&f.bpm, root, |data| {
+        BtreeInternalPage::init(data)
+            .populate_new_root(left, &256u32.to_le_bytes(), right)
+            .unwrap()
+    });
+    change(&f.bpm, header_page_id, |data| {
+        BtreeHeaderPage::new(data).unwrap().set_root_page_id(root)
+    });
 
     let keys: Vec<u32> = tree
         .begin()
@@ -602,13 +600,12 @@ fn tree_orders_keys_with_its_comparator() {
 fn keys_of_different_lengths() {
     let f = setup();
     let leaf = f.bpm.new_page();
-    {
-        let mut guard = f.bpm.checked_write_page(leaf, AccessType::Unknown).unwrap();
-        let mut page = Leaf::init(guard.get_data_mut());
+    change(&f.bpm, leaf, |data| {
+        let mut page = Leaf::init(data);
         for (n, k) in ["pear", "", "apple", "app"].into_iter().enumerate() {
             page.insert(k.as_bytes(), rid(n as u64), &CMP).unwrap();
         }
-    }
+    });
     f.set_root(leaf);
 
     let keys: Vec<Vec<u8>> = f.tree.begin().unwrap().map(|e| e.unwrap().0).collect();
@@ -624,11 +621,6 @@ fn keys_of_different_lengths() {
 #[test]
 fn split_leaf_under_new_root() {
     let f = setup();
-    let write = |page_id| {
-        f.bpm
-            .checked_write_page(page_id, AccessType::Unknown)
-            .unwrap()
-    };
     // Keys of 8 to 200 bytes that order as their number.
     let long_key = |n: u64| {
         let mut k = key(n).to_vec();
@@ -638,21 +630,25 @@ fn split_leaf_under_new_root() {
 
     let (left, right) = (f.bpm.new_page(), f.bpm.new_page());
     let mut count = 0;
-    let mut left_guard = write(left);
-    let mut left_page = Leaf::init(left_guard.get_data_mut());
+    let mtr = f.bpm.bpm().mtr(Logged::System);
+    let mut left_guard = mtr.write_page(left).unwrap();
+    let mut left_page = Leaf::init(left_guard.raw_mut());
     while left_page.insert(&long_key(count), rid(count), &CMP).is_ok() {
         count += 1;
     }
-    let mut right_guard = write(right);
-    let mut right_page = Leaf::init(right_guard.get_data_mut());
+    let mut right_guard = mtr.write_page(right).unwrap();
+    let mut right_page = Leaf::init(right_guard.raw_mut());
     left_page.split_to(&mut right_page, right);
     let separator = right_page.key_at(0).to_vec();
     drop((left_guard, right_guard));
+    mtr.commit();
 
     let root = f.bpm.new_page();
-    Internal::init(write(root).get_data_mut())
-        .populate_new_root(left, &separator, right)
-        .unwrap();
+    change(&f.bpm, root, |data| {
+        Internal::init(data)
+            .populate_new_root(left, &separator, right)
+            .unwrap()
+    });
     f.set_root(root);
 
     for n in 0..count {
@@ -846,13 +842,12 @@ fn split_latches_from_the_header_down() {
     let leaf = f.leaf(&[], INVALID_PAGE_ID);
     f.set_root(leaf);
     let mut n = 0;
-    {
-        let mut guard = f.bpm.checked_write_page(leaf, AccessType::Unknown).unwrap();
-        let mut page = Leaf::init(guard.get_data_mut());
+    change(&f.bpm, leaf, |data| {
+        let mut page = Leaf::init(data);
         while page.insert(&key(n), rid(n), &CMP).is_ok() {
             n += 1;
         }
-    }
+    });
     f.bpm.start_tracing();
     assert!(f.tree.insert(&key(n), rid(n)).unwrap());
     let trace = f.bpm.take_trace();
@@ -886,13 +881,12 @@ fn split_stops_at_a_parent_with_room() {
     // 16-byte keys between 10 and 20, so they all belong in the first leaf.
     let between = |n: u64| [key(10), key(n)].concat();
     let mut n = 0;
-    {
-        let mut guard = f.bpm.checked_write_page(l1, AccessType::Unknown).unwrap();
-        let mut page = Leaf::new(guard.get_data_mut()).unwrap();
+    change(&f.bpm, l1, |data| {
+        let mut page = Leaf::new(data).unwrap();
         while page.insert(&between(n), rid(n), &CMP).is_ok() {
             n += 1;
         }
-    }
+    });
     f.bpm.start_tracing();
     assert!(f.tree.insert(&between(n), rid(n)).unwrap());
     let trace = f.bpm.take_trace();

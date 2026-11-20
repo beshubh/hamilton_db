@@ -7,7 +7,8 @@ use parking_lot::Mutex;
 use crate::buffer::arc_replacer::AccessType;
 use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::error::Result;
-use crate::page::page_guard::{ReadPageGuard, WritePageGuard};
+use crate::page::page_guard::ReadPageGuard;
+use crate::wal::mtr::{Mtr, MtrPage};
 
 /// One page operation that went through a `TracedBufferPoolManager`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,11 +73,10 @@ impl TracedBufferPoolManager {
         page_id
     }
 
-    /// See `BufferPoolManager::delete_page`.
-    pub fn delete_page(&self, page_id: PageId) -> Result<()> {
-        self.bpm.delete_page(page_id)?;
+    /// See `Mtr::free_page`.
+    pub fn free_page(&self, mtr: &Mtr<'_>, page_id: PageId) {
+        mtr.free_page(page_id);
         self.record(PageAccess::Delete(page_id));
-        Ok(())
     }
 
     /// See `BufferPoolManager::checked_read_page`.
@@ -90,15 +90,11 @@ impl TracedBufferPoolManager {
         Ok(guard)
     }
 
-    /// See `BufferPoolManager::checked_write_page`.
-    pub fn checked_write_page(
-        &self,
-        page_id: PageId,
-        access_type: AccessType,
-    ) -> Result<WritePageGuard> {
-        let guard = self.bpm.checked_write_page(page_id, access_type)?;
+    /// See `Mtr::write_page`.
+    pub fn write_page<'m>(&self, mtr: &'m Mtr<'_>, page_id: PageId) -> Result<MtrPage<'m>> {
+        let page = mtr.write_page(page_id)?;
         self.record(PageAccess::Write(page_id));
-        Ok(guard)
+        Ok(page)
     }
 
     /// Pin count of the page, or `None` if it is not in memory. Not traced.

@@ -2,8 +2,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use common::{
-    INVALID_PAGE_ID, INVALID_TXN_ID, PageId, Rid, Schema, SlotId, TXN_UNCOMMITTED_BIT, Tuple,
-    TxnId, Value,
+    INVALID_PAGE_ID, PageId, Rid, Schema, SlotId, TXN_UNCOMMITTED_BIT, Tuple, TxnId, Value,
 };
 use parking_lot::Mutex;
 
@@ -12,10 +11,11 @@ use crate::buffer::buffer_pool_manager::BufferPoolManager;
 use crate::concurrency::read_ts::ReadTimestamps;
 use crate::error::{Result, StorageError};
 use crate::page::PAGE_SIZE;
-use crate::page::page_guard::WritePageGuard;
 use crate::table::table_iterator::{TableIterator, TableRow};
-use crate::table::table_page::{INVALID_UNDO_PTR, TablePage, TupleMeta};
+use crate::table::table_page::{TablePage, TupleMeta};
 use crate::table::undo_log::{self, UndoLog, UndoRecord};
+use crate::wal::mtr::{Logged, Mtr};
+use crate::wal::op::PageOp;
 
 /// A table stored as a linked list of table pages, reached through the
 /// buffer pool.
@@ -25,20 +25,21 @@ use crate::table::undo_log::{self, UndoLog, UndoRecord};
 /// describes; the other methods read and write the newest version alone.
 ///
 /// A versioned write whose `ts` has `TXN_UNCOMMITTED_BIT` set write-locks
-/// the tuple for its transaction until `stamp_commit` or `rollback`. A
-/// shrinking locked update keeps the tuple's old length, padding the new
-/// payload with zeros, so that its rollback always fits back in place;
-/// `stamp_commit` releases the padding. Reads at a timestamp cut it off;
-/// `get` and `iter` return it.
+/// the tuple for its transaction until the transaction commits or aborts.
+/// A shrinking locked update keeps the tuple's old length, padding the new
+/// payload with zeros, so that undoing it always fits back in place; the
+/// commit's stamp releases the padding. Reads at a timestamp cut it off;
+/// `get` and `iter` return it. Writes logged as a transaction's (see
+/// `Logged`) are undone from the log if it aborts.
 ///
 /// Once no reader can see a deleted tuple, `reclaim` frees its bytes and
 /// leaves its slot dead (see `table_page`). Transactional reads see a dead
 /// slot as no tuple and writes as a deleted one; `get` fails on it with
 /// `InvalidSlot`.
 ///
-/// Each operation latches only the pages it touches, through the buffer
-/// pool's page guards. Inserts also take `last_page_id`'s mutex, so that two
-/// inserts never both append a new page to the end of the list.
+/// Each operation latches only the pages it touches, and changes them
+/// through one mini-transaction. Inserts also take `last_page_id`'s mutex, so
+/// that two inserts never both append a new page to the end of the list.
 pub struct TableHeap {
     bpm: Arc<BufferPoolManager>,
     first_page_id: PageId,
@@ -48,10 +49,12 @@ pub struct TableHeap {
 impl TableHeap {
     /// Creates an empty table with one empty page.
     pub fn create(bpm: Arc<BufferPoolManager>) -> Result<Self> {
-        let page_id = bpm.new_page();
-        let mut guard = bpm.checked_write_page(page_id, AccessType::Unknown)?;
-        TablePage::init(guard.get_data_mut());
-        drop(guard);
+        let page_id = {
+            let mtr = bpm.mtr(Logged::System);
+            let mut page = mtr.new_page()?;
+            page.apply(PageOp::HeapInit)?;
+            page.page_id()
+        };
         Ok(Self {
             bpm,
             first_page_id: page_id,
@@ -83,41 +86,36 @@ impl TableHeap {
 
     /// Every page of the heap, in list order.
     pub fn page_ids(&self) -> Result<Vec<PageId>> {
-        let mut pages = Vec::new();
-        let mut page_id = self.first_page_id;
-        while page_id != INVALID_PAGE_ID {
-            pages.push(page_id);
-            let guard = self.bpm.checked_read_page(page_id, AccessType::Scan)?;
-            page_id = TablePage::new(guard.get_data())?.next_page_id();
-        }
-        Ok(pages)
+        page_ids(&self.bpm, self.first_page_id)
     }
 
     /// Appends a tuple to the last page, starting a new page when that one is
-    /// full, and returns where it went.
-    pub fn insert(&self, meta: &TupleMeta, tuple: &Tuple) -> Result<Rid> {
+    /// full, and returns where it went. The insert is logged as `by`'s.
+    pub fn insert(&self, by: Logged<'_>, meta: &TupleMeta, tuple: &Tuple) -> Result<Rid> {
         let mut last_page_id = self.last_page_id.lock();
-        let mut guard = self
-            .bpm
-            .checked_write_page(*last_page_id, AccessType::Unknown)?;
-        let mut page = TablePage::new(guard.get_data_mut())?;
-        match page.insert(meta, tuple.data()) {
-            Ok(slot) => return Ok(Rid::new(*last_page_id, slot)),
+        let mtr = self.bpm.mtr(by);
+        let mut guard = mtr.write_page(*last_page_id)?;
+        let insert = |slot| PageOp::HeapInsert {
+            slot,
+            meta: *meta,
+            payload: tuple.data(),
+        };
+        let slot = TablePage::new(guard.data())?.insert_slot();
+        match guard.apply(insert(slot)) {
+            Ok(()) => return Ok(Rid::new(*last_page_id, slot)),
             Err(StorageError::PageFull) => {}
             Err(e) => return Err(e),
         }
 
         // The new page is unreachable until it is linked in, so latching it
         // while still holding the old last page cannot deadlock.
-        let new_page_id = self.bpm.new_page();
-        let mut new_guard = self
-            .bpm
-            .checked_write_page(new_page_id, AccessType::Unknown)?;
-        let mut new_page = TablePage::init(new_guard.get_data_mut());
-        let slot = new_page.insert(meta, tuple.data())?;
-        page.set_next_page_id(new_page_id);
+        let mut new_guard = mtr.new_page()?;
+        let new_page_id = new_guard.page_id();
+        new_guard.apply(PageOp::HeapInit)?;
+        new_guard.apply(insert(0))?;
+        guard.apply(PageOp::HeapSetNext { next: new_page_id })?;
         *last_page_id = new_page_id;
-        Ok(Rid::new(new_page_id, slot))
+        Ok(Rid::new(new_page_id, 0))
     }
 
     /// The tuple at `rid`, copied out of the page and carrying `rid`. Deleted
@@ -134,37 +132,58 @@ impl TableHeap {
     /// Replaces the meta of the tuple at `rid`, such as stamping the commit
     /// timestamp once its transaction commits.
     pub fn update_meta(&self, rid: Rid, meta: &TupleMeta) -> Result<()> {
-        let mut guard = self.write_page(rid)?;
-        TablePage::new(guard.get_data_mut())?.update_meta(rid.slot, meta)
+        let mtr = self.mtr();
+        let mut guard = mtr.write_page(rid.page_id)?;
+        guard.apply(PageOp::HeapSetMeta {
+            slot: rid.slot,
+            meta: *meta,
+        })
     }
 
     /// Marks the tuple at `rid` deleted as of `ts`, with `undo_ptr` pointing
     /// at the undo entry that restores it. The tuple stays on the page:
     /// garbage collection reclaims only tuples that transactions deleted.
     pub fn mark_delete(&self, rid: Rid, ts: u64, undo_ptr: u64) -> Result<()> {
-        let mut guard = self.write_page(rid)?;
-        let mut page = TablePage::new(guard.get_data_mut())?;
-        let (old, _) = page.get(rid.slot)?;
+        let mtr = self.mtr();
+        let mut guard = mtr.write_page(rid.page_id)?;
+        let (old, _) = TablePage::new(guard.data())?.get(rid.slot)?;
         let meta = TupleMeta {
             ts,
             undo_ptr,
             is_deleted: true,
             ..old
         };
-        page.update_meta(rid.slot, &meta)
+        guard.apply(PageOp::HeapSetMeta {
+            slot: rid.slot,
+            meta,
+        })
     }
 
-    /// Replaces the tuple at `rid`, keeping its `Rid`. Fails with `PageFull`
-    /// if the new version does not fit on the tuple's page; the caller then
-    /// deletes it and inserts the new version elsewhere.
-    pub fn update_in_place(&self, rid: Rid, meta: &TupleMeta, tuple: &Tuple) -> Result<()> {
-        let mut guard = self.write_page(rid)?;
-        TablePage::new(guard.get_data_mut())?.update(rid.slot, meta, tuple.data())
+    /// Replaces the tuple at `rid`, keeping its `Rid`, logged as `by`'s
+    /// change. Fails with `PageFull` if the new version does not fit on the
+    /// tuple's page; the caller then deletes it and inserts the new version
+    /// elsewhere.
+    pub fn update_in_place(
+        &self,
+        by: Logged<'_>,
+        rid: Rid,
+        meta: &TupleMeta,
+        tuple: &Tuple,
+    ) -> Result<()> {
+        let mtr = self.bpm.mtr(by);
+        let mut guard = mtr.write_page(rid.page_id)?;
+        guard.apply(PageOp::HeapSetTuple {
+            slot: rid.slot,
+            meta: *meta,
+            payload: tuple.data(),
+            padded_to: tuple.len(),
+        })
     }
 
     /// Replaces the tuple at `rid` with `new`, written at `ts`, keeping its
-    /// `Rid`. The version it replaces stays readable through a record pushed
-    /// to `undo`, which holds the old values of the columns that changed.
+    /// `Rid`, logged as `by`'s write. The version it replaces stays readable
+    /// through a record pushed to `undo`, which holds the old values of the
+    /// columns that changed.
     ///
     /// Fails with `PageFull` if `new` does not fit on the tuple's page,
     /// leaving the heap and `undo` unchanged. The caller then deletes the
@@ -173,8 +192,10 @@ impl TableHeap {
     /// is locked by another transaction, was committed after `ts`, or was
     /// read by a transaction newer than `ts` (see `check_write`), and with
     /// `TupleDeleted` if it is deleted or reclaimed.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_versioned(
         &self,
+        by: Logged<'_>,
         rid: Rid,
         new: &Tuple,
         ts: u64,
@@ -182,23 +203,21 @@ impl TableHeap {
         undo: &UndoLog,
         read_ts: &ReadTimestamps,
     ) -> Result<()> {
-        let mut guard = self.write_page(rid)?;
-        let mut page = TablePage::new(guard.get_data_mut())?;
+        let mtr = self.bpm.mtr(by);
+        let mut guard = mtr.write_page(rid.page_id)?;
+        let page = TablePage::new(guard.data())?;
         let (head, payload) = head_to_write(&page, rid)?;
         check_write(rid, &head, ts, read_ts)?;
         if head.is_deleted {
             return Err(StorageError::TupleDeleted(rid));
         }
         let old = Tuple::from_bytes(payload.to_vec());
-        let mut padded = Vec::new();
-        let data = if ts & TXN_UNCOMMITTED_BIT != 0 && new.len() < old.len() {
-            padded.extend_from_slice(new.data());
-            padded.resize(old.len(), 0);
-            &padded
+        let padded_to = if ts & TXN_UNCOMMITTED_BIT != 0 {
+            new.len().max(old.len())
         } else {
-            new.data()
+            new.len()
         };
-        page.check_update(rid.slot, data.len())?;
+        page.check_update(rid.slot, padded_to)?;
 
         let old_values = old.decode(schema)?;
         let new_values = new.decode(schema)?;
@@ -218,24 +237,30 @@ impl TableHeap {
             is_deleted: false,
             has_nulls: new_values.iter().any(|value| matches!(value, Value::Null)),
         };
-        page.update(rid.slot, &meta, data)
+        guard.apply(PageOp::HeapSetTuple {
+            slot: rid.slot,
+            meta,
+            payload: new.data(),
+            padded_to,
+        })
     }
 
-    /// Marks the tuple at `rid` deleted as of `ts`. The version before the
-    /// delete stays readable through a record pushed to `undo`, with no
-    /// changed columns: the tuple's bytes stay on the page. Fails with
-    /// `Conflict` as `update_versioned` does, and with `TupleDeleted` if the
-    /// tuple is already deleted or reclaimed.
+    /// Marks the tuple at `rid` deleted as of `ts`, logged as `by`'s write.
+    /// The version before the delete stays readable through a record pushed
+    /// to `undo`, with no changed columns: the tuple's bytes stay on the
+    /// page. Fails with `Conflict` as `update_versioned` does, and with
+    /// `TupleDeleted` if the tuple is already deleted or reclaimed.
     pub fn delete_versioned(
         &self,
+        by: Logged<'_>,
         rid: Rid,
         ts: u64,
         undo: &UndoLog,
         read_ts: &ReadTimestamps,
     ) -> Result<()> {
-        let mut guard = self.write_page(rid)?;
-        let mut page = TablePage::new(guard.get_data_mut())?;
-        let (head, _) = head_to_write(&page, rid)?;
+        let mtr = self.bpm.mtr(by);
+        let mut guard = mtr.write_page(rid.page_id)?;
+        let (head, _) = head_to_write(&TablePage::new(guard.data())?, rid)?;
         check_write(rid, &head, ts, read_ts)?;
         if head.is_deleted {
             return Err(StorageError::TupleDeleted(rid));
@@ -252,7 +277,10 @@ impl TableHeap {
             is_deleted: true,
             ..head
         };
-        page.update_meta(rid.slot, &meta)
+        guard.apply(PageOp::HeapSetMeta {
+            slot: rid.slot,
+            meta,
+        })
     }
 
     /// The version of the tuple at `rid` visible at `ts`, with its meta, or
@@ -334,112 +362,44 @@ impl TableHeap {
         Ok(Some(page.get(rid.slot)?.0))
     }
 
-    /// Commits the head of the tuple at `rid`, which the running transaction
-    /// `tid` wrote: clears `TXN_UNCOMMITTED_BIT` from its `ts`, and releases
-    /// any padding a shrinking update kept, which needs `schema` to find the
-    /// payload's real length. The undo records are left alone: their
-    /// `writer_ts` is already `tid`.
-    ///
-    /// Returns whether the committed head is a delete, which garbage
-    /// collection reclaims once `tid` is below the watermark.
-    pub fn stamp_commit(&self, rid: Rid, tid: TxnId, schema: &Schema) -> Result<bool> {
-        let mut guard = self.write_page(rid)?;
-        let mut page = TablePage::new(guard.get_data_mut())?;
-        let (head, payload) = page.get(rid.slot)?;
-        debug_assert_eq!(
-            head.ts,
-            tid | TXN_UNCOMMITTED_BIT,
-            "tuple {rid} is not locked by transaction {tid}"
-        );
-        let meta = TupleMeta { ts: tid, ..head };
-        let tuple = Tuple::from_bytes(payload.to_vec());
-        let len = tuple.encoded_len(schema)?;
-        if len < tuple.len() {
-            page.update(rid.slot, &meta, &tuple.data()[..len])?;
-        } else {
-            page.update_meta(rid.slot, &meta)?;
-        }
-        Ok(meta.is_deleted)
-    }
-
-    /// Undoes every write the running transaction `tid` made to the tuple at
-    /// `rid`, newest first, and puts back the version from before the first
-    /// of them. A tuple that `tid` inserted is left deleted at `ts` 0, which
-    /// no reader sees; rollback then returns `true`, and garbage collection
-    /// reclaims the tuple once `tid` is below the watermark.
-    ///
-    /// The restored version always fits in place, because a shrinking locked
-    /// update keeps the tuple's old length. Fails with `MissingUndoRecord` if
-    /// one of `tid`'s records is gone, which garbage collection does not do
-    /// while `tid` is running.
-    pub fn rollback(&self, rid: Rid, tid: TxnId, schema: &Schema, undo: &UndoLog) -> Result<bool> {
-        let locked = tid | TXN_UNCOMMITTED_BIT;
-        let mut guard = self.write_page(rid)?;
-        let mut page = TablePage::new(guard.get_data_mut())?;
-        let (head, payload) = page.get(rid.slot)?;
-        debug_assert_eq!(
-            head.ts, locked,
-            "tuple {rid} is not locked by transaction {tid}"
-        );
-        let tuple = Tuple::from_bytes(payload.to_vec());
-
-        let mut meta = head;
-        let mut values: Option<Vec<Value>> = None;
-        while meta.ts == locked {
-            if meta.undo_ptr == INVALID_UNDO_PTR {
-                // `tid` inserted the tuple.
-                let meta = TupleMeta {
-                    ts: INVALID_TXN_ID,
-                    is_deleted: true,
-                    ..meta
-                };
-                page.update_meta(rid.slot, &meta)?;
-                return Ok(true);
-            }
-            let record = undo_log::older_record(rid, &meta, undo)?;
-            if !record.delta.is_empty() {
-                let values = match &mut values {
-                    Some(values) => values,
-                    None => values.insert(tuple.decode(schema)?),
-                };
-                record.apply(values)?;
-            }
-            meta = record.meta;
-        }
-
-        let data = match values {
-            Some(values) => Tuple::encode(schema, &values)?.into_data(),
-            // Only deletes, or writes that changed nothing, were undone: the
-            // bytes are the old version's, perhaps padded.
-            None => {
-                let len = tuple.encoded_len(schema)?;
-                let mut data = tuple.into_data();
-                data.truncate(len);
-                data
-            }
-        };
-        page.update(rid.slot, &meta, &data)?;
-        Ok(false)
-    }
-
     /// Frees the bytes of the tuple at `rid` if no reader at or above
     /// `watermark` can see it: its head is a delete committed below
-    /// `watermark`, or an aborted insert. Its slot is left dead, never
-    /// reused. Returns whether it reclaimed the tuple; a tuple that is
-    /// already reclaimed, or not dead, is left alone.
+    /// `watermark`, or an undone insert, which undo leaves deleted at `ts`
+    /// 0. Its slot is left dead, never reused. Returns whether it reclaimed
+    /// the tuple; a tuple that is already reclaimed, or not dead, is left
+    /// alone.
     pub fn reclaim(&self, rid: Rid, watermark: TxnId) -> Result<bool> {
-        let mut guard = self.write_page(rid)?;
-        let mut page = TablePage::new(guard.get_data_mut())?;
-        if page.is_dead(rid.slot) {
+        let mtr = self.mtr();
+        let mut guard = mtr.write_page(rid.page_id)?;
+        let page = TablePage::new(guard.data())?;
+        if page.is_dead(rid.slot) || !is_reclaimable(&page.get(rid.slot)?.0, watermark) {
             return Ok(false);
         }
-        let (head, _) = page.get(rid.slot)?;
-        let committed = head.ts & TXN_UNCOMMITTED_BIT == 0;
-        if !(head.is_deleted && committed && head.ts < watermark) {
-            return Ok(false);
-        }
-        page.mark_dead(rid.slot)?;
+        guard.apply(PageOp::HeapMarkDead { slot: rid.slot })?;
         Ok(true)
+    }
+
+    /// The tuples `reclaim` would reclaim at `watermark`, a page's at a
+    /// time, in rid order. No page stays latched between items.
+    pub fn reclaimable(&self, watermark: TxnId) -> impl Iterator<Item = Result<Vec<Rid>>> + '_ {
+        let read = move |page_id| -> Result<(Vec<Rid>, PageId)> {
+            let guard = self.bpm.checked_read_page(page_id, AccessType::Scan)?;
+            let page = TablePage::new(guard.get_data())?;
+            let rids = (page.iter())
+                .filter(|(_, head, _)| is_reclaimable(head, watermark))
+                .map(|(slot, _, _)| Rid::new(page_id, slot))
+                .collect();
+            Ok((rids, page.next_page_id()))
+        };
+        let mut next = self.first_page_id;
+        std::iter::from_fn(move || {
+            if next == INVALID_PAGE_ID {
+                return None;
+            }
+            let page = read(next);
+            next = page.as_ref().map_or(INVALID_PAGE_ID, |&(_, next)| next);
+            Some(page.map(|(rids, _)| rids))
+        })
     }
 
     /// Iterates over the live rows of the table. See `TableIterator`.
@@ -462,9 +422,25 @@ impl TableHeap {
         &self.bpm
     }
 
-    fn write_page(&self, rid: Rid) -> Result<WritePageGuard> {
-        self.bpm.checked_write_page(rid.page_id, AccessType::Lookup)
+    fn mtr(&self) -> Mtr<'_> {
+        self.bpm.mtr(Logged::System)
     }
+}
+
+/// Every page of the heap whose first page is `first`, in list order.
+pub(crate) fn page_ids(bpm: &BufferPoolManager, first: PageId) -> Result<Vec<PageId>> {
+    let mut pages = Vec::new();
+    let mut page_id = first;
+    while page_id != INVALID_PAGE_ID {
+        pages.push(page_id);
+        let guard = bpm.checked_read_page(page_id, AccessType::Scan)?;
+        page_id = TablePage::new(guard.get_data())?.next_page_id();
+    }
+    Ok(pages)
+}
+
+fn is_reclaimable(head: &TupleMeta, watermark: TxnId) -> bool {
+    head.is_deleted && head.ts & TXN_UNCOMMITTED_BIT == 0 && head.ts < watermark
 }
 
 /// The head of the tuple at `rid`, for a versioned write. A reclaimed tuple
@@ -504,7 +480,6 @@ fn check_write(rid: Rid, head: &TupleMeta, ts: u64, read_ts: &ReadTimestamps) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk::disk_manager::DiskManager;
     use crate::table::table_page::MAX_PAYLOAD_SIZE;
     use std::collections::HashSet;
     use std::thread;
@@ -512,8 +487,10 @@ mod tests {
 
     fn setup(num_frames: usize) -> (TempDir, Arc<BufferPoolManager>) {
         let dir = TempDir::new().unwrap();
-        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        (dir, Arc::new(BufferPoolManager::new(num_frames, dm)))
+        let bpm = crate::open(dir.path().join("test.db"), num_frames)
+            .unwrap()
+            .bpm;
+        (dir, bpm)
     }
 
     fn tuple(bytes: impl AsRef<[u8]>) -> Tuple {
@@ -531,8 +508,12 @@ mod tests {
     fn insert_and_get() {
         let (_dir, bpm) = setup(4);
         let heap = TableHeap::create(bpm).unwrap();
-        let a = heap.insert(&TupleMeta::new(1), &tuple(b"alpha")).unwrap();
-        let b = heap.insert(&TupleMeta::new(2), &tuple(b"beta")).unwrap();
+        let a = heap
+            .insert(Logged::System, &TupleMeta::new(1), &tuple(b"alpha"))
+            .unwrap();
+        let b = heap
+            .insert(Logged::System, &TupleMeta::new(2), &tuple(b"beta"))
+            .unwrap();
         assert_eq!(a, Rid::new(heap.first_page_id(), 0));
         assert_eq!(b, Rid::new(heap.first_page_id(), 1));
         assert_eq!(get(&heap, a), (TupleMeta::new(1), b"alpha".to_vec()));
@@ -545,8 +526,12 @@ mod tests {
         let heap = TableHeap::create(Arc::clone(&bpm)).unwrap();
         let rids: Vec<Rid> = (0..200u32)
             .map(|i| {
-                heap.insert(&TupleMeta::new(i as u64), &tuple([i as u8; 100]))
-                    .unwrap()
+                heap.insert(
+                    Logged::System,
+                    &TupleMeta::new(i as u64),
+                    &tuple([i as u8; 100]),
+                )
+                .unwrap()
             })
             .collect();
 
@@ -566,7 +551,7 @@ mod tests {
         let reopened = TableHeap::open(bpm, heap.first_page_id()).unwrap();
         assert_eq!(*reopened.last_page_id.lock(), *heap.last_page_id.lock());
         let next = reopened
-            .insert(&TupleMeta::new(0), &tuple(b"tail"))
+            .insert(Logged::System, &TupleMeta::new(0), &tuple(b"tail"))
             .unwrap();
         assert_eq!(next.page_id, rids.last().unwrap().page_id);
     }
@@ -577,7 +562,11 @@ mod tests {
         let heap = TableHeap::create(bpm).unwrap();
         let first = heap.first_page_id();
         assert!(matches!(
-            heap.insert(&TupleMeta::new(1), &tuple(vec![0u8; MAX_PAYLOAD_SIZE + 1])),
+            heap.insert(
+                Logged::System,
+                &TupleMeta::new(1),
+                &tuple(vec![0u8; MAX_PAYLOAD_SIZE + 1])
+            ),
             Err(StorageError::TupleTooLarge { .. })
         ));
         assert_eq!(*heap.last_page_id.lock(), first);
@@ -591,7 +580,7 @@ mod tests {
             has_nulls: true,
             ..TupleMeta::new(1)
         };
-        let rid = heap.insert(&meta, &tuple(b"row")).unwrap();
+        let rid = heap.insert(Logged::System, &meta, &tuple(b"row")).unwrap();
         heap.mark_delete(rid, 7, 42).unwrap();
 
         let expected = TupleMeta {
@@ -608,7 +597,7 @@ mod tests {
         let (_dir, bpm) = setup(4);
         let heap = TableHeap::create(bpm).unwrap();
         let rid = heap
-            .insert(&TupleMeta::new(1 << 63 | 5), &tuple(b"row"))
+            .insert(Logged::System, &TupleMeta::new(1 << 63 | 5), &tuple(b"row"))
             .unwrap();
         heap.update_meta(rid, &TupleMeta::new(10)).unwrap();
         assert_eq!(get(&heap, rid).0, TupleMeta::new(10));
@@ -618,9 +607,16 @@ mod tests {
     fn update_in_place() {
         let (_dir, bpm) = setup(4);
         let heap = TableHeap::create(bpm).unwrap();
-        let rid = heap.insert(&TupleMeta::new(1), &tuple(b"short")).unwrap();
-        heap.update_in_place(rid, &TupleMeta::new(2), &tuple(b"a much longer row"))
+        let rid = heap
+            .insert(Logged::System, &TupleMeta::new(1), &tuple(b"short"))
             .unwrap();
+        heap.update_in_place(
+            Logged::System,
+            rid,
+            &TupleMeta::new(2),
+            &tuple(b"a much longer row"),
+        )
+        .unwrap();
         assert_eq!(
             get(&heap, rid),
             (TupleMeta::new(2), b"a much longer row".to_vec())
@@ -632,12 +628,12 @@ mod tests {
         let (_dir, bpm) = setup(4);
         let heap = TableHeap::create(bpm).unwrap();
         let rid = heap
-            .insert(&TupleMeta::new(1), &tuple([1u8; 1500]))
+            .insert(Logged::System, &TupleMeta::new(1), &tuple([1u8; 1500]))
             .unwrap();
-        heap.insert(&TupleMeta::new(1), &tuple([2u8; 1500]))
+        heap.insert(Logged::System, &TupleMeta::new(1), &tuple([2u8; 1500]))
             .unwrap();
         assert!(matches!(
-            heap.update_in_place(rid, &TupleMeta::new(2), &tuple([3u8; 3000])),
+            heap.update_in_place(Logged::System, rid, &TupleMeta::new(2), &tuple([3u8; 3000])),
             Err(StorageError::PageFull)
         ));
         assert_eq!(get(&heap, rid).1, vec![1u8; 1500]);
@@ -666,8 +662,12 @@ mod tests {
                     (0..100u8)
                         .map(|i| {
                             (
-                                heap.insert(&TupleMeta::new(t as u64), &tuple([t, i]))
-                                    .unwrap(),
+                                heap.insert(
+                                    Logged::System,
+                                    &TupleMeta::new(t as u64),
+                                    &tuple([t, i]),
+                                )
+                                .unwrap(),
                                 t,
                                 i,
                             )

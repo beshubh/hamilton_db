@@ -10,10 +10,9 @@
 //! ```
 //!
 //! Each is an ordinary table heap whose first page is recorded on page 0.
-//! A table's or index's own row is inserted after the rows that describe it
-//! (its columns, its key columns, its identity columns' sequences), so a
-//! crash part way through a create leaves only rows nothing points to,
-//! which loading ignores.
+//! A DDL statement writes its rows as its transaction's changes, so one
+//! that does not commit leaves none: undo leaves them deleted, and scans
+//! skip deleted rows.
 
 use std::sync::{Arc, LazyLock};
 
@@ -21,13 +20,15 @@ use common::{Column, DataType, IndexKind, PageId, Rid, Schema, Tuple, Value};
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::table::table_heap::TableHeap;
 use storage::table::table_page::TupleMeta;
+use storage::wal::Logged;
 
 use crate::catalog::{IndexOid, MAX_NAME_LEN, RelationKind, TableOid};
 use crate::error::{CatalogError, Result};
 use crate::header_page::SystemTableRoots;
 
-/// Catalog rows are written outside of any transaction, as if committed at
-/// the start of time, so every snapshot sees them.
+/// Catalog rows are read without a snapshot, so they carry `ts` 0, as if
+/// committed at the start of time, even when a transaction writes them: its
+/// commit has nothing to stamp, and its undo leaves them deleted.
 pub(crate) const CATALOG_TS: u64 = 0;
 
 fn name_column(name: &str) -> Column {
@@ -102,6 +103,7 @@ pub(crate) struct IndexRow {
     pub table_oid: TableOid,
     pub header_page_id: PageId,
     pub kind: IndexKind,
+    pub constraint: bool,
 }
 
 /// A row of `index_columns`: key column `position` of index `index_oid` is
@@ -140,6 +142,15 @@ impl SystemTables {
         })
     }
 
+    pub fn heaps(&self) -> [&TableHeap; 4] {
+        [
+            &self.tables,
+            &self.columns,
+            &self.indexes,
+            &self.index_columns,
+        ]
+    }
+
     pub fn roots(&self) -> SystemTableRoots {
         SystemTableRoots {
             tables: self.tables.first_page_id(),
@@ -149,17 +160,17 @@ impl SystemTables {
         }
     }
 
-    pub fn insert_table(&self, row: &TableRow) -> Result<()> {
+    pub fn insert_table(&self, by: Logged<'_>, row: &TableRow) -> Result<()> {
         let values = [
             oid_value(row.oid),
             Value::Varchar(row.name.clone()),
             Value::Int(row.first_page_id),
             Value::Int(encode_relation_kind(row.kind)),
         ];
-        insert(&self.tables, &TABLES_SCHEMA, &values)
+        insert(by, &self.tables, &TABLES_SCHEMA, &values)
     }
 
-    pub fn insert_column(&self, row: &ColumnRow) -> Result<()> {
+    pub fn insert_column(&self, by: Logged<'_>, row: &ColumnRow) -> Result<()> {
         let (type_id, max_len) = encode_type(row.column.data_type);
         let values = [
             oid_value(row.table_oid),
@@ -170,47 +181,61 @@ impl SystemTables {
             Value::Bool(row.column.nullable),
             row.sequence.map_or(Value::Null, oid_value),
         ];
-        insert(&self.columns, &COLUMNS_SCHEMA, &values)
+        insert(by, &self.columns, &COLUMNS_SCHEMA, &values)
     }
 
-    pub fn insert_index(&self, row: &IndexRow) -> Result<()> {
+    pub fn insert_index(&self, by: Logged<'_>, row: &IndexRow) -> Result<()> {
         let values = [
             oid_value(row.oid),
             Value::Varchar(row.name.clone()),
             oid_value(row.table_oid),
             Value::Int(row.header_page_id),
-            Value::Int(encode_kind(row.kind)),
+            Value::Int(encode_kind(row.kind, row.constraint)),
         ];
-        insert(&self.indexes, &INDEXES_SCHEMA, &values)
+        insert(by, &self.indexes, &INDEXES_SCHEMA, &values)
     }
 
-    pub fn insert_index_column(&self, row: &IndexColumnRow) -> Result<()> {
+    pub fn insert_index_column(&self, by: Logged<'_>, row: &IndexColumnRow) -> Result<()> {
         let values = [
             oid_value(row.index_oid),
             int_value(row.position),
             int_value(row.column),
         ];
-        insert(&self.index_columns, &INDEX_COLUMNS_SCHEMA, &values)
+        insert(by, &self.index_columns, &INDEX_COLUMNS_SCHEMA, &values)
     }
 
-    /// Points the `tables` row of `oid` at a new first page.
-    pub fn set_first_page_id(&self, oid: TableOid, page_id: PageId) -> Result<()> {
-        set_page_id(&self.tables, &TABLES_SCHEMA, oid, 2, page_id)
+    /// Points the `tables` row of `oid` at a new first page, as `by`'s
+    /// change.
+    pub fn set_first_page_id(&self, by: Logged<'_>, oid: TableOid, page_id: PageId) -> Result<()> {
+        set_page_id(by, &self.tables, &TABLES_SCHEMA, oid, 2, page_id)
     }
 
-    /// Points the `indexes` row of `oid` at a new header page.
-    pub fn set_header_page_id(&self, oid: IndexOid, page_id: PageId) -> Result<()> {
-        set_page_id(&self.indexes, &INDEXES_SCHEMA, oid, 3, page_id)
+    /// Points the `indexes` row of `oid` at a new header page, as `by`'s
+    /// change.
+    pub fn set_header_page_id(&self, by: Logged<'_>, oid: IndexOid, page_id: PageId) -> Result<()> {
+        set_page_id(by, &self.indexes, &INDEXES_SCHEMA, oid, 3, page_id)
     }
 
-    /// The page holding the `tables` row of `oid`.
-    pub fn table_row_page(&self, oid: TableOid) -> Result<PageId> {
-        Ok(find_row(&self.tables, &TABLES_SCHEMA, oid)?.0.page_id)
+    /// Deletes the `tables` row of `oid`, as `by`'s change. Returns whether
+    /// there was one.
+    pub fn delete_table(&self, by: Logged<'_>, oid: TableOid) -> Result<bool> {
+        Ok(delete_rows(by, &self.tables, &TABLES_SCHEMA, oid)? > 0)
     }
 
-    /// The page holding the `indexes` row of `oid`.
-    pub fn index_row_page(&self, oid: IndexOid) -> Result<PageId> {
-        Ok(find_row(&self.indexes, &INDEXES_SCHEMA, oid)?.0.page_id)
+    /// Deletes the `columns` rows of table `table_oid`, as `by`'s change.
+    pub fn delete_columns(&self, by: Logged<'_>, table_oid: TableOid) -> Result<()> {
+        delete_rows(by, &self.columns, &COLUMNS_SCHEMA, table_oid).map(drop)
+    }
+
+    /// Deletes the `indexes` row of `oid`, as `by`'s change.
+    pub fn delete_index(&self, by: Logged<'_>, oid: IndexOid) -> Result<()> {
+        delete_rows(by, &self.indexes, &INDEXES_SCHEMA, oid).map(drop)
+    }
+
+    /// Deletes the `index_columns` rows of index `index_oid`, as `by`'s
+    /// change.
+    pub fn delete_index_columns(&self, by: Logged<'_>, index_oid: IndexOid) -> Result<()> {
+        delete_rows(by, &self.index_columns, &INDEX_COLUMNS_SCHEMA, index_oid).map(drop)
     }
 
     pub fn scan_tables(&self) -> Result<Vec<TableRow>> {
@@ -241,12 +266,14 @@ impl SystemTables {
 
     pub fn scan_indexes(&self) -> Result<Vec<IndexRow>> {
         scan(&self.indexes, &INDEXES_SCHEMA, |values| {
+            let (kind, constraint) = decode_kind(as_int(&values[4])?)?;
             Ok(IndexRow {
                 oid: as_oid(&values[0])?,
                 name: as_string(&values[1])?,
                 table_oid: as_oid(&values[2])?,
                 header_page_id: as_int(&values[3])?,
-                kind: decode_kind(as_int(&values[4])?)?,
+                kind,
+                constraint,
             })
         })
     }
@@ -262,9 +289,10 @@ impl SystemTables {
     }
 }
 
-/// Sets column `column`, a page id, of the row whose first column is `oid`.
-/// The row keeps its size, so it is changed in place.
+/// Sets column `column`, a page id, of the row whose first column is `oid`,
+/// as `by`'s change. The row keeps its size, so it is changed in place.
 fn set_page_id(
+    by: Logged<'_>,
     heap: &TableHeap,
     schema: &Schema,
     oid: u32,
@@ -273,7 +301,7 @@ fn set_page_id(
 ) -> Result<()> {
     let (rid, meta, mut values) = find_row(heap, schema, oid)?;
     values[column] = Value::Int(page_id);
-    heap.update_in_place(rid, &meta, &Tuple::encode(schema, &values)?)?;
+    heap.update_in_place(by, rid, &meta, &Tuple::encode(schema, &values)?)?;
     Ok(())
 }
 
@@ -292,9 +320,31 @@ fn find_row(heap: &TableHeap, schema: &Schema, oid: u32) -> Result<(Rid, TupleMe
     )))
 }
 
-fn insert(heap: &TableHeap, schema: &Schema, values: &[Value]) -> Result<()> {
+/// Marks deleted every row whose first column is `oid`, as `by`'s change,
+/// and returns how many. Each keeps its payload, so undo puts it back whole.
+fn delete_rows(by: Logged<'_>, heap: &TableHeap, schema: &Schema, oid: u32) -> Result<usize> {
+    let mut matching = Vec::new();
+    for row in heap.iter()? {
+        let (meta, tuple) = row?;
+        if as_oid(&tuple.decode(schema)?[0])? == oid {
+            matching.push((meta, tuple));
+        }
+    }
+    let deleted = matching.len();
+    for (meta, tuple) in matching {
+        let rid = tuple.rid().expect("the heap's rows carry their rid");
+        let meta = TupleMeta {
+            is_deleted: true,
+            ..meta
+        };
+        heap.update_in_place(by, rid, &meta, &tuple)?;
+    }
+    Ok(deleted)
+}
+
+fn insert(by: Logged<'_>, heap: &TableHeap, schema: &Schema, values: &[Value]) -> Result<()> {
     let tuple = Tuple::encode(schema, values)?;
-    heap.insert(&TupleMeta::new(CATALOG_TS), &tuple)?;
+    heap.insert(by, &TupleMeta::new(CATALOG_TS), &tuple)?;
     Ok(())
 }
 
@@ -355,31 +405,36 @@ fn decode_relation_kind(kind: i32) -> Result<RelationKind> {
     })
 }
 
-fn encode_kind(kind: IndexKind) -> i32 {
-    match kind {
-        IndexKind::Plain => 0,
-        IndexKind::Unique {
-            nulls_distinct: true,
-        } => 1,
-        IndexKind::Unique {
-            nulls_distinct: false,
-        } => 2,
-        IndexKind::PrimaryKey => 3,
-    }
+const UNIQUE: IndexKind = IndexKind::Unique {
+    nulls_distinct: true,
+};
+const UNIQUE_NULLS_NOT_DISTINCT: IndexKind = IndexKind::Unique {
+    nulls_distinct: false,
+};
+
+const INDEX_KINDS: [(i32, IndexKind, bool); 6] = [
+    (0, IndexKind::Plain, false),
+    (1, UNIQUE, false),
+    (2, UNIQUE_NULLS_NOT_DISTINCT, false),
+    (3, IndexKind::PrimaryKey, true),
+    (4, UNIQUE, true),
+    (5, UNIQUE_NULLS_NOT_DISTINCT, true),
+];
+
+fn encode_kind(kind: IndexKind, constraint: bool) -> i32 {
+    let (code, ..) = INDEX_KINDS
+        .iter()
+        .find(|&&(_, k, c)| k == kind && c == constraint)
+        .expect("a primary key is a constraint, a plain index is not");
+    *code
 }
 
-fn decode_kind(kind: i32) -> Result<IndexKind> {
-    Ok(match kind {
-        0 => IndexKind::Plain,
-        1 => IndexKind::Unique {
-            nulls_distinct: true,
-        },
-        2 => IndexKind::Unique {
-            nulls_distinct: false,
-        },
-        3 => IndexKind::PrimaryKey,
-        other => return Err(CatalogError::Corrupt(format!("unknown index kind {other}"))),
-    })
+fn decode_kind(code: i32) -> Result<(IndexKind, bool)> {
+    INDEX_KINDS
+        .iter()
+        .find(|&&(c, ..)| c == code)
+        .map(|&(_, kind, constraint)| (kind, constraint))
+        .ok_or_else(|| CatalogError::Corrupt(format!("unknown index kind {code}")))
 }
 
 fn oid_value(oid: u32) -> Value {
@@ -459,18 +514,17 @@ mod tests {
 
     #[test]
     fn index_kinds_round_trip() {
-        for kind in [
-            IndexKind::Plain,
-            IndexKind::Unique {
-                nulls_distinct: true,
-            },
-            IndexKind::Unique {
-                nulls_distinct: false,
-            },
-            IndexKind::PrimaryKey,
+        for (kind, constraint) in [
+            (IndexKind::Plain, false),
+            (UNIQUE, false),
+            (UNIQUE_NULLS_NOT_DISTINCT, false),
+            (UNIQUE, true),
+            (UNIQUE_NULLS_NOT_DISTINCT, true),
+            (IndexKind::PrimaryKey, true),
         ] {
-            assert_eq!(decode_kind(encode_kind(kind)).unwrap(), kind);
+            let code = encode_kind(kind, constraint);
+            assert_eq!(decode_kind(code).unwrap(), (kind, constraint));
         }
-        assert!(matches!(decode_kind(4), Err(CatalogError::Corrupt(_))));
+        assert!(matches!(decode_kind(6), Err(CatalogError::Corrupt(_))));
     }
 }

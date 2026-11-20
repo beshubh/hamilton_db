@@ -25,8 +25,8 @@ use sqlparser::ast::{
 use sqlparser::parser::Parser;
 
 use crate::ast::{
-    self, BinaryOp, CreateIndex, CreateTable, Delete, FromItem, Insert, JoinKind, OrderByItem,
-    Select, Statement, TableRef, Truncate, UnaryOp, Update, WindowSpec,
+    self, BinaryOp, CreateIndex, CreateTable, Delete, DropIndex, DropTable, FromItem, Insert,
+    JoinKind, OrderByItem, Select, Statement, TableRef, Truncate, UnaryOp, Update, WindowSpec,
 };
 use crate::dialect::HamiltonDialect;
 use crate::error::{ParseError, Result};
@@ -90,6 +90,22 @@ fn convert_statement(stmt: &sql::Statement) -> Result<Statement> {
         sql::Statement::Update(update) => convert_update(stmt, update),
         sql::Statement::Delete(delete) => convert_delete(stmt, delete),
         sql::Statement::Truncate(truncate) => convert_truncate(stmt, truncate),
+        sql::Statement::Drop {
+            object_type: sql::ObjectType::Table,
+            if_exists,
+            names,
+            cascade,
+            restrict,
+            ..
+        } => convert_drop_table(stmt, names, *if_exists, *cascade, *restrict),
+        sql::Statement::Drop {
+            object_type: sql::ObjectType::Index,
+            if_exists,
+            names,
+            cascade,
+            restrict,
+            ..
+        } => convert_drop_index(stmt, names, *if_exists, *cascade, *restrict),
         sql::Statement::Explain { statement, .. } => convert_explain(stmt, statement),
         sql::Statement::StartTransaction { .. } => convert_begin(stmt),
         // Matched by field, not by rendering: the AST drops `TRANSACTION`
@@ -813,6 +829,65 @@ fn convert_truncate(stmt: &sql::Statement, truncate: &sql::Truncate) -> Result<S
             .map(|target| object_name(&target.name))
             .collect::<Result<_>>()?,
         restart_identity: truncate.identity == Some(TruncateIdentityOption::Restart),
+    }))
+}
+
+fn convert_drop_table(
+    stmt: &sql::Statement,
+    names: &[ObjectName],
+    if_exists: bool,
+    cascade: bool,
+    restrict: bool,
+) -> Result<Statement> {
+    let canonical = format!(
+        "DROP TABLE{} {}{}{}",
+        if if_exists { " IF EXISTS" } else { "" },
+        join(names.iter()),
+        if cascade { " CASCADE" } else { "" },
+        if restrict { " RESTRICT" } else { "" },
+    );
+    ensure_canonical(
+        stmt,
+        &canonical,
+        "DROP TABLE [IF EXISTS] <table>, ... [CASCADE | RESTRICT]",
+    )?;
+
+    Ok(Statement::DropTable(DropTable {
+        tables: names.iter().map(object_name).collect::<Result<_>>()?,
+        if_exists,
+    }))
+}
+
+fn convert_drop_index(
+    stmt: &sql::Statement,
+    names: &[ObjectName],
+    if_exists: bool,
+    cascade: bool,
+    restrict: bool,
+) -> Result<Statement> {
+    let canonical = format!(
+        "DROP INDEX{} {}{}{}",
+        if if_exists { " IF EXISTS" } else { "" },
+        join(names.iter()),
+        if cascade { " CASCADE" } else { "" },
+        if restrict { " RESTRICT" } else { "" },
+    );
+    ensure_canonical(
+        stmt,
+        &canonical,
+        "DROP INDEX [IF EXISTS] <index>, ... [CASCADE | RESTRICT]",
+    )?;
+    // sqlparser reads `DROP INDEX CONCURRENTLY` as an index of that name.
+    let concurrently = |name: &ObjectName| {
+        matches!(name.0.as_slice(), [ObjectNamePart::Identifier(id)]
+            if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("concurrently"))
+    };
+    if names.iter().any(concurrently) {
+        return Err(ParseError::Unsupported("DROP INDEX CONCURRENTLY".into()));
+    }
+    Ok(Statement::DropIndex(DropIndex {
+        names: names.iter().map(object_name).collect::<Result<_>>()?,
+        if_exists,
     }))
 }
 
@@ -2019,9 +2094,83 @@ mod tests {
     }
 
     #[test]
+    fn drop_table() {
+        let drop = |tables: &[&str], if_exists| {
+            Statement::DropTable(DropTable {
+                tables: tables.iter().map(|t| t.to_string()).collect(),
+                if_exists,
+            })
+        };
+        assert_eq!(parse_one("DROP TABLE t").unwrap(), drop(&["t"], false));
+        assert_eq!(parse_one("drop table T").unwrap(), drop(&["t"], false));
+        assert_eq!(
+            parse_one(r#"DROP TABLE IF EXISTS "Tweet", u, t"#).unwrap(),
+            drop(&["Tweet", "u", "t"], true)
+        );
+        assert_eq!(
+            parse_one("DROP TABLE a, a CASCADE").unwrap(),
+            drop(&["a", "a"], false)
+        );
+        assert_eq!(
+            parse_one("drop table if exists t restrict").unwrap(),
+            drop(&["t"], true)
+        );
+    }
+
+    #[test]
+    fn drop_table_rejects_unsupported_parts() {
+        assert!(parse_one("DROP TEMPORARY TABLE t").is_err());
+        assert_unsupported("DROP TABLE t PURGE");
+        assert_unsupported("DROP TABLE s.t");
+        assert_unsupported("DROP VIEW v");
+        assert_unsupported("EXPLAIN DROP TABLE t");
+    }
+
+    #[test]
+    fn drop_index() {
+        let drop_index = |names: &[&str], if_exists| {
+            Statement::DropIndex(DropIndex {
+                names: names.iter().map(|&n| n.into()).collect(),
+                if_exists,
+            })
+        };
+        assert_eq!(
+            parse_one("DROP INDEX i").unwrap(),
+            drop_index(&["i"], false)
+        );
+        assert_eq!(
+            parse_one(r#"drop index if exists "Idx", j"#).unwrap(),
+            drop_index(&["Idx", "j"], true)
+        );
+        assert_eq!(
+            parse_one("DROP INDEX i, i CASCADE").unwrap(),
+            drop_index(&["i", "i"], false)
+        );
+        assert_eq!(
+            parse_one("DROP INDEX IF EXISTS i RESTRICT").unwrap(),
+            drop_index(&["i"], true)
+        );
+        assert_eq!(
+            parse_one(r#"DROP INDEX "concurrently""#).unwrap(),
+            drop_index(&["concurrently"], false)
+        );
+    }
+
+    #[test]
+    fn drop_index_rejects_unsupported_parts() {
+        assert_unsupported("DROP INDEX s.i");
+        assert_unsupported("DROP INDEX i ON t");
+        assert_unsupported("DROP INDEX i PURGE");
+        assert_unsupported("DROP INDEX CONCURRENTLY");
+        assert!(parse("DROP INDEX CONCURRENTLY i").is_err());
+        assert!(parse("DROP INDEX CONCURRENTLY IF EXISTS i").is_err());
+        assert!(parse("DROP INDEX i CASCADE RESTRICT").is_err());
+    }
+
+    #[test]
     fn other_statements_are_unsupported() {
-        assert_unsupported("DROP TABLE t");
-        assert_unsupported("DROP INDEX i");
+        assert_unsupported("DROP SEQUENCE s");
+        assert_unsupported("DROP VIEW v");
     }
 
     #[test]

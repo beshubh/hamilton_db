@@ -2,24 +2,23 @@
 //! through the undo log, and garbage collection of undo records.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use common::{Column, DataType, PageId, Rid, Schema, Tuple, Value};
 use storage::StorageError;
-use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::concurrency::read_ts::ReadTimestamps;
-use storage::disk::disk_manager::DiskManager;
 use storage::table::table_heap::TableHeap;
 use storage::table::table_page::{INVALID_UNDO_PTR, TupleMeta};
 use storage::table::undo_log::UndoLog;
+use storage::wal::Logged;
 use tempfile::TempDir;
 
 fn setup(num_frames: usize) -> (TempDir, TableHeap) {
     let dir = TempDir::new().unwrap();
-    let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(num_frames, dm));
+    let bpm = storage::open(dir.path().join("test.db"), num_frames)
+        .unwrap()
+        .bpm;
     (dir, TableHeap::create(bpm).unwrap())
 }
 
@@ -52,11 +51,13 @@ fn encode(values: &[Value]) -> Tuple {
 }
 
 fn insert(heap: &TableHeap, values: &[Value], ts: u64) -> Rid {
-    heap.insert(&TupleMeta::new(ts), &encode(values)).unwrap()
+    heap.insert(Logged::System, &TupleMeta::new(ts), &encode(values))
+        .unwrap()
 }
 
 fn update(heap: &TableHeap, undo: &UndoLog, rid: Rid, values: &[Value], ts: u64) {
     heap.update_versioned(
+        Logged::System,
         rid,
         &encode(values),
         ts,
@@ -194,7 +195,7 @@ fn a_delete_hides_the_row_from_its_ts_on() {
     let (_dir, heap) = setup(4);
     let undo = UndoLog::new();
     let rid = three_versions(&heap, &undo);
-    heap.delete_versioned(rid, 40, &undo, &ReadTimestamps::new())
+    heap.delete_versioned(Logged::System, rid, 40, &undo, &ReadTimestamps::new())
         .unwrap();
 
     let record = head_record(&heap, &undo, rid);
@@ -212,11 +213,11 @@ fn a_delete_hides_the_row_from_its_ts_on() {
 
     // A deleted tuple cannot be written again.
     assert!(matches!(
-        heap.delete_versioned(rid, 50, &undo, &ReadTimestamps::new()),
+        heap.delete_versioned(Logged::System, rid, 50, &undo, &ReadTimestamps::new()),
         Err(StorageError::TupleDeleted(r)) if r == rid
     ));
     assert!(matches!(
-        heap.update_versioned(rid, &encode(&version(1, 50)), 50, &schema(), &undo, &ReadTimestamps::new()),
+        heap.update_versioned(Logged::System, rid, &encode(&version(1, 50)), 50, &schema(), &undo, &ReadTimestamps::new()),
         Err(StorageError::TupleDeleted(r)) if r == rid
     ));
     assert_eq!(undo.len(), 3);
@@ -243,7 +244,7 @@ fn reading_a_visible_head_decodes_nothing_and_skips_the_undo_log() {
         undo_ptr: 12345,
         ..TupleMeta::new(10)
     };
-    let rid = heap.insert(&dangling, &garbage).unwrap();
+    let rid = heap.insert(Logged::System, &dangling, &garbage).unwrap();
     let (meta, tuple) = heap
         .get_at(rid, 10, &schema(), &undo, None)
         .unwrap()
@@ -260,7 +261,9 @@ fn reading_a_visible_head_decodes_nothing_and_skips_the_undo_log() {
     ));
 
     // A tuple with no history, read before its insert, is just absent.
-    let fresh = heap.insert(&TupleMeta::new(10), &garbage).unwrap();
+    let fresh = heap
+        .insert(Logged::System, &TupleMeta::new(10), &garbage)
+        .unwrap();
     assert!(
         heap.get_at(fresh, 5, &schema(), &undo, None)
             .unwrap()
@@ -284,7 +287,9 @@ fn an_undo_ptr_from_before_a_restart_is_not_followed() {
         undo_ptr: 1,
         ..TupleMeta::new(30)
     };
-    let old = heap.insert(&stale, &encode(&version(1, 30))).unwrap();
+    let old = heap
+        .insert(Logged::System, &stale, &encode(&version(1, 30)))
+        .unwrap();
 
     // After the restart, another tuple's update is issued handle 1.
     let undo = UndoLog::new();
@@ -368,6 +373,7 @@ fn a_growing_update_that_does_not_fit_leaves_the_heap_alone() {
 
     assert!(matches!(
         heap.update_versioned(
+            Logged::System,
             rid,
             &encode(&big(20, 3000)),
             20,
@@ -382,7 +388,7 @@ fn a_growing_update_that_does_not_fit_leaves_the_heap_alone() {
 
     // What the caller does instead: delete the tuple and insert the new
     // version at a new Rid, which starts its own chain.
-    heap.delete_versioned(rid, 20, &undo, &ReadTimestamps::new())
+    heap.delete_versioned(Logged::System, rid, 20, &undo, &ReadTimestamps::new())
         .unwrap();
     let moved = insert(&heap, &big(20, 3000), 20);
     assert_ne!(moved.page_id, rid.page_id);
@@ -433,7 +439,7 @@ fn a_scan_at_ts_sees_each_row_as_it_was() {
             versions.push((20, Some(value(id, 20))));
         }
         if matches!(fate, Fate::Deleted | Fate::UpdatedThenDeleted) {
-            heap.delete_versioned(*rid, 30, &undo, &ReadTimestamps::new())
+            heap.delete_versioned(Logged::System, *rid, 30, &undo, &ReadTimestamps::new())
                 .unwrap();
             versions.push((30, None));
         }

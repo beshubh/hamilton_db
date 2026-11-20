@@ -230,9 +230,11 @@ fn a_failing_statement_stops_the_query_and_reports_its_sqlstate() {
     assert!(error.message.contains("division by zero"), "{error}");
 
     assert_eq!(error_code(&mut c, "SELEC 1"), "42601");
-    assert_eq!(error_code(&mut c, "SELECT * FROM missing"), "42000");
+    assert_eq!(error_code(&mut c, "SELECT * FROM missing"), "42P01");
     query(&mut c, "INSERT INTO t VALUES (1)");
     assert_eq!(error_code(&mut c, "INSERT INTO t VALUES (1)"), "23505");
+    assert_eq!(error_code(&mut c, "DROP INDEX missing"), "42704");
+    assert_eq!(error_code(&mut c, "DROP INDEX t_pkey"), "2BP01");
     server.stop();
 }
 

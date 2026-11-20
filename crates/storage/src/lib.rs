@@ -9,8 +9,10 @@ pub mod error;
 pub mod index;
 pub mod page;
 pub mod table;
+pub mod wal;
 
 pub use error::{Result, StorageError};
+pub use wal::{Storage, open, open_with};
 
 #[cfg(test)]
 #[path = "../tests/util/io.rs"]

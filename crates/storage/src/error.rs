@@ -24,10 +24,6 @@ pub enum StorageError {
     #[error("invalid page id {0}")]
     InvalidPageId(PageId),
 
-    /// The page has no slot in the db file.
-    #[error("page {0} is not allocated")]
-    PageNotAllocated(PageId),
-
     /// The page cannot be deleted while a guard holds it.
     #[error("page {0} is pinned")]
     PagePinned(PageId),
@@ -35,9 +31,6 @@ pub enum StorageError {
     /// Every frame in the buffer pool is pinned, so nothing can be evicted.
     #[error("no free frame in the buffer pool")]
     NoFreeFrame,
-
-    #[error("free space {0} is larger than a page")]
-    InvalidFreeSpace(usize),
 
     /// A page read from disk does not match its checksum.
     #[error("page {page_id} is corrupted: checksum is {stored:#010x}, expected {expected:#010x}")]
@@ -57,9 +50,22 @@ pub enum StorageError {
     #[error("unsupported metadata version {0}")]
     UnsupportedMetadataVersion(u32),
 
+    #[error("corrupt log: {0}")]
+    CorruptLog(String),
+
+    /// An earlier write or sync of the log failed, so nothing more can be
+    /// made durable.
+    #[error("the log failed earlier and accepts no more records")]
+    LogFailed,
+
     /// The page's header names a different page type than the caller expects.
     #[error("expected a {expected:?} page, found page type {found}")]
     UnexpectedPageType { expected: PageType, found: u32 },
+
+    /// The B+ tree with this header page was built to order its keys
+    /// another way than the comparator it is opened with.
+    #[error("B+ tree {0} orders its keys another way")]
+    BtreeMismatch(PageId),
 
     /// The page does not have room for the tuple right now.
     #[error("page is full")]

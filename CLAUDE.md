@@ -10,7 +10,7 @@ Hamilton DB is a relational OLTP DBMS built in rust, that speaks postgres dialec
 
 # How does it works  
 - `hamilton-server` owns the database files and serves them on port 6942; `hamilton-cli` is only a client and never opens files. Only one process can have a database open: a second gets "already open in another process".
-- To start the server fresh (or after bumping the catalog `VERSION`), stop it and delete all three database files: `<name>.db`, `<name>.meta` and `<name>.log`. Deleting only the `.db` leaves a stale `.meta` that claims pages exist, and opening fails with "page 0 is not a catalog header page".
+- To start the server fresh (or after bumping a format version: the catalog's `VERSION`, the `.meta` file's `META_VERSION` or the log's `VERSION`), stop it and delete all the database files: `<name>.db`, `<name>.meta` and the log segments `<name>.log.*`. Deleting only the `.db` leaves a stale `.meta` that claims pages exist, and opening fails with "page 0 is not a catalog header page".
 
 ## A small glossary
  - **you** means the agent reading this file and chaning HamiltonDB
@@ -33,7 +33,7 @@ Most code changes do not need an internal documentation change. Agents can read 
 # Taste
 ---
 - Default to no comment. Write one only for a constraint, an external quirk, or an invariant the code can't show, in one line where you can and four at most. Don't restate names or signatures, narrate steps, record history, or explain the fix you just made; the PR carries that.
-- Do not add complex state machinery for simple nitpick features, and prefer state machine where we would want to concretely remove the wrong state transformations.
+- Model anything with a lifecycle as a state machine: a transaction, a connection, a recovery step. Encode the states in types, so an invalid transition does not compile. A method that is legal only in one state lives on that state's type, and a transition consumes `self` and returns the next state. States read from disk or the network cannot be checked by the compiler, so check them in one transition table at the boundary.
 
 # Performance
 ---
@@ -49,5 +49,6 @@ Most code changes do not need an internal documentation change. Agents can read 
 # Verification
 ---
 - Before you push, run `cargo nextest run -p <crate>`, to test the changes in the crate where you made a change.
-- if you have made changes on sql or index storage or transactions, run `uv run sqltest/run.py <transaction>` for testing transaction invariants and `uv run sqltest/run.py index_storage` for testing index storage invariants.
+- if you have made changes on sql or index storage or transactions, run `uv run sqltest/run.py transactions` for testing transaction invariants and `uv run sqltest/run.py index_storage` for testing index storage invariants.
+- if you have made changes on the log, recovery, checkpoints or anything that writes pages, run `uv run sqltest/run.py recovery` for testing crash recovery invariants.
 

@@ -15,6 +15,11 @@
 //! before its parent's is released (latch crabbing), so a writer can never
 //! slip in between.
 //!
+//! Each insert or remove changes pages through one mini-transaction, so a
+//! split or merge is logged as one record. A page it changes stays latched
+//! until that record is appended; pages it only passed through are released
+//! as before.
+//!
 //! An insert first tries the optimistic way: it descends like a reader and
 //! write-latches only the leaf. Most inserts fit in their leaf and are done
 //! there. One that does not, or one into an empty tree, starts over the
@@ -43,10 +48,12 @@ use crate::index::index_iter::IndexIterator;
 use crate::page::PAGE_SIZE;
 use crate::page::btree_header_page::BtreeHeaderPage;
 use crate::page::btree_internal_page::BtreeInternalPage;
-use crate::page::btree_leaf_page::BtreeLeafPage;
+use crate::page::btree_leaf_page::{BtreeLeafPage, InsertPosition};
 use crate::page::btree_page::{KeyComparator, check_key_size};
-use crate::page::page_guard::{ReadPageGuard, WritePageGuard};
+use crate::page::page_guard::ReadPageGuard;
 use crate::page::page_header::{PageHeader, PageType};
+use crate::wal::mtr::{Logged, Mtr, MtrPage};
+use crate::wal::op::PageOp;
 
 type InternalPage<'a> = BtreeInternalPage<&'a [u8; PAGE_SIZE]>;
 type LeafPage<'a, const NUM_TOMBS: usize> = BtreeLeafPage<&'a [u8; PAGE_SIZE], NUM_TOMBS>;
@@ -59,19 +66,19 @@ type InternalPageMut<'a> = BtreeInternalPage<&'a mut [u8; PAGE_SIZE]>;
 /// a child that is safe, one that will not split or underflow, and then
 /// releases everything above it. What is left in `write_set` is the path it
 /// still has to fix up on the way back.
-struct Context {
+struct Context<'m> {
     /// The header page, held while the root may still change.
-    header_page: Option<WritePageGuard>,
+    header_page: Option<MtrPage<'m>>,
     /// The root when the operation started.
     root_page_id: PageId,
     /// Latched pages from the top down, the last one being the deepest.
-    write_set: VecDeque<WritePageGuard>,
+    write_set: VecDeque<MtrPage<'m>>,
     /// Pages read on an optimistic descent, before retaking them for writing.
     #[allow(dead_code)] // Not used by any operation yet.
     read_set: VecDeque<ReadPageGuard>,
 }
 
-impl Context {
+impl Context<'_> {
     fn new() -> Self {
         Self {
             header_page: None,
@@ -110,22 +117,32 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
 
     /// Opens the tree whose header page is `header_page_id`. A header page
     /// that was allocated but never written, as the catalog leaves it, is
-    /// formatted as an empty tree first.
+    /// formatted as an empty tree first, recording how `comparator` orders
+    /// keys and `NUM_TOMBS`.
     ///
-    /// Fails with `UnexpectedPageType` if the page is some other kind of page.
+    /// Fails with `UnexpectedPageType` if the page is some other kind of
+    /// page, and with `BtreeMismatch` if the tree was built with another
+    /// order or `NUM_TOMBS`.
     pub fn new(
         index_name: impl Into<String>,
         header_page_id: PageId,
         bpm: Arc<TracedBufferPoolManager>,
         comparator: CmpT,
     ) -> Result<Self> {
-        let mut guard = bpm.checked_write_page(header_page_id, AccessType::Index)?;
-        if page_type(guard.get_data()) == Ok(PageType::Invalid) {
-            BtreeHeaderPage::init(guard.get_data_mut());
-        } else {
-            BtreeHeaderPage::new(guard.get_data())?;
+        {
+            let mtr = bpm.bpm().mtr(Logged::System);
+            let mut header = bpm.write_page(&mtr, header_page_id)?;
+            if page_type(header.data()) == Ok(PageType::Invalid) {
+                Self::format_header(header.raw_mut(), &comparator);
+            } else {
+                let mut format = Vec::new();
+                comparator.describe(&mut format);
+                let header = BtreeHeaderPage::new(header.data())?;
+                if header.num_tombs() != NUM_TOMBS || header.entry_format() != format {
+                    return Err(StorageError::BtreeMismatch(header_page_id));
+                }
+            }
         }
-        drop(guard);
 
         Ok(Self {
             index_name: index_name.into(),
@@ -133,6 +150,14 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
             comparator,
             header_page_id,
         })
+    }
+
+    /// Formats `page` as the header page of an empty tree, recording how
+    /// `comparator` orders keys and `NUM_TOMBS`.
+    pub(crate) fn format_header(page: &mut [u8; PAGE_SIZE], comparator: &CmpT) {
+        let mut format = Vec::new();
+        comparator.describe(&mut format);
+        BtreeHeaderPage::init(page).set_entry_format(NUM_TOMBS, &format);
     }
 
     pub fn index_name(&self) -> &str {
@@ -203,27 +228,38 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     ///
     /// Fails with `KeyTooLarge` if `key` is longer than `MAX_KEY_SIZE`.
     pub fn insert(&self, key: &[u8], rid: Rid) -> Result<bool> {
+        self.insert_by(Logged::System, key, rid)
+    }
+
+    /// `insert`, logged as `by`'s change. A transaction's insert is undone
+    /// by removing `key` from this tree, which `undo` opens from its header
+    /// alone, so the comparator must describe itself.
+    pub(crate) fn insert_by(&self, by: Logged<'_>, key: &[u8], rid: Rid) -> Result<bool> {
         check_key_size(key, Self::MAX_KEY_SIZE)?;
-        match self.insert_optimistic(key, rid)? {
+        match self.insert_optimistic(by, key, rid)? {
             Some(inserted) => Ok(inserted),
-            None => self.insert_pessimistic(key, rid),
+            None => self.insert_pessimistic(by, key, rid),
         }
     }
 
     /// Inserts `key` into its leaf, holding only read latches above it.
     /// Returns `None`, changing nothing, if the tree is empty or the leaf
     /// has no room for `key`: either needs the pessimistic insert.
-    fn insert_optimistic(&self, key: &[u8], rid: Rid) -> Result<Option<bool>> {
-        let Some((mut guard, _)) = self.find_leaf_mut(key)? else {
+    fn insert_optimistic(&self, by: Logged<'_>, key: &[u8], rid: Rid) -> Result<Option<bool>> {
+        let mtr = self.mtr(by);
+        mtr.undo_index_insert(self.header_page_id, key);
+        let Some((mut guard, _)) = self.find_leaf_mut(&mtr, key)? else {
             return Ok(None);
         };
-        let mut leaf = LeafPageMut::<NUM_TOMBS>::new(guard.get_data_mut())?;
-        match leaf.insert(key, rid, &self.comparator) {
-            Ok(_) => Ok(Some(true)),
-            Err(StorageError::DuplicateKey) => Ok(Some(false)),
-            Err(StorageError::PageFull) => Ok(None),
-            Err(e) => Err(e),
-        }
+        let leaf = LeafPage::<NUM_TOMBS>::new(guard.data())?;
+        let position = match leaf.insert_position(key, &self.comparator) {
+            Ok(position) => position,
+            Err(StorageError::DuplicateKey) => return Ok(Some(false)),
+            Err(StorageError::PageFull) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        guard.apply(leaf_insert::<NUM_TOMBS>(position, key, rid))?;
+        Ok(Some(true))
     }
 
     /// Inserts `key` holding write latches from the header page down, so it
@@ -231,32 +267,28 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     ///
     /// On the way down, reaching a safe page releases every page above it,
     /// the header page included: a split stops there, so they do not change.
-    fn insert_pessimistic(&self, key: &[u8], rid: Rid) -> Result<bool> {
+    fn insert_pessimistic(&self, by: Logged<'_>, key: &[u8], rid: Rid) -> Result<bool> {
+        let mtr = self.mtr(by);
+        mtr.undo_index_insert(self.header_page_id, key);
         let mut ctx = Context::new();
-        let mut header = self
-            .bpm
-            .checked_write_page(self.header_page_id, AccessType::Index)?;
-        ctx.root_page_id = BtreeHeaderPage::new(header.get_data())?.root_page_id();
+        let mut header = self.bpm.write_page(&mtr, self.header_page_id)?;
+        ctx.root_page_id = BtreeHeaderPage::new(header.data())?.root_page_id();
         // Another insert may have started the tree since the optimistic
         // attempt saw it empty.
         if ctx.root_page_id == INVALID_PAGE_ID {
-            self.start_new_tree(&mut header, key, rid)?;
+            self.start_new_tree(&mtr, &mut header, key, rid)?;
             return Ok(true);
         }
         ctx.header_page = Some(header);
 
-        let mut guard = self
-            .bpm
-            .checked_write_page(ctx.root_page_id, AccessType::Index)?;
-        if self.is_insert_safe(guard.get_data(), key)? {
+        let mut guard = self.bpm.write_page(&mtr, ctx.root_page_id)?;
+        if self.is_insert_safe(guard.data(), key)? {
             ctx.header_page = None;
         }
-        while page_type(guard.get_data()) != Ok(PageType::BTreeLeaf) {
-            let child_page_id = InternalPage::new(guard.get_data())?.lookup(key, &self.comparator);
-            let child = self
-                .bpm
-                .checked_write_page(child_page_id, AccessType::Index)?;
-            if self.is_insert_safe(child.get_data(), key)? {
+        while page_type(guard.data()) != Ok(PageType::BTreeLeaf) {
+            let child_page_id = InternalPage::new(guard.data())?.lookup(key, &self.comparator);
+            let child = self.bpm.write_page(&mtr, child_page_id)?;
+            if self.is_insert_safe(child.data(), key)? {
                 ctx.header_page = None;
                 ctx.write_set.clear();
                 // Assigning drops the current page's guard after the
@@ -269,21 +301,23 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
         }
 
         let leaf_page_id = guard.page_id();
-        let mut leaf = LeafPageMut::<NUM_TOMBS>::new(guard.get_data_mut())?;
         // The leaf may not need splitting after all: `key` may be there
         // already, or tombstoned, or another writer made room.
-        match leaf.insert(key, rid, &self.comparator) {
-            Ok(_) => return Ok(true),
+        let leaf = LeafPage::<NUM_TOMBS>::new(guard.data())?;
+        match leaf.insert_position(key, &self.comparator) {
+            Ok(position) => {
+                guard.apply(leaf_insert::<NUM_TOMBS>(position, key, rid))?;
+                return Ok(true);
+            }
             Err(StorageError::DuplicateKey) => return Ok(false),
             Err(StorageError::PageFull) => {}
             Err(e) => return Err(e),
         }
 
         let right_page_id = self.bpm.new_page();
-        let mut right_guard = self
-            .bpm
-            .checked_write_page(right_page_id, AccessType::Index)?;
-        let mut right = LeafPageMut::<NUM_TOMBS>::init(right_guard.get_data_mut());
+        let mut right_guard = self.bpm.write_page(&mtr, right_page_id)?;
+        let mut leaf = LeafPageMut::<NUM_TOMBS>::new(guard.raw_mut())?;
+        let mut right = LeafPageMut::<NUM_TOMBS>::init(right_guard.raw_mut());
         leaf.split_to(&mut right, right_page_id);
         let separator = right.key_at(0).to_vec();
         if self.comparator.compare(key, &separator).is_lt() {
@@ -292,9 +326,14 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
             right.insert(key, rid, &self.comparator)
         }
         .expect("each half of a split has room for one more key");
-        drop((guard, right_guard));
 
-        self.insert_into_parent(&mut ctx, leaf_page_id, separator, right_page_id)?;
+        finish_change(self.insert_into_parent(
+            &mtr,
+            &mut ctx,
+            leaf_page_id,
+            separator,
+            right_page_id,
+        ));
         Ok(true)
     }
 
@@ -304,14 +343,15 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     /// and a root that splits gets a new root above it.
     fn insert_into_parent(
         &self,
-        ctx: &mut Context,
+        mtr: &Mtr<'_>,
+        ctx: &mut Context<'_>,
         mut left_page_id: PageId,
         mut separator: Vec<u8>,
         mut right_page_id: PageId,
     ) -> Result<()> {
         while let Some(mut guard) = ctx.write_set.pop_back() {
             let page_id = guard.page_id();
-            let mut page = InternalPageMut::new(guard.get_data_mut())?;
+            let mut page = InternalPageMut::new(guard.raw_mut())?;
             match page.insert(&separator, right_page_id, &self.comparator) {
                 Ok(_) => return Ok(()),
                 Err(StorageError::PageFull) => {}
@@ -319,10 +359,8 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
             }
 
             let new_page_id = self.bpm.new_page();
-            let mut new_guard = self
-                .bpm
-                .checked_write_page(new_page_id, AccessType::Index)?;
-            let mut new_page = InternalPageMut::init(new_guard.get_data_mut());
+            let mut new_guard = self.bpm.write_page(mtr, new_page_id)?;
+            let mut new_page = InternalPageMut::init(new_guard.raw_mut());
             let promoted = page.split_to(&mut new_page);
             if self.comparator.compare(&separator, &promoted).is_lt() {
                 page.insert(&separator, right_page_id, &self.comparator)
@@ -343,15 +381,13 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
             .as_mut()
             .expect("the header page is held while the root may split");
         let root_page_id = self.bpm.new_page();
-        let mut root = self
-            .bpm
-            .checked_write_page(root_page_id, AccessType::Index)?;
-        InternalPageMut::init(root.get_data_mut()).populate_new_root(
+        let mut root = self.bpm.write_page(mtr, root_page_id)?;
+        InternalPageMut::init(root.raw_mut()).populate_new_root(
             left_page_id,
             &separator,
             right_page_id,
         )?;
-        BtreeHeaderPage::new(header.get_data_mut())?.set_root_page_id(root_page_id);
+        BtreeHeaderPage::new(header.raw_mut())?.set_root_page_id(root_page_id);
         Ok(())
     }
 
@@ -368,21 +404,30 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
 
     /// Makes a leaf holding only `key` the root of the empty tree whose
     /// header page is write-latched in `header`.
-    fn start_new_tree(&self, header: &mut WritePageGuard, key: &[u8], rid: Rid) -> Result<()> {
+    fn start_new_tree(
+        &self,
+        mtr: &Mtr<'_>,
+        header: &mut MtrPage<'_>,
+        key: &[u8],
+        rid: Rid,
+    ) -> Result<()> {
         let root_page_id = self.bpm.new_page();
-        let mut guard = self
-            .bpm
-            .checked_write_page(root_page_id, AccessType::Index)?;
-        LeafPageMut::<NUM_TOMBS>::init(guard.get_data_mut()).insert(key, rid, &self.comparator)?;
-        BtreeHeaderPage::new(header.get_data_mut())?.set_root_page_id(root_page_id);
+        let mut guard = self.bpm.write_page(mtr, root_page_id)?;
+        LeafPageMut::<NUM_TOMBS>::init(guard.raw_mut()).insert(key, rid, &self.comparator)?;
+        BtreeHeaderPage::new(header.raw_mut())?.set_root_page_id(root_page_id);
         Ok(())
     }
 
     /// Removes `key`, if the tree holds it. Returns whether it did.
     pub fn remove(&self, key: &[u8]) -> Result<bool> {
-        match self.remove_optimistic(key)? {
+        self.remove_by(Logged::System, key)
+    }
+
+    /// `remove`, logged as `by`'s change, which must not need undo.
+    pub(crate) fn remove_by(&self, by: Logged<'_>, key: &[u8]) -> Result<bool> {
+        match self.remove_optimistic(by, key)? {
             Some(removed) => Ok(removed),
-            None => self.remove_pessimistic(key),
+            None => self.remove_pessimistic(by, key),
         }
     }
 
@@ -390,15 +435,23 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     /// returns whether it was there. Returns `None`, changing nothing, if
     /// that would leave the leaf underfull, or a root leaf empty: either
     /// needs the pessimistic remove.
-    fn remove_optimistic(&self, key: &[u8]) -> Result<Option<bool>> {
-        let Some((mut guard, is_root)) = self.find_leaf_mut(key)? else {
+    fn remove_optimistic(&self, by: Logged<'_>, key: &[u8]) -> Result<Option<bool>> {
+        let mtr = self.mtr(by);
+        let Some((mut guard, is_root)) = self.find_leaf_mut(&mtr, key)? else {
             return Ok(Some(false));
         };
-        let mut leaf = LeafPageMut::<NUM_TOMBS>::new(guard.get_data_mut())?;
+        let leaf = LeafPage::<NUM_TOMBS>::new(guard.data())?;
+        let Some(index) = leaf.live_index(key, &self.comparator) else {
+            return Ok(Some(false));
+        };
         if !self.is_leaf_remove_safe(&leaf, key, is_root) {
             return Ok(None);
         }
-        Ok(Some(leaf.remove(key, &self.comparator).is_some()))
+        guard.apply(PageOp::LeafRemove {
+            num_tombs: NUM_TOMBS,
+            index,
+        })?;
+        Ok(Some(true))
     }
 
     /// Removes `key` holding write latches from the header page down, so it
@@ -407,29 +460,24 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     /// On the way down, reaching a safe page releases every page above it,
     /// the header page included: rebalancing stops there, so they do not
     /// change.
-    fn remove_pessimistic(&self, key: &[u8]) -> Result<bool> {
+    fn remove_pessimistic(&self, by: Logged<'_>, key: &[u8]) -> Result<bool> {
+        let mtr = self.mtr(by);
         let mut ctx = Context::new();
-        let header = self
-            .bpm
-            .checked_write_page(self.header_page_id, AccessType::Index)?;
-        ctx.root_page_id = BtreeHeaderPage::new(header.get_data())?.root_page_id();
+        let header = self.bpm.write_page(&mtr, self.header_page_id)?;
+        ctx.root_page_id = BtreeHeaderPage::new(header.data())?.root_page_id();
         if ctx.root_page_id == INVALID_PAGE_ID {
             return Ok(false);
         }
         ctx.header_page = Some(header);
 
-        let mut guard = self
-            .bpm
-            .checked_write_page(ctx.root_page_id, AccessType::Index)?;
-        if self.is_remove_safe(guard.get_data(), key, true)? {
+        let mut guard = self.bpm.write_page(&mtr, ctx.root_page_id)?;
+        if self.is_remove_safe(guard.data(), key, true)? {
             ctx.header_page = None;
         }
-        while page_type(guard.get_data()) != Ok(PageType::BTreeLeaf) {
-            let child_page_id = InternalPage::new(guard.get_data())?.lookup(key, &self.comparator);
-            let child = self
-                .bpm
-                .checked_write_page(child_page_id, AccessType::Index)?;
-            if self.is_remove_safe(child.get_data(), key, false)? {
+        while page_type(guard.data()) != Ok(PageType::BTreeLeaf) {
+            let child_page_id = InternalPage::new(guard.data())?.lookup(key, &self.comparator);
+            let child = self.bpm.write_page(&mtr, child_page_id)?;
+            if self.is_remove_safe(child.data(), key, false)? {
                 ctx.header_page = None;
                 ctx.write_set.clear();
                 // Assigning drops the current page's guard after the
@@ -441,25 +489,69 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
             }
         }
 
-        let removed =
-            LeafPageMut::<NUM_TOMBS>::new(guard.get_data_mut())?.remove(key, &self.comparator);
-        if removed.is_none() {
+        if LeafPage::<NUM_TOMBS>::new(guard.data())?
+            .live_index(key, &self.comparator)
+            .is_none()
+        {
             return Ok(false);
         }
-        self.rebalance(&mut ctx, guard)?;
+        let (mut guard, left) = self.latch_left_sibling(&mtr, &ctx, guard)?;
+        // The parent's latch, or the leaf's own, kept `key` where it was.
+        let index = LeafPage::<NUM_TOMBS>::new(guard.data())?
+            .live_index(key, &self.comparator)
+            .expect("the key is still in its leaf");
+        guard.apply(PageOp::LeafRemove {
+            num_tombs: NUM_TOMBS,
+            index,
+        })?;
+        finish_change(self.rebalance(&mtr, &mut ctx, guard, left));
         Ok(true)
+    }
+
+    /// Returns `leaf` with its left sibling write-latched too when a remove
+    /// would rebalance the two (the parent is held and `leaf` is its last
+    /// child). Scans latch left to right and a changed leaf stays latched, so
+    /// the sibling is taken first while the parent's latch holds both still.
+    fn latch_left_sibling<'m>(
+        &self,
+        mtr: &'m Mtr<'_>,
+        ctx: &Context<'m>,
+        leaf: MtrPage<'m>,
+    ) -> Result<(MtrPage<'m>, Option<MtrPage<'m>>)> {
+        let Some(parent) = ctx.write_set.back() else {
+            return Ok((leaf, None));
+        };
+        let parent = InternalPage::new(parent.data())?;
+        let leaf_page_id = leaf.page_id();
+        let index = parent
+            .value_index(leaf_page_id)
+            .expect("a leaf is a child of the page above it in the write set");
+        if index == 0 || index + 1 < parent.size() {
+            return Ok((leaf, None));
+        }
+        let left_page_id = parent.value_at(index - 1);
+        drop(leaf);
+        let left = self.bpm.write_page(mtr, left_page_id)?;
+        Ok((self.bpm.write_page(mtr, leaf_page_id)?, Some(left)))
     }
 
     /// Fixes up the tree after a remove, from the leaf in `guard` up through
     /// the write set: an underfull page is rebalanced with a sibling, which
     /// may leave its parent underfull in turn, and an empty root leaf or a
-    /// root with one child is dropped.
-    fn rebalance(&self, ctx: &mut Context, mut guard: WritePageGuard) -> Result<()> {
+    /// root with one child is dropped. `left` is the leaf's left sibling if
+    /// `latch_left_sibling` latched it.
+    fn rebalance<'m>(
+        &self,
+        mtr: &'m Mtr<'_>,
+        ctx: &mut Context<'m>,
+        mut guard: MtrPage<'m>,
+        mut left: Option<MtrPage<'m>>,
+    ) -> Result<()> {
         loop {
             if ctx.is_root_page(guard.page_id()) {
-                return self.shrink_root(ctx, guard);
+                return self.shrink_root(mtr, ctx, guard);
             }
-            if !Self::is_underfull(guard.get_data())? {
+            if !Self::is_underfull(guard.data())? {
                 return Ok(());
             }
             // An underfull page whose parent was released was already
@@ -467,7 +559,7 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
             let Some(mut parent) = ctx.write_set.pop_back() else {
                 return Ok(());
             };
-            self.rebalance_child(&mut parent, guard)?;
+            self.rebalance_child(mtr, &mut parent, guard, left.take())?;
             guard = parent;
         }
     }
@@ -475,14 +567,14 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     /// Drops the root in `guard` if it is a leaf with no keys, leaving the
     /// tree empty, or an internal page with one child, which becomes the
     /// root.
-    fn shrink_root(&self, ctx: &mut Context, guard: WritePageGuard) -> Result<()> {
-        let new_root_page_id = if page_type(guard.get_data()) == Ok(PageType::BTreeLeaf) {
-            if LeafPage::<NUM_TOMBS>::new(guard.get_data())?.size() > 0 {
+    fn shrink_root(&self, mtr: &Mtr<'_>, ctx: &mut Context<'_>, guard: MtrPage<'_>) -> Result<()> {
+        let new_root_page_id = if page_type(guard.data()) == Ok(PageType::BTreeLeaf) {
+            if LeafPage::<NUM_TOMBS>::new(guard.data())?.size() > 0 {
                 return Ok(());
             }
             INVALID_PAGE_ID
         } else {
-            let root = InternalPage::new(guard.get_data())?;
+            let root = InternalPage::new(guard.data())?;
             if root.size() > 1 {
                 return Ok(());
             }
@@ -492,54 +584,39 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
             .header_page
             .as_mut()
             .expect("the header page is held while the root may go");
-        BtreeHeaderPage::new(header.get_data_mut())?.set_root_page_id(new_root_page_id);
-        let page_id = guard.page_id();
-        drop(guard);
-        self.delete_unlinked_page(page_id)
-    }
-
-    /// Deletes a page the tree no longer links to, whose write latch this
-    /// thread held after unlinking it.
-    ///
-    /// Another thread may still pin it for a moment: a page guard releases
-    /// its latch before its pin, so a scan that just moved past the page can
-    /// be between the two. Nothing can reach the page any more, so that pin
-    /// is about to go, and the delete is retried until it does.
-    fn delete_unlinked_page(&self, page_id: PageId) -> Result<()> {
-        loop {
-            match self.bpm.delete_page(page_id) {
-                Err(StorageError::PagePinned(_)) => std::thread::yield_now(),
-                result => return result,
-            }
-        }
+        BtreeHeaderPage::new(header.raw_mut())?.set_root_page_id(new_root_page_id);
+        self.bpm.free_page(mtr, guard.page_id());
+        Ok(())
     }
 
     /// Rebalances `child`, an underfull child of `parent`, with its right
-    /// sibling, or with its left one if it is the last child. A page that is
-    /// its parent's only child is left as it is.
-    fn rebalance_child(&self, parent: &mut WritePageGuard, child: WritePageGuard) -> Result<()> {
-        let mut parent = InternalPageMut::new(parent.get_data_mut())?;
-        let index = parent
+    /// sibling, or with its left one, `left` if the caller latched it, if it
+    /// is the last child. A page that is its parent's only child is left as
+    /// it is.
+    fn rebalance_child<'m>(
+        &self,
+        mtr: &'m Mtr<'_>,
+        parent: &mut MtrPage<'m>,
+        child: MtrPage<'m>,
+        left: Option<MtrPage<'m>>,
+    ) -> Result<()> {
+        let page = InternalPage::new(parent.data())?;
+        let index = page
             .value_index(child.page_id())
             .expect("an underfull page is a child of the page above it in the write set");
-        if index + 1 < parent.size() {
-            let right = self
-                .bpm
-                .checked_write_page(parent.value_at(index + 1), AccessType::Index)?;
-            self.merge_or_redistribute(&mut parent, index + 1, child, right, true)
+        if index + 1 < page.size() {
+            let right = self.bpm.write_page(mtr, page.value_at(index + 1))?;
+            let mut parent = InternalPageMut::new(parent.raw_mut())?;
+            self.merge_or_redistribute(mtr, &mut parent, index + 1, child, right, true)
         } else if index > 0 {
-            // Scans latch leaves left to right, so latching the left sibling
-            // while holding the child could deadlock with one. The parent's
-            // write latch keeps both pages as they are meanwhile.
-            let child_page_id = child.page_id();
-            drop(child);
-            let left = self
-                .bpm
-                .checked_write_page(parent.value_at(index - 1), AccessType::Index)?;
-            let child = self
-                .bpm
-                .checked_write_page(child_page_id, AccessType::Index)?;
-            self.merge_or_redistribute(&mut parent, index, left, child, false)
+            let left = match left {
+                Some(left) => left,
+                // Unlike leaves, internal pages are only latched top down,
+                // so holding `child` while latching its sibling is safe.
+                None => self.bpm.write_page(mtr, page.value_at(index - 1))?,
+            };
+            let mut parent = InternalPageMut::new(parent.raw_mut())?;
+            self.merge_or_redistribute(mtr, &mut parent, index, left, child, false)
         } else {
             Ok(())
         }
@@ -553,16 +630,17 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     /// the parent has room for the new key between them.
     fn merge_or_redistribute(
         &self,
+        mtr: &Mtr<'_>,
         parent: &mut InternalPageMut,
         sep_index: usize,
-        mut left_guard: WritePageGuard,
-        mut right_guard: WritePageGuard,
+        mut left_guard: MtrPage<'_>,
+        mut right_guard: MtrPage<'_>,
         left_is_underfull: bool,
     ) -> Result<()> {
         let right_page_id = right_guard.page_id();
-        let merged = if page_type(left_guard.get_data()) == Ok(PageType::BTreeLeaf) {
-            let mut left = LeafPageMut::<NUM_TOMBS>::new(left_guard.get_data_mut())?;
-            let mut right = LeafPageMut::<NUM_TOMBS>::new(right_guard.get_data_mut())?;
+        let merged = if page_type(left_guard.data()) == Ok(PageType::BTreeLeaf) {
+            let mut left = LeafPageMut::<NUM_TOMBS>::new(left_guard.raw_mut())?;
+            let mut right = LeafPageMut::<NUM_TOMBS>::new(right_guard.raw_mut())?;
             // Moving a key would lose its tombstone.
             left.purge_tombstones();
             right.purge_tombstones();
@@ -574,8 +652,8 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
                 false
             }
         } else {
-            let mut left = InternalPageMut::new(left_guard.get_data_mut())?;
-            let mut right = InternalPageMut::new(right_guard.get_data_mut())?;
+            let mut left = InternalPageMut::new(left_guard.raw_mut())?;
+            let mut right = InternalPageMut::new(right_guard.raw_mut())?;
             let middle_key = parent.key_at(sep_index).to_vec();
             if left.used_space() + right.used_space() + middle_key.len() <= InternalPage::CAPACITY {
                 right.move_all_to(&mut left, &middle_key);
@@ -593,8 +671,7 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
         };
         if merged {
             parent.remove_at(sep_index);
-            drop(right_guard);
-            self.delete_unlinked_page(right_page_id)?;
+            self.bpm.free_page(mtr, right_page_id);
         }
         Ok(())
     }
@@ -720,6 +797,10 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
         Ok(Some(guard))
     }
 
+    fn mtr<'a>(&'a self, by: Logged<'a>) -> Mtr<'a> {
+        self.bpm.bpm().mtr(by)
+    }
+
     /// Descends to the leaf whose range holds `key` like `find_leaf`, but
     /// returns it write-latched, with whether it is the root. Returns `None`
     /// if the tree is empty.
@@ -730,7 +811,11 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
     /// meanwhile, and a leaf cannot be split or merged away without a write
     /// latch on that page, so it is still the leaf for `key`. Nor can it stop
     /// or start being the root while it is latched.
-    fn find_leaf_mut(&self, key: &[u8]) -> Result<Option<(WritePageGuard, bool)>> {
+    fn find_leaf_mut<'m>(
+        &self,
+        mtr: &'m Mtr<'_>,
+        key: &[u8],
+    ) -> Result<Option<(MtrPage<'m>, bool)>> {
         let header = self
             .bpm
             .checked_read_page(self.header_page_id, AccessType::Index)?;
@@ -744,7 +829,7 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
             let guard = self.bpm.checked_read_page(page_id, AccessType::Index)?;
             if page_type(guard.get_data()) == Ok(PageType::BTreeLeaf) {
                 drop(guard);
-                let leaf = self.bpm.checked_write_page(page_id, AccessType::Index)?;
+                let leaf = self.bpm.write_page(mtr, page_id)?;
                 drop(parent);
                 return Ok(Some((leaf, page_id == root_page_id)));
             }
@@ -753,6 +838,30 @@ impl<CmpT: KeyComparator, const NUM_TOMBS: usize> Btree<CmpT, NUM_TOMBS> {
             // taken.
             parent = guard;
         }
+    }
+}
+
+fn leaf_insert<const NUM_TOMBS: usize>(
+    position: InsertPosition,
+    key: &[u8],
+    rid: Rid,
+) -> PageOp<'_> {
+    PageOp::LeafInsert {
+        num_tombs: NUM_TOMBS,
+        position,
+        key,
+        rid,
+    }
+}
+
+/// The rest of a split or merge that has changed a page already. Failing
+/// now, say for want of a frame, would leave the tree half changed, and the
+/// mtr logs what it holds when it drops, so the process stops instead:
+/// recovery redoes whole mtrs only.
+fn finish_change(result: Result<()>) {
+    if let Err(e) = result {
+        eprintln!("hamilton: cannot finish a B+ tree split or merge: {e}");
+        std::process::abort();
     }
 }
 

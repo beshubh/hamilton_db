@@ -66,7 +66,10 @@ class Connection:
         if len(header) < 5:
             raise ConnectionError("the server closed the connection")
         (length,) = struct.unpack("!i", header[1:])
-        return header[:1], self.file.read(length - 4)
+        body = self.file.read(length - 4)
+        if len(body) < length - 4:
+            raise ConnectionError("the server closed the connection")
+        return header[:1], body
 
     def _until_ready(self) -> list[Rows | Command | Error]:
         results, columns, bools, rows = [], None, [], []

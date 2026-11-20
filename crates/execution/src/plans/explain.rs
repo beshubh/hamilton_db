@@ -172,6 +172,8 @@ fn describe(plan: &AbstractPlanNode) -> (String, Vec<(&'static str, String)>) {
         }
         AbstractPlanNode::DeletePlan(plan) => format!("Delete on {}", plan.table_name()),
         AbstractPlanNode::TruncatePlan(_) => "Truncate".to_owned(),
+        AbstractPlanNode::DropTablePlan(_) => "Drop Table".to_owned(),
+        AbstractPlanNode::DropIndexPlan(_) => "Drop Index".to_owned(),
         AbstractPlanNode::FilterPlan(plan) => {
             properties.push((
                 "Condition",

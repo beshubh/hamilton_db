@@ -18,7 +18,8 @@ pub enum LockMode {
     AccessShare,
     /// Writing rows, or adding an index.
     RowExclusive,
-    /// Replacing the table's storage, as TRUNCATE does.
+    /// Replacing or dropping storage of the table, as TRUNCATE, DROP TABLE
+    /// and DROP INDEX do.
     AccessExclusive,
 }
 
@@ -39,8 +40,9 @@ struct State {
     /// The newest transaction that locked the table. A truncate older than
     /// it would remove rows it wrote or read after them in Tid order.
     used_by: TxnId,
-    /// The newest transaction whose truncate of the table committed. An
-    /// older one would see the rows it removed, which are gone.
+    /// The newest transaction whose truncate or drop of the table
+    /// committed. An older one would see the rows it removed, which are
+    /// gone.
     truncated_by: TxnId,
 }
 
@@ -82,7 +84,7 @@ impl TableLocks {
         Ok(())
     }
 
-    /// Records that `tid`'s truncate of the table committed.
+    /// Records that `tid`'s truncate or drop of the table committed.
     pub fn truncated(&self, tid: TxnId) {
         let mut state = self.0.lock();
         state.truncated_by = state.truncated_by.max(tid);

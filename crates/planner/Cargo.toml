@@ -12,5 +12,6 @@ storage = { path = "../storage" }
 thiserror.workspace = true
 
 [dev-dependencies]
+parking_lot = "0.12.5"
 storage = { path = "../storage" }
 tempfile = "3.27.0"

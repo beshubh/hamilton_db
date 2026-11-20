@@ -1,18 +1,19 @@
 # Persistence
 
-A database is three files next to each other: `<name>.db`, `<name>.meta` and `<name>.log`. The server creates them if missing, writes everything out on a clean shutdown (Ctrl-C or SIGTERM), and serves the same tables and rows when started on them again. Only one process can have a database open.
+A database is files next to each other: `<name>.db`, `<name>.meta`, and the log's segments `<name>.log.00000001`, `<name>.log.00000002` and so on. The server creates them if missing, writes everything out on a clean shutdown (Ctrl-C or SIGTERM), and serves the same tables and rows when started on them again. Only one process can have a database open.
 
 ## Sub-features
 
-- `persist-create` creates the three files when started on a path that doesn't exist.
+- `persist-create` creates the files when started on a path that doesn't exist.
 - `persist-restart` keeps schema, indexes, rows and identity sequences across a clean restart.
-- `persist-crash` behavior after the server is killed without shutting down.
+- `persist-crash` keeps every committed row after the server is killed without shutting down.
 - `persist-lock` refuses a second server on the same files.
 - `persist-shutdown` exits 0 and logs `shut down` on SIGTERM.
+- `persist-log-bounded` keeps the log to a few segments while writes go on: each checkpoint removes the segments it no longer needs.
 
 ## How to get to it (user POV)
 
-- `hamilton-server [--host HOST] [--port PORT] [FILE]`, stopped with Ctrl-C or SIGTERM.
+- `hamilton-server [--host HOST] [--port PORT] [--pool-size FRAMES] [--log-segment-size BYTES] [FILE]`, stopped with Ctrl-C or SIGTERM.
 - Starting it again on the same `FILE`.
 
 ## Driving it with hdb
@@ -22,7 +23,7 @@ Preconditions:
 - `hdb doctor` exits 0.
 - No table named `ps_notes` exists.
 
-- **Files.** Run `ls /tmp/hamilton-verify/$HDB_RUN/data`. It lists `verify.db`, `verify.log` and `verify.meta`.
+- **Files.** Run `ls /tmp/hamilton-verify/$HDB_RUN/data` on a new run. It lists `verify.db`, `verify.log.00000001` and `verify.meta`.
 
 - **Write.** Run `hdb sql persist-write`. Output ends with rows `1 | first` and `2 | second`.
 
@@ -47,13 +48,16 @@ Preconditions:
 
 - **Lock.** With the server up, run `target/debug/hamilton-server --port 0 /tmp/hamilton-verify/$HDB_RUN/data/verify.db; echo "exit=$?"`. It prints `is already open in another process` and `exit=1`, and `hdb doctor` still exits 0.
 
-- **Crash.** Run `hdb sql persist-precrash` with `INSERT INTO ps_notes (body) VALUES ('doomed'); SELECT count(*) FROM ps_notes;`, then `hdb crash`, `hdb start`, and `hdb sql persist-postcrash` with `SELECT * FROM ps_notes ORDER BY id;`. The server must start and answer; record which rows survived. See Gotchas for what to expect today.
+- **Crash.** Run `hdb sql persist-precrash` with `INSERT INTO ps_notes (body) VALUES ('doomed'); SELECT count(*) FROM ps_notes;`, then `hdb crash`, `hdb start`, and `hdb sql persist-postcrash` with `SELECT * FROM ps_notes ORDER BY id;`. The server must start and answer with every committed row, `doomed` included.
+
+- **Log stays bounded.** Keep inserts going for a few minutes (a single-row insert logs about 700 bytes) and run `ls -l /tmp/hamilton-verify/$HDB_RUN/data` every few seconds. Segment numbers keep rising, each segment stops at about 64 MiB, and the oldest ones disappear once a checkpoint runs (every 30 s, or once the log has grown by a segment), so only a handful are ever listed. After `hdb crash` and `hdb start`, every segment from before the crash is gone but the last; the sweep that ends the open may have started more after it. `uv run sqltest/run.py recovery -k checkpoints` shows the same in about 10 s, on a server it starts with `--log-segment-size 262144`.
 
 ## Gotchas
 
-- There is no crash recovery yet: a row committed just before `hdb crash` is lost unless a periodic checkpoint happened to run first (observed at 4f7a538: the committed `INSERT` was gone after SIGKILL). That is the current behavior, not a pass. When a change claims durability, this journey must show the row surviving; don't swap `crash` for `restart` to get there.
+- With `HAMILTON_LOG=info`, every open logs `recovered in … ms` and then `swept … dead tuples and … index entries`. After a clean restart the sweep finds 0 and 0, unless a CREATE TABLE or CREATE INDEX failed since the last open.
+- Opening the files after `hdb crash` replays the log, so every statement that returned before the kill is there. A statement still running at the kill is not, and neither is anything from a transaction block left open: recovery rolls those back, so no row stays locked. Don't swap `crash` for `restart` to prove durability.
 - The port changes on every start. Anything holding the old port (an open `hdb repl` tab, a `psql` in another pane) is dead after a restart.
 - `hdb restart` doesn't rebuild. To test that a new build reads an old database, `hdb stop && hdb up`.
 - Bumping the catalog `VERSION` makes old files unreadable by design: start over with `hdb down && hdb up`.
-- Starting over means deleting all three files. Deleting only the `.db` leaves a stale `.meta`, and opening fails with `page 0 is not a catalog header page`. `hdb down` removes the whole data directory.
+- Starting over means deleting all the files, every `.log.*` segment included. Deleting only the `.db` leaves a stale `.meta`, and opening fails with `page 0 is not a catalog header page`. `hdb down` removes the whole data directory.
 - The server creates the files but not their directory.

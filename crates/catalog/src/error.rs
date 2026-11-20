@@ -24,6 +24,12 @@ pub enum CatalogError {
     #[error("index {0} already exists")]
     IndexExists(String),
 
+    #[error("index \"{0}\" does not exist")]
+    IndexNotFound(String),
+
+    #[error("cannot drop index {index} because constraint {index} on table {table} requires it")]
+    IndexRequiredByConstraint { index: String, table: String },
+
     #[error("column {column} does not exist in table {table}")]
     ColumnNotFound { table: String, column: String },
 
@@ -48,8 +54,9 @@ pub enum CatalogError {
     #[error("could not obtain lock on relation \"{table}\"")]
     LockConflict { table: String, other: TxnId },
 
-    /// A newer transaction truncated the table, removing rows this one
-    /// would see, or used it, so this one can't truncate it.
+    /// A newer transaction truncated or dropped the table, removing rows
+    /// this one would see, or used it, so this one can't truncate or drop
+    /// it.
     #[error("could not serialize access to relation \"{table}\" due to a newer transaction")]
     ChangedSince { table: String, other: TxnId },
 

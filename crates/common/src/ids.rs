@@ -16,6 +16,9 @@ pub type TxnId = u64;
 
 pub const INVALID_TXN_ID: TxnId = 0;
 
+/// The Tid of a new database's first transaction.
+pub const FIRST_TXN_ID: TxnId = 1;
+
 /// Set in a tuple's `ts` while the transaction that wrote it is running: the
 /// version is uncommitted and write-locked by the Tid in the lower bits.
 /// Tids stay below it.

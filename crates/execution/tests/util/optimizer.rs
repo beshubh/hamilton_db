@@ -21,7 +21,7 @@ pub fn db_with_indexes(indexes: &[(&str, &[&str])]) -> Db {
     let db = Db::new();
     // Created before the rows are inserted, so that the rows are in them.
     for (name, key) in indexes {
-        db.catalog().create_index(name, "users", key).unwrap();
+        db.create_index(name, "users", key);
     }
     db.insert(&[
         (4, Some("b")),

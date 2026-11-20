@@ -13,7 +13,6 @@ use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::concurrency::transaction::Transaction;
 use storage::concurrency::transaction_manager::TransactionManager;
-use storage::disk::disk_manager::DiskManager;
 use storage::page::PAGE_SIZE;
 use storage::table::table_heap::TableHeap;
 use storage::table::table_page::TablePage;
@@ -31,14 +30,16 @@ struct Db {
 
 fn setup(num_frames: usize) -> Db {
     let dir = TempDir::new().unwrap();
-    let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(num_frames, dm));
+    let bpm = storage::open(dir.path().join("test.db"), num_frames)
+        .unwrap()
+        .bpm;
     let heap = Arc::new(TableHeap::create(Arc::clone(&bpm)).unwrap());
+    let tm = TransactionManager::new(Arc::clone(&bpm));
     Db {
         _dir: dir,
         bpm,
         heap,
-        tm: TransactionManager::new(1),
+        tm,
     }
 }
 
@@ -75,7 +76,7 @@ impl Db {
     }
 
     fn delete(&self, txn: &Transaction, rid: Rid) {
-        txn.delete(&self.heap, &schema(), rid).unwrap()
+        txn.delete(&self.heap, rid).unwrap()
     }
 
     fn read(&self, txn: &Transaction, rid: Rid) -> Option<Vec<Value>> {
@@ -291,7 +292,7 @@ fn a_dead_slot_is_not_reused_and_reads_as_nothing() {
         Err(StorageError::TupleDeleted(rid)) if rid == a
     ));
     assert!(matches!(
-        txn.delete(&db.heap, &schema(), a),
+        txn.delete(&db.heap, a),
         Err(StorageError::TupleDeleted(rid)) if rid == a
     ));
     db.tm.commit(&txn).unwrap();
@@ -543,7 +544,7 @@ fn random_transaction(
             continue;
         }
         if rng.below(4) == 0 {
-            txn.delete(&db.heap, &schema(), rid)?;
+            txn.delete(&db.heap, rid)?;
             writes.push(Write {
                 rid,
                 values: None,

@@ -48,6 +48,7 @@ impl Executor for CreateIndexExecutor {
                 self.plan.key_columns().iter().map(String::as_str).collect();
             let txn = self.ctx.txn();
             self.ctx.catalog().create_index_with(
+                txn,
                 self.plan.index_name(),
                 self.plan.table_name(),
                 &key_columns,

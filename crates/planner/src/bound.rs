@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use catalog::{Sequence, TableOid};
+use catalog::{IndexOid, Sequence, TableOid};
 use common::{Column, IndexKind, Schema, UniqueKey, Value};
 use parser::{BinaryOp, JoinKind, UnaryOp};
 
@@ -35,6 +35,8 @@ pub enum BoundStatement {
     Update(BoundUpdate),
     Delete(BoundDelete),
     Truncate(BoundTruncate),
+    DropTable(BoundDropTable),
+    DropIndex(BoundDropIndex),
     Explain(Box<BoundStatement>),
     /// BEGIN, COMMIT or ROLLBACK. These change the session's transaction
     /// state rather than data, so they are run by the `ExecutionEngine`
@@ -185,6 +187,29 @@ pub struct BoundTruncate {
     /// Each table once, in the order first written.
     pub tables: Vec<BoundTable>,
     pub restart_identity: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundDropTable {
+    /// Each table once, in the order first written, without the missing
+    /// ones IF EXISTS skips.
+    pub tables: Vec<BoundTable>,
+    pub if_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundDropIndex {
+    /// Each index once, in the order first written. With `if_exists`, the
+    /// names that found none are left out.
+    pub indexes: Vec<BoundIndex>,
+    pub if_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundIndex {
+    pub oid: IndexOid,
+    pub name: String,
+    pub table_oid: TableOid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

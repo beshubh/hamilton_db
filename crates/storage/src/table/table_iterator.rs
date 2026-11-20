@@ -280,13 +280,15 @@ impl Iterator for TableIterator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk::disk_manager::DiskManager;
+    use crate::wal::Logged;
     use tempfile::TempDir;
 
     fn setup(num_frames: usize) -> (TempDir, Arc<BufferPoolManager>) {
         let dir = TempDir::new().unwrap();
-        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        (dir, Arc::new(BufferPoolManager::new(num_frames, dm)))
+        let bpm = crate::open(dir.path().join("test.db"), num_frames)
+            .unwrap()
+            .bpm;
+        (dir, bpm)
     }
 
     fn tuple(bytes: impl AsRef<[u8]>) -> Tuple {
@@ -314,8 +316,12 @@ mod tests {
         let heap = TableHeap::create(bpm).unwrap();
         let rids: Vec<Rid> = (0..200u32)
             .map(|i| {
-                heap.insert(&TupleMeta::new(i as u64), &tuple([i as u8; 100]))
-                    .unwrap()
+                heap.insert(
+                    Logged::System,
+                    &TupleMeta::new(i as u64),
+                    &tuple([i as u8; 100]),
+                )
+                .unwrap()
             })
             .collect();
 
@@ -333,7 +339,8 @@ mod tests {
         let (_dir, bpm) = setup(3);
         let heap = TableHeap::create(bpm).unwrap();
         for i in 0..100u8 {
-            heap.insert(&TupleMeta::new(1), &tuple([i; 100])).unwrap();
+            heap.insert(Logged::System, &TupleMeta::new(1), &tuple([i; 100]))
+                .unwrap();
         }
         let mut iter = heap.iter().unwrap();
         let mut total = 0;
@@ -354,7 +361,10 @@ mod tests {
         let (_dir, bpm) = setup(4);
         let heap = TableHeap::create(bpm).unwrap();
         let rids: Vec<Rid> = (0..90u8)
-            .map(|i| heap.insert(&TupleMeta::new(1), &tuple([i; 100])).unwrap())
+            .map(|i| {
+                heap.insert(Logged::System, &TupleMeta::new(1), &tuple([i; 100]))
+                    .unwrap()
+            })
             .collect();
         // Delete every row on the first page, and every other row after.
         let first = heap.first_page_id();
@@ -378,14 +388,15 @@ mod tests {
         let (_dir, bpm) = setup(4);
         let heap = TableHeap::create(bpm).unwrap();
         for i in 0..40u8 {
-            heap.insert(&TupleMeta::new(1), &tuple([i; 100])).unwrap();
+            heap.insert(Logged::System, &TupleMeta::new(1), &tuple([i; 100]))
+                .unwrap();
         }
         let mut seen = 0;
         // Insert a copy of every row while scanning, as `INSERT INTO t SELECT
         // * FROM t` would. Spills onto new pages and fills the old last page.
         for row in heap.iter().unwrap() {
             let (meta, tuple) = row.unwrap();
-            heap.insert(&meta, &tuple).unwrap();
+            heap.insert(Logged::System, &meta, &tuple).unwrap();
             seen += 1;
         }
         assert_eq!(seen, 40);

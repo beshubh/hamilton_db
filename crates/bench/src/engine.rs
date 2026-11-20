@@ -8,8 +8,7 @@ use catalog::Catalog;
 use common::Value;
 use planner::{ExecutionEngine, Output};
 use postgres::{Client, NoTls, SimpleQueryMessage};
-use storage::buffer::buffer_pool_manager::BufferPoolManager;
-use storage::disk::disk_manager::DiskManager;
+use storage::Storage;
 use tempfile::TempDir;
 
 pub type Row = Vec<Option<String>>;
@@ -28,8 +27,7 @@ pub trait Engine {
 /// same session as the CLI: parse, bind, plan (which optimizes), execute,
 /// each statement in a transaction of its own.
 pub struct Hamilton {
-    disk: Arc<DiskManager>,
-    bpm: Arc<BufferPoolManager>,
+    storage: Storage,
     engine: ExecutionEngine,
     _dir: TempDir,
 }
@@ -37,13 +35,11 @@ pub struct Hamilton {
 impl Hamilton {
     pub fn new(frames: usize) -> Result<Self> {
         let dir = TempDir::new()?;
-        let disk = Arc::new(DiskManager::new(dir.path().join("bench.db"))?);
-        let bpm = Arc::new(BufferPoolManager::new(frames, Arc::clone(&disk)));
-        let catalog = Arc::new(Catalog::open(Arc::clone(&bpm))?);
+        let storage = storage::open(dir.path().join("bench.db"), frames)?;
+        let catalog = Arc::new(Catalog::open(Arc::clone(&storage.bpm))?);
         Ok(Self {
-            disk,
-            bpm,
-            engine: ExecutionEngine::new(catalog)?,
+            storage,
+            engine: ExecutionEngine::new(catalog),
             _dir: dir,
         })
     }
@@ -70,8 +66,7 @@ impl Engine for Hamilton {
     }
 
     fn finish_load(&mut self) -> Result<()> {
-        self.bpm.flush_all_pages()?;
-        self.disk.checkpoint()?;
+        self.storage.bpm.checkpoint()?;
         Ok(())
     }
 }

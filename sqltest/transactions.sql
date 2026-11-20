@@ -118,3 +118,23 @@ COMMIT;
 \session b
 COMMIT;
 SELECT id, balance FROM accounts;                         -- => 1, 70; 2, 130
+
+
+-- case: drop index: a block's drop holds the table and the name until it ends, and its rollback keeps the index
+CREATE INDEX accounts_balance ON accounts (balance);
+\session a
+BEGIN;
+DROP INDEX accounts_balance;                              -- => DROP INDEX
+\session b
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1;                -- => error: could not obtain lock
+ROLLBACK;                                                 -- => ROLLBACK
+CREATE INDEX accounts_balance ON doctors (name);          -- => error: already exists
+\session a
+SELECT id FROM accounts WHERE balance = 100 ORDER BY id;  -- => 1; 2
+ROLLBACK;
+\session b
+SELECT id FROM accounts WHERE balance = 100 ORDER BY id;  -- => 1; 2
+DROP INDEX accounts_balance;                              -- => DROP INDEX
+DROP INDEX accounts_balance;                              -- => error: does not exist
+CREATE INDEX accounts_balance ON doctors (name);          -- => CREATE INDEX

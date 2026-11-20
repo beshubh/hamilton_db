@@ -23,34 +23,76 @@ def build():
 
 class Server:
     """hamilton-server on a free port, serving the database at `db`, for as
-    long as the `with` block runs."""
+    long as the `with` block runs. `log` holds what it wrote to stderr."""
 
-    def __init__(self, db: Path):
-        self.db = db
+    def __init__(self, db: Path, binary: Path = SERVER, args=(), env=None):
+        self.command = [binary, "--port", "0", *args, db]
+        self.env = env
         self.port = None
         self.log = []
 
     def __enter__(self):
-        self.proc = subprocess.Popen(
-            [SERVER, "--port", "0", self.db], stderr=subprocess.PIPE, text=True
-        )
-        line = self.proc.stderr.readline()
-        match = LISTENING.search(line)
-        if not match:
-            self.proc.kill()
-            raise RuntimeError(f"hamilton-server didn't start: {line}{self.proc.stderr.read()}")
-        self.port = int(match[1])
-        # Drained so the server never blocks on a full pipe.
-        self.drain = threading.Thread(target=lambda: self.log.extend(self.proc.stderr), daemon=True)
-        self.drain.start()
+        self.start()
         return self
 
     def __exit__(self, *exc):
+        if self.proc.poll() is None:
+            self.stop(check=exc[0] is None)
+
+    def start(self):
+        """Starts the server and waits until it listens."""
+        self.spawn()
+        self.wait()
+
+    def wait(self, timeout=120):
+        """Waits until the server that `spawn` started listens, and fails if
+        it exits first or takes longer than `timeout` seconds."""
+        try:
+            if not self.listening.wait(timeout):
+                raise RuntimeError(f"hamilton-server didn't listen within {timeout} s: {''.join(self.log)}")
+            if self.port is None:
+                self.proc.wait()
+                raise RuntimeError(f"hamilton-server didn't start: {''.join(self.log)}")
+        except BaseException:
+            self.kill()
+            raise
+
+    def stop(self, check=True):
+        """Stops the server with SIGTERM, as Ctrl-C would, and fails unless
+        it exits cleanly."""
         self.proc.send_signal(signal.SIGTERM)
-        code = self.proc.wait(timeout=120)
+        try:
+            code = self.proc.wait(timeout=120)
+        except BaseException:
+            self.kill()
+            raise
         self.drain.join()
-        if code != 0 and exc[0] is None:
+        if code != 0 and check:
             raise RuntimeError(f"hamilton-server exited with {code}:\n{''.join(self.log)}")
+
+    def spawn(self):
+        """Starts the server without waiting for it to listen."""
+        self.proc = subprocess.Popen(self.command, stderr=subprocess.PIPE, text=True, env=self.env)
+        self.listening = threading.Event()
+        # Drained so the server never blocks on a full pipe.
+        self.drain = threading.Thread(target=self._read_log, daemon=True)
+        self.drain.start()
+
+    def _read_log(self):
+        for line in self.proc.stderr:
+            self.log.append(line)
+            if self.port is None and (match := LISTENING.search(line)):
+                self.port = int(match[1])
+                self.listening.set()
+        self.listening.set()
+
+    def kill(self) -> int:
+        """Kills the server with SIGKILL, as a crash would, and returns its
+        exit status: -9, unless it had died already."""
+        self.proc.kill()
+        code = self.proc.wait()
+        self.drain.join()
+        return code
 
 
 def run(server: Server, script: str) -> list[str]:

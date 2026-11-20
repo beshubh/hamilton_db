@@ -13,7 +13,6 @@ use storage::buffer::arc_replacer::AccessType;
 use storage::buffer::buffer_pool_manager::BufferPoolManager;
 use storage::concurrency::transaction::{Transaction, TransactionState};
 use storage::concurrency::transaction_manager::TransactionManager;
-use storage::disk::disk_manager::DiskManager;
 use storage::table::table_heap::TableHeap;
 use storage::table::table_page::{TablePage, TupleMeta};
 use tempfile::TempDir;
@@ -27,14 +26,16 @@ struct Db {
 
 fn setup(num_frames: usize) -> Db {
     let dir = TempDir::new().unwrap();
-    let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(num_frames, dm));
+    let bpm = storage::open(dir.path().join("test.db"), num_frames)
+        .unwrap()
+        .bpm;
     let heap = Arc::new(TableHeap::create(Arc::clone(&bpm)).unwrap());
+    let tm = TransactionManager::new(Arc::clone(&bpm));
     Db {
         _dir: dir,
         bpm,
         heap,
-        tm: TransactionManager::new(1),
+        tm,
     }
 }
 
@@ -172,7 +173,7 @@ fn an_ended_transaction_cannot_read_or_write() {
     assert!(not_running(
         txn.update(&db.heap, &schema(), rid, &tuple).map(|_| ())
     ));
-    assert!(not_running(txn.delete(&db.heap, &schema(), rid)));
+    assert!(not_running(txn.delete(&db.heap, rid)));
     assert!(not_running(txn.get(&db.heap, &schema(), rid).map(|_| ())));
     assert!(not_running(txn.scan(&db.heap, &schema()).map(|_| ())));
 }
@@ -201,7 +202,7 @@ fn a_transaction_reads_its_own_writes() {
     // A shrinking update reads back without its padding.
     assert_eq!(db.update(&txn, a, &row(1, tid, 4)), a);
     assert_eq!(db.read(&txn, a), Some(row(1, tid, 4)));
-    txn.delete(&db.heap, &schema(), b).unwrap();
+    txn.delete(&db.heap, b).unwrap();
     assert_eq!(db.read(&txn, b), None);
 
     let rows = db.scan(&txn).unwrap();
@@ -299,12 +300,12 @@ fn abort_restores_every_tuple_it_wrote() {
     // Updated in place.
     db.update(&txn, rids[0], &row(0, tid, 1200));
     // Deleted.
-    txn.delete(&db.heap, &schema(), rids[1]).unwrap();
+    txn.delete(&db.heap, rids[1]).unwrap();
     // Written several times, shrinking, growing, then deleted.
     db.update(&txn, rids[2], &row(2, tid, 10));
     db.update(&txn, rids[2], &row(2, tid, 1550));
     db.update(&txn, rids[2], &row(2, tid, 3));
-    txn.delete(&db.heap, &schema(), rids[2]).unwrap();
+    txn.delete(&db.heap, rids[2]).unwrap();
     // Too big for its page, so moved to a new Rid.
     let moved = db.update(&txn, rids[3], &row(3, tid, 3500));
     assert_ne!(moved, rids[3]);
@@ -360,11 +361,7 @@ fn a_write_to_a_locked_tuple_conflicts_until_the_holder_ends() {
         rid,
         t1.tid()
     ));
-    assert!(is_conflict(
-        t2.delete(&db.heap, &schema(), rid),
-        rid,
-        t1.tid()
-    ));
+    assert!(is_conflict(t2.delete(&db.heap, rid), rid, t1.tid()));
     // The newer writer's reads conflict too; the older one is not blocked
     // by a newer lock.
     assert!(is_conflict(t2.get(&db.heap, &schema(), rid), rid, t1.tid()));
@@ -389,7 +386,7 @@ fn an_older_transaction_cannot_write_over_a_newer_commit() {
     let t1 = db.tm.begin();
     let t2 = db.tm.begin();
     db.update(&t2, a, &row(1, t2.tid(), 40));
-    t2.delete(&db.heap, &schema(), b).unwrap();
+    t2.delete(&db.heap, b).unwrap();
     db.tm.commit(&t2).unwrap();
 
     let new = encode(&row(1, t1.tid(), 50));
@@ -398,7 +395,7 @@ fn an_older_transaction_cannot_write_over_a_newer_commit() {
         a,
         t2.tid()
     ));
-    assert!(is_conflict(t1.delete(&db.heap, &schema(), a), a, t2.tid()));
+    assert!(is_conflict(t1.delete(&db.heap, a), a, t2.tid()));
     // A delete by a newer transaction conflicts too, rather than reporting
     // the tuple deleted.
     assert!(is_conflict(
@@ -599,7 +596,7 @@ fn random_transaction(
             unreachable!()
         };
         if rng.below(10) == 0 {
-            txn.delete(&db.heap, &schema(), rid)?;
+            txn.delete(&db.heap, rid)?;
             written.insert(rid, None);
         } else {
             let new = row(id, tid, len);

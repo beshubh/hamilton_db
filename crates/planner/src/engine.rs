@@ -18,9 +18,11 @@
 //!   either one ends the block, reporting ROLLBACK.
 //! - BEGIN in a block, and COMMIT or ROLLBACK outside one, are errors that
 //!   change nothing. (Postgres only warns.)
-//! - CREATE TABLE and CREATE INDEX are rejected in a block, failing it: the
-//!   catalog isn't transactional. Outside a block they run as other
-//!   statements do.
+//! - CREATE TABLE, CREATE INDEX and DROP TABLE are rejected in a block,
+//!   failing it. Outside a block each runs in a transaction of its own, as
+//!   other statements do, and takes all of its changes back if it fails.
+//!   Other sessions see its change as soon as the statement ends, so it
+//!   must commit then (MySQL 8's atomic DDL).
 //! - Dropping the engine with a block open rolls it back.
 //! - A statement outside a block that fails with a storage `Conflict` is
 //!   run again in a new transaction, until it gets past the conflict or the
@@ -29,21 +31,14 @@
 //!   failed statement may have written rows, which only aborting the whole
 //!   transaction undoes, so the block fails and the client retries it.
 //!   A statement that can't get a table lock (`LockConflict`) is retried
-//!   the same way, once the holder ends.
-//!   CREATE TABLE is never retried, as the catalog isn't transactional
-//!   (see `retryable`). CREATE INDEX is: a failed build records nothing,
-//!   and a unique index's conflicts come before it adds an entry, so the
-//!   catalog frees each attempt's empty tree. It waits out writers that
-//!   haven't committed.
+//!   the same way, once the holder ends. CREATE INDEX is retried like any
+//!   other: it waits out writers that haven't committed.
 //!
 //! [`ExecutionEngine::session`] opens another session on the same database.
 //! Sessions share one `TransactionManager`, so their transactions are
 //! ordered against each other by Tid as MVTO requires.
 //!
-//! Every commit first records the next Tid in the catalog header, so that a
-//! restarted session never starts below a committed `ts` on disk (see
-//! `storage::concurrency::watermark`). There is no write-ahead log: what
-//! reaches disk, and when, is up to whoever flushes the buffer pool.
+//! A commit that wrote rows returns once its `Commit` record is durable.
 
 use std::mem;
 use std::sync::Arc;
@@ -149,18 +144,18 @@ enum State {
 }
 
 impl ExecutionEngine {
-    /// A session on the database `catalog` describes. Its first transaction
-    /// gets the Tid the catalog header recorded.
-    pub fn new(catalog: Arc<Catalog>) -> Result<Self> {
-        let next_tid = catalog.next_tid().map_err(ExecutionError::from)?;
-        Ok(Self {
+    /// A session on the database `catalog` describes, with a transaction
+    /// manager of its own.
+    pub fn new(catalog: Arc<Catalog>) -> Self {
+        let txn_manager = TransactionManager::new(Arc::clone(catalog.bpm()));
+        Self {
             catalog,
-            txn_manager: Arc::new(TransactionManager::new(next_tid)),
+            txn_manager: Arc::new(txn_manager),
             settings: ExecutionSettings::default(),
             batch_size: DEFAULT_BATCH_SIZE,
             conflict_timeout: DEFAULT_CONFLICT_TIMEOUT,
             state: State::Idle,
-        })
+        }
     }
 
     /// Another session on the same database, sharing this one's
@@ -269,11 +264,7 @@ impl ExecutionEngine {
             }
             (_, State::Idle) => Err(EngineError::NoTransaction),
             (TransactionCommand::Commit, State::InBlock(txn)) => {
-                if let Err(err) = self.commit(&txn) {
-                    // The commit's error is the one to report.
-                    let _ = self.txn_manager.abort(&txn);
-                    return Err(err);
-                }
+                self.commit(&txn)?;
                 Ok(Output::Done("COMMIT"))
             }
             (TransactionCommand::Rollback, State::InBlock(txn)) => {
@@ -289,18 +280,23 @@ impl ExecutionEngine {
         let ddl = match bound {
             BoundStatement::CreateTable(_) => Some("CREATE TABLE"),
             BoundStatement::CreateIndex(_) => Some("CREATE INDEX"),
+            BoundStatement::DropTable(_) => Some("DROP TABLE"),
             _ => None,
         };
         if let (Some(ddl), State::InBlock(_)) = (ddl, &self.state) {
             return Err(EngineError::NotInTransactionBlock(ddl));
         }
-        let plan = Planner::new(&self.catalog).plan(bound)?;
+        let planner = Planner::new(&self.catalog);
         if let State::InBlock(txn) = &self.state {
+            let plan = planner.plan(bound)?;
             return self.run_plan(txn, &plan, bound);
         }
         let deadline = Instant::now() + self.conflict_timeout;
         let mut attempt = 0;
         loop {
+            // A DROP INDEX that committed since the last attempt may have
+            // taken an index the old plan used.
+            let plan = planner.plan(bound)?;
             let txn = self.txn_manager.begin();
             let result = self
                 .run_plan(&txn, &plan, bound)
@@ -312,8 +308,8 @@ impl ExecutionEngine {
                 return result;
             }
             let conflict = match &result {
-                Err(err) if retryable(bound) => conflict(err),
-                _ => None,
+                Err(err) => conflict(err),
+                Ok(_) => None,
             };
             match conflict {
                 Some(conflict) if self.wait_to_retry(txn.tid(), conflict, attempt, deadline) => {
@@ -341,6 +337,7 @@ impl ExecutionEngine {
         let wait_for = match conflict {
             Conflict::Row(other) => Some(other).filter(|&other| other < tid),
             Conflict::Lock(other) => Some(other),
+            Conflict::StalePlan => None,
         };
         if let Some(other) = wait_for
             && !self.txn_manager.wait_for_end(other, deadline)
@@ -355,16 +352,9 @@ impl ExecutionEngine {
         Instant::now() < deadline
     }
 
-    /// Readies the catalog changes `txn` made, records the next Tid in the
-    /// catalog header, then commits `txn`. If this fails, `txn` is still
-    /// running and must be aborted.
+    /// Commits `txn`, which survives a crash once this returns. Fails only
+    /// if `txn` has ended.
     fn commit(&self, txn: &Transaction) -> Result<()> {
-        self.catalog
-            .prepare_commit(txn)
-            .map_err(ExecutionError::from)?;
-        self.catalog
-            .set_next_tid(self.txn_manager.next_tid())
-            .map_err(ExecutionError::from)?;
         self.txn_manager.commit(txn).map_err(ExecutionError::from)?;
         Ok(())
     }
@@ -404,6 +394,8 @@ impl ExecutionEngine {
             BoundStatement::Delete(_) => ("DELETE", false),
             // Postgres reports no count.
             BoundStatement::Truncate(_) => return Ok(Output::Done("TRUNCATE TABLE")),
+            BoundStatement::DropTable(_) => return Ok(Output::Done("DROP TABLE")),
+            BoundStatement::DropIndex(_) => return Ok(Output::Done("DROP INDEX")),
             BoundStatement::Transaction(_) => unreachable!("transaction commands are not planned"),
         };
         if returns_rows {
@@ -454,23 +446,6 @@ impl Drop for ExecutionEngine {
     }
 }
 
-/// Whether `bound`, run outside a block, may run again after a `Conflict`.
-/// Every statement must answer: running one again must not repeat
-/// anything the failed attempt left in the catalog.
-fn retryable(bound: &BoundStatement) -> bool {
-    match bound {
-        BoundStatement::CreateTable(_) => false,
-        BoundStatement::CreateIndex(_)
-        | BoundStatement::Insert(_)
-        | BoundStatement::Select(_)
-        | BoundStatement::Update(_)
-        | BoundStatement::Delete(_)
-        | BoundStatement::Truncate(_)
-        | BoundStatement::Explain(_) => true,
-        BoundStatement::Transaction(_) => unreachable!("transaction commands are not run here"),
-    }
-}
-
 /// What a statement that failed with `err` should wait out before running
 /// again, if anything.
 #[derive(Clone, Copy)]
@@ -479,6 +454,8 @@ enum Conflict {
     Row(TxnId),
     /// A transaction holding a table lock.
     Lock(TxnId),
+    /// A plan naming an index dropped since it was made.
+    StalePlan,
 }
 
 fn conflict(err: &EngineError) -> Option<Conflict> {
@@ -495,6 +472,7 @@ fn conflict(err: &EngineError) -> Option<Conflict> {
             other,
             ..
         })) => Some(Conflict::Row(*other)),
+        EngineError::Execution(ExecutionError::IndexNotFound(_)) => Some(Conflict::StalePlan),
         _ => None,
     }
 }

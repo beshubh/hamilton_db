@@ -3,8 +3,7 @@ use std::sync::Arc;
 use catalog::Catalog;
 use common::{Column, DataType, Schema, Value, ValueError};
 use parser::{BinaryOp, JoinKind, Statement, UnaryOp};
-use storage::buffer::buffer_pool_manager::BufferPoolManager;
-use storage::disk::disk_manager::DiskManager;
+use storage::concurrency::transaction_manager::TransactionManager;
 use tempfile::TempDir;
 
 use planner::Binder;
@@ -17,39 +16,53 @@ use planner::error::{PlannerError, Result};
 /// - `orders (id INT NOT NULL, user_id INT, total BIGINT)`
 struct Db {
     _dir: TempDir,
-    catalog: Catalog,
+    catalog: Arc<Catalog>,
+    tm: TransactionManager,
 }
 
 impl Db {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
-        let dm = Arc::new(DiskManager::new(dir.path().join("test.db")).unwrap());
-        let bpm = Arc::new(BufferPoolManager::new(16, dm));
-        let catalog = Catalog::open(bpm).unwrap();
-        catalog
-            .create_table(
-                "users",
-                Schema::new(vec![
-                    Column::new("id", DataType::Int, false),
-                    Column::new("name", DataType::Varchar(32), true),
-                    Column::new("score", DataType::BigInt, false),
-                    Column::new("active", DataType::Bool, true),
-                ]),
-                &[],
-            )
-            .unwrap();
-        catalog
-            .create_table(
-                "orders",
-                Schema::new(vec![
-                    Column::new("id", DataType::Int, false),
-                    Column::new("user_id", DataType::Int, true),
-                    Column::new("total", DataType::BigInt, true),
-                ]),
-                &[],
-            )
-            .unwrap();
-        Self { _dir: dir, catalog }
+        let bpm = storage::open(dir.path().join("test.db"), 16).unwrap().bpm;
+        let catalog = Arc::new(Catalog::open(Arc::clone(&bpm)).unwrap());
+        let tm = TransactionManager::new(bpm);
+        let db = Self {
+            _dir: dir,
+            catalog,
+            tm,
+        };
+        db.create_table(
+            "users",
+            Schema::new(vec![
+                Column::new("id", DataType::Int, false),
+                Column::new("name", DataType::Varchar(32), true),
+                Column::new("score", DataType::BigInt, false),
+                Column::new("active", DataType::Bool, true),
+            ]),
+        );
+        db.create_table(
+            "orders",
+            Schema::new(vec![
+                Column::new("id", DataType::Int, false),
+                Column::new("user_id", DataType::Int, true),
+                Column::new("total", DataType::BigInt, true),
+            ]),
+        );
+        db
+    }
+
+    /// Creates table `name` in a transaction of its own.
+    fn create_table(&self, name: &str, schema: Schema) {
+        let txn = self.tm.begin();
+        self.catalog.create_table(&txn, name, schema, &[]).unwrap();
+        self.tm.commit(&txn).unwrap();
+    }
+
+    /// Creates an empty index in a transaction of its own.
+    fn create_index(&self, name: &str, table: &str, key: &[&str]) {
+        let txn = self.tm.begin();
+        self.catalog.create_index(&txn, name, table, key).unwrap();
+        self.tm.commit(&txn).unwrap();
     }
 
     fn bind(&self, sql: &str) -> Result<BoundStatement> {
@@ -830,9 +843,7 @@ fn create_index() {
         db.err("CREATE INDEX i ON users (id, name, id)"),
         PlannerError::DuplicateColumn("id".into())
     );
-    db.catalog
-        .create_index("users_id", "users", &["id"])
-        .unwrap();
+    db.create_index("users_id", "users", &["id"]);
     assert_eq!(
         db.err("CREATE INDEX users_id ON orders (id)"),
         PlannerError::IndexExists("users_id".into())

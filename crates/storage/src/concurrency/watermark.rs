@@ -25,9 +25,10 @@
 //! a tuple marks an uncommitted version by storing its writer's Tid with
 //! that bit set.
 //!
-//! A restarted counter must not start below any committed `ts` on disk, or
-//! the new transactions would not see those versions. The catalog header
-//! keeps the next Tid for that, and [`Watermark::new`] takes it.
+//! A restarted counter must not start below any `ts` on disk: the new
+//! transactions would not see the committed versions, and would take the
+//! locked ones for their own. The log keeps the next Tid for that
+//! (`Log::next_tid`), and [`Watermark::new`] takes it.
 
 use std::collections::BTreeSet;
 use std::time::Instant;

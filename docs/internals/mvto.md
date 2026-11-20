@@ -11,7 +11,7 @@ The tuple header in the heap page is on disk. It holds:
 - The deleted flag.
 - The write lock, which is not a separate field. While the writer is running, `ts` holds the writer's Tid with `TXN_UNCOMMITTED_BIT` set. There is no lock table.
 
-The next Tid is also on disk, in the catalog header page. The engine writes it before each commit.
+The next Tid is not stored on its own: the log holds every Tid that wrote anything, and a restart starts above them ([Recovery](recovery.md#analysis-analyze)).
 
 The rest is in memory only, and a restart loses it:
 
@@ -54,42 +54,29 @@ One collector thread in [`TransactionManager`](../../crates/storage/src/concurre
 
 ## Restart and crashes
 
-There is no WAL. While the server runs, dirty pages reach disk in two ways: when the buffer pool evicts them, and at a periodic checkpoint ([`Checkpointer`](../../crates/hamilton-server/src/database.rs)). A checkpoint writes every dirty page, uncommitted versions included, and is not atomic across pages. A commit waits for neither.
+Opening a database replays the log, finishes the commits a crash cut off between their stamps, and undoes the transactions it cut off before they committed, so no tuple stays locked ([Recovery](recovery.md#undo-finish_transactions)). A commit survives a crash once `TransactionManager::commit` returns, and a reader never sees one that a crash can lose. The log does not hold what MVTO keeps in memory. A restart, clean or not, loses the undo log, the read timestamps, and the watermark, and a crash also loses the garbage collector's queue. That does no harm:
 
-Only a clean shutdown is safe. It stops the checkpoints and writes everything after the last transaction has ended. A restart loses the undo log, the read timestamps, and the watermark. After a clean shutdown the loss does no harm:
-
-- The new Tid counter starts from the catalog header, above every committed `ts` on disk. New readers therefore see those versions as committed.
+- The new Tid counter starts above every Tid in the log. New readers therefore see the committed versions as committed.
 - No reader is older than the versions on disk, so no reader walks an undo chain. Stale `undo_ptr`s are still on disk. `older_record` rejects them, because it requires the record's `rid` and `writer_ts` to match.
+- Opening ends with a sweep of every table and index, which collects what the queue held ([Recovery](recovery.md#the-startup-sweep)).
 
-A crash is not safe. Commits since the last checkpoint are lost, and a crash during a checkpoint leaves some pages written and others not. A locked tuple that reached disk keeps the uncommitted bit and an older Tid, so every later reader and writer fails on that tuple with `Conflict`. Nothing clears these locks when the database opens.
+`nextval` hands values out from a counter in memory, outside any transaction ([`sequence.rs`](../../crates/catalog/src/sequence.rs)). When the sequence's row stops covering the next value, `nextval` first writes it 32 values ahead, a redo-only record that nothing syncs. A value reaches a committed row only through an insert whose transaction logs `Commit` after that record, and the commit's sync makes the record durable too. So a crash skips up to 32 values and never repeats one that a committed row holds. A clean shutdown writes each row back to the last value handed out (`Catalog::save_sequences`), so only a crash skips. A way to hand a value out with no commit after it, such as `SELECT nextval(...)`, would need its own sync.
 
-Sequences need their own protection. `nextval` changes a sequence row ([`sequence.rs`](../../crates/catalog/src/sequence.rs)) in place, outside any transaction, at `ts` 0, so a crash also loses the latest changes to the row. Without more care, the sequence would then hand out ids that are already on disk. A sequence's page is in constant use, so it is written mostly at checkpoints, while the table pages that hold its ids are written whenever they are evicted.
+`TRUNCATE ... RESTART IDENTITY` is the only change that moves a sequence back. It is a change of the truncate's transaction, so an abort, or a crash before the commit, puts the row back ([Recovery](recovery.md#how-ddl-is-logged)).
 
-So `nextval` writes the row to disk 32 values ahead before it hands those values out. A checkpoint or an eviction can then write the page with the row's current value, which leaves the page clean. On its first call after that, `nextval` writes ahead again. After a crash, the sequence skips up to 32 values and never repeats one. The write ahead does the job of the WAL record that Postgres writes. `nextval` does not fsync, so the write survives a process crash but not a power loss.
+## Table locks, TRUNCATE and DROP TABLE
 
-`TRUNCATE ... RESTART IDENTITY` is the only change that moves a sequence back. The row therefore does not change until the truncate is on disk, as the next section explains.
+TRUNCATE does not delete rows. It gives the table a new, empty heap and new indexes ([`Catalog::truncate`](../../crates/catalog/src/catalog.rs)), and DROP TABLE takes the table away with its storage (`Catalog::drop_table`), so every reader loses the old versions at the same moment. No row timestamp is left to check either against other transactions. Table locks ([`locks.rs`](../../crates/catalog/src/locks.rs)) do that check:
 
-## Table locks and TRUNCATE
-
-TRUNCATE does not delete rows. It gives the table a new, empty heap and new indexes ([`Catalog::truncate`](../../crates/catalog/src/catalog.rs)), so every reader loses the old versions at the same moment. No row timestamp is left to check the truncate against other transactions. Table locks ([`locks.rs`](../../crates/catalog/src/locks.rs)) do that check:
-
-- Each statement locks the tables that its plan uses before it runs (`lock_tables` in [`executors.rs`](../../crates/execution/src/executors.rs)). Reads, writes, and CREATE INDEX take modes that conflict only with TRUNCATE's exclusive mode. A transaction holds its locks until it ends.
+- Each statement locks the tables that its plan uses before it runs (`lock_tables` in [`executors.rs`](../../crates/execution/src/executors.rs)). Reads, writes, and CREATE INDEX take modes that conflict only with the exclusive mode of TRUNCATE, DROP TABLE and DROP INDEX, which CREATE TABLE also holds on its new table until it ends. A transaction holds its locks until it ends. A plan names its indexes before its statement locks anything, so a statement outside a block is planned again on each attempt, and a plan that finds its index dropped meanwhile is retried as a conflict.
 - A lock never waits. A conflict fails the statement with `LockConflict`. Outside a block, the engine retries after the holder ends, whether the holder is older or newer. In a block, the block fails. No transaction waits while it holds a lock, so there are no deadlocks to detect. The cost is that an exclusive request can keep failing while readers keep arriving.
-- Locks also do the job of the timestamps that MVTO keeps on rows, and fail with `ChangedSince`. A transaction older than a committed truncate cannot use the table, because it comes first in Tid order and should still see the rows. A truncate cannot run in a transaction older than one that has used the table, because it would remove rows that the newer transaction wrote or read. Postgres has neither check. There, older snapshots see an empty table.
-- Garbage collection frees the replaced pages through `after_readers` work, after it has handled any garbage that still points into them.
+- Locks also do the job of the timestamps that MVTO keeps on rows, and fail with `ChangedSince`. A transaction older than a committed truncate cannot use the table, because it comes first in Tid order and should still see the rows. A truncate or drop cannot run in a transaction older than one that has used the table, because it would remove rows that the newer transaction wrote or read. DROP INDEX takes the same exclusive mode, so in a block older than a transaction that has used the table it also fails with `ChangedSince` (40001), even though dropping an index removes no rows. Postgres has neither check. There, older snapshots see an empty table.
+- Garbage collection frees the replaced or dropped pages after it has handled any garbage that still points into them.
 
-A commit that truncated costs a checkpoint. The engine prepares the commit first (`prepare_commit`):
-
-1. A checkpoint writes every page and the disk's list of pages.
-2. The catalog rows are pointed at the new pages in memory. A failure up to here aborts the transaction.
-3. The transaction commits.
-4. The new heap is written again, with its rows now stamped committed. Then the pages that hold the catalog rows are written.
-5. The restarted sequence is written, and the old pages are freed.
-
-A crash before the catalog rows reach disk finds the old table, complete. The checkpoint's sync holds the disk manager's lock, so every page read from disk and every page write to disk stalls until the sync ends.
+A truncate's new storage and the catalog rows that point at it, and a drop's catalog deletes, are changes of their statement's transaction, so they commit or roll back with it, across a crash too ([Recovery](recovery.md#how-ddl-is-logged)).
 
 ## Known gaps
 
 - **Phantoms.** Read timestamps guard tuples that exist. If an older transaction inserts a row that a newer transaction's scan should have seen, nothing detects it. Schedules with inserts are therefore not serializable.
-- **The catalog is not transactional.** CREATE TABLE and CREATE INDEX are rejected inside a block.
-- **A commit or abort that fails partway** leaves the transaction running, with some tuples finished and the rest locked.
+- **DDL is a transaction of its own.** CREATE TABLE, CREATE INDEX and DROP TABLE commit or roll back whole, but are rejected inside a block ([Recovery](recovery.md#how-ddl-is-logged)).
+- **The catalog has no versions.** A transaction older than a committed DROP TABLE finds the table gone, or, if its name was made again, the new table, where Tid order says it should still see the old rows. Table locks catch only a transaction that looked the table up before the drop removed it.

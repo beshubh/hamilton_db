@@ -30,7 +30,7 @@
 
 use std::ops::{Deref, DerefMut, Range};
 
-use common::{INVALID_PAGE_ID, PageId, Rid};
+use common::{INVALID_PAGE_ID, PageId, Rid, SlotId};
 use zerocopy::byteorder::little_endian::{I32, U16};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -62,6 +62,15 @@ struct RidBytes {
 
 const _: () = assert!(size_of::<RidBytes>() == 6);
 
+/// Where `insert_at` puts a key, as `insert_position` found it on a page
+/// that has not changed since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InsertPosition {
+    pub(crate) index: usize,
+    /// The tombstone of the key at `index`, which the insert revives.
+    pub(crate) tomb: Option<usize>,
+}
+
 /// A view of a B+tree leaf page with room for `NUM_TOMBS` tombstones over
 /// borrowed page bytes `BufT`, such as `guard.get_data()` (read-only) or
 /// `guard.get_data_mut()` (read-write).
@@ -73,7 +82,7 @@ pub struct BtreeLeafPage<BufT, const NUM_TOMBS: usize> {
 }
 
 impl<BufT, const NUM_TOMBS: usize> BtreeLeafPage<BufT, NUM_TOMBS> {
-    const LAYOUT: SlotLayout = SlotLayout::new(TOMBS_OFFSET + NUM_TOMBS * TOMB_SIZE, RID_SIZE);
+    const LAYOUT: SlotLayout = layout(NUM_TOMBS);
 
     /// Bytes for entries in an empty page.
     pub const CAPACITY: usize = Self::LAYOUT.capacity();
@@ -84,11 +93,6 @@ impl<BufT, const NUM_TOMBS: usize> BtreeLeafPage<BufT, NUM_TOMBS> {
     /// Bytes an entry with a key of `key_len` bytes takes: its slot and key.
     pub const fn entry_size(key_len: usize) -> usize {
         Self::LAYOUT.entry_size(key_len)
-    }
-
-    fn tomb_range(pos: usize) -> Range<usize> {
-        let start = TOMBS_OFFSET + pos * TOMB_SIZE;
-        start..start + TOMB_SIZE
     }
 }
 
@@ -146,16 +150,16 @@ impl<BufT: Deref<Target = [u8; PAGE_SIZE]>, const NUM_TOMBS: usize> BtreeLeafPag
     }
 
     pub fn num_tombstones(&self) -> usize {
-        self.header().num_tombstones.get() as usize
+        num_tombstones(&self.data)
     }
 
     /// Slot indexes of the tombstoned keys, oldest first.
     pub fn tombstones(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.num_tombstones()).map(|pos| self.read_tomb(pos))
+        (0..self.num_tombstones()).map(|pos| read_tomb(&self.data, pos))
     }
 
     pub fn is_tombstone(&self, index: usize) -> bool {
-        self.tomb_position(index).is_some()
+        tomb_position(&self.data, index).is_some()
     }
 
     /// The key at `index`, which must be in `0..size`. It may be tombstoned.
@@ -173,9 +177,15 @@ impl<BufT: Deref<Target = [u8; PAGE_SIZE]>, const NUM_TOMBS: usize> BtreeLeafPag
 
     /// The record id of `key`, unless it is missing or tombstoned.
     pub fn lookup(&self, key: &[u8], cmp: &impl KeyComparator) -> Option<Rid> {
+        self.live_index(key, cmp)
+            .map(|index| self.read_value(index))
+    }
+
+    /// The index of `key`, unless it is missing or tombstoned: what
+    /// `remove` deletes.
+    pub fn live_index(&self, key: &[u8], cmp: &impl KeyComparator) -> Option<usize> {
         let index = self.key_index(key, cmp);
-        (self.holds_at(index, key, cmp) && !self.is_tombstone(index))
-            .then(|| self.read_value(index))
+        (self.holds_at(index, key, cmp) && !self.is_tombstone(index)).then_some(index)
     }
 
     /// Bytes `remove(key)` would free: those of the entry it removes for
@@ -190,11 +200,29 @@ impl<BufT: Deref<Target = [u8; PAGE_SIZE]>, const NUM_TOMBS: usize> BtreeLeafPag
         let removed = if NUM_TOMBS == 0 {
             index
         } else if self.num_tombstones() == NUM_TOMBS {
-            self.read_tomb(0)
+            read_tomb(&self.data, 0)
         } else {
             return 0;
         };
         Self::entry_size(Self::LAYOUT.key(&self.data, removed).len())
+    }
+
+    /// Where `insert` would put `key`. Fails as `insert` does, and like it
+    /// changes nothing then.
+    pub fn insert_position(&self, key: &[u8], cmp: &impl KeyComparator) -> Result<InsertPosition> {
+        check_key_size(key, Self::MAX_KEY_SIZE)?;
+        let index = self.key_index(key, cmp);
+        if self.holds_at(index, key, cmp) {
+            let tomb = tomb_position(&self.data, index).ok_or(StorageError::DuplicateKey)?;
+            return Ok(InsertPosition {
+                index,
+                tomb: Some(tomb),
+            });
+        }
+        if !self.has_room_for(key.len()) {
+            return Err(StorageError::PageFull);
+        }
+        Ok(InsertPosition { index, tomb: None })
     }
 
     /// Index of the first key `>= key`, tombstoned or not, or `size` if there
@@ -221,20 +249,9 @@ impl<BufT: Deref<Target = [u8; PAGE_SIZE]>, const NUM_TOMBS: usize> BtreeLeafPag
                 .is_eq()
     }
 
-    /// Position in the tombstone buffer of the tombstone for slot `index`.
-    fn tomb_position(&self, index: usize) -> Option<usize> {
-        (0..self.num_tombstones()).find(|&pos| self.read_tomb(pos) == index)
-    }
-
     fn read_value(&self, index: usize) -> Rid {
         let rid = RidBytes::ref_from_bytes(Self::LAYOUT.value(&self.data, index)).unwrap();
         Rid::new(rid.page_id.get(), rid.slot.get())
-    }
-
-    fn read_tomb(&self, pos: usize) -> usize {
-        U16::ref_from_bytes(&self.data[Self::tomb_range(pos)])
-            .unwrap()
-            .get() as usize
     }
 
     fn check_index(&self, index: usize) {
@@ -246,7 +263,7 @@ impl<BufT: Deref<Target = [u8; PAGE_SIZE]>, const NUM_TOMBS: usize> BtreeLeafPag
     }
 
     fn header(&self) -> &LeafHeader {
-        LeafHeader::ref_from_bytes(&self.data[LEAF_HEADER_OFFSET..TOMBS_OFFSET]).unwrap()
+        header(&self.data)
     }
 }
 
@@ -268,7 +285,7 @@ impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>, const NUM_TOMBS: usize>
     }
 
     pub fn set_next_page_id(&mut self, page_id: PageId) {
-        self.header_mut().next_page_id = page_id.into();
+        header_mut(&mut self.data).next_page_id = page_id.into();
     }
 
     /// Inserts `key` with `rid` and returns its index. A tombstoned `key` is
@@ -279,52 +296,24 @@ impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>, const NUM_TOMBS: usize>
     /// entry does not fit; the caller splits the page first, or makes room
     /// with `purge_tombstones`.
     pub fn insert(&mut self, key: &[u8], rid: Rid, cmp: &impl KeyComparator) -> Result<usize> {
-        check_key_size(key, Self::MAX_KEY_SIZE)?;
-        let index = self.key_index(key, cmp);
-        if self.holds_at(index, key, cmp) {
-            let Some(pos) = self.tomb_position(index) else {
-                return Err(StorageError::DuplicateKey);
-            };
-            self.remove_tomb(pos);
-            self.write_value(index, rid);
-            return Ok(index);
-        }
-        if !self.has_room_for(key.len()) {
-            return Err(StorageError::PageFull);
-        }
-        for pos in 0..self.num_tombstones() {
-            let t = self.read_tomb(pos);
-            if t >= index {
-                self.write_tomb(pos, t + 1);
-            }
-        }
-        Self::LAYOUT.insert(&mut self.data, index, key, rid_bytes(rid).as_bytes());
-        Ok(index)
+        let position = self.insert_position(key, cmp)?;
+        Ok(self.insert_at(position, key, rid))
+    }
+
+    /// Inserts `key` with `rid` at `position`, which `insert_position` gave
+    /// for `key`, and returns its index.
+    pub fn insert_at(&mut self, position: InsertPosition, key: &[u8], rid: Rid) -> usize {
+        insert_at(&mut self.data, NUM_TOMBS, position, key, rid);
+        position.index
     }
 
     /// Deletes `key` by tombstoning it, and returns its record id, or `None`
     /// if it is missing or already tombstoned. If the tombstone buffer is
     /// full, the oldest tombstoned key is removed for good first.
     pub fn remove(&mut self, key: &[u8], cmp: &impl KeyComparator) -> Option<Rid> {
-        let mut index = self.key_index(key, cmp);
-        if !self.holds_at(index, key, cmp) || self.is_tombstone(index) {
-            return None;
-        }
+        let index = self.live_index(key, cmp)?;
         let rid = self.read_value(index);
-        if NUM_TOMBS == 0 {
-            self.remove_slot(index);
-            return Some(rid);
-        }
-        if self.num_tombstones() == NUM_TOMBS {
-            let oldest = self.read_tomb(0);
-            self.remove_slot(oldest);
-            if index > oldest {
-                index -= 1;
-            }
-        }
-        let count = self.num_tombstones();
-        self.write_tomb(count, index);
-        self.header_mut().num_tombstones = (count as u16 + 1).into();
+        remove_live(&mut self.data, NUM_TOMBS, index);
         Some(rid)
     }
 
@@ -333,7 +322,7 @@ impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>, const NUM_TOMBS: usize>
     pub fn remove_at(&mut self, index: usize) -> (Vec<u8>, Rid) {
         self.check_index(index);
         let removed = (self.key_at(index).to_vec(), self.read_value(index));
-        self.remove_slot(index);
+        remove_slot(&mut self.data, Self::LAYOUT, index);
         removed
     }
 
@@ -343,7 +332,7 @@ impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>, const NUM_TOMBS: usize>
         // Highest first, so removing one does not move the others.
         tombs.sort_unstable_by(|a, b| b.cmp(a));
         for index in tombs {
-            self.remove_slot(index);
+            remove_slot(&mut self.data, Self::LAYOUT, index);
         }
     }
 
@@ -455,50 +444,176 @@ impl<BufT: DerefMut<Target = [u8; PAGE_SIZE]>, const NUM_TOMBS: usize>
         );
     }
 
-    /// Removes slot `index` and its tombstone, if any. Tombstones follow
-    /// their keys.
-    fn remove_slot(&mut self, index: usize) {
-        if let Some(pos) = self.tomb_position(index) {
-            self.remove_tomb(pos);
-        }
-        Self::LAYOUT.remove(&mut self.data, index);
-        for pos in 0..self.num_tombstones() {
-            let t = self.read_tomb(pos);
-            if t > index {
-                self.write_tomb(pos, t - 1);
-            }
-        }
-    }
-
-    /// Drops the tombstone at `pos` in the buffer, keeping the rest in order.
-    fn remove_tomb(&mut self, pos: usize) {
-        let count = self.num_tombstones();
-        let tombs = Self::tomb_range(pos + 1).start..Self::tomb_range(count).start;
-        self.data.copy_within(tombs, Self::tomb_range(pos).start);
-        self.header_mut().num_tombstones = (count as u16 - 1).into();
-    }
-
     /// Replaces the whole tombstone buffer, oldest first.
     fn set_tombstones(&mut self, tombs: &[usize]) {
         for (pos, &index) in tombs.iter().enumerate() {
-            self.write_tomb(pos, index);
+            write_tomb(&mut self.data, pos, index);
         }
-        self.header_mut().num_tombstones = (tombs.len() as u16).into();
+        header_mut(&mut self.data).num_tombstones = (tombs.len() as u16).into();
     }
+}
 
-    fn write_value(&mut self, index: usize, rid: Rid) {
-        Self::LAYOUT
-            .value_mut(&mut self.data, index)
+// The changes a `PageOp` logs, written once over a tombstone capacity known
+// only at run time. Redo learns it from the op, and the typed page passes
+// `NUM_TOMBS`. Every other change to a leaf is logged as an image.
+
+/// Inserts as `insert_at` does, once it has checked that `insert_position`
+/// could give `position` for `key` on the leaf in `data`. Fails with
+/// `InvalidSlot` or `PageFull`, changing nothing, if it could not.
+pub(crate) fn apply_insert(
+    data: &mut [u8; PAGE_SIZE],
+    num_tombs: usize,
+    position: InsertPosition,
+    key: &[u8],
+    rid: Rid,
+) -> Result<()> {
+    check_leaf(data)?;
+    let layout = layout(num_tombs);
+    let InsertPosition { index, tomb } = position;
+    let bad = || StorageError::InvalidSlot(index as SlotId);
+    if index > layout.size(data) || num_tombstones(data) > num_tombs {
+        return Err(bad());
+    }
+    match tomb {
+        Some(pos) if pos >= num_tombstones(data) || read_tomb(data, pos) != index => {
+            return Err(bad());
+        }
+        Some(_) => {}
+        None => {
+            check_key_size(key, layout.max_key_size())?;
+            if layout.entry_size(key.len()) > layout.free_space(data) {
+                return Err(StorageError::PageFull);
+            }
+        }
+    }
+    insert_at(data, num_tombs, position, key, rid);
+    Ok(())
+}
+
+/// Removes the live key at `index`, as `remove` does. Fails with
+/// `InvalidSlot`, changing nothing, if there is none.
+pub(crate) fn apply_remove(
+    data: &mut [u8; PAGE_SIZE],
+    num_tombs: usize,
+    index: usize,
+) -> Result<()> {
+    check_leaf(data)?;
+    if index >= layout(num_tombs).size(data)
+        || tomb_position(data, index).is_some()
+        || num_tombstones(data) > num_tombs
+    {
+        return Err(StorageError::InvalidSlot(index as SlotId));
+    }
+    remove_live(data, num_tombs, index);
+    Ok(())
+}
+
+fn insert_at(
+    data: &mut [u8; PAGE_SIZE],
+    num_tombs: usize,
+    position: InsertPosition,
+    key: &[u8],
+    rid: Rid,
+) {
+    let InsertPosition { index, tomb } = position;
+    let layout = layout(num_tombs);
+    if let Some(pos) = tomb {
+        remove_tomb(data, pos);
+        layout
+            .value_mut(data, index)
             .copy_from_slice(rid_bytes(rid).as_bytes());
+        return;
     }
+    for pos in 0..num_tombstones(data) {
+        let t = read_tomb(data, pos);
+        if t >= index {
+            write_tomb(data, pos, t + 1);
+        }
+    }
+    layout.insert(data, index, key, rid_bytes(rid).as_bytes());
+}
 
-    fn write_tomb(&mut self, pos: usize, index: usize) {
-        self.data[Self::tomb_range(pos)].copy_from_slice(U16::new(index as u16).as_bytes());
+/// Tombstones the live key at `index`, or removes it for good with no
+/// room for tombstones. A full tombstone buffer gives up its oldest key
+/// for good first.
+fn remove_live(data: &mut [u8; PAGE_SIZE], num_tombs: usize, mut index: usize) {
+    let layout = layout(num_tombs);
+    if num_tombs == 0 {
+        remove_slot(data, layout, index);
+        return;
     }
+    if num_tombstones(data) == num_tombs {
+        let oldest = read_tomb(data, 0);
+        remove_slot(data, layout, oldest);
+        if index > oldest {
+            index -= 1;
+        }
+    }
+    let count = num_tombstones(data);
+    write_tomb(data, count, index);
+    header_mut(data).num_tombstones = (count as u16 + 1).into();
+}
 
-    fn header_mut(&mut self) -> &mut LeafHeader {
-        LeafHeader::mut_from_bytes(&mut self.data[LEAF_HEADER_OFFSET..TOMBS_OFFSET]).unwrap()
+/// Removes slot `index` and its tombstone, if any. Tombstones follow their
+/// keys.
+fn remove_slot(data: &mut [u8; PAGE_SIZE], layout: SlotLayout, index: usize) {
+    if let Some(pos) = tomb_position(data, index) {
+        remove_tomb(data, pos);
     }
+    layout.remove(data, index);
+    for pos in 0..num_tombstones(data) {
+        let t = read_tomb(data, pos);
+        if t > index {
+            write_tomb(data, pos, t - 1);
+        }
+    }
+}
+
+/// The slot layout of a leaf with room for `num_tombs` tombstones.
+const fn layout(num_tombs: usize) -> SlotLayout {
+    SlotLayout::new(TOMBS_OFFSET + num_tombs * TOMB_SIZE, RID_SIZE)
+}
+
+fn check_leaf(data: &[u8; PAGE_SIZE]) -> Result<()> {
+    BtreeLeafPage::<_, 0>::new(data).map(drop)
+}
+
+fn header(data: &[u8; PAGE_SIZE]) -> &LeafHeader {
+    LeafHeader::ref_from_bytes(&data[LEAF_HEADER_OFFSET..TOMBS_OFFSET]).unwrap()
+}
+
+fn header_mut(data: &mut [u8; PAGE_SIZE]) -> &mut LeafHeader {
+    LeafHeader::mut_from_bytes(&mut data[LEAF_HEADER_OFFSET..TOMBS_OFFSET]).unwrap()
+}
+
+fn num_tombstones(data: &[u8; PAGE_SIZE]) -> usize {
+    header(data).num_tombstones.get() as usize
+}
+
+fn tomb_range(pos: usize) -> Range<usize> {
+    let start = TOMBS_OFFSET + pos * TOMB_SIZE;
+    start..start + TOMB_SIZE
+}
+
+fn read_tomb(data: &[u8; PAGE_SIZE], pos: usize) -> usize {
+    U16::ref_from_bytes(&data[tomb_range(pos)]).unwrap().get() as usize
+}
+
+fn write_tomb(data: &mut [u8; PAGE_SIZE], pos: usize, index: usize) {
+    data[tomb_range(pos)].copy_from_slice(U16::new(index as u16).as_bytes());
+}
+
+/// Position in the tombstone buffer of the tombstone for slot `index`.
+fn tomb_position(data: &[u8; PAGE_SIZE], index: usize) -> Option<usize> {
+    (0..num_tombstones(data)).find(|&pos| read_tomb(data, pos) == index)
+}
+
+/// Drops the tombstone at `pos` in the buffer, keeping the rest in order.
+fn remove_tomb(data: &mut [u8; PAGE_SIZE], pos: usize) {
+    let count = num_tombstones(data);
+    let tombs = tomb_range(pos + 1).start..tomb_range(count).start;
+    data.copy_within(tombs, tomb_range(pos).start);
+    header_mut(data).num_tombstones = (count as u16 - 1).into();
 }
 
 fn rid_bytes(rid: Rid) -> RidBytes {

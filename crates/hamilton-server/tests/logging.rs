@@ -2,14 +2,24 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 use tempfile::TempDir;
 use wire::Client;
 
+/// Kills and reaps the server on drop, so a panicking test leaves none running.
+struct Killed(Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Runs the server binary with HAMILTON_LOG set to `log`, or unset, inserts
 /// a row that takes its id from a sequence, and returns what the server
-/// wrote to stderr after its startup line.
+/// wrote to stderr after the line saying where it listens.
 fn stderr_after_an_insert(log: Option<&str>) -> String {
     let dir = TempDir::new().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_hamilton-server"));
@@ -21,10 +31,14 @@ fn stderr_after_an_insert(log: Option<&str>) -> String {
     if let Some(log) = log {
         command.env("HAMILTON_LOG", log);
     }
-    let mut server = command.spawn().unwrap();
-    let mut stderr = BufReader::new(server.stderr.take().unwrap());
+    let mut server = Killed(command.spawn().unwrap());
+    let mut stderr = BufReader::new(server.0.stderr.take().unwrap());
     let mut startup = String::new();
-    stderr.read_line(&mut startup).unwrap();
+    while !startup.contains("listening on") {
+        startup.clear();
+        let read = stderr.read_line(&mut startup).unwrap();
+        assert!(read > 0, "the server stopped before listening");
+    }
     let addr: SocketAddr = startup
         .split_whitespace()
         .find_map(|word| word.trim_end_matches(',').parse().ok())
@@ -38,19 +52,18 @@ fn stderr_after_an_insert(log: Option<&str>) -> String {
         assert_eq!(client.simple_query(sql).unwrap().error, None, "{sql}");
     }
     drop(client);
-    server.kill().unwrap();
-    server.wait().unwrap();
+    drop(server);
     let mut rest = String::new();
     stderr.read_to_string(&mut rest).unwrap();
     rest
 }
 
 #[test]
-fn the_mock_wal_record_of_a_sequence_is_logged_at_debug() {
+fn a_sequence_logging_ahead_is_logged_at_debug() {
     let logged = stderr_after_an_insert(Some("debug"));
     assert!(
         logged.contains(
-            "DEBUG catalog::sequence: sequence t_id_seq: WAL record would cover values through 33"
+            "DEBUG catalog::sequence: sequence t_id_seq: the row covers values through 33"
         ),
         "{logged}"
     );
