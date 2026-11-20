@@ -21,6 +21,9 @@ pub enum PlannerError {
     #[error("index {0} already exists")]
     IndexExists(String),
 
+    #[error("index \"{0}\" does not exist")]
+    IndexNotFound(String),
+
     /// A qualifier (`t.a`, `t.*`) names no table in FROM.
     #[error("missing FROM entry for table {0}")]
     UnknownTable(String),

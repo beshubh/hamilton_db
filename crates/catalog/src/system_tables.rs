@@ -103,6 +103,7 @@ pub(crate) struct IndexRow {
     pub table_oid: TableOid,
     pub header_page_id: PageId,
     pub kind: IndexKind,
+    pub constraint: bool,
 }
 
 /// A row of `index_columns`: key column `position` of index `index_oid` is
@@ -189,7 +190,7 @@ impl SystemTables {
             Value::Varchar(row.name.clone()),
             oid_value(row.table_oid),
             Value::Int(row.header_page_id),
-            Value::Int(encode_kind(row.kind)),
+            Value::Int(encode_kind(row.kind, row.constraint)),
         ];
         insert(by, &self.indexes, &INDEXES_SCHEMA, &values)
     }
@@ -265,12 +266,14 @@ impl SystemTables {
 
     pub fn scan_indexes(&self) -> Result<Vec<IndexRow>> {
         scan(&self.indexes, &INDEXES_SCHEMA, |values| {
+            let (kind, constraint) = decode_kind(as_int(&values[4])?)?;
             Ok(IndexRow {
                 oid: as_oid(&values[0])?,
                 name: as_string(&values[1])?,
                 table_oid: as_oid(&values[2])?,
                 header_page_id: as_int(&values[3])?,
-                kind: decode_kind(as_int(&values[4])?)?,
+                kind,
+                constraint,
             })
         })
     }
@@ -402,31 +405,36 @@ fn decode_relation_kind(kind: i32) -> Result<RelationKind> {
     })
 }
 
-fn encode_kind(kind: IndexKind) -> i32 {
-    match kind {
-        IndexKind::Plain => 0,
-        IndexKind::Unique {
-            nulls_distinct: true,
-        } => 1,
-        IndexKind::Unique {
-            nulls_distinct: false,
-        } => 2,
-        IndexKind::PrimaryKey => 3,
-    }
+const UNIQUE: IndexKind = IndexKind::Unique {
+    nulls_distinct: true,
+};
+const UNIQUE_NULLS_NOT_DISTINCT: IndexKind = IndexKind::Unique {
+    nulls_distinct: false,
+};
+
+const INDEX_KINDS: [(i32, IndexKind, bool); 6] = [
+    (0, IndexKind::Plain, false),
+    (1, UNIQUE, false),
+    (2, UNIQUE_NULLS_NOT_DISTINCT, false),
+    (3, IndexKind::PrimaryKey, true),
+    (4, UNIQUE, true),
+    (5, UNIQUE_NULLS_NOT_DISTINCT, true),
+];
+
+fn encode_kind(kind: IndexKind, constraint: bool) -> i32 {
+    let (code, ..) = INDEX_KINDS
+        .iter()
+        .find(|&&(_, k, c)| k == kind && c == constraint)
+        .expect("a primary key is a constraint, a plain index is not");
+    *code
 }
 
-fn decode_kind(kind: i32) -> Result<IndexKind> {
-    Ok(match kind {
-        0 => IndexKind::Plain,
-        1 => IndexKind::Unique {
-            nulls_distinct: true,
-        },
-        2 => IndexKind::Unique {
-            nulls_distinct: false,
-        },
-        3 => IndexKind::PrimaryKey,
-        other => return Err(CatalogError::Corrupt(format!("unknown index kind {other}"))),
-    })
+fn decode_kind(code: i32) -> Result<(IndexKind, bool)> {
+    INDEX_KINDS
+        .iter()
+        .find(|&&(c, ..)| c == code)
+        .map(|&(_, kind, constraint)| (kind, constraint))
+        .ok_or_else(|| CatalogError::Corrupt(format!("unknown index kind {code}")))
 }
 
 fn oid_value(oid: u32) -> Value {
@@ -506,18 +514,17 @@ mod tests {
 
     #[test]
     fn index_kinds_round_trip() {
-        for kind in [
-            IndexKind::Plain,
-            IndexKind::Unique {
-                nulls_distinct: true,
-            },
-            IndexKind::Unique {
-                nulls_distinct: false,
-            },
-            IndexKind::PrimaryKey,
+        for (kind, constraint) in [
+            (IndexKind::Plain, false),
+            (UNIQUE, false),
+            (UNIQUE_NULLS_NOT_DISTINCT, false),
+            (UNIQUE, true),
+            (UNIQUE_NULLS_NOT_DISTINCT, true),
+            (IndexKind::PrimaryKey, true),
         ] {
-            assert_eq!(decode_kind(encode_kind(kind)).unwrap(), kind);
+            let code = encode_kind(kind, constraint);
+            assert_eq!(decode_kind(code).unwrap(), (kind, constraint));
         }
-        assert!(matches!(decode_kind(4), Err(CatalogError::Corrupt(_))));
+        assert!(matches!(decode_kind(6), Err(CatalogError::Corrupt(_))));
     }
 }

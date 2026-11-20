@@ -164,6 +164,9 @@ pub struct IndexInfo {
     /// Whether rows may share a key, and whether this is the table's primary
     /// key.
     pub kind: IndexKind,
+    /// Whether a PRIMARY KEY or UNIQUE constraint made the index, which then
+    /// can't be dropped on its own.
+    pub constraint: bool,
     /// Which `RowLocator` the index stores. Not saved to disk: it follows
     /// from whether the table has a primary key.
     pub locator: LocatorKind,
@@ -182,6 +185,7 @@ impl fmt::Debug for IndexInfo {
             .field("key_schema", &self.key_schema)
             .field("header_page_id", &self.header_page_id)
             .field("kind", &self.kind)
+            .field("constraint", &self.constraint)
             .field("locator", &self.locator)
             .finish()
     }
@@ -211,6 +215,8 @@ struct CatalogState {
     index_names: HashMap<String, IndexOid>,
     /// Each table's indexes, in the order they were created.
     table_indexes: HashMap<TableOid, Vec<IndexOid>>,
+    /// Indexes whose drop has not ended yet, still holding their names.
+    dropping: HashMap<IndexOid, Arc<IndexInfo>>,
     next_table_oid: TableOid,
     next_index_oid: IndexOid,
 }
@@ -405,6 +411,7 @@ impl Catalog {
                 key_schema,
                 header_page_id: row.header_page_id,
                 kind: row.kind,
+                constraint: row.constraint,
                 locator,
                 index,
             };
@@ -612,6 +619,7 @@ impl Catalog {
                     index.kind,
                     has_primary_key,
                 )
+                .made_by_constraint()
             })
             .collect();
         let metadata: Vec<&IndexMetadata> = planned.iter().map(|plan| &plan.metadata).collect();
@@ -824,6 +832,7 @@ impl Catalog {
                 table_oid: index.table_oid,
                 header_page_id: index.header_page_id,
                 kind: index.kind,
+                constraint: index.constraint,
             },
         )
     }
@@ -874,6 +883,7 @@ impl Catalog {
                     key_schema: index.key_schema.clone(),
                     header_page_id: btree.tree().header_page_id(),
                     kind: index.kind,
+                    constraint: index.constraint,
                     locator: index.locator,
                     index: Arc::new(tree),
                 })
@@ -970,6 +980,57 @@ impl Catalog {
         Ok(())
     }
 
+    /// `txn` must hold the index's table in `AccessExclusive`. An abort or a
+    /// crash before the commit keeps the index whole, and its name stays
+    /// taken until `txn` ends. An index a constraint made is refused. If this
+    /// fails, `txn` must abort.
+    pub fn drop_index(self: &Arc<Self>, txn: &Transaction, oid: IndexOid) -> Result<()> {
+        let mut state = self.state.write();
+        let index = state
+            .indexes
+            .get(&oid)
+            .cloned()
+            .ok_or_else(|| CatalogError::IndexNotFound(oid.to_string()))?;
+        if index.constraint {
+            return Err(CatalogError::IndexRequiredByConstraint {
+                index: index.name.clone(),
+                table: index.table_name.clone(),
+            });
+        }
+        txn.drop_storage(&[], &[index.header_page_id])?;
+        txn.undoable(|by| {
+            self.system.delete_index(by, oid)?;
+            self.system.delete_index_columns(by, oid)
+        })?;
+
+        let table_indexes = state.table_indexes.entry(index.table_oid).or_default();
+        let position = table_indexes
+            .iter()
+            .position(|&other| other == oid)
+            .expect("an index is among its table's");
+        let catalog = Arc::clone(self);
+        let dropped = Arc::clone(&index);
+        txn.on_end(move |outcome| {
+            let mut state = catalog.state.write();
+            state.dropping.remove(&oid);
+            match outcome {
+                Outcome::Committed => {
+                    state.index_names.remove(&dropped.name);
+                }
+                // Hooks run newest first, so later drops are back already.
+                Outcome::Aborted => {
+                    let indexes = state.table_indexes.entry(dropped.table_oid).or_default();
+                    indexes.insert(position, oid);
+                    state.indexes.insert(oid, dropped);
+                }
+            }
+        })?;
+        table_indexes.remove(position);
+        state.indexes.remove(&oid);
+        state.dropping.insert(oid, index);
+        Ok(())
+    }
+
     /// Collects, through `tm`, the garbage a restart left where no queue
     /// holds it: every deleted tuple no transaction can see, in the system
     /// tables and in every table, and every index entry that no version
@@ -1011,6 +1072,14 @@ impl Catalog {
     pub fn get_index(&self, name: &str) -> Option<Arc<IndexInfo>> {
         let state = self.state.read();
         state.indexes.get(state.index_names.get(name)?).cloned()
+    }
+
+    /// Like `get_index`, but also finds an index another transaction is
+    /// dropping, so that a second drop waits on its table's lock.
+    pub fn get_index_to_drop(&self, name: &str) -> Option<Arc<IndexInfo>> {
+        let state = self.state.read();
+        let oid = state.index_names.get(name)?;
+        state.indexes.get(oid).or(state.dropping.get(oid)).cloned()
     }
 
     pub fn get_index_by_oid(&self, oid: IndexOid) -> Option<Arc<IndexInfo>> {
@@ -1110,6 +1179,7 @@ fn generated_name(name1: &str, name2: Option<&str>, label: &str) -> String {
 struct IndexPlan {
     name: String,
     kind: IndexKind,
+    constraint: bool,
     key: Vec<usize>,
     key_schema: Schema,
     locator: LocatorKind,
@@ -1133,10 +1203,19 @@ impl IndexPlan {
         Self {
             name,
             kind,
+            constraint: false,
             key,
             key_schema,
             locator,
             metadata,
+        }
+    }
+
+    /// This index, as made by a PRIMARY KEY or UNIQUE constraint.
+    fn made_by_constraint(self) -> Self {
+        Self {
+            constraint: true,
+            ..self
         }
     }
 
@@ -1160,6 +1239,7 @@ impl IndexPlan {
             key_schema: self.key_schema,
             header_page_id: btree.tree().header_page_id(),
             kind: self.kind,
+            constraint: self.constraint,
             locator: self.locator,
             index,
         }
@@ -2483,6 +2563,116 @@ mod tests {
             drop_table(&db, sequence.oid),
             Err(CatalogError::NotATable(_))
         ));
+    }
+
+    fn drop_index(db: &Db, txn: &Transaction, name: &str) -> Result<()> {
+        let index = db.catalog.get_index(name).unwrap();
+        db.catalog
+            .lock_table(txn, index.table_oid, LockMode::AccessExclusive)?;
+        db.catalog.drop_index(txn, index.oid)
+    }
+
+    #[test]
+    fn a_committed_drop_frees_the_index_and_then_its_name() {
+        let db = Db::new(16);
+        db.create_table("users", users(), &["id"]).unwrap();
+        db.create_table("teams", users(), &[]).unwrap();
+        let before = allocated(&db);
+        db.create_index("users_name", "users", &["name"]).unwrap();
+        db.create_index("users_score", "users", &["score"]).unwrap();
+
+        let oid = db.catalog.get_index("users_name").unwrap().oid;
+        let txn = db.tm.begin();
+        drop_index(&db, &txn, "users_name").unwrap();
+        assert!(db.catalog.get_index("users_name").is_none());
+        assert_eq!(
+            names(&db.catalog.table_indexes("users")),
+            ["users_pkey", "users_score"]
+        );
+        assert!(matches!(
+            db.catalog.drop_index(&txn, oid),
+            Err(CatalogError::IndexNotFound(_))
+        ));
+        let other = db.tm.begin();
+        assert!(matches!(
+            db.catalog
+                .create_index(&other, "users_name", "teams", &["name"]),
+            Err(CatalogError::IndexExists(_))
+        ));
+        db.tm.abort(&other).unwrap();
+        db.tm.commit(&txn).unwrap();
+        db.tm.wait_for_gc();
+        db.ddl(|txn| drop_index(&db, txn, "users_score")).unwrap();
+        db.tm.wait_for_gc();
+        assert_eq!(allocated(&db), before, "pages the drops did not free");
+
+        db.create_index("users_name", "teams", &["name"]).unwrap();
+        let db = db.restart();
+        assert_eq!(names(&db.catalog.table_indexes("users")), ["users_pkey"]);
+        assert_eq!(names(&db.catalog.table_indexes("teams")), ["users_name"]);
+    }
+
+    #[test]
+    fn an_aborted_drop_keeps_the_index() {
+        let db = Db::new(16);
+        db.create_table("users", users(), &["id"]).unwrap();
+        for name in ["users_name", "users_score", "users_active"] {
+            let column = &name["users_".len()..];
+            db.create_index(name, "users", &[column]).unwrap();
+        }
+        let indexes: Vec<String> = db
+            .catalog
+            .table_indexes("users")
+            .iter()
+            .map(|index| described(index))
+            .collect();
+        let pages = allocated(&db);
+
+        let txn = db.tm.begin();
+        drop_index(&db, &txn, "users_name").unwrap();
+        drop_index(&db, &txn, "users_active").unwrap();
+        assert_eq!(
+            names(&db.catalog.table_indexes("users")),
+            ["users_pkey", "users_score"]
+        );
+        db.tm.abort(&txn).unwrap();
+        db.tm.wait_for_gc();
+        let described_now = |db: &Db| -> Vec<String> {
+            let indexes = db.catalog.table_indexes("users");
+            indexes.iter().map(|index| described(index)).collect()
+        };
+        assert_eq!(described_now(&db), indexes);
+        assert_eq!(allocated(&db), pages, "pages the abort freed");
+        let db = db.restart();
+        assert_eq!(described_now(&db), indexes);
+    }
+
+    #[test]
+    fn a_constraints_index_cannot_be_dropped() {
+        let db = Db::new(16);
+        db.ddl(|txn| with_everything(&db, txn, "users")).unwrap();
+        let kind = IndexKind::Unique {
+            nulls_distinct: true,
+        };
+        db.create_index_with("users_score", "users", &["score"], kind, |_, _| Ok(()))
+            .unwrap();
+        let db = db.restart();
+        for name in ["users_pkey", "users_name_key"] {
+            let refused = db.ddl(|txn| drop_index(&db, txn, name));
+            assert!(
+                matches!(
+                    &refused,
+                    Err(CatalogError::IndexRequiredByConstraint { index, table })
+                        if index == name && table == "users"
+                ),
+                "{name}: {refused:?}"
+            );
+        }
+        db.ddl(|txn| drop_index(&db, txn, "users_score")).unwrap();
+        assert_eq!(
+            names(&db.catalog.table_indexes("users")),
+            ["users_pkey", "users_name_key"]
+        );
     }
 
     #[test]

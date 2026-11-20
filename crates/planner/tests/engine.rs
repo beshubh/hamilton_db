@@ -1169,6 +1169,15 @@ fn is_table_not_found(result: &Result<Output, EngineError>) -> bool {
     )
 }
 
+fn is_index_not_found(result: &Result<Output, EngineError>) -> bool {
+    matches!(
+        result,
+        Err(EngineError::Planner(planner::PlannerError::IndexNotFound(
+            _
+        )))
+    )
+}
+
 /// A dropped table takes its index and sequence with it, so all three
 /// names are free for a new table, whose ids start over.
 #[test]
@@ -1276,4 +1285,282 @@ fn a_statement_waiting_out_a_drop_finds_the_table_gone() {
         Err(EngineError::Execution(ExecutionError::TableNotFound(found))) if found == oid
     ));
     assert!(is_table_not_found(&db.try_run("SELECT * FROM users")));
+}
+
+fn tree_pages(db: &Db, name: &str) -> usize {
+    let index = db.engine.catalog().get_index(name).unwrap();
+    let Index::BtreeIndex(btree) = &*index.index;
+    btree.tree().page_ids().unwrap().len()
+}
+
+#[test]
+fn a_dropped_index_is_no_longer_used() {
+    let mut db = Db::with_tables();
+    let by_name = "SELECT id FROM accounts WHERE name = 'ann'";
+    assert!(uses_an_index(&mut db, by_name));
+    assert_eq!(db.ok("DROP INDEX accounts_name"), done("DROP INDEX"));
+    assert!(!uses_an_index(&mut db, by_name));
+    assert_eq!(db.rows(by_name), [[int(1)]]);
+    db.ok("INSERT INTO accounts VALUES (3, 'ann', 1)");
+    assert_eq!(sorted(db.rows(by_name)), [[int(1)], [int(3)]]);
+    assert!(is_index_not_found(&db.try_run("DROP INDEX accounts_name")));
+}
+
+#[test]
+fn drop_index_if_exists_skips_missing_indexes() {
+    let mut db = Db::with_tables();
+    assert_eq!(db.ok("DROP INDEX IF EXISTS nope"), done("DROP INDEX"));
+    assert_eq!(
+        db.ok("DROP INDEX IF EXISTS nope, log_id, log_id CASCADE"),
+        done("DROP INDEX")
+    );
+    assert!(db.engine.catalog().get_index("log_id").is_none());
+    assert_eq!(
+        db.rows("SELECT note FROM log WHERE id = 2"),
+        [[text("opened")]]
+    );
+}
+
+#[test]
+fn drop_index_drops_all_or_nothing() {
+    let mut db = Db::with_tables();
+    assert!(is_index_not_found(
+        &db.try_run("DROP INDEX accounts_name, missing")
+    ));
+    assert!(db.engine.catalog().get_index("accounts_name").is_some());
+    assert_eq!(db.ok("DROP INDEX log_id, log_id"), done("DROP INDEX"));
+    assert!(db.engine.catalog().get_index("log_id").is_none());
+}
+
+#[test]
+fn a_constraints_index_cannot_be_dropped() {
+    let mut db = Db::new();
+    db.ok("CREATE TABLE u (id INT PRIMARY KEY, email VARCHAR(16) UNIQUE)");
+    db.ok("CREATE UNIQUE INDEX u_email ON u (email)");
+    db.ok("INSERT INTO u VALUES (1, 'a')");
+    for sql in [
+        "DROP INDEX u_pkey",
+        "DROP INDEX u_email_key CASCADE",
+        "DROP INDEX u_email, u_pkey",
+    ] {
+        let result = db.try_run(sql);
+        assert!(
+            matches!(
+                &result,
+                Err(EngineError::Execution(ExecutionError::Catalog(
+                    CatalogError::IndexRequiredByConstraint { .. }
+                )))
+            ),
+            "{sql}: {result:?}"
+        );
+    }
+    let refused = db.try_run("DROP INDEX u_pkey").unwrap_err().to_string();
+    assert_eq!(
+        refused,
+        "cannot drop index u_pkey because constraint u_pkey on table u requires it"
+    );
+    assert_eq!(db.ok("DROP INDEX u_email"), done("DROP INDEX"));
+    assert!(db.try_run("INSERT INTO u VALUES (2, 'a')").is_err());
+}
+
+#[test]
+fn a_rolled_back_drop_keeps_the_index() {
+    let mut db = Db::with_tables();
+    let entries = db.all_entries();
+    let by_name = "SELECT id FROM accounts WHERE name = 'bo'";
+    db.ok("BEGIN");
+    db.ok("DROP INDEX accounts_name, log_id");
+    assert!(!uses_an_index(&mut db, by_name));
+    assert_eq!(db.rows(by_name), [[int(2)]]);
+    db.ok("ROLLBACK");
+    assert!(uses_an_index(&mut db, by_name));
+    assert_eq!(db.rows(by_name), [[int(2)]]);
+    assert_eq!(db.all_entries(), entries);
+}
+
+#[test]
+fn drop_index_frees_the_tree_on_commit_only() {
+    let mut db = Db::with_tables();
+    let values: Vec<_> = (10..400).map(|n| format!("({n}, 'n{n}', 0)")).collect();
+    db.ok(&format!(
+        "INSERT INTO accounts VALUES {}",
+        values.join(", ")
+    ));
+    let pages = tree_pages(&db, "accounts_name");
+    assert!(pages > 2, "the tree never split");
+    for (end, freed) in [("ROLLBACK", 0), ("COMMIT", pages)] {
+        db.engine.catalog().bpm().flush_all_pages().unwrap();
+        let deletes = db.disk.num_deletes();
+        db.ok("BEGIN");
+        db.ok("DROP INDEX accounts_name");
+        db.ok(end);
+        db.engine.transaction_manager().wait_for_gc();
+        assert_eq!(db.disk.num_deletes() - deletes, freed, "{end}");
+    }
+}
+
+#[test]
+fn a_block_that_writes_then_drops_an_index() {
+    for end in ["COMMIT", "ROLLBACK"] {
+        let mut db = Db::with_tables();
+        let entries = db.index_entries("accounts_name");
+        db.ok("BEGIN");
+        db.ok("INSERT INTO accounts VALUES (3, 'cy', 5)");
+        db.ok("UPDATE accounts SET name = 'dee' WHERE id = 1");
+        db.ok("DELETE FROM accounts WHERE id = 2");
+        db.ok("DROP INDEX accounts_name");
+        db.ok(end);
+        db.engine.transaction_manager().wait_for_gc();
+        let names = sorted(db.rows("SELECT name FROM accounts"));
+        if end == "COMMIT" {
+            assert_eq!(names, [[text("cy")], [text("dee")]]);
+            assert!(db.engine.catalog().get_index("accounts_name").is_none());
+        } else {
+            assert_eq!(names, [[text("ann")], [text("bo")]]);
+            assert_eq!(db.index_entries("accounts_name"), entries);
+            let by_name = "SELECT id FROM accounts WHERE name = 'ann'";
+            assert!(uses_an_index(&mut db, by_name));
+            assert_eq!(db.rows(by_name), [[int(1)]]);
+        }
+    }
+}
+
+#[test]
+fn a_block_that_drops_an_index_then_truncates() {
+    for end in ["COMMIT", "ROLLBACK"] {
+        let mut db = Db::with_tables();
+        let entries = db.index_entries("accounts_name");
+        db.ok("BEGIN");
+        db.ok("DROP INDEX accounts_name");
+        db.ok("TRUNCATE accounts");
+        db.ok("INSERT INTO accounts VALUES (3, 'cy', 5)");
+        db.ok(end);
+        db.engine.transaction_manager().wait_for_gc();
+        let rows = sorted(db.rows("SELECT * FROM accounts"));
+        if end == "COMMIT" {
+            assert_eq!(rows, [account(3, "cy", 5)]);
+            assert!(db.engine.catalog().get_index("accounts_name").is_none());
+        } else {
+            assert_eq!(rows, [account(1, "ann", 100), account(2, "bo", 50)]);
+            assert_eq!(db.index_entries("accounts_name"), entries);
+        }
+    }
+}
+
+#[test]
+fn a_block_that_truncates_then_drops_an_index() {
+    for end in ["COMMIT", "ROLLBACK"] {
+        let mut db = Db::with_tables();
+        let entries = db.index_entries("accounts_name");
+        db.ok("BEGIN");
+        db.ok("TRUNCATE accounts");
+        db.ok("INSERT INTO accounts VALUES (3, 'cy', 5)");
+        db.ok("DROP INDEX accounts_name");
+        db.ok(end);
+        db.engine.transaction_manager().wait_for_gc();
+        let rows = sorted(db.rows("SELECT * FROM accounts"));
+        if end == "COMMIT" {
+            assert_eq!(rows, [account(3, "cy", 5)]);
+            assert!(db.engine.catalog().get_index("accounts_name").is_none());
+        } else {
+            assert_eq!(rows, [account(1, "ann", 100), account(2, "bo", 50)]);
+            assert_eq!(db.index_entries("accounts_name"), entries);
+        }
+        let reopened = db.crash_copy();
+        let index = reopened.engine.catalog().get_index("accounts_name");
+        assert_eq!(index.is_some(), end == "ROLLBACK", "{end}");
+    }
+}
+
+#[test]
+fn a_drop_waits_for_another_sessions_drop_of_the_index() {
+    for end in ["ROLLBACK", "COMMIT"] {
+        let mut db = Db::with_tables();
+        let mut other = db.engine.session().with_conflict_timeout(Duration::ZERO);
+        db.ok("BEGIN");
+        db.ok("DROP INDEX accounts_name");
+        let result = run_in(&mut other, "DROP INDEX IF EXISTS accounts_name");
+        assert!(
+            matches!(
+                result,
+                Err(EngineError::Execution(ExecutionError::Catalog(
+                    CatalogError::LockConflict { .. }
+                )))
+            ),
+            "{result:?}"
+        );
+        db.ok(end);
+        let result = run_in(&mut other, "DROP INDEX accounts_name");
+        match end {
+            "ROLLBACK" => assert_eq!(result.unwrap(), done("DROP INDEX")),
+            _ => assert!(is_index_not_found(&result), "{result:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_dropped_index_keeps_its_name_until_the_drop_ends() {
+    for end in ["ROLLBACK", "COMMIT"] {
+        let mut db = Db::with_tables();
+        let mut other = db.engine.session().with_conflict_timeout(Duration::ZERO);
+        let create = "CREATE INDEX accounts_name ON log (note)";
+        db.ok("BEGIN");
+        db.ok("DROP INDEX accounts_name");
+        let result = run_in(&mut other, create);
+        assert!(
+            matches!(
+                result,
+                Err(EngineError::Execution(ExecutionError::Catalog(
+                    CatalogError::IndexExists(_)
+                )))
+            ),
+            "{result:?}"
+        );
+        db.ok(end);
+        let mut reopened = db.crash_copy();
+        let index = reopened.engine.catalog().get_index("accounts_name");
+        if end == "COMMIT" {
+            assert!(index.is_none());
+            run_in(&mut other, create).unwrap();
+        } else {
+            assert_eq!(index.unwrap().table_name, "accounts");
+        }
+        assert_eq!(
+            reopened.rows("SELECT id FROM accounts WHERE name = 'ann'"),
+            [[int(1)]]
+        );
+    }
+}
+
+#[test]
+fn a_statement_planned_on_a_dropped_index_runs_again_without_it() {
+    let mut db = Db::with_tables();
+    db.ok("CREATE INDEX log_note ON log (note)");
+    let mut other = db.engine.session();
+    let by_id = "SELECT note FROM log WHERE id = 1";
+    assert!(uses_an_index(&mut db, by_id));
+    db.ok("BEGIN");
+    db.ok("DROP INDEX log_note");
+    thread::scope(|s| {
+        let reader = s.spawn(|| rows_in(&mut other, by_id));
+        thread::sleep(Duration::from_millis(50));
+        assert!(!reader.is_finished(), "the read waits for the drop");
+        db.ok("DROP INDEX log_id");
+        db.ok("COMMIT");
+        assert_eq!(reader.join().unwrap(), [[text("opened")]]);
+    });
+}
+
+#[test]
+fn a_committed_drop_survives_a_restart() {
+    let mut db = Db::with_tables();
+    db.ok("DROP INDEX accounts_name");
+    db.engine.transaction_manager().wait_for_gc();
+    let mut db = db.crash_copy();
+    assert!(db.engine.catalog().get_index("accounts_name").is_none());
+    let by_name = "SELECT id FROM accounts WHERE name = 'bo'";
+    assert!(!uses_an_index(&mut db, by_name));
+    assert_eq!(db.rows(by_name), [[int(2)]]);
+    db.ok("CREATE INDEX accounts_name ON accounts (name)");
+    assert!(uses_an_index(&mut db, by_name));
 }

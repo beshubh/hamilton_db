@@ -373,13 +373,13 @@ impl<'a> Undo<'a> {
     /// whose header pages are `trees`.
     ///
     /// # Panics
-    /// If `heaps` is empty.
+    /// If both are empty.
     pub(crate) fn encode_drop(
         buf: &mut Vec<u8>,
         heaps: impl ExactSizeIterator<Item = PageId>,
         trees: impl ExactSizeIterator<Item = PageId>,
     ) {
-        assert!(heaps.len() > 0, "a drop gives up a table's heap");
+        assert!(heaps.len() + trees.len() > 0, "a drop gives up storage");
         Self::encode_roots(buf, UNDO_DROP, heaps, trees);
     }
 
@@ -477,7 +477,7 @@ impl<'a> Undo<'a> {
             }
             UNDO_DROP => {
                 let (heaps, trees) = r.roots()?;
-                if heaps.0.is_empty() {
+                if heaps.0.is_empty() && trees.0.is_empty() {
                     return Err(corrupt_undo(UNDO_DROP));
                 }
                 Self::Drop { heaps, trees }
@@ -695,11 +695,22 @@ mod tests {
     }
 
     #[test]
-    fn a_drop_without_a_heap_is_corrupt() {
+    fn a_drop_of_trees_alone_reads_back() {
+        let mut buf = Vec::new();
+        Undo::encode_drop(&mut buf, [].into_iter(), [9].into_iter());
+        let (undo, _) = Undo::decode(&buf).unwrap();
+        let Undo::Drop { heaps, trees } = undo else {
+            panic!("read back {undo:?}");
+        };
+        assert_eq!(heaps.iter().count(), 0);
+        assert_eq!(trees.iter().collect::<Vec<_>>(), [9]);
+    }
+
+    #[test]
+    fn a_drop_of_nothing_is_corrupt() {
         let mut buf = vec![UNDO_DROP];
         buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&1u16.to_le_bytes());
-        buf.extend_from_slice(&9i32.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
         assert!(Undo::decode(&buf).is_err());
     }
 }

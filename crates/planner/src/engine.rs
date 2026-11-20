@@ -286,13 +286,17 @@ impl ExecutionEngine {
         if let (Some(ddl), State::InBlock(_)) = (ddl, &self.state) {
             return Err(EngineError::NotInTransactionBlock(ddl));
         }
-        let plan = Planner::new(&self.catalog).plan(bound)?;
+        let planner = Planner::new(&self.catalog);
         if let State::InBlock(txn) = &self.state {
+            let plan = planner.plan(bound)?;
             return self.run_plan(txn, &plan, bound);
         }
         let deadline = Instant::now() + self.conflict_timeout;
         let mut attempt = 0;
         loop {
+            // A DROP INDEX that committed since the last attempt may have
+            // taken an index the old plan used.
+            let plan = planner.plan(bound)?;
             let txn = self.txn_manager.begin();
             let result = self
                 .run_plan(&txn, &plan, bound)
@@ -333,6 +337,7 @@ impl ExecutionEngine {
         let wait_for = match conflict {
             Conflict::Row(other) => Some(other).filter(|&other| other < tid),
             Conflict::Lock(other) => Some(other),
+            Conflict::StalePlan => None,
         };
         if let Some(other) = wait_for
             && !self.txn_manager.wait_for_end(other, deadline)
@@ -390,6 +395,7 @@ impl ExecutionEngine {
             // Postgres reports no count.
             BoundStatement::Truncate(_) => return Ok(Output::Done("TRUNCATE TABLE")),
             BoundStatement::DropTable(_) => return Ok(Output::Done("DROP TABLE")),
+            BoundStatement::DropIndex(_) => return Ok(Output::Done("DROP INDEX")),
             BoundStatement::Transaction(_) => unreachable!("transaction commands are not planned"),
         };
         if returns_rows {
@@ -448,6 +454,8 @@ enum Conflict {
     Row(TxnId),
     /// A transaction holding a table lock.
     Lock(TxnId),
+    /// A plan naming an index dropped since it was made.
+    StalePlan,
 }
 
 fn conflict(err: &EngineError) -> Option<Conflict> {
@@ -464,6 +472,7 @@ fn conflict(err: &EngineError) -> Option<Conflict> {
             other,
             ..
         })) => Some(Conflict::Row(*other)),
+        EngineError::Execution(ExecutionError::IndexNotFound(_)) => Some(Conflict::StalePlan),
         _ => None,
     }
 }

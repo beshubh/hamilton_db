@@ -14,6 +14,7 @@ mod aggregation;
 mod create_index;
 mod create_table;
 mod delete;
+mod drop_index;
 mod drop_table;
 mod explain;
 mod filter;
@@ -37,6 +38,7 @@ pub use aggregation::{Aggregate, AggregationPlan};
 pub use create_index::CreateIndexPlan;
 pub use create_table::CreateTablePlan;
 pub use delete::DeletePlan;
+pub use drop_index::{DropIndexPlan, DroppedIndex};
 pub use drop_table::DropTablePlan;
 pub use explain::ExplainPlan;
 pub use filter::FilterPlan;
@@ -90,6 +92,7 @@ pub enum AbstractPlanNode {
     DeletePlan,
     TruncatePlan,
     DropTablePlan,
+    DropIndexPlan,
     FilterPlan,
     ProjectionPlan,
     NestedLoopJoinPlan,

@@ -105,6 +105,7 @@ fn shape(plan: &AbstractPlanNode) -> String {
         AbstractPlanNode::DeletePlan(_) => "Delete",
         AbstractPlanNode::TruncatePlan(_) => "Truncate",
         AbstractPlanNode::DropTablePlan(_) => "DropTable",
+        AbstractPlanNode::DropIndexPlan(_) => "DropIndex",
         AbstractPlanNode::FilterPlan(_) => "Filter",
         AbstractPlanNode::ProjectionPlan(_) => "Projection",
         AbstractPlanNode::NestedLoopJoinPlan(_) => "NestedLoopJoin",
