@@ -10,6 +10,7 @@ common = { path = "../common" }
 ctrlc = { version = "3.5.2", features = ["termination"] }
 execution = { path = "../execution" }
 log = "0.4.34"
+parser = { path = "../parser" }
 planner = { path = "../planner" }
 storage = { path = "../storage" }
 wire = { path = "../wire" }

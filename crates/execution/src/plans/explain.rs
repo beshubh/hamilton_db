@@ -151,6 +151,9 @@ fn describe(plan: &AbstractPlanNode) -> (String, Vec<(&'static str, String)>) {
             1 => "Values (1 row)".to_string(),
             rows => format!("Values ({rows} rows)"),
         },
+        AbstractPlanNode::InsertPlan(plan) if plan.on_conflict_do_nothing() => {
+            format!("Insert on {} ON CONFLICT DO NOTHING", plan.table_name())
+        }
         AbstractPlanNode::InsertPlan(plan) => format!("Insert on {}", plan.table_name()),
         AbstractPlanNode::UpdatePlan(plan) => {
             // A column the UPDATE does not set reads itself.

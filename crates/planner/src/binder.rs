@@ -6,9 +6,11 @@
 //! columns they are stored in. See [`crate::bound`] for what comes out.
 
 mod aggregate;
+mod describe;
 mod expr;
 mod scope;
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -16,7 +18,7 @@ use catalog::{Catalog, RelationKind, TableInfo};
 use common::{DataType, Schema, Value, ValueError};
 use parser::{
     CreateIndex, CreateTable, Delete, DropIndex, DropTable, Expr, FromItem, Insert, JoinKind,
-    OrderByItem, Select, SelectItem, Statement, TableRef, Truncate, Update,
+    Limit, OrderByItem, Select, SelectItem, Statement, TableRef, Truncate, Update,
 };
 
 use self::aggregate::Rewriter;
@@ -29,13 +31,34 @@ use crate::bound::{
 };
 use crate::error::{PlannerError, Result};
 
+pub use self::describe::Described;
+
 pub struct Binder<'a> {
     catalog: &'a Catalog,
+    parameters: Parameters<'a>,
+}
+
+/// What `$n` binds to.
+enum Parameters<'a> {
+    /// The values of a statement about to run.
+    Values(&'a [Value]),
+    /// A statement being described: each parameter's type so far, `None`
+    /// until one is known.
+    Types(RefCell<Vec<Option<DataType>>>),
 }
 
 impl<'a> Binder<'a> {
     pub fn new(catalog: &'a Catalog) -> Self {
-        Self { catalog }
+        Self {
+            catalog,
+            parameters: Parameters::Values(&[]),
+        }
+    }
+
+    /// Binds `$n` to `values[n - 1]`.
+    pub fn with_parameters(mut self, values: &'a [Value]) -> Self {
+        self.parameters = Parameters::Values(values);
+        self
     }
 
     pub fn bind(&self, stmt: &Statement) -> Result<BoundStatement> {
@@ -59,7 +82,7 @@ impl<'a> Binder<'a> {
     /// The catalog checks the column names when the table is created.
     /// Primary key and identity columns are made NOT NULL, as in Postgres.
     fn bind_create_table(&self, create: &CreateTable) -> Result<BoundStatement> {
-        if self.catalog.get_table(&create.name).is_some() {
+        if !create.if_not_exists && self.catalog.get_table(&create.name).is_some() {
             return Err(PlannerError::TableExists(create.name.clone()));
         }
         for key in &create.unique {
@@ -102,6 +125,7 @@ impl<'a> Binder<'a> {
             primary_key: create.primary_key.clone(),
             unique: create.unique.clone(),
             identity: create.identity.clone(),
+            if_not_exists: create.if_not_exists,
         }))
     }
 
@@ -200,6 +224,7 @@ impl<'a> Binder<'a> {
         Ok(BoundStatement::Insert(BoundInsert {
             table,
             rows,
+            on_conflict_do_nothing: insert.on_conflict_do_nothing,
             returning,
         }))
     }
@@ -286,8 +311,40 @@ impl<'a> Binder<'a> {
             windows,
             projection,
             order_by,
-            limit: select.limit,
+            limit: match select.limit {
+                Some(limit) => self.bind_limit(limit)?,
+                None => None,
+            },
         })
+    }
+
+    /// The row count of `LIMIT n` or `LIMIT $n`. `LIMIT NULL` is no limit,
+    /// as in Postgres.
+    fn bind_limit(&self, limit: Limit) -> Result<Option<u64>> {
+        let n = match limit {
+            Limit::Count(n) => return Ok(Some(n)),
+            Limit::Parameter(n) => n,
+        };
+        let value = match &self.parameters {
+            Parameters::Values(values) => values
+                .get(n - 1)
+                .ok_or(PlannerError::ParameterNotFound(n))?,
+            Parameters::Types(types) => {
+                let mut types = types.borrow_mut();
+                if types.len() < n {
+                    types.resize(n, None);
+                }
+                types[n - 1].get_or_insert(DataType::BigInt);
+                return Ok(None);
+            }
+        };
+        match value {
+            Value::Null => Some(None),
+            Value::Int(count) => u64::try_from(*count).map(Some).ok(),
+            Value::BigInt(count) => u64::try_from(*count).map(Some).ok(),
+            _ => None,
+        }
+        .ok_or_else(|| PlannerError::InvalidLimit(value.to_string()))
     }
 
     /// Binds a FROM item, adding its tables to `scope`.

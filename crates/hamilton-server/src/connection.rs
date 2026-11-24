@@ -14,6 +14,7 @@ use wire::frontend::{self, Message, Startup};
 use wire::oid;
 
 use crate::database::{Database, Error, Session};
+use crate::extended::{Extended, Failure};
 
 /// What the server tells clients it is. Clients such as psql read the
 /// version to decide what they may send, and Django sets the time zone with
@@ -38,6 +39,7 @@ pub(crate) fn serve(db: &Database, mut stream: TcpStream) -> io::Result<()> {
         return Ok(());
     }
     let mut session = db.session();
+    let mut extended = Extended::default();
     let mut body = Vec::new();
     // After an extended query message fails, the rest up to its Sync are
     // skipped, as Postgres does.
@@ -52,14 +54,25 @@ pub(crate) fn serve(db: &Database, mut stream: TcpStream) -> io::Result<()> {
             Message::Terminate => return Ok(()),
             Message::Sync => {
                 skipping = false;
+                extended.sync(&session);
                 backend::ready_for_query(&mut out, status(&session));
             }
             Message::Flush => {}
-            Message::Extended(_) => {
-                if !skipping {
-                    let message =
-                        "the extended query protocol is not supported; use simple queries";
-                    backend::error_response(&mut out, "0A000", message);
+            Message::Parse(_)
+            | Message::Bind(_)
+            | Message::Describe(_)
+            | Message::Execute { .. }
+            | Message::Close(_)
+                if skipping => {}
+            message @ (Message::Parse(_)
+            | Message::Bind(_)
+            | Message::Describe(_)
+            | Message::Execute { .. }
+            | Message::Close(_)) => {
+                if let Err(Failure { code, message }) =
+                    extended.handle(&mut session, message, &mut out)
+                {
+                    backend::error_response(&mut out, code, &message);
                     skipping = true;
                 }
             }
@@ -140,15 +153,7 @@ fn write_output(out: &mut Vec<u8>, output: &Output) {
             let fields: Vec<Field> = columns.iter().map(field).collect();
             backend::row_description(out, &fields);
             for row in rows {
-                let mut data = DataRow::begin(out);
-                for value in row {
-                    match value {
-                        Value::Null => data.null(),
-                        Value::Bool(b) => data.text(if *b { "t" } else { "f" }),
-                        value => data.text(value),
-                    }
-                }
-                data.finish();
+                data_row(out, row, &[]);
             }
             backend::command_complete(out, &command_tag(command, rows.len()));
         }
@@ -159,7 +164,37 @@ fn write_output(out: &mut Vec<u8>, output: &Output) {
     }
 }
 
-fn command_tag(command: &str, count: impl std::fmt::Display) -> String {
+/// Writes `row`, its `i`-th value in binary format if `binary[i]` is, and
+/// in text format past the end of `binary`.
+pub(crate) fn data_row(out: &mut Vec<u8>, row: &[Value], binary: &[bool]) {
+    let mut data = DataRow::begin(out);
+    for (i, value) in row.iter().enumerate() {
+        if binary.get(i).copied().unwrap_or(false) {
+            match value {
+                Value::Null => data.null(),
+                Value::Int(n) => data.bytes(&n.to_be_bytes()),
+                Value::BigInt(n) => data.bytes(&n.to_be_bytes()),
+                Value::Double(n) => data.bytes(&n.to_be_bytes()),
+                Value::Bool(b) => data.bytes(&[u8::from(*b)]),
+                Value::Varchar(s) => data.bytes(s.as_bytes()),
+                Value::Timestamptz(micros) => {
+                    data.bytes(&(micros - crate::extended::POSTGRES_EPOCH).to_be_bytes())
+                }
+                // Described as TEXT, whose binary format is its text.
+                Value::Array(_) => data.text(value),
+            }
+            continue;
+        }
+        match value {
+            Value::Null => data.null(),
+            Value::Bool(b) => data.text(if *b { "t" } else { "f" }),
+            value => data.text(value),
+        }
+    }
+    data.finish();
+}
+
+pub(crate) fn command_tag(command: &str, count: impl std::fmt::Display) -> String {
     match command {
         // Postgres puts an oid, always 0 now, before INSERT's count.
         "INSERT" => format!("INSERT 0 {count}"),
@@ -167,7 +202,11 @@ fn command_tag(command: &str, count: impl std::fmt::Display) -> String {
     }
 }
 
-fn field(column: &Column) -> Field {
+pub(crate) fn type_oid(data_type: DataType) -> u32 {
+    field(&Column::new("", data_type, true)).type_oid
+}
+
+pub(crate) fn field(column: &Column) -> Field {
     let (type_oid, type_size, type_modifier) = match column.data_type {
         DataType::Int => (oid::INT4, 4, -1),
         DataType::BigInt => (oid::INT8, 8, -1),
@@ -199,7 +238,7 @@ fn status(session: &Session) -> wire::TransactionStatus {
 
 /// The SQLSTATE that tells clients what kind of error `err` is, so that
 /// they can retry on a serialization failure, say.
-fn sqlstate(err: &Error) -> &'static str {
+pub(crate) fn sqlstate(err: &Error) -> &'static str {
     let Error::Engine(err) = err;
     // A bad timestamp literal fails while binding, other bad text when run.
     if let EngineError::Planner(PlannerError::Value(value))
@@ -225,6 +264,7 @@ fn sqlstate(err: &Error) -> &'static str {
     }
     match err {
         EngineError::Parse(_) => "42601",                 // syntax_error
+        EngineError::MultipleStatements => "42601",       // syntax_error
         EngineError::Planner(_) => "42000",               // syntax_error_or_access_rule_violation
         EngineError::InFailedTransaction => "25P02",      // in_failed_sql_transaction
         EngineError::AlreadyInTransaction => "25001",     // active_sql_transaction

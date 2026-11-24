@@ -4,6 +4,7 @@
 
 mod connection;
 pub mod database;
+mod extended;
 mod server;
 
 pub use database::{Database, Session};

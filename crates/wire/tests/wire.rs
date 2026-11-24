@@ -101,7 +101,7 @@ fn frontend_messages_decode() {
     let mut buf = Vec::new();
     frontend::query(&mut buf, "SELECT 1; SELECT 2");
     frontend::terminate(&mut buf);
-    buf.extend_from_slice(&[b'P', 0, 0, 0, 4, b'S', 0, 0, 0, 4]);
+    buf.extend_from_slice(&[b'H', 0, 0, 0, 4, b'S', 0, 0, 0, 4]);
 
     let mut r = Cursor::new(&buf);
     let mut body = Vec::new();
@@ -114,7 +114,7 @@ fn frontend_messages_decode() {
         [
             r#"Query("SELECT 1; SELECT 2")"#,
             "Terminate",
-            "Extended(80)",
+            "Flush",
             "Sync"
         ]
     );

@@ -12,7 +12,7 @@ pub mod engine;
 pub mod error;
 pub mod planner;
 
-pub use binder::Binder;
+pub use binder::{Binder, Described};
 pub use bound::{
     AggregateFunction, BoundAggregate, BoundCreateIndex, BoundCreateTable, BoundDelete,
     BoundDropIndex, BoundDropTable, BoundExpr, BoundExprKind, BoundFrom, BoundIndex, BoundInsert,

@@ -16,6 +16,8 @@ pub struct InsertPlan {
     children: Vec<Arc<AbstractPlanNode>>,
     table_oid: TableOid,
     table_name: String,
+    /// Skips a row whose key a unique index holds instead of failing.
+    on_conflict_do_nothing: bool,
 }
 
 impl InsertPlan {
@@ -30,7 +32,17 @@ impl InsertPlan {
             children: vec![child],
             table_oid,
             table_name: table_name.into(),
+            on_conflict_do_nothing: false,
         }
+    }
+
+    pub fn with_on_conflict_do_nothing(mut self, do_nothing: bool) -> Self {
+        self.on_conflict_do_nothing = do_nothing;
+        self
+    }
+
+    pub fn on_conflict_do_nothing(&self) -> bool {
+        self.on_conflict_do_nothing
     }
 
     /// Produces each inserted row, of `table_schema`, instead of the count,

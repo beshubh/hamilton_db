@@ -20,14 +20,15 @@
 //!
 //! A NULL literal has no type of its own. It takes the type its context
 //! asks for (the other operand, BOOL under AND, the column it is stored
-//! in) and is INT where nothing does, as in `SELECT NULL`.
+//! in) and is INT where nothing does, as in `SELECT NULL`. So does a `$n`
+//! being described whose type the client didn't give.
 
 use common::value::can_cast;
 use common::{Column, DataType, Value, ValueError};
 use parser::{BinaryOp, Expr, UnaryOp, WindowSpec};
 
-use super::Binder;
 use super::scope::Scope;
+use super::{Binder, Parameters};
 use crate::bound::{
     AggregateFunction, BoundAggregate, BoundExpr, BoundExprKind, BoundOrderBy, BoundSelect,
     BoundWindow, BoundWindowFunction, Function,
@@ -51,6 +52,7 @@ impl Binder<'_> {
                 })
             }
             Expr::Literal(value) => Ok(constant(value.clone())),
+            Expr::Parameter(n) => self.bind_parameter(*n),
             Expr::Binary { op, left, right } => bind_binary(
                 *op,
                 self.bind_expr(left, scope)?,
@@ -130,6 +132,29 @@ impl Binder<'_> {
                         negated: *negated,
                     },
                     return_type: unnamed(DataType::Bool, true),
+                })
+            }
+        }
+    }
+
+    fn bind_parameter(&self, n: usize) -> Result<BoundExpr> {
+        match &self.parameters {
+            Parameters::Values(values) => values
+                .get(n - 1)
+                .map(|value| constant(value.clone()))
+                .ok_or(PlannerError::ParameterNotFound(n)),
+            Parameters::Types(types) => {
+                let mut types = types.borrow_mut();
+                if types.len() < n {
+                    types.resize(n, None);
+                }
+                let known = types[n - 1];
+                Ok(BoundExpr {
+                    kind: BoundExprKind::Parameter {
+                        index: n,
+                        typed: known.is_some(),
+                    },
+                    return_type: unnamed(known.unwrap_or(DataType::Int), true),
                 })
             }
         }
@@ -271,8 +296,8 @@ fn single_column(subquery: &BoundSelect) -> Result<Column> {
 /// column (its length is checked when the row is stored), and a NULL literal
 /// fits any nullable column.
 pub(super) fn assign(mut expr: BoundExpr, column: &Column) -> Result<BoundExpr> {
-    if is_null_literal(&expr) {
-        if !column.nullable {
+    if is_untyped(&expr) {
+        if is_null_literal(&expr) && !column.nullable {
             return Err(ValueError::NullNotAllowed(column.name.clone()).into());
         }
         type_null(&mut expr, column.data_type);
@@ -599,11 +624,23 @@ fn is_null_literal(expr: &BoundExpr) -> bool {
     matches!(expr.kind, BoundExprKind::Constant(Value::Null))
 }
 
-/// Gives a NULL literal the type its context expects; other expressions
-/// are left alone.
+/// A NULL literal, or a parameter of no type yet.
+fn is_untyped(expr: &BoundExpr) -> bool {
+    matches!(
+        expr.kind,
+        BoundExprKind::Constant(Value::Null) | BoundExprKind::Parameter { typed: false, .. }
+    )
+}
+
+/// Gives a NULL literal or untyped parameter the type its context expects;
+/// other expressions are left alone.
 fn type_null(expr: &mut BoundExpr, data_type: DataType) {
-    if is_null_literal(expr) {
-        expr.return_type.data_type = data_type;
+    if !is_untyped(expr) {
+        return;
+    }
+    expr.return_type.data_type = data_type;
+    if let BoundExprKind::Parameter { typed, .. } = &mut expr.kind {
+        *typed = true;
     }
 }
 

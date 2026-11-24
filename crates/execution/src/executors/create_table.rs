@@ -8,7 +8,8 @@ use crate::execution_context::ExecutionContext;
 use crate::plans::{CreateTablePlan, PlanNode};
 
 /// Creates the table, with its primary key and unique indexes, on the first
-/// call to `next`. Produces no rows.
+/// call to `next`, unless IF NOT EXISTS finds one of that name. Produces no
+/// rows.
 pub struct CreateTableExecutor {
     ctx: Arc<ExecutionContext>,
     plan: CreateTablePlan,
@@ -44,6 +45,15 @@ impl Executor for CreateTableExecutor {
             let primary_key: Vec<&str> =
                 self.plan.primary_key().iter().map(String::as_str).collect();
             let identity: Vec<&str> = self.plan.identity().iter().map(String::as_str).collect();
+            if self.plan.if_not_exists()
+                && self
+                    .ctx
+                    .catalog()
+                    .get_table(self.plan.table_name())
+                    .is_some()
+            {
+                return Ok(false);
+            }
             self.ctx.catalog().create_table_with_constraints(
                 self.ctx.txn(),
                 self.plan.table_name(),
