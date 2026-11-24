@@ -108,6 +108,13 @@ pub enum PlannerError {
     #[error("cannot change sequence {0}")]
     CannotChangeSequence(String),
 
+    /// `$n` beyond the parameters given.
+    #[error("there is no parameter ${0}")]
+    ParameterNotFound(usize),
+
+    #[error("LIMIT must be a non-negative integer, not {0}")]
+    InvalidLimit(String),
+
     /// Something the parser accepts but the binder or planner does not
     /// handle yet, such as a correlated subquery.
     #[error("{0} is not supported")]

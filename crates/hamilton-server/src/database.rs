@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use catalog::{Catalog, SWEEP_BATCH};
-use planner::{EngineError, ExecutionEngine, Output, TransactionStatus};
+use common::{DataType, Value};
+use parser::Statement;
+use planner::{Described, EngineError, ExecutionEngine, Output, TransactionStatus};
 use storage::Storage;
 use storage::buffer::buffer_pool_manager::DEFAULT_POOL_SIZE;
 use storage::disk::fs::OsFs;
@@ -122,6 +124,24 @@ impl Session<'_> {
             each(self.engine.execute(stmt)?);
         }
         Ok(())
+    }
+
+    /// See [`ExecutionEngine::prepare`].
+    pub fn prepare(
+        &mut self,
+        sql: &str,
+        given: &[Option<DataType>],
+    ) -> Result<Option<(Statement, Described)>, Error> {
+        Ok(self.engine.prepare(sql, given)?)
+    }
+
+    /// Runs a prepared statement with `$n` bound to `parameters[n - 1]`.
+    pub fn execute_prepared(
+        &mut self,
+        stmt: &Statement,
+        parameters: &[Value],
+    ) -> Result<Output, Error> {
+        Ok(self.engine.execute_with(stmt, parameters)?)
     }
 }
 

@@ -46,7 +46,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use catalog::{Catalog, CatalogError};
-use common::{Column, TxnId, Value};
+use common::{Column, DataType, TxnId, Value};
 use execution::ExecutionError;
 use execution::execution_context::{ExecutionContext, ExecutionSettings};
 use execution::executors::{Executor, create_executor, lock_tables};
@@ -57,7 +57,7 @@ use storage::concurrency::transaction::{Transaction, TransactionState};
 use storage::concurrency::transaction_manager::TransactionManager;
 use thiserror::Error;
 
-use crate::binder::Binder;
+use crate::binder::{Binder, Described};
 use crate::bound::{BoundStatement, TransactionCommand};
 use crate::error::PlannerError;
 use crate::planner::Planner;
@@ -122,6 +122,9 @@ pub enum EngineError {
     /// CREATE TABLE.
     #[error("{0} cannot run inside a transaction block")]
     NotInTransactionBlock(&'static str),
+
+    #[error("cannot insert multiple commands into a prepared statement")]
+    MultipleStatements,
 }
 
 pub type Result<T, E = EngineError> = std::result::Result<T, E>;
@@ -223,9 +226,43 @@ impl ExecutionEngine {
         stmts.iter().map(|stmt| self.execute(stmt)).collect()
     }
 
+    /// Parses `sql`, at most one statement, and describes it, its
+    /// parameters having the types in `given` where those are `Some`.
+    /// `None` for an empty query. In a failed block only COMMIT and
+    /// ROLLBACK can be prepared.
+    pub fn prepare(
+        &mut self,
+        sql: &str,
+        given: &[Option<DataType>],
+    ) -> Result<Option<(Statement, Described)>> {
+        let mut stmts = self.parse(sql)?;
+        let stmt = match stmts.len() {
+            0 => return Ok(None),
+            1 => stmts.remove(0),
+            _ => return Err(self.fail(EngineError::MultipleStatements)),
+        };
+        if matches!(self.state, State::Failed)
+            && !matches!(stmt, Statement::Commit | Statement::Rollback)
+        {
+            return Err(EngineError::InFailedTransaction);
+        }
+        match Binder::new(&self.catalog).describe(&stmt, given) {
+            Ok(described) => Ok(Some((stmt, described))),
+            Err(e) => Err(self.fail(e.into())),
+        }
+    }
+
     /// Runs one statement, in the block's transaction or in one of its own.
     pub fn execute(&mut self, stmt: &Statement) -> Result<Output> {
-        let bound = Binder::new(&self.catalog).bind(stmt);
+        self.execute_with(stmt, &[])
+    }
+
+    /// Runs one statement, as `execute` does, with `$n` bound to
+    /// `parameters[n - 1]`.
+    pub fn execute_with(&mut self, stmt: &Statement, parameters: &[Value]) -> Result<Output> {
+        let bound = Binder::new(&self.catalog)
+            .with_parameters(parameters)
+            .bind(stmt);
         if matches!(self.state, State::Failed)
             && !matches!(
                 bound,

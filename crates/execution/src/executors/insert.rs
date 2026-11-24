@@ -15,7 +15,8 @@ use crate::plans::{InsertPlan, PlanNode};
 /// indexes, on the first call to `next`, and produces one row holding how
 /// many there were, or with RETURNING the inserted rows themselves. A row
 /// whose key in a unique index is taken, by a row already in the table or
-/// one inserted before it, fails the statement.
+/// one inserted before it, fails the statement, or with ON CONFLICT DO
+/// NOTHING is taken back and skipped.
 pub struct InsertExecutor {
     ctx: Arc<ExecutionContext>,
     plan: InsertPlan,
@@ -73,22 +74,37 @@ impl Executor for InsertExecutor {
         let (_writes, indexes) = write_indexes(&self.ctx, &table);
         let indexed = self.ctx.indexed_table(&table);
         let txn = self.ctx.txn();
+        let mut inserted = Vec::with_capacity(rows.len());
         // The child's rows are already in the table's layout.
-        for tuple in &rows {
-            let keys = index_keys(&table, &indexes, tuple)?;
-            let rid = txn.insert(&table.heap, &table.schema, tuple)?;
+        for tuple in rows {
+            let keys = index_keys(&table, &indexes, &tuple)?;
+            let rid = txn.insert(&table.heap, &table.schema, &tuple)?;
             let locators = locators(&indexes, &keys, rid);
+            let mut added = 0;
             for ((index, key), locator) in indexes.iter().zip(&keys).zip(&locators) {
                 if !txn.insert_entry(&indexed, &index.index, key, locator, rid)? {
-                    return Err(duplicate_key(index.index.metadata(), key));
+                    if !self.plan.on_conflict_do_nothing() {
+                        return Err(duplicate_key(index.index.metadata(), key));
+                    }
+                    break;
                 }
+                added += 1;
             }
+            if added < indexes.len() {
+                txn.delete(&table.heap, rid)?;
+                let entries = indexes.iter().zip(&keys).zip(&locators).take(added);
+                for ((index, key), locator) in entries {
+                    txn.retire_entry(&indexed, &index.index, key, locator)?;
+                }
+                continue;
+            }
+            inserted.push(tuple);
         }
         if !self.plan.returning() {
-            tuples.push(count_row(self.plan.get_output_schema(), rows.len())?);
+            tuples.push(count_row(self.plan.get_output_schema(), inserted.len())?);
             return Ok(true);
         }
-        self.returned = rows.into();
+        self.returned = inserted.into();
         self.next(tuples, rids, batch_size)
     }
 

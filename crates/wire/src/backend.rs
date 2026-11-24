@@ -56,18 +56,62 @@ pub fn ready_for_query(buf: &mut Vec<u8>, status: TransactionStatus) {
 }
 
 pub fn row_description(buf: &mut Vec<u8>, fields: &[Field]) {
+    row_description_in(buf, fields, &[]);
+}
+
+/// A row description whose `i`-th column is in binary format if
+/// `binary[i]` is, and in text format past the end of `binary`.
+pub fn row_description_in(buf: &mut Vec<u8>, fields: &[Field], binary: &[bool]) {
     let at = begin(buf, b'T');
     let count = i16::try_from(fields.len()).expect("at most i16::MAX columns");
     buf.extend_from_slice(&count.to_be_bytes());
-    for field in fields {
+    for (i, field) in fields.iter().enumerate() {
         put_cstr(buf, &field.name);
         buf.extend_from_slice(&0i32.to_be_bytes()); // table oid
         buf.extend_from_slice(&0i16.to_be_bytes()); // column number
         buf.extend_from_slice(&field.type_oid.to_be_bytes());
         buf.extend_from_slice(&field.type_size.to_be_bytes());
         buf.extend_from_slice(&field.type_modifier.to_be_bytes());
-        buf.extend_from_slice(&0i16.to_be_bytes()); // text format
+        let format = i16::from(binary.get(i).copied().unwrap_or(false));
+        buf.extend_from_slice(&format.to_be_bytes());
     }
+    end(buf, at);
+}
+
+pub fn parameter_description(buf: &mut Vec<u8>, oids: &[u32]) {
+    let at = begin(buf, b't');
+    let count = i16::try_from(oids.len()).expect("at most i16::MAX parameters");
+    buf.extend_from_slice(&count.to_be_bytes());
+    for oid in oids {
+        buf.extend_from_slice(&oid.to_be_bytes());
+    }
+    end(buf, at);
+}
+
+pub fn parse_complete(buf: &mut Vec<u8>) {
+    let at = begin(buf, b'1');
+    end(buf, at);
+}
+
+pub fn bind_complete(buf: &mut Vec<u8>) {
+    let at = begin(buf, b'2');
+    end(buf, at);
+}
+
+pub fn close_complete(buf: &mut Vec<u8>) {
+    let at = begin(buf, b'3');
+    end(buf, at);
+}
+
+/// Describe's answer for a statement that produces no rows.
+pub fn no_data(buf: &mut Vec<u8>) {
+    let at = begin(buf, b'n');
+    end(buf, at);
+}
+
+/// Execute stopped at its row limit with rows left.
+pub fn portal_suspended(buf: &mut Vec<u8>) {
+    let at = begin(buf, b's');
     end(buf, at);
 }
 
@@ -104,6 +148,14 @@ impl<'a> DataRow<'a> {
         write!(self.buf, "{value}").expect("writing to a Vec cannot fail");
         let len = i32::try_from(self.buf.len() - len_at - 4).expect("value fits in an i32 length");
         self.buf[len_at..len_at + 4].copy_from_slice(&len.to_be_bytes());
+        self.count += 1;
+    }
+
+    /// Writes `value` as is, for a value in binary format.
+    pub fn bytes(&mut self, value: &[u8]) {
+        let len = i32::try_from(value.len()).expect("value fits in an i32 length");
+        self.buf.extend_from_slice(&len.to_be_bytes());
+        self.buf.extend_from_slice(value);
         self.count += 1;
     }
 

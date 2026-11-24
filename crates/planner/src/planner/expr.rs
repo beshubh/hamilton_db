@@ -95,6 +95,9 @@ pub(super) fn plan_expr(expr: &BoundExpr, inputs: Inputs) -> Result<AbstractExpr
         BoundExprKind::Aggregate(_) | BoundExprKind::Window(_) => {
             unreachable!("the binder replaces aggregate and window calls with columns")
         }
+        BoundExprKind::Parameter { .. } => {
+            unreachable!("only a described statement keeps its parameters, and it is not planned")
+        }
     };
     Ok(planned)
 }

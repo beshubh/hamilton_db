@@ -1,6 +1,7 @@
 //! The Postgres frontend/backend protocol, version 3, as far as HamiltonDB
 //! speaks it: startup without authentication, then the simple query flow
-//! with every value in text format. Both sides are here: `hamilton-server`
+//! with every value in text format, or the extended query flow with values
+//! in text or binary format. Both sides are here: `hamilton-server`
 //! encodes backend messages and decodes frontend ones, and [`Client`] does
 //! the reverse.
 //!
@@ -30,12 +31,18 @@ pub const SCHEMA_REQUEST: &str = "\\schema";
 
 /// The type oids a row description uses, Postgres's own.
 pub mod oid {
+    pub const UNSPECIFIED: u32 = 0;
     pub const BOOL: u32 = 16;
     pub const INT8: u32 = 20;
+    pub const INT2: u32 = 21;
     pub const INT4: u32 = 23;
     pub const TEXT: u32 = 25;
+    pub const FLOAT4: u32 = 700;
     pub const FLOAT8: u32 = 701;
+    pub const UNKNOWN: u32 = 705;
+    pub const BPCHAR: u32 = 1042;
     pub const VARCHAR: u32 = 1043;
+    pub const TIMESTAMP: u32 = 1114;
     pub const TIMESTAMPTZ: u32 = 1184;
 }
 

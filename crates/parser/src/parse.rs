@@ -17,16 +17,17 @@ use sqlparser::ast::{
     CharacterLength, ColumnDef, ColumnOption, ExactNumberInfo, Expr, FromTable, FunctionArg,
     FunctionArgExpr, FunctionArguments, GeneratedAs, GroupByExpr, Ident, IndexColumn,
     JoinConstraint, JoinOperator, KeyOrIndexDisplay, LimitClause, NullsDistinctOption, ObjectName,
-    ObjectNamePart, OrderByKind, OrderByOptions, OrderBySort, PrimaryKeyConstraint, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, TableConstraint, TableFactor, TableObject,
-    TableWithJoins, TimezoneInfo, TruncateIdentityOption, UnaryOperator, UniqueConstraint,
-    WindowType,
+    ObjectNamePart, OnConflict, OnConflictAction, OnInsert, OrderByKind, OrderByOptions,
+    OrderBySort, PrimaryKeyConstraint, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
+    TableConstraint, TableFactor, TableObject, TableWithJoins, TimezoneInfo,
+    TruncateIdentityOption, UnaryOperator, UniqueConstraint, WindowType,
 };
 use sqlparser::parser::Parser;
 
 use crate::ast::{
     self, BinaryOp, CreateIndex, CreateTable, Delete, DropIndex, DropTable, FromItem, Insert,
-    JoinKind, OrderByItem, Select, Statement, TableRef, Truncate, UnaryOp, Update, WindowSpec,
+    JoinKind, Limit, OrderByItem, Select, Statement, TableRef, Truncate, UnaryOp, Update,
+    WindowSpec,
 };
 use crate::dialect::HamiltonDialect;
 use crate::error::{ParseError, Result};
@@ -161,9 +162,6 @@ fn convert_explain(stmt: &sql::Statement, explained: &sql::Statement) -> Result<
 }
 
 fn convert_create_table(stmt: &sql::Statement, create: &sql::CreateTable) -> Result<Statement> {
-    if create.if_not_exists {
-        return Err(ParseError::Unsupported("CREATE TABLE IF NOT EXISTS".into()));
-    }
     if create.query.is_some() {
         return Err(ParseError::Unsupported("CREATE TABLE ... AS".into()));
     }
@@ -176,11 +174,20 @@ fn convert_create_table(stmt: &sql::Statement, create: &sql::CreateTable) -> Res
         .iter()
         .map(ToString::to_string)
         .chain(create.constraints.iter().map(ToString::to_string));
-    let canonical = format!("CREATE TABLE {} ({})", create.name, join(elements));
+    let if_not_exists = if create.if_not_exists {
+        "IF NOT EXISTS "
+    } else {
+        ""
+    };
+    let canonical = format!(
+        "CREATE TABLE {if_not_exists}{} ({})",
+        create.name,
+        join(elements)
+    );
     ensure_canonical(
         stmt,
         &canonical,
-        "CREATE TABLE <name> (<column> <type>, ... [, PRIMARY KEY (<column>, ...)] [, UNIQUE (<column>, ...)])",
+        "CREATE TABLE [IF NOT EXISTS] <name> (<column> <type>, ... [, PRIMARY KEY (<column>, ...)] [, UNIQUE (<column>, ...)])",
     )?;
 
     let name = object_name(&create.name)?;
@@ -218,6 +225,7 @@ fn convert_create_table(stmt: &sql::Statement, create: &sql::CreateTable) -> Res
     };
     Ok(Statement::CreateTable(CreateTable {
         name,
+        if_not_exists: create.if_not_exists,
         columns,
         primary_key,
         unique,
@@ -469,15 +477,27 @@ fn convert_insert(
     } else {
         format!(" ({})", join(insert.columns.iter()))
     };
+    let on_conflict_do_nothing = matches!(
+        insert.on,
+        Some(OnInsert::OnConflict(OnConflict {
+            conflict_target: None,
+            action: OnConflictAction::DoNothing,
+        }))
+    );
+    let on_conflict = if on_conflict_do_nothing {
+        " ON CONFLICT DO NOTHING"
+    } else {
+        ""
+    };
     let returning = match &insert.returning {
         Some(items) => format!(" RETURNING {}", join(items.iter())),
         None => String::new(),
     };
-    let canonical = format!("INSERT INTO {table}{columns} {values}{returning}");
+    let canonical = format!("INSERT INTO {table}{columns} {values}{on_conflict}{returning}");
     ensure_canonical(
         stmt,
         &canonical,
-        "INSERT INTO <table> [(<column>, ...)] VALUES (...), ... [RETURNING <items>]",
+        "INSERT INTO <table> [(<column>, ...)] VALUES (...), ... [ON CONFLICT DO NOTHING] [RETURNING <items>]",
     )?;
 
     let source_rows = taken_rows.unwrap_or(&values.rows);
@@ -497,6 +517,7 @@ fn convert_insert(
             .map(object_name)
             .collect::<Result<_>>()?,
         rows,
+        on_conflict_do_nothing,
         returning: insert
             .returning
             .iter()
@@ -541,7 +562,7 @@ fn convert_query(query: &sql::Query) -> Result<Select> {
         query,
         &canonical,
         "SELECT <items> [FROM <tables>] [WHERE <expr>] [GROUP BY <expr>, ...] \
-         [HAVING <expr>] [ORDER BY <expr>, ...] [LIMIT <n>]",
+         [HAVING <expr>] [ORDER BY <expr>, ...] [LIMIT <n> | LIMIT $<n>]",
     )?;
 
     let projection = select
@@ -717,10 +738,15 @@ fn convert_order_by(item: &sql::OrderByExpr) -> Result<OrderByItem> {
     })
 }
 
-/// `LIMIT <n>` with a non-negative integer literal. OFFSET is not supported.
-fn convert_limit(limit: &LimitClause) -> Result<u64> {
-    let reject =
-        || ParseError::Unsupported(format!("`{}` (only LIMIT <n>)", limit.to_string().trim()));
+/// `LIMIT <n>` with a non-negative integer literal, or `LIMIT $<n>`. OFFSET
+/// is not supported.
+fn convert_limit(limit: &LimitClause) -> Result<Limit> {
+    let reject = || {
+        ParseError::Unsupported(format!(
+            "`{}` (only LIMIT <n> or LIMIT $<n>)",
+            limit.to_string().trim()
+        ))
+    };
     let LimitClause::LimitOffset {
         limit: Some(n),
         offset: None,
@@ -729,14 +755,23 @@ fn convert_limit(limit: &LimitClause) -> Result<u64> {
     else {
         return Err(reject());
     };
+    if !limit_by.is_empty() {
+        return Err(reject());
+    }
+    if let Expr::Value(value) = n
+        && let sql::Value::Placeholder(name) = &value.value
+    {
+        return parameter(name).map(Limit::Parameter);
+    }
     let Some(digits) = number(n) else {
         return Err(reject());
     };
-    if !limit_by.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(reject());
     }
     digits
         .parse()
+        .map(Limit::Count)
         .map_err(|_| ParseError::IntegerOutOfRange(digits.to_owned()))
 }
 
@@ -976,9 +1011,19 @@ fn convert_literal(value: &sql::Value) -> Option<Result<ast::Expr>> {
         sql::Value::SingleQuotedString(s) => Value::Varchar(s.clone()),
         sql::Value::Boolean(b) => Value::Bool(*b),
         sql::Value::Null => Value::Null,
+        sql::Value::Placeholder(name) => return Some(parameter(name).map(ast::Expr::Parameter)),
         _ => return None,
     };
     Some(Ok(ast::Expr::Literal(value)))
+}
+
+/// The number of a `$n` parameter, counted from 1.
+fn parameter(name: &str) -> Result<usize> {
+    name.strip_prefix('$')
+        .filter(|digits| digits.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|digits| digits.parse().ok())
+        .filter(|&n| n > 0)
+        .ok_or_else(|| ParseError::Unsupported(format!("parameter {name} (only $<n>)")))
 }
 
 /// The digits of a numeric literal.
@@ -1261,6 +1306,7 @@ mod tests {
                     Column::new("big", DataType::BigInt, true),
                     Column::new("ok", DataType::Bool, true),
                 ],
+                if_not_exists: false,
                 primary_key: vec![],
                 unique: vec![],
                 identity: vec![],
@@ -1506,7 +1552,6 @@ mod tests {
 
     #[test]
     fn create_table_rejects_unsupported_parts() {
-        assert_unsupported("CREATE TABLE IF NOT EXISTS t (id INT)");
         assert_unsupported("CREATE TABLE t (id INT DEFAULT 1)");
         assert_unsupported("CREATE TABLE t (id INT UNIQUE DEFERRABLE)");
         assert_unsupported("CREATE TABLE t (id INT CONSTRAINT pk PRIMARY KEY)");
@@ -1551,6 +1596,7 @@ mod tests {
                     vec![lit(1), lit("a"), lit(true), lit(Value::Null)],
                     vec![lit(-2147483649i64), lit("it's"), lit(false), lit(i64::MIN),],
                 ],
+                on_conflict_do_nothing: false,
                 returning: vec![],
             })
         );
@@ -1571,6 +1617,7 @@ mod tests {
                         expr: Box::new(col("x")),
                     },
                 ]],
+                on_conflict_do_nothing: false,
                 returning: vec![],
             })
         );
@@ -1604,8 +1651,7 @@ mod tests {
     #[test]
     fn insert_rejects_unsupported_parts() {
         assert_unsupported("INSERT INTO t SELECT * FROM u");
-        assert_unsupported("INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING");
-        assert_unsupported("INSERT INTO t VALUES ($1)");
+        assert_unsupported("INSERT INTO t VALUES (1) ON CONFLICT (a) DO NOTHING");
         assert_unsupported("INSERT INTO t DEFAULT VALUES");
     }
 
@@ -1691,7 +1737,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(s.limit, Some(10));
+        assert_eq!(s.limit, Some(Limit::Count(10)));
     }
 
     #[test]
@@ -1839,7 +1885,6 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_expressions() {
-        assert_unsupported("SELECT $1");
         assert_unsupported("SELECT 'a' || 'b'");
         assert_unsupported("SELECT a.b.c FROM t");
         assert_unsupported("SELECT a IN (1, 2) FROM t");
@@ -1976,7 +2021,6 @@ mod tests {
     fn subqueries_are_checked_for_unsupported_parts() {
         assert_unsupported("SELECT * FROM (SELECT DISTINCT a FROM t) AS x");
         assert_unsupported("SELECT EXISTS (SELECT * FROM t LIMIT 1 OFFSET 1)");
-        assert_unsupported("SELECT a IN (SELECT $1) FROM t");
     }
 
     #[test]

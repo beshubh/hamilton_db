@@ -614,32 +614,6 @@ fn ssl_requests_are_declined() {
 }
 
 #[test]
-fn extended_queries_are_refused_until_sync() {
-    let server = Running::start();
-    let mut raw = Raw::connect(server.addr);
-    raw.startup();
-    // Parse, Bind, Execute, then Sync.
-    raw.send(&[
-        b'P', 0, 0, 0, 4, b'B', 0, 0, 0, 4, b'E', 0, 0, 0, 4, b'S', 0, 0, 0, 4,
-    ]);
-    let messages = raw.until_ready();
-    let [
-        Message::ErrorResponse(error),
-        Message::ReadyForQuery(TransactionStatus::Idle),
-    ] = messages.as_slice()
-    else {
-        panic!("{messages:?}");
-    };
-    assert_eq!(error.code, "0A000");
-
-    let mut buf = Vec::new();
-    frontend::query(&mut buf, "SELECT 1");
-    raw.send(&buf);
-    assert!(matches!(raw.until_ready()[0], Message::RowDescription(_)));
-    server.stop();
-}
-
-#[test]
 fn closed_clients_are_forgotten() {
     let server = Running::start();
     for _ in 0..20 {

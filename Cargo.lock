@@ -538,6 +538,7 @@ dependencies = [
  "ctrlc",
  "execution",
  "log",
+ "parser",
  "planner",
  "proptest",
  "rand",

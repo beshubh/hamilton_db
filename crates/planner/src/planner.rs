@@ -68,6 +68,7 @@ impl<'a> Planner<'a> {
             )
             .with_identity(create.identity.clone())
             .with_unique(create.unique.clone())
+            .with_if_not_exists(create.if_not_exists)
             .into(),
             BoundStatement::CreateIndex(create) => {
                 CreateIndexPlan::new(&create.name, &create.table, create.columns.clone())
@@ -208,7 +209,8 @@ impl<'a> Planner<'a> {
             insert.table.oid,
             &insert.table.name,
             Arc::new(values.into()),
-        );
+        )
+        .with_on_conflict_do_nothing(insert.on_conflict_do_nothing);
         if insert.returning.is_empty() {
             return Ok(plan.into());
         }
