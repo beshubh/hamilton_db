@@ -1,0 +1,14 @@
+target/
+.git/
+.plans/
+**/__pycache__/
+examples/
+sqltest/
+docs/
+assets/
+*.db
+*.meta
+*.log
+*.log.*
+Dockerfile
+.dockerignore
